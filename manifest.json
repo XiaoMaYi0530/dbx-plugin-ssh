@@ -1,0 +1,755 @@
+{
+  "$schema": "https://raw.githubusercontent.com/t8y2/dbx/dev/plugin-framework-current/plugins/manifest.schema.json",
+  "manifest_version": 1,
+  "id": "io.dbx.ssh",
+  "name": "SSH & SFTP",
+  "version": "0.2.5",
+  "publisher": "xynanan",
+  "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
+  "icon": "assets/plugin.svg",
+  "engines": {
+    "dbx": ">=0.5.77",
+    "host_api": ">=1.0.0"
+  },
+  "permissions": [
+    "host.events",
+    "host.binary",
+    "host.filesystem",
+    "host.workbench"
+  ],
+  "entrypoints": {
+    "backend": {
+      "transport": "stdio-framed",
+      "executable": "bin/dbx-plugin-ssh"
+    },
+    "ui": {
+      "root": "ui",
+      "entry": "ui/index.html"
+    }
+  },
+  "contributions": [
+    {
+      "type": "connection-provider",
+      "id": "io.dbx.ssh.connection",
+      "label": "SSH server",
+      "icon": "assets/plugin.svg",
+      "database_type": "ssh",
+      "description": "SSH terminal and SFTP connection with password, private key, agent, or no authentication.",
+      "fields": [
+        {
+          "key": "display_name",
+          "label": "Connection name",
+          "type": "text",
+          "binding": "name",
+          "required": true,
+          "default": "SSH server"
+        },
+        {
+          "key": "host",
+          "label": "Host",
+          "type": "text",
+          "binding": "host",
+          "required": true,
+          "default": "127.0.0.1"
+        },
+        {
+          "key": "port",
+          "label": "Port",
+          "type": "number",
+          "binding": "port",
+          "required": true,
+          "default": 22
+        },
+        {
+          "key": "username",
+          "label": "Username",
+          "type": "text",
+          "binding": "username",
+          "required": true,
+          "default": "root"
+        },
+        {
+          "key": "authentication",
+          "label": "Authentication",
+          "type": "select",
+          "binding": "config",
+          "default": "password",
+          "options": [
+            {
+              "label": "Password",
+              "value": "password"
+            },
+            {
+              "label": "Private key",
+              "value": "private-key"
+            },
+            {
+              "label": "Private key, then password",
+              "value": "private-key-password"
+            },
+            {
+              "label": "SSH Agent",
+              "value": "agent"
+            },
+            {
+              "label": "No authentication",
+              "value": "none"
+            }
+          ]
+        },
+        {
+          "key": "password",
+          "label": "Password",
+          "type": "password",
+          "binding": "password",
+          "visible_when": {
+            "field": "authentication",
+            "one_of": [
+              "password",
+              "private-key-password"
+            ]
+          },
+          "required_when": {
+            "field": "authentication",
+            "one_of": [
+              "password",
+              "private-key-password"
+            ]
+          }
+        },
+        {
+          "key": "private_key_path",
+          "label": "Private key path",
+          "type": "text",
+          "binding": "config",
+          "description": "Desktop: local path. Web/Docker: path on the DBX server or container.",
+          "visible_when": {
+            "field": "authentication",
+            "one_of": [
+              "private-key",
+              "private-key-password"
+            ]
+          },
+          "required_when": {
+            "field": "authentication",
+            "one_of": [
+              "private-key",
+              "private-key-password"
+            ]
+          }
+        },
+        {
+          "key": "private_key_passphrase",
+          "label": "Private key passphrase",
+          "type": "password",
+          "binding": "secret",
+          "visible_when": {
+            "field": "authentication",
+            "one_of": [
+              "private-key",
+              "private-key-password"
+            ]
+          }
+        },
+        {
+          "key": "agent_socket",
+          "label": "Agent socket",
+          "type": "text",
+          "binding": "config",
+          "description": "Optional SSH_AUTH_SOCK override. Leave empty for the environment default or Windows Pageant.",
+          "visible_when": {
+            "field": "authentication",
+            "one_of": [
+              "agent"
+            ]
+          }
+        },
+        {
+          "key": "connect_timeout_secs",
+          "label": "Connect timeout (seconds)",
+          "type": "number",
+          "binding": "config",
+          "default": 15,
+          "description": "SSH handshake and authentication timeout."
+        },
+        {
+          "key": "keepalive_interval_secs",
+          "label": "Keepalive interval (seconds)",
+          "type": "number",
+          "binding": "config",
+          "default": 30,
+          "description": "Keepalive probe interval; 3 missed probes disconnect the session. 0 disables probes."
+        },
+        {
+          "key": "quick_sudo",
+          "label": "Quick Sudo",
+          "type": "boolean",
+          "binding": "config",
+          "default": true,
+          "description": "Pipe the sudo password automatically and answer 2FA/TOTP prompts in the terminal and command dialog. Ignored on read-only connections."
+        },
+        {
+          "key": "sudo_password",
+          "label": "Sudo password override",
+          "type": "password",
+          "binding": "secret",
+          "visible_when": {
+            "field": "quick_sudo",
+            "one_of": [
+              "true"
+            ]
+          },
+          "description": "Password piped to sudo; leave empty to reuse the login password."
+        },
+        {
+          "key": "totp_secret",
+          "label": "TOTP secrets",
+          "type": "textarea",
+          "binding": "secret",
+          "description": "One secret per line: otpauth:// URI, base32 key, or a static code. Rotating selection avoids reusing a code in the same window. Also answers login-time keyboard-interactive 2FA."
+        },
+        {
+          "key": "auth_flow_mode",
+          "label": "2FA flow",
+          "type": "select",
+          "binding": "config",
+          "default": "password_then_otp",
+          "options": [
+            {
+              "value": "password_then_otp",
+              "label": "Password first, then OTP"
+            },
+            {
+              "value": "password_plus_otp",
+              "label": "Password + OTP combined"
+            },
+            {
+              "value": "password_only",
+              "label": "Password only"
+            }
+          ],
+          "description": "How login and sudo 2FA prompts are answered."
+        },
+        {
+          "key": "password_prompt_hint",
+          "label": "Password prompt hint",
+          "type": "text",
+          "binding": "config",
+          "description": "Custom substring that identifies password prompts (e.g. 'identity token')."
+        },
+        {
+          "key": "totp_prompt_hint",
+          "label": "OTP prompt hint",
+          "type": "text",
+          "binding": "config",
+          "description": "Custom substring that identifies OTP prompts (e.g. 'duo passcode')."
+        },
+        {
+          "key": "sudo_use_pty",
+          "label": "Request PTY for sudo commands",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "visible_when": {
+            "field": "quick_sudo",
+            "one_of": [
+              "true"
+            ]
+          },
+          "description": "Some PAM stacks only prompt correctly with a TTY."
+        },
+        {
+          "key": "read_only",
+          "label": "Read only",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "description": "Reject every write operation (SFTP changes, uploads, sudo commands) on this connection; Quick Sudo stays off while enabled."
+        }
+      ],
+      "workbench": "io.dbx.ssh.workbench",
+      "filesystem_provider": "io.dbx.ssh.files",
+      "capabilities": [
+        "test",
+        "connect",
+        "disconnect"
+      ]
+    },
+    {
+      "type": "workbench",
+      "id": "io.dbx.ssh.workbench",
+      "label": "SSH & SFTP Workbench",
+      "description": "Interactive terminal and SFTP file manager.",
+      "icon": "assets/plugin.svg"
+    },
+    {
+      "type": "filesystem-provider",
+      "id": "io.dbx.ssh.files",
+      "label": "SFTP files",
+      "description": "Remote filesystem exposed through SFTP.",
+      "schemes": [
+        "sftp"
+      ],
+      "root_uri": "sftp:/",
+      "capabilities": [
+        "read",
+        "write",
+        "delete",
+        "rename",
+        "mkdir"
+      ]
+    }
+  ],
+  "localizations": {
+    "es": {
+      "name": "DBX SSH y SFTP",
+      "description": "Terminal SSH y área de trabajo SFTP completa para DBX.",
+      "contributions": {
+        "io.dbx.ssh.connection": {
+          "label": "Servidor SSH",
+          "description": "Conexión SSH y SFTP con contraseña, clave privada, agente o sin autenticación.",
+          "fields": {
+            "display_name": {
+              "label": "Nombre de conexión"
+            },
+            "host": {
+              "label": "Host"
+            },
+            "port": {
+              "label": "Puerto"
+            },
+            "username": {
+              "label": "Usuario"
+            },
+            "authentication": {
+              "label": "Autenticación",
+              "options": {
+                "password": "Contraseña",
+                "private-key": "Clave privada",
+                "private-key-password": "Clave privada y después contraseña",
+                "agent": "Agente SSH",
+                "none": "Sin autenticación"
+              }
+            },
+            "password": {
+              "label": "Contraseña"
+            },
+            "private_key_path": {
+              "label": "Ruta de clave privada"
+            },
+            "private_key_passphrase": {
+              "label": "Frase de contraseña de la clave"
+            },
+            "agent_socket": {
+              "label": "Socket del agente"
+            },
+            "connect_timeout_secs": {
+              "label": "Tiempo de espera de conexión (segundos)"
+            },
+            "keepalive_interval_secs": {
+              "label": "Intervalo de keepalive (segundos)"
+            },
+            "quick_sudo": {
+              "label": "Quick sudo"
+            },
+            "sudo_password": {
+              "label": "Contraseña de sudo (override)"
+            },
+            "totp_secret": {
+              "label": "Secretos TOTP"
+            },
+            "auth_flow_mode": {
+              "label": "Flujo 2FA"
+            },
+            "password_prompt_hint": {
+              "label": "Pista de prompt de contraseña"
+            },
+            "totp_prompt_hint": {
+              "label": "Pista de prompt de OTP"
+            },
+            "sudo_use_pty": {
+              "label": "Solicitar PTY para sudo"
+            },
+            "read_only": {
+              "label": "Solo lectura"
+            }
+          }
+        },
+        "io.dbx.ssh.workbench": {
+          "label": "Área de trabajo SSH y SFTP",
+          "description": "Terminal interactivo y gestor de archivos SFTP."
+        },
+        "io.dbx.ssh.files": {
+          "label": "Archivos SFTP",
+          "description": "Sistema de archivos remoto mediante SFTP."
+        }
+      }
+    },
+    "it": {
+      "name": "DBX SSH e SFTP",
+      "description": "Terminale SSH e area di lavoro SFTP completa per DBX.",
+      "contributions": {
+        "io.dbx.ssh.connection": {
+          "label": "Server SSH",
+          "description": "Connessione SSH e SFTP con password, chiave privata, agent o senza autenticazione.",
+          "fields": {
+            "display_name": {
+              "label": "Nome connessione"
+            },
+            "host": {
+              "label": "Host"
+            },
+            "port": {
+              "label": "Porta"
+            },
+            "username": {
+              "label": "Nome utente"
+            },
+            "authentication": {
+              "label": "Autenticazione",
+              "options": {
+                "password": "Password",
+                "private-key": "Chiave privata",
+                "private-key-password": "Chiave privata, poi password",
+                "agent": "SSH Agent",
+                "none": "Nessuna autenticazione"
+              }
+            },
+            "password": {
+              "label": "Password"
+            },
+            "private_key_path": {
+              "label": "Percorso chiave privata"
+            },
+            "private_key_passphrase": {
+              "label": "Passphrase chiave privata"
+            },
+            "agent_socket": {
+              "label": "Socket agent"
+            },
+            "read_only": {
+              "label": "Sola lettura"
+            }
+          }
+        },
+        "io.dbx.ssh.workbench": {
+          "label": "Area di lavoro SSH e SFTP",
+          "description": "Terminale interattivo e gestore file SFTP."
+        },
+        "io.dbx.ssh.files": {
+          "label": "File SFTP",
+          "description": "File system remoto tramite SFTP."
+        }
+      }
+    },
+    "ja": {
+      "name": "DBX SSH & SFTP",
+      "description": "DBX 用の完全な SSH ターミナルと SFTP ワークベンチ。",
+      "contributions": {
+        "io.dbx.ssh.connection": {
+          "label": "SSH サーバー",
+          "description": "パスワード、秘密鍵、エージェント、または認証なしの SSH/SFTP 接続。",
+          "fields": {
+            "display_name": {
+              "label": "接続名"
+            },
+            "host": {
+              "label": "ホスト"
+            },
+            "port": {
+              "label": "ポート"
+            },
+            "username": {
+              "label": "ユーザー名"
+            },
+            "authentication": {
+              "label": "認証方式",
+              "options": {
+                "password": "パスワード",
+                "private-key": "秘密鍵",
+                "private-key-password": "秘密鍵の後にパスワード",
+                "agent": "SSH Agent",
+                "none": "認証なし"
+              }
+            },
+            "password": {
+              "label": "パスワード"
+            },
+            "private_key_path": {
+              "label": "秘密鍵のパス"
+            },
+            "private_key_passphrase": {
+              "label": "秘密鍵のパスフレーズ"
+            },
+            "agent_socket": {
+              "label": "エージェントソケット"
+            },
+            "connect_timeout_secs": {
+              "label": "接続タイムアウト（秒）"
+            },
+            "keepalive_interval_secs": {
+              "label": "Keepalive 間隔（秒）"
+            },
+            "quick_sudo": {
+              "label": "Quick sudo（自動昇格）"
+            },
+            "sudo_password": {
+              "label": "sudo パスワード（上書き）"
+            },
+            "totp_secret": {
+              "label": "TOTP シークレット"
+            },
+            "auth_flow_mode": {
+              "label": "2FA フロー"
+            },
+            "password_prompt_hint": {
+              "label": "パスワード プロンプト判定語"
+            },
+            "totp_prompt_hint": {
+              "label": "OTP プロンプト判定語"
+            },
+            "sudo_use_pty": {
+              "label": "sudo で PTY を要求"
+            },
+            "read_only": {
+              "label": "読み取り専用"
+            }
+          }
+        },
+        "io.dbx.ssh.workbench": {
+          "label": "SSH & SFTP ワークベンチ",
+          "description": "対話型ターミナルと SFTP ファイルマネージャー。"
+        },
+        "io.dbx.ssh.files": {
+          "label": "SFTP ファイル",
+          "description": "SFTP 経由のリモートファイルシステム。"
+        }
+      }
+    },
+    "pt-BR": {
+      "name": "DBX SSH e SFTP",
+      "description": "Terminal SSH e área de trabalho SFTP completa para DBX.",
+      "contributions": {
+        "io.dbx.ssh.connection": {
+          "label": "Servidor SSH",
+          "description": "Conexão SSH e SFTP com senha, chave privada, agente ou sem autenticação.",
+          "fields": {
+            "display_name": {
+              "label": "Nome da conexão"
+            },
+            "host": {
+              "label": "Host"
+            },
+            "port": {
+              "label": "Porta"
+            },
+            "username": {
+              "label": "Usuário"
+            },
+            "authentication": {
+              "label": "Autenticação",
+              "options": {
+                "password": "Senha",
+                "private-key": "Chave privada",
+                "private-key-password": "Chave privada e depois senha",
+                "agent": "Agente SSH",
+                "none": "Sem autenticação"
+              }
+            },
+            "password": {
+              "label": "Senha"
+            },
+            "private_key_path": {
+              "label": "Caminho da chave privada"
+            },
+            "private_key_passphrase": {
+              "label": "Frase secreta da chave"
+            },
+            "agent_socket": {
+              "label": "Socket do agente"
+            },
+            "read_only": {
+              "label": "Somente leitura"
+            }
+          }
+        },
+        "io.dbx.ssh.workbench": {
+          "label": "Área de trabalho SSH e SFTP",
+          "description": "Terminal interativo e gerenciador de arquivos SFTP."
+        },
+        "io.dbx.ssh.files": {
+          "label": "Arquivos SFTP",
+          "description": "Sistema de arquivos remoto via SFTP."
+        }
+      }
+    },
+    "zh-CN": {
+      "name": "DBX SSH/SFTP",
+      "description": "为 DBX 提供完整的 SSH 终端和 SFTP 工作台。",
+      "contributions": {
+        "io.dbx.ssh.connection": {
+          "label": "SSH 服务器",
+          "description": "支持密码、私钥、SSH Agent 或无认证的 SSH/SFTP 连接。",
+          "fields": {
+            "display_name": {
+              "label": "连接名称"
+            },
+            "host": {
+              "label": "主机"
+            },
+            "port": {
+              "label": "端口"
+            },
+            "username": {
+              "label": "用户名"
+            },
+            "authentication": {
+              "label": "认证方式",
+              "options": {
+                "password": "密码",
+                "private-key": "私钥",
+                "private-key-password": "私钥后密码",
+                "agent": "SSH Agent",
+                "none": "无认证"
+              }
+            },
+            "password": {
+              "label": "密码"
+            },
+            "private_key_path": {
+              "label": "私钥路径"
+            },
+            "private_key_passphrase": {
+              "label": "私钥口令"
+            },
+            "agent_socket": {
+              "label": "Agent Socket"
+            },
+            "connect_timeout_secs": {
+              "label": "连接超时（秒）"
+            },
+            "keepalive_interval_secs": {
+              "label": "Keepalive 间隔（秒）"
+            },
+            "quick_sudo": {
+              "label": "Quick Sudo（自动提权）"
+            },
+            "sudo_password": {
+              "label": "sudo 密码覆盖"
+            },
+            "totp_secret": {
+              "label": "TOTP 密钥"
+            },
+            "auth_flow_mode": {
+              "label": "2FA 认证流"
+            },
+            "password_prompt_hint": {
+              "label": "密码提示词"
+            },
+            "totp_prompt_hint": {
+              "label": "OTP 提示词"
+            },
+            "sudo_use_pty": {
+              "label": "sudo 命令请求 PTY"
+            },
+            "read_only": {
+              "label": "只读"
+            }
+          }
+        },
+        "io.dbx.ssh.workbench": {
+          "label": "SSH 与 SFTP 工作台",
+          "description": "交互式终端与 SFTP 文件管理器。"
+        },
+        "io.dbx.ssh.files": {
+          "label": "SFTP 文件",
+          "description": "通过 SFTP 访问远程文件系统。"
+        }
+      }
+    },
+    "zh-TW": {
+      "name": "DBX SSH 與 SFTP",
+      "description": "為 DBX 提供完整的 SSH 終端與 SFTP 工作臺。",
+      "contributions": {
+        "io.dbx.ssh.connection": {
+          "label": "SSH 伺服器",
+          "description": "支援密碼、私鑰、SSH Agent 或無認證的 SSH 與 SFTP 連線。",
+          "fields": {
+            "display_name": {
+              "label": "連線名稱"
+            },
+            "host": {
+              "label": "主機"
+            },
+            "port": {
+              "label": "連接埠"
+            },
+            "username": {
+              "label": "使用者名稱"
+            },
+            "authentication": {
+              "label": "認證方式",
+              "options": {
+                "password": "密碼",
+                "private-key": "私鑰",
+                "private-key-password": "私鑰後密碼",
+                "agent": "SSH Agent",
+                "none": "無認證"
+              }
+            },
+            "password": {
+              "label": "密碼"
+            },
+            "private_key_path": {
+              "label": "私鑰路徑"
+            },
+            "private_key_passphrase": {
+              "label": "私鑰密語"
+            },
+            "agent_socket": {
+              "label": "Agent Socket"
+            },
+            "connect_timeout_secs": {
+              "label": "連線逾時（秒）"
+            },
+            "keepalive_interval_secs": {
+              "label": "Keepalive 間隔（秒）"
+            },
+            "quick_sudo": {
+              "label": "Quick Sudo（自動提權）"
+            },
+            "sudo_password": {
+              "label": "sudo 密碼覆寫"
+            },
+            "totp_secret": {
+              "label": "TOTP 金鑰"
+            },
+            "auth_flow_mode": {
+              "label": "2FA 認證流程"
+            },
+            "password_prompt_hint": {
+              "label": "密碼提示詞"
+            },
+            "totp_prompt_hint": {
+              "label": "OTP 提示詞"
+            },
+            "sudo_use_pty": {
+              "label": "sudo 命令請求 PTY"
+            },
+            "read_only": {
+              "label": "唯讀"
+            }
+          }
+        },
+        "io.dbx.ssh.workbench": {
+          "label": "SSH 與 SFTP 工作臺",
+          "description": "互動式終端與 SFTP 檔案管理器。"
+        },
+        "io.dbx.ssh.files": {
+          "label": "SFTP 檔案",
+          "description": "透過 SFTP 存取遠端檔案系統。"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1798 @@
+//! Remote command execution with Quick Sudo support, ported from the
+//! tiny-rdm auth-orchestration pipeline: `sudo -S` password injection over
+//! stdin plus automatic follow-up answers for 2FA/TOTP prompts.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use data_encoding::BASE32;
+use hmac::{Hmac, Mac};
+use russh::client::Handle;
+use russh::ChannelMsg;
+use sha1::Sha1;
+use sha2::{Sha256, Sha512};
+
+use crate::ssh::SshClient;
+
+pub const SUDO_EXEC_TIMEOUT: Duration = Duration::from_secs(90);
+pub const PLAIN_EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_AUTH_ROUNDS: u32 = 3;
+
+const PASSWORD_PROMPT_PATTERS: &[&str] = &[
+    "password:",
+    "passphrase:",
+    "pass phrase",
+    "[sudo] password for",
+    "密码:",
+    "密码：",
+];
+
+const TOTP_PROMPT_PATTERS: &[&str] = &[
+    "verification code",
+    "verification code:",
+    "otp:",
+    "totp:",
+    "2fa code",
+    "one-time password",
+    "one time password",
+    "authentication code",
+];
+
+const AUTH_FAILURE_MARKERS: &[&str] = &[
+    "sorry, try again",
+    "authentication failure",
+    "incorrect password",
+];
+
+/// Wraps a command in `sh -c '…'` with POSIX single-quote escaping so sudo
+/// receives one argument and metacharacters cannot escape the quoting.
+pub fn sanitize_sudo_command(command: &str) -> String {
+    let escaped = command.replace('\'', r"'\''");
+    format!("sh -c '{escaped}'")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFlowMode {
+    PasswordOnly,
+    PasswordPlusOtp,
+    PasswordThenOtp,
+}
+
+impl AuthFlowMode {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "password" | "password_only" => Self::PasswordOnly,
+            "password+otp" | "password_totp" | "password_plus_otp" => Self::PasswordPlusOtp,
+            _ => Self::PasswordThenOtp,
+        }
+    }
+
+    fn allows_otp_after_password(self) -> bool {
+        match self {
+            Self::PasswordOnly => false,
+            Self::PasswordPlusOtp => true,
+            Self::PasswordThenOtp => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptKind {
+    Password,
+    Totp,
+    Combined,
+}
+
+#[derive(Debug, Clone)]
+pub enum TotpSecret {
+    /// RFC 6238 shared secret with parameters.
+    Key {
+        key: Vec<u8>,
+        digits: u32,
+        period: u64,
+        algorithm: TotpAlgorithm,
+    },
+    /// Static numeric code (4-10 digits) that is not time-based.
+    Static(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TotpAlgorithm {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+/// Quick Sudo orchestration settings resolved from a stored connection.
+/// Shared behind an `Arc<RwLock<…>>` so runtime settings updates apply to
+/// running terminals and exec calls immediately, mirroring tiny-rdm's
+/// per-output `resolveAuthOrchestrationForProfile` lookups.
+#[derive(Debug, Clone, Default)]
+pub struct SudoAuth {
+    /// Password piped to `sudo -S`; falls back to the login password.
+    pub password: String,
+    /// One or more TOTP secrets (newline/semicolon separated in the source
+    /// field); rotating OTP selection prefers unused codes with the longest
+    /// remaining validity, exactly like tiny-rdm's resolveRotatingOTP.
+    pub totp_secrets: Vec<TotpSecret>,
+    /// Marked OTP usage keyed by `secret-index|validUntil|code`.
+    otp_usage: Arc<Mutex<HashMap<String, u64>>>,
+    /// Codes already auto-submitted, keyed by code with their replay-window
+    /// expiry (`validUntil + period`, i.e. including the ±1-step acceptance
+    /// slack). Shared across clones so exec calls and terminals share one
+    /// view per session; in-memory only, cleared on restart.
+    committed_totp: Arc<Mutex<HashMap<String, u64>>>,
+    pub password_prompt_hint: String,
+    pub totp_prompt_hint: String,
+    pub flow_mode: Option<AuthFlowMode>,
+}
+
+impl SudoAuth {
+    pub fn new(sudo_password: &str, login_password: &str, totp_secret: &str, hints: Hints) -> Self {
+        let password = if sudo_password.trim().is_empty() {
+            login_password.to_string()
+        } else {
+            sudo_password.trim().to_string()
+        };
+        Self {
+            password,
+            totp_secrets: parse_totp_secrets(totp_secret),
+            password_prompt_hint: hints.password,
+            totp_prompt_hint: hints.totp,
+            flow_mode: hints.flow_mode,
+            ..Default::default()
+        }
+    }
+
+    pub fn totp_configured(&self) -> bool {
+        !self.totp_secrets.is_empty()
+    }
+
+    fn flow_mode(&self) -> AuthFlowMode {
+        self.flow_mode.unwrap_or(AuthFlowMode::PasswordThenOtp)
+    }
+
+    fn classify(&self, prompt: &str) -> Option<PromptKind> {
+        classify_auth_prompt(prompt, self)
+    }
+
+    /// Returns the answer to send for a detected prompt, if one is configured.
+    /// OTP answers go through [`Self::take_totp_answer`], so a code that was
+    /// already submitted within its replay window is skipped (with a log)
+    /// instead of being injected twice.
+    pub(crate) fn answer_for(&self, kind: PromptKind) -> Option<String> {
+        match kind {
+            PromptKind::Password => (!self.password.is_empty()).then(|| self.password.clone()),
+            PromptKind::Totp => self.totp_answer_logged(),
+            PromptKind::Combined => {
+                let password = (!self.password.is_empty()).then(|| self.password.clone())?;
+                if self.flow_mode() == AuthFlowMode::PasswordPlusOtp {
+                    let code = self.totp_answer_logged()?;
+                    Some(format!("{password}{code}"))
+                } else {
+                    Some(password)
+                }
+            }
+        }
+    }
+
+    /// Resolves the OTP answer for a prompt, logging (and skipping) when the
+    /// only available code was already committed inside its replay window.
+    fn totp_answer_logged(&self) -> Option<String> {
+        match self.take_totp_answer() {
+            Ok(code) => Some(code),
+            Err(reason) => {
+                eprintln!("[ssh] otp auto-answer skipped: {reason}");
+                None
+            }
+        }
+    }
+
+    /// Picks the code to auto-submit for an OTP prompt, or explains why the
+    /// submission must be skipped: a code that was already injected while its
+    /// acceptance window (±1 step) is still open must not be replayed
+    /// (tiny-rdm's isOTPUsageMarked semantics, hardened to a hard skip). The
+    /// chosen code is marked committed on return, so later prompts in the
+    /// same window are skipped instead of re-submitting it.
+    pub(crate) fn take_totp_answer(&self) -> Result<String, String> {
+        let now = unix_now();
+        let selection = self
+            .current_totp_selection()
+            .ok_or_else(|| "no TOTP secret is configured or currently valid".to_string())?;
+        let mut committed = self
+            .committed_totp
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        committed.retain(|_, until| is_totp_in_replay_window(now, *until));
+        if let Some(until) = committed.get(&selection.code).copied() {
+            return Err(format!(
+                "code {} was already submitted and its replay window (±1 step) stays open for {}s",
+                selection.code,
+                until.saturating_sub(now)
+            ));
+        }
+        committed.insert(
+            selection.code.clone(),
+            totp_replay_window_expiry(selection.valid_until, selection.period),
+        );
+        Ok(selection.code)
+    }
+
+    /// Picks the OTP code to use right now across all configured secrets:
+    /// unused codes first (longest remaining validity wins), then any code as
+    /// a fallback; used codes are marked until their window expires.
+    fn current_totp_selection(&self) -> Option<TotpSelection> {
+        let now = unix_now();
+        let candidates: Vec<(usize, String, u64, u64)> = self
+            .totp_secrets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, secret)| match secret {
+                TotpSecret::Static(code) => Some((
+                    index,
+                    code.clone(),
+                    now.saturating_add(30),
+                    OTP_STATIC_WINDOW,
+                )),
+                TotpSecret::Key {
+                    key,
+                    digits,
+                    period,
+                    algorithm,
+                } => {
+                    let counter = now / period;
+                    Some((
+                        index,
+                        hotp(key, counter, *digits, *algorithm),
+                        (counter + 1) * period,
+                        *period,
+                    ))
+                }
+            })
+            .filter(|(_, _, valid_until, _)| *valid_until > now)
+            .collect();
+        let (index, code, valid_until, period) = candidates.first().cloned()?;
+
+        let mut usage = self
+            .otp_usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        usage.retain(|_, valid_until| *valid_until > now);
+        let key_of =
+            |index: usize, code: &str, valid_until: u64| format!("{index}|{valid_until}|{code}");
+        let mut chosen = (index, code, valid_until, period);
+        for candidate in &candidates {
+            if !usage.contains_key(&key_of(candidate.0, &candidate.1, candidate.2)) {
+                chosen = candidate.clone();
+                if candidate.2.saturating_sub(now) >= 5 {
+                    break;
+                }
+            }
+        }
+        usage.insert(key_of(chosen.0, &chosen.1, chosen.2), chosen.2);
+        Some(TotpSelection {
+            code: chosen.1,
+            valid_until: chosen.2,
+            period: chosen.3,
+        })
+    }
+}
+
+/// Nominal replay window for static OTP codes, which carry no period of
+/// their own (mirrors tiny-rdm's `otpReuseWindowFallback`).
+const OTP_STATIC_WINDOW: u64 = 30;
+
+/// One OTP selection with the data the replay guard needs.
+struct TotpSelection {
+    code: String,
+    /// Unix seconds after which the code's own window expires.
+    valid_until: u64,
+    /// Secret period (or the static fallback window).
+    period: u64,
+}
+
+/// Replay-window expiry for a committed code: its nominal validity plus one
+/// extra step, because servers commonly accept the previous and next
+/// window's code alongside the current one (the ±1-step slack).
+pub fn totp_replay_window_expiry(valid_until: u64, period: u64) -> u64 {
+    valid_until.saturating_add(period)
+}
+
+/// True while a committed code must not be auto-submitted again.
+pub fn is_totp_in_replay_window(now: u64, committed_until: u64) -> bool {
+    now <= committed_until
+}
+
+/// How often the per-connection sudo keepalive refreshes the timestamp:
+/// 4 minutes, comfortably under every common sudo `timestamp_timeout`
+/// (tiny-rdm's sudoKeepaliveLoop refreshes on the same order).
+pub const SUDO_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(240);
+
+/// Consecutive failed `sudo -nv` validations after which the keepalive loop
+/// stops itself (the timestamp is gone; the next sudo exec re-registers).
+pub const SUDO_KEEPALIVE_MAX_FAILURES: u32 = 2;
+
+/// Advances the sudo keepalive consecutive-failure counter: success resets
+/// it, a failure increments it, and reaching
+/// [`SUDO_KEEPALIVE_MAX_FAILURES`] returns `None` — the caller must stop the
+/// loop and drop its registration.
+pub fn keepalive_failure_step(failures: u32, succeeded: bool) -> Option<u32> {
+    if succeeded {
+        return Some(0);
+    }
+    let next = failures + 1;
+    (next < SUDO_KEEPALIVE_MAX_FAILURES).then_some(next)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Hints {
+    pub password: String,
+    pub totp: String,
+    pub flow_mode: Option<AuthFlowMode>,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parses one or more TOTP secrets separated by newlines or semicolons
+/// (tiny-rdm's multi-secret `TOTPSecretRefs` equivalent).
+pub fn parse_totp_secrets(input: &str) -> Vec<TotpSecret> {
+    input
+        .split(['\n', '\r', ';'])
+        .filter_map(parse_totp_secret)
+        .collect()
+}
+
+/// Parses a TOTP secret reference: an `otpauth://totp/…` URI, a base32 key,
+/// or a static numeric code. Returns `None` for empty or unusable values.
+pub fn parse_totp_secret(input: &str) -> Option<TotpSecret> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("otpauth://")
+        .or_else(|| trimmed.strip_prefix("OTPAUTH://"))
+    {
+        return parse_otpauth(rest);
+    }
+    if is_numeric_otp(trimmed) {
+        return Some(TotpSecret::Static(trimmed.to_string()));
+    }
+    let key = BASE32
+        .decode(trimmed.to_ascii_uppercase().as_bytes())
+        .ok()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(TotpSecret::Key {
+        key,
+        digits: 6,
+        period: 30,
+        algorithm: TotpAlgorithm::Sha1,
+    })
+}
+
+fn parse_otpauth(rest: &str) -> Option<TotpSecret> {
+    let (scheme_path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    if !scheme_path
+        .split('/')
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case("totp"))
+    {
+        return None;
+    }
+    let mut secret = None;
+    let mut digits = 6_u32;
+    let mut period = 30_u64;
+    let mut algorithm = TotpAlgorithm::Sha1;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match key {
+            "secret" => {
+                secret = BASE32
+                    .decode(value.to_ascii_uppercase().as_bytes())
+                    .ok()
+                    .filter(|decoded| !decoded.is_empty());
+            }
+            "digits" => digits = value.parse().ok().filter(|d| (6..=8).contains(d))?,
+            "period" => period = value.parse().ok().filter(|&p| (1..=120).contains(&p))?,
+            "algorithm" => {
+                algorithm = match value.to_ascii_uppercase().as_str() {
+                    "SHA256" => TotpAlgorithm::Sha256,
+                    "SHA512" => TotpAlgorithm::Sha512,
+                    _ => TotpAlgorithm::Sha1,
+                };
+            }
+            _ => {}
+        }
+    }
+    Some(TotpSecret::Key {
+        key: secret?,
+        digits,
+        period,
+        algorithm,
+    })
+}
+
+fn is_numeric_otp(input: &str) -> bool {
+    (4..=10).contains(&input.len()) && input.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn hotp(key: &[u8], counter: u64, digits: u32, algorithm: TotpAlgorithm) -> String {
+    let message = counter.to_be_bytes();
+    let digest: Vec<u8> = match algorithm {
+        TotpAlgorithm::Sha1 => {
+            let mut mac =
+                <Hmac<Sha1> as Mac>::new_from_slice(key).expect("HMAC accepts keys of any length");
+            mac.update(&message);
+            mac.finalize().into_bytes().to_vec()
+        }
+        TotpAlgorithm::Sha256 => {
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+                .expect("HMAC accepts keys of any length");
+            mac.update(&message);
+            mac.finalize().into_bytes().to_vec()
+        }
+        TotpAlgorithm::Sha512 => {
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key)
+                .expect("HMAC accepts keys of any length");
+            mac.update(&message);
+            mac.finalize().into_bytes().to_vec()
+        }
+    };
+    let offset = (digest[digest.len() - 1] & 0x0f) as usize;
+    let binary = ((digest[offset] as u32 & 0x7f) << 24)
+        | ((digest[offset + 1] as u32) << 16)
+        | ((digest[offset + 2] as u32) << 8)
+        | digest[offset + 3] as u32;
+    let code = binary % 10_u32.pow(digits);
+    format!("{code:0width$}", width = digits as usize)
+}
+
+/// Strips ANSI escape sequences and non-printable control characters, then
+/// trims the result so prompt fragments can be matched reliably.
+pub fn normalize_auth_prompt_text(input: &str) -> String {
+    let stripped = strip_ansi_control_sequences(&input.replace('\r', "\n"));
+    let cleaned: String = stripped
+        .chars()
+        .filter(|&character| {
+            character == '\n' || character == '\t' || character == ' ' || !character.is_control()
+        })
+        .collect();
+    cleaned.trim().to_string()
+}
+
+/// Hard cap for custom prompt hints so a runaway `settings/set` update (or a
+/// malformed host-provided config) cannot store unbounded junk on the
+/// connection and every live session.
+pub const MAX_PROMPT_HINT_LEN: usize = 512;
+
+/// Normalizes a user-provided prompt hint for reliable matching: strips ANSI
+/// escape sequences and control characters, trims, and caps the length.
+/// Malformed hints degrade to their printable residue instead of poisoning
+/// the prompt classifier or the stored connection.
+pub fn sanitize_prompt_hint(input: &str) -> String {
+    let mut normalized = normalize_auth_prompt_text(input);
+    if normalized.len() > MAX_PROMPT_HINT_LEN {
+        // Cut on a char boundary so the hint stays valid UTF-8.
+        let mut end = MAX_PROMPT_HINT_LEN;
+        while !normalized.is_char_boundary(end) {
+            end -= 1;
+        }
+        normalized.truncate(end);
+    }
+    normalized
+}
+
+fn strip_ansi_control_sequences(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0x1b {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 1 >= bytes.len() {
+            break;
+        }
+        match bytes[index + 1] {
+            b'[' => {
+                index += 2;
+                while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
+                    index += 1;
+                }
+                index += 1;
+            }
+            b']' => {
+                index += 2;
+                while index < bytes.len() {
+                    if bytes[index] == 0x07 {
+                        break;
+                    }
+                    if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'\\'
+                    {
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            _ => index += 2,
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+pub(crate) fn classify_auth_prompt(prompt: &str, auth: &SudoAuth) -> Option<PromptKind> {
+    let trimmed = normalize_auth_prompt_text(prompt);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    let mut password_matched = false;
+    let mut totp_matched = false;
+    // Hints are matched against the normalized prompt text, so legacy or
+    // host-provided hints carrying control characters/ANSI sequences are
+    // normalized the same way instead of never matching.
+    let password_hint = normalize_auth_prompt_text(&auth.password_prompt_hint).to_lowercase();
+    if !password_hint.is_empty() && lower.contains(&password_hint) {
+        password_matched = true;
+    }
+    let totp_hint = normalize_auth_prompt_text(&auth.totp_prompt_hint).to_lowercase();
+    if !totp_hint.is_empty() && lower.contains(&totp_hint) {
+        totp_matched = true;
+    }
+    if !password_matched && PASSWORD_PROMPT_PATTERS.iter().any(|p| lower.contains(p)) {
+        password_matched = true;
+    }
+    if !totp_matched && TOTP_PROMPT_PATTERS.iter().any(|p| lower.contains(p)) {
+        totp_matched = true;
+    }
+    match (password_matched, totp_matched) {
+        (true, true) => Some(PromptKind::Combined),
+        (false, true) => Some(PromptKind::Totp),
+        (true, false) => Some(PromptKind::Password),
+        (false, false) => None,
+    }
+}
+
+pub(crate) fn can_respond_to_prompt(
+    mode: AuthFlowMode,
+    kind: PromptKind,
+    password_answered: bool,
+) -> bool {
+    match kind {
+        PromptKind::Password => true,
+        PromptKind::Totp => {
+            mode.allows_otp_after_password()
+                && (mode != AuthFlowMode::PasswordThenOtp || password_answered)
+        }
+        PromptKind::Combined => {
+            if mode == AuthFlowMode::PasswordPlusOtp {
+                true
+            } else if mode == AuthFlowMode::PasswordOnly {
+                true
+            } else {
+                password_answered
+            }
+        }
+    }
+}
+
+/// Result of a remote command execution.
+pub struct ExecOutcome {
+    pub output: String,
+    pub exit_code: i32,
+}
+
+/// Runs a command without privilege escalation on a new channel.
+pub async fn exec_plain(
+    handle: &Handle<SshClient>,
+    command: &str,
+    timeout: Duration,
+) -> Result<ExecOutcome, String> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("Failed to open exec channel: {error}"))?;
+    channel
+        .exec(true, command.as_bytes())
+        .await
+        .map_err(|error| format!("Failed to start command: {error}"))?;
+    match run_to_completion(&mut channel, timeout, None).await {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => Err(abort_exec_channel(&mut channel, error).await),
+    }
+}
+
+/// Runs a command with Quick Sudo: pipes the password to `sudo -S` stdin and,
+/// while the command is still authenticating, watches the prompt stream for
+/// 2FA/TOTP follow-up prompts and answers them automatically. When no
+/// password is configured it falls back to non-interactive `sudo -n`.
+pub async fn exec_with_sudo(
+    handle: &Handle<SshClient>,
+    auth: &SudoAuth,
+    command: &str,
+    timeout: Duration,
+    use_pty: bool,
+) -> Result<ExecOutcome, String> {
+    if auth.password.is_empty() {
+        let command_line = format!("sudo -n {}", sanitize_sudo_command(command));
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|error| format!("Failed to open sudo channel: {error}"))?;
+        channel
+            .exec(true, command_line.as_bytes())
+            .await
+            .map_err(|error| format!("Failed to start sudo command: {error}"))?;
+        let outcome = match run_to_completion(&mut channel, timeout, None).await {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(abort_exec_channel(&mut channel, error).await),
+        };
+        if outcome.exit_code != 0 {
+            return Err(format!(
+                "sudo exited {}: {} (no password configured - run sudo in the terminal first or configure Quick Sudo)",
+                outcome.exit_code, outcome.output
+            ));
+        }
+        return Ok(outcome);
+    }
+
+    let command_line = format!("sudo -S -p '' {}", sanitize_sudo_command(command));
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("Failed to open sudo channel: {error}"))?;
+    if use_pty {
+        // Some PAM stacks only prompt correctly with a TTY. With a PTY the
+        // prompt arrives on the merged stdout stream instead of stderr.
+        let _ = channel
+            .request_pty(true, "xterm-256color", 24, 80, 0, 0, &[])
+            .await;
+    }
+    let _ = channel.set_env(true, "SUDO_ASKPASS", "").await;
+    channel
+        .exec(true, command_line.as_bytes())
+        .await
+        .map_err(|error| format!("Failed to start sudo command: {error}"))?;
+
+    // Phase 1: hand sudo the password immediately. Stdin stays open so
+    // follow-up OTP answers can still be written in phase 2.
+    let password_line = format!("{}\n", auth.password);
+    if let Err(error) = channel.data(password_line.as_bytes()).await {
+        return Err(abort_exec_channel(&mut channel, format!("Failed to write sudo password: {error}")).await);
+    }
+
+    // Phase 2: watch for follow-up prompts and collect output.
+    let outcome = match run_to_completion(&mut channel, timeout, Some((auth, use_pty))).await {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(abort_exec_channel(&mut channel, error).await),
+    };
+    if outcome.exit_code != 0 {
+        return Err(format!(
+            "sudo exited {}: {}",
+            outcome.exit_code, outcome.output
+        ));
+    }
+    Ok(outcome)
+}
+
+/// Aborts an exec channel after a failed/aborted remote run. Dropping a
+/// russh `Channel` does NOT send SSH_MSG_CHANNEL_CLOSE, so the remote
+/// process would keep waiting on stdin forever - a mid-authentication
+/// `sudo` holds the sudo timestamp lock and deadlocks every later sudo on
+/// the connection. Close the channel so sshd reaps the process.
+async fn abort_exec_channel(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    error: String,
+) -> String {
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
+    error
+}
+
+type PromptContext<'a> = (&'a SudoAuth, bool);
+
+async fn run_to_completion(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    timeout: Duration,
+    prompt_context: Option<PromptContext<'_>>,
+) -> Result<ExecOutcome, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code: Option<i32> = None;
+    let mut closed = false;
+    let mut auth_rounds = 0_u32;
+    let mut password_answered = prompt_context.is_some();
+    let mut otp_answered = false;
+
+    while !closed {
+        let message = tokio::time::timeout_at(deadline, channel.wait())
+            .await
+            .map_err(|_| "Timed out waiting for the remote command to finish".to_string())?;
+        let message = match message {
+            Some(message) => message,
+            None => break,
+        };
+        match message {
+            ChannelMsg::Data { ref data } => {
+                stdout.extend_from_slice(data);
+                if let Some((auth, use_pty)) = prompt_context.as_ref() {
+                    if *use_pty {
+                        if let Some(error) = maybe_answer_prompt(
+                            channel,
+                            auth,
+                            &String::from_utf8_lossy(data),
+                            &mut auth_rounds,
+                            &mut password_answered,
+                            &mut otp_answered,
+                        )
+                        .await
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            ChannelMsg::ExtendedData { ref data, .. } => {
+                stderr.extend_from_slice(data);
+                if let Some((auth, _)) = prompt_context.as_ref() {
+                    if let Some(error) = maybe_answer_prompt(
+                        channel,
+                        auth,
+                        &String::from_utf8_lossy(data),
+                        &mut auth_rounds,
+                        &mut password_answered,
+                        &mut otp_answered,
+                    )
+                    .await
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit_code = Some(exit_status as i32);
+            }
+            ChannelMsg::Eof | ChannelMsg::Close => {
+                closed = true;
+            }
+            _ => {}
+        }
+    }
+
+    let mut output = String::from_utf8_lossy(&stdout)
+        .trim_end_matches('\n')
+        .to_string();
+    let stderr_text = String::from_utf8_lossy(&stderr).trim().to_string();
+    if output.is_empty() {
+        if !stderr_text.is_empty() {
+            output = stderr_text;
+        }
+    } else if !stderr_text.is_empty() && exit_code.unwrap_or(0) != 0 {
+        output.push('\n');
+        output.push_str(&stderr_text);
+    }
+    Ok(ExecOutcome {
+        output,
+        exit_code: exit_code.unwrap_or(0),
+    })
+}
+
+/// Detects auth prompts in a freshly received chunk and answers them on the
+/// channel stdin. Returns `Err` when sudo reports an authentication failure.
+async fn maybe_answer_prompt(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    auth: &SudoAuth,
+    chunk: &str,
+    auth_rounds: &mut u32,
+    password_answered: &mut bool,
+    otp_answered: &mut bool,
+) -> Option<String> {
+    let normalized = normalize_auth_prompt_text(chunk).to_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if AUTH_FAILURE_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return Some(format!("sudo authentication failed: {normalized}"));
+    }
+    let mode = auth.flow_mode();
+    let kind = auth.classify(&normalized)?;
+    if *auth_rounds >= MAX_AUTH_ROUNDS {
+        return None;
+    }
+    if matches!(kind, PromptKind::Totp | PromptKind::Combined) && *otp_answered {
+        return None;
+    }
+    if !can_respond_to_prompt(mode, kind, *password_answered) {
+        return None;
+    }
+    let answer = auth.answer_for(kind)?;
+    let mut payload = answer.into_bytes();
+    payload.push(b'\n');
+    if let Err(error) = channel.data(&payload[..]).await {
+        return Some(format!("Failed to write auth answer: {error}"));
+    }
+    match kind {
+        PromptKind::Password => *password_answered = true,
+        PromptKind::Totp => *otp_answered = true,
+        PromptKind::Combined => {
+            *password_answered = true;
+            if mode == AuthFlowMode::PasswordPlusOtp {
+                *otp_answered = true;
+            }
+        }
+    }
+    *auth_rounds += 1;
+    None
+}
+
+/// Validates a cached sudo timestamp without prompting; used by the
+/// background keepalive loop.
+pub async fn validate_sudo_timestamp(handle: &Handle<SshClient>) -> Result<(), String> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("Failed to open sudo keepalive channel: {error}"))?;
+    channel
+        .exec(true, b"sudo -nv")
+        .await
+        .map_err(|error| format!("Failed to start sudo keepalive: {error}"))?;
+    let outcome = run_to_completion(&mut channel, Duration::from_secs(15), None).await?;
+    if outcome.exit_code == 0 {
+        Ok(())
+    } else {
+        Err("sudo timestamp expired".to_string())
+    }
+}
+
+/// Single-quote shell escaping for embedding a path in a remote command.
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Server metrics collected with read-only commands: /proc readers, two
+/// /proc/stat samples for CPU utilization, `df -kP` for mounts, plus the
+/// network-rate and top-process extensions. Thin delegation to
+/// [`crate::metrics`], which owns the extended collector and parsers.
+pub async fn collect_metrics(handle: &Handle<SshClient>) -> Result<serde_json::Value, String> {
+    crate::metrics::collect_metrics(handle).await
+}
+
+/// Parses the output of [`METRICS_SCRIPT`] into a metrics JSON object.
+/// Pure so it can be unit-tested without a server.
+pub fn parse_metrics_output(output: &str) -> serde_json::Value {
+    use serde_json::json;
+
+    let mut hostname = serde_json::Value::Null;
+    let mut kernel = serde_json::Value::Null;
+    let mut loadavg = String::new();
+    let mut uptime = String::new();
+    let mut nproc: serde_json::Value = serde_json::Value::Null;
+    let mut mem_kib: HashMap<&str, u64> = HashMap::new();
+    let mut cpu_samples: Vec<Vec<u64>> = Vec::new();
+    let mut disks = Vec::new();
+    let mut section = "";
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "--mem--" || line == "--cpu--" || line == "--df--" {
+            section = line;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("hostname=") {
+            hostname = json!(rest);
+        } else if let Some(rest) = line.strip_prefix("kernel=") {
+            kernel = json!(rest);
+        } else if let Some(rest) = line.strip_prefix("loadavg=") {
+            loadavg = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("uptime=") {
+            uptime = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("nproc=") {
+            nproc = rest
+                .parse::<u32>()
+                .map(|v| json!(v))
+                .unwrap_or(serde_json::Value::Null);
+        } else if section == "--mem--" {
+            // "MemTotal:       16384 kB"
+            if let Some((key, value)) = rest_after_colon(line) {
+                if let Some(kib) = value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<u64>().ok())
+                {
+                    mem_kib.insert(key, kib);
+                }
+            }
+        } else if section == "--cpu--" {
+            if let Some(rest) = line.strip_prefix("cpu ") {
+                let values = rest
+                    .split_whitespace()
+                    .filter_map(|n| n.parse::<u64>().ok())
+                    .collect::<Vec<_>>();
+                if values.len() >= 4 {
+                    cpu_samples.push(values);
+                }
+            }
+        } else if section == "--df--" {
+            // filesystem total used avail pct mount
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() >= 6 {
+                let (total, used, available) = (
+                    fields[1].parse::<u64>().unwrap_or(0) * 1024,
+                    fields[2].parse::<u64>().unwrap_or(0) * 1024,
+                    fields[3].parse::<u64>().unwrap_or(0) * 1024,
+                );
+                disks.push(json!({
+                    "filesystem": fields[0],
+                    "mount": fields[5],
+                    "totalBytes": total,
+                    "usedBytes": used,
+                    "availableBytes": available,
+                    "percentUsed": fields[4].trim_end_matches('%').parse::<f64>().unwrap_or(0.0),
+                }));
+            }
+        }
+    }
+
+    let mut cpu_percent = serde_json::Value::Null;
+    if cpu_samples.len() == 2 {
+        let first = &cpu_samples[0];
+        let second = &cpu_samples[1];
+        let delta: Vec<i64> = second
+            .iter()
+            .zip(first.iter())
+            .map(|(next, prev)| *next as i64 - *prev as i64)
+            .collect();
+        let total: i64 = delta.iter().sum();
+        // Columns are user nice system idle iowait …; idle time is idle+iowait.
+        let idle = delta.get(3).copied().unwrap_or(0) + delta.get(4).copied().unwrap_or(0);
+        if total > 0 {
+            cpu_percent =
+                json!(((total - idle) as f64 * 100.0 / total as f64 * 10.0).round() / 10.0);
+        }
+    }
+
+    let loads: Vec<f64> = loadavg
+        .split_whitespace()
+        .take(3)
+        .filter_map(|n| n.parse::<f64>().ok())
+        .collect();
+    let (load1, load5, load15) = match loads.as_slice() {
+        [one, five, fifteen] => (json!(one), json!(five), json!(fifteen)),
+        _ => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
+    };
+    let mem_total = mem_kib.get("MemTotal").copied().unwrap_or(0) * 1024;
+    let mem_available = mem_kib.get("MemAvailable").copied().unwrap_or(0) * 1024;
+    let swap_total = mem_kib.get("SwapTotal").copied().unwrap_or(0) * 1024;
+    let swap_free = mem_kib.get("SwapFree").copied().unwrap_or(0) * 1024;
+    let uptime_seconds = uptime
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse::<f64>().ok())
+        .map(|v| json!(v as u64))
+        .unwrap_or(serde_json::Value::Null);
+
+    json!({
+        "hostname": hostname,
+        "kernel": kernel,
+        "uptimeSeconds": uptime_seconds,
+        "cpu": { "cores": nproc, "percent": cpu_percent, "load1": load1, "load5": load5, "load15": load15 },
+        "memory": {
+            "totalBytes": mem_total,
+            "availableBytes": mem_available,
+            "usedBytes": mem_total.saturating_sub(mem_available),
+            "swapTotalBytes": swap_total,
+            "swapUsedBytes": swap_total.saturating_sub(swap_free),
+        },
+        "disks": disks,
+    })
+}
+
+fn rest_after_colon(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    Some((key.trim(), value.trim()))
+}
+
+/// Parses `df -kP <path>` output (header stripped) into a usage object.
+pub fn parse_disk_usage(df_output: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let line = df_output
+        .lines()
+        .rev()
+        .find(|line| line.trim().starts_with('/'))?;
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 6 {
+        return None;
+    }
+    Some(json!({
+        "filesystem": fields[0],
+        "mount": fields[5],
+        "totalBytes": fields[1].parse::<u64>().ok()? * 1024,
+        "usedBytes": fields[2].parse::<u64>().ok()? * 1024,
+        "availableBytes": fields[3].parse::<u64>().ok()? * 1024,
+        "percentUsed": fields[4].trim_end_matches('%').parse::<f64>().ok()?,
+    }))
+}
+
+/// Tracks whether a password answer was already accepted during a
+/// keyboard-interactive handshake, mirroring tiny-rdm's per-connection state.
+#[derive(Debug, Default)]
+pub struct KeyboardInteractiveState {
+    password_answered: bool,
+}
+
+/// Builds automatic answers for a keyboard-interactive login round. Prompts
+/// are classified individually; unknown or unanswered prompts get an empty
+/// string so the server can re-prompt or fail cleanly. Ported from
+/// tiny-rdm's keyboardInteractivePasswordAuth callback.
+pub fn keyboard_interactive_answers(
+    auth: &SudoAuth,
+    state: &mut KeyboardInteractiveState,
+    prompts: &[russh::client::Prompt],
+) -> Vec<String> {
+    let mode = auth.flow_mode();
+    let mut password_answered_round = false;
+    let answers = prompts
+        .iter()
+        .map(|prompt| match classify_auth_prompt(&prompt.prompt, auth) {
+            Some(PromptKind::Password) => {
+                if auth.password.is_empty() {
+                    String::new()
+                } else {
+                    password_answered_round = true;
+                    auth.password.clone()
+                }
+            }
+            Some(PromptKind::Totp) => {
+                if !can_respond_to_prompt(
+                    mode,
+                    PromptKind::Totp,
+                    state.password_answered || password_answered_round,
+                ) {
+                    String::new()
+                } else {
+                    auth.totp_answer_logged().unwrap_or_default()
+                }
+            }
+            Some(PromptKind::Combined) => {
+                if auth.password.is_empty() {
+                    String::new()
+                } else if mode == AuthFlowMode::PasswordPlusOtp {
+                    match auth.totp_answer_logged() {
+                        Some(code) => {
+                            password_answered_round = true;
+                            format!("{}{}", auth.password, code)
+                        }
+                        // No code available (or the previous one is still
+                        // inside its replay window): leave the prompt empty
+                        // so the server re-prompts or fails cleanly.
+                        None => String::new(),
+                    }
+                } else {
+                    password_answered_round = true;
+                    auth.password.clone()
+                }
+            }
+            None => String::new(),
+        })
+        .collect();
+    if password_answered_round {
+        state.password_answered = true;
+    }
+    answers
+}
+
+const SUDO_PROMPT_PATTERS: &[&str] = &["[sudo] password for", "password:"];
+
+/// True when the last non-empty line of the terminal output looks like a
+/// shell prompt, meaning any in-flight auth sequence has finished.
+pub(crate) fn has_shell_prompt(normalized: &str) -> bool {
+    normalized
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            let line = line.trim_end();
+            line.ends_with('$') || line.ends_with('#')
+        })
+}
+
+/// What the state machine decided to type into the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSudoKind {
+    Password,
+    Totp,
+}
+
+/// In-terminal Quick Sudo, ported from tiny-rdm's detectAndHandleSudo and
+/// handleOrchestrationPrompt: watches PTY output and answers sudo password /
+/// 2FA prompts automatically while the user keeps typing normal commands.
+/// The auth settings are read through a shared lock on every chunk, so
+/// runtime settings updates apply without reopening the terminal.
+pub struct TerminalAutoSudo {
+    auth: Arc<RwLock<SudoAuth>>,
+    sudo_pending: bool,
+    password_sent: bool,
+    otp_sent: bool,
+}
+
+impl TerminalAutoSudo {
+    pub fn new(auth: Arc<RwLock<SudoAuth>>) -> Self {
+        Self {
+            auth,
+            sudo_pending: false,
+            password_sent: false,
+            otp_sent: false,
+        }
+    }
+
+    pub fn is_useful(&self) -> bool {
+        let auth = self
+            .auth
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        !auth.password.is_empty() || auth.totp_configured()
+    }
+
+    /// Feeds one terminal output chunk and returns the answer to type back
+    /// (without the carriage return), if any prompt was answered.
+    pub fn observe(&mut self, chunk: &str) -> Option<(AutoSudoKind, String)> {
+        let auth = self
+            .auth
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let auth = &auth;
+        let normalized = normalize_auth_prompt_text(chunk);
+        if normalized.is_empty() {
+            return None;
+        }
+        if has_shell_prompt(&normalized) {
+            self.sudo_pending = false;
+            self.password_sent = false;
+            self.otp_sent = false;
+            return None;
+        }
+        let lower = normalized.to_lowercase();
+        let mode = auth.flow_mode();
+        let kind = classify_auth_prompt(&lower, auth);
+
+        if self.sudo_pending {
+            match kind {
+                Some(PromptKind::Totp) => {
+                    if self.otp_sent
+                        || !can_respond_to_prompt(mode, PromptKind::Totp, self.password_sent)
+                    {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        // Direct sudo password prompts are answered unconditionally.
+        if SUDO_PROMPT_PATTERS
+            .iter()
+            .any(|pattern| lower.contains(pattern))
+        {
+            if auth.password.is_empty() {
+                return None;
+            }
+            self.sudo_pending = true;
+            self.password_sent = true;
+            return Some((AutoSudoKind::Password, auth.password.clone()));
+        }
+
+        // Generic prompts are only auto-answered when custom hints are
+        // configured; broad default patterns would false-positive on other
+        // interactive programs (tiny-rdm applies the same guard).
+        let has_custom_hint = !auth.password_prompt_hint.trim().is_empty()
+            || !auth.totp_prompt_hint.trim().is_empty();
+        if !has_custom_hint {
+            return None;
+        }
+        let kind = kind?;
+        if !can_respond_to_prompt(mode, kind, self.password_sent) {
+            return None;
+        }
+        let answer = auth.answer_for(kind)?;
+        let auto_kind = match kind {
+            PromptKind::Totp => AutoSudoKind::Totp,
+            _ => AutoSudoKind::Password,
+        };
+        if matches!(kind, PromptKind::Password | PromptKind::Combined) {
+            self.password_sent = true;
+        }
+        if matches!(kind, PromptKind::Totp)
+            || (kind == PromptKind::Combined && mode == AuthFlowMode::PasswordPlusOtp)
+        {
+            self.otp_sent = true;
+        }
+        self.sudo_pending = true;
+        Some((auto_kind, answer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RFC 6238 appendix B vectors use the ASCII secret of "12345678901234567890".
+    const RFC_KEY: &[u8] = b"12345678901234567890";
+
+    #[test]
+    fn rfc6238_sha1_vectors() {
+        // (counter, 8-digit code) from RFC 6238 appendix B.
+        let vectors = [
+            (1_u64, "94287082"),
+            (0x23523EC, "07081804"),
+            (0x23523ED, "14050471"),
+            (0x273EF07, "89005924"),
+            (0x3F940AA, "69279037"),
+            (0x27BC86AA, "65353130"),
+        ];
+        for (counter, expected) in vectors {
+            assert_eq!(hotp(RFC_KEY, counter, 8, TotpAlgorithm::Sha1), expected);
+        }
+    }
+
+    #[test]
+    fn parses_base32_and_static_secrets() {
+        let base32 = parse_totp_secret("JBSWY3DPEHPK3PXP").unwrap();
+        match base32 {
+            TotpSecret::Key { digits, period, .. } => {
+                assert_eq!(digits, 6);
+                assert_eq!(period, 30);
+            }
+            other => panic!("expected key, got {other:?}"),
+        }
+        match parse_totp_secret("12345678").unwrap() {
+            TotpSecret::Static(code) => assert_eq!(code, "12345678"),
+            other => panic!("expected static, got {other:?}"),
+        }
+        assert!(parse_totp_secret("  ").is_none());
+        assert!(parse_totp_secret("not base32!!").is_none());
+    }
+
+    #[test]
+    fn parses_otpauth_uri() {
+        let secret = parse_totp_secret(
+            "otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME&digits=8&period=60&algorithm=SHA256",
+        )
+        .unwrap();
+        match secret {
+            TotpSecret::Key {
+                key,
+                digits,
+                period,
+                algorithm,
+            } => {
+                assert_eq!(key, b"Hello!\xde\xad\xbe\xef");
+                assert_eq!(digits, 8);
+                assert_eq!(period, 60);
+                assert_eq!(algorithm, TotpAlgorithm::Sha256);
+            }
+            other => panic!("expected key, got {other:?}"),
+        }
+        assert!(parse_totp_secret("otpauth://hotp/x?secret=JBSWY3DPEHPK3PXP").is_none());
+    }
+
+    #[test]
+    fn sanitizes_sudo_commands() {
+        assert_eq!(sanitize_sudo_command("ls -la"), "sh -c 'ls -la'");
+        assert_eq!(
+            sanitize_sudo_command("echo 'hi'; rm -rf /tmp/x"),
+            "sh -c 'echo '\\''hi'\\''; rm -rf /tmp/x'"
+        );
+    }
+
+    #[test]
+    fn sanitizes_prompt_hints_against_adversarial_input() {
+        // ANSI sequences and control characters are stripped, not stored.
+        assert_eq!(
+            sanitize_prompt_hint("\x1b[1midentity token\x1b[0m\u{7}"),
+            "identity token"
+        );
+        assert_eq!(sanitize_prompt_hint("  duo \r passcode \n"), "duo \n passcode");
+        // Overlong hints are capped on a char boundary.
+        let long = "a".repeat(MAX_PROMPT_HINT_LEN + 4096);
+        let sanitized = sanitize_prompt_hint(&long);
+        assert!(sanitized.len() <= MAX_PROMPT_HINT_LEN);
+        let multibyte = "密".repeat(MAX_PROMPT_HINT_LEN / 2 + 16);
+        assert!(sanitize_prompt_hint(&multibyte).is_char_boundary(0));
+        assert!(sanitize_prompt_hint(&multibyte).len() <= MAX_PROMPT_HINT_LEN);
+        // Clean input passes through unchanged.
+        assert_eq!(sanitize_prompt_hint("verification code"), "verification code");
+    }
+
+    #[test]
+    fn classify_matches_hints_despite_control_characters() {
+        // A hint stored before sanitization existed (or delivered by an older
+        // host) still matches the normalized prompt text.
+        let auth = SudoAuth {
+            password: "pw".into(),
+            totp_secrets: Vec::new(),
+            password_prompt_hint: "\x1b[1midentity token\x1b[0m".into(),
+            totp_prompt_hint: String::new(),
+            flow_mode: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            auth.classify("Enter identity token:"),
+            Some(PromptKind::Password)
+        );
+    }
+
+    #[test]
+    fn auth_flow_mode_parse_falls_back_for_adversarial_values() {
+        // Unknown / hostile values degrade to the default flow instead of
+        // panicking or producing an invalid mode.
+        for value in [
+            "",
+            "garbage",
+            "password\u{0}otp",
+            "PASSWORD+OTP ",
+            " password_only\t",
+        ] {
+            let _ = AuthFlowMode::parse(value);
+        }
+        assert_eq!(AuthFlowMode::parse("garbage"), AuthFlowMode::PasswordThenOtp);
+        assert_eq!(AuthFlowMode::parse("PASSWORD+OTP"), AuthFlowMode::PasswordPlusOtp);
+        assert_eq!(AuthFlowMode::parse(" password_only\t"), AuthFlowMode::PasswordOnly);
+    }
+
+    #[test]
+    fn totp_secret_parsing_degrades_for_malformed_input() {
+        // Multi-line input keeps the usable lines and drops the junk.
+        let secrets = parse_totp_secrets("JBSWY3DPEHPK3PXP\nnot base32!!\n\n123456");
+        assert_eq!(secrets.len(), 2);
+        assert!(matches!(secrets[0], TotpSecret::Key { .. }));
+        assert!(matches!(secrets[1], TotpSecret::Static(_)));
+        // A space-laden pseudo-base32 line is rejected rather than decoded.
+        assert!(parse_totp_secret("JBSW Y3DP EHPK 3PXP").is_none());
+        // Semicolon-separated multi-secret input behaves like newlines.
+        assert_eq!(parse_totp_secrets("JBSWY3DPEHPK3PXP;;bad value!").len(), 1);
+        assert!(parse_totp_secrets("").is_empty());
+    }
+
+    #[test]
+    fn classifies_prompts_with_hints_and_defaults() {
+        let auth = SudoAuth {
+            password: "pw".into(),
+            totp_secrets: parse_totp_secrets("JBSWY3DPEHPK3PXP"),
+            password_prompt_hint: String::new(),
+            totp_prompt_hint: String::new(),
+            flow_mode: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            auth.classify("[sudo] password for user:"),
+            Some(PromptKind::Password)
+        );
+        assert_eq!(auth.classify("Verification code:"), Some(PromptKind::Totp));
+        assert_eq!(auth.classify("密码："), Some(PromptKind::Password));
+        assert_eq!(auth.classify("some regular output"), None);
+
+        let hinted = SudoAuth {
+            password: "pw".into(),
+            totp_secrets: Vec::new(),
+            password_prompt_hint: "identity token".into(),
+            totp_prompt_hint: "duo passcode".into(),
+            flow_mode: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            hinted.classify("Enter identity token:"),
+            Some(PromptKind::Password)
+        );
+        assert_eq!(hinted.classify("Duo passcode:"), Some(PromptKind::Totp));
+    }
+
+    #[test]
+    fn ansi_and_control_sequences_are_stripped() {
+        assert_eq!(
+            normalize_auth_prompt_text("\x1b[1m[sudo] password\x1b[0m for u: "),
+            "[sudo] password for u:"
+        );
+        assert_eq!(normalize_auth_prompt_text("\r\nOTP:\u{7}"), "OTP:");
+    }
+
+    #[test]
+    fn flow_modes_gate_otp_answers() {
+        assert!(can_respond_to_prompt(
+            AuthFlowMode::PasswordThenOtp,
+            PromptKind::Totp,
+            true
+        ));
+        assert!(!can_respond_to_prompt(
+            AuthFlowMode::PasswordThenOtp,
+            PromptKind::Totp,
+            false
+        ));
+        assert!(!can_respond_to_prompt(
+            AuthFlowMode::PasswordOnly,
+            PromptKind::Totp,
+            true
+        ));
+        assert!(can_respond_to_prompt(
+            AuthFlowMode::PasswordPlusOtp,
+            PromptKind::Totp,
+            false
+        ));
+        assert!(can_respond_to_prompt(
+            AuthFlowMode::PasswordOnly,
+            PromptKind::Combined,
+            false
+        ));
+    }
+
+    #[test]
+    fn sudo_password_overrides_login_password() {
+        let auth = SudoAuth::new("sudo-pw", "login-pw", "", Hints::default());
+        assert_eq!(auth.password, "sudo-pw");
+        let fallback = SudoAuth::new("", "login-pw", "", Hints::default());
+        assert_eq!(fallback.password, "login-pw");
+    }
+
+    #[test]
+    fn combined_answers_follow_flow_mode() {
+        let mut auth = SudoAuth {
+            password: "pw".into(),
+            totp_secrets: parse_totp_secrets("123456"),
+            password_prompt_hint: String::new(),
+            totp_prompt_hint: String::new(),
+            flow_mode: Some(AuthFlowMode::PasswordThenOtp),
+            ..Default::default()
+        };
+        assert_eq!(auth.answer_for(PromptKind::Combined).unwrap(), "pw");
+        auth.flow_mode = Some(AuthFlowMode::PasswordPlusOtp);
+        let combined = auth.answer_for(PromptKind::Combined).unwrap();
+        assert_eq!(combined.len(), 8);
+        assert!(combined.starts_with("pw"));
+    }
+
+    fn prompt(text: &str, echo: bool) -> russh::client::Prompt {
+        russh::client::Prompt {
+            prompt: text.to_string(),
+            echo,
+        }
+    }
+
+    fn terminal_auth() -> SudoAuth {
+        SudoAuth {
+            password: "pw".into(),
+            totp_secrets: parse_totp_secrets("654321"),
+            password_prompt_hint: String::new(),
+            totp_prompt_hint: String::new(),
+            flow_mode: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn keyboard_interactive_answers_follow_flow_mode() {
+        let mut state = KeyboardInteractiveState::default();
+        let auth = terminal_auth();
+
+        // Round 1: password question.
+        let answers = keyboard_interactive_answers(
+            &auth,
+            &mut state,
+            &[
+                prompt("Password:", false),
+                prompt("Enter account name:", true),
+            ],
+        );
+        assert_eq!(answers, vec!["pw".to_string(), String::new()]);
+        assert!(state.password_answered);
+
+        // Round 2: TOTP is allowed because a password round already succeeded.
+        let answers =
+            keyboard_interactive_answers(&auth, &mut state, &[prompt("Verification code:", false)]);
+        assert_eq!(answers, vec!["654321".to_string()]);
+
+        // password+otp combined prompts concatenate when configured.
+        let mut plus = terminal_auth();
+        plus.flow_mode = Some(AuthFlowMode::PasswordPlusOtp);
+        let answers = keyboard_interactive_answers(
+            &plus,
+            &mut KeyboardInteractiveState::default(),
+            &[prompt("Password: otp:", false)],
+        );
+        assert_eq!(answers, vec!["pw654321".to_string()]);
+
+        // password_only never answers OTP.
+        let mut only = terminal_auth();
+        only.flow_mode = Some(AuthFlowMode::PasswordOnly);
+        let answers = keyboard_interactive_answers(
+            &only,
+            &mut KeyboardInteractiveState::default(),
+            &[prompt("Verification code:", false)],
+        );
+        assert_eq!(answers, vec![String::new()]);
+    }
+
+    #[test]
+    fn keyboard_interactive_without_totp_leaves_prompts_blank() {
+        let mut auth = terminal_auth();
+        auth.totp_secrets = Vec::new();
+        let answers = keyboard_interactive_answers(
+            &auth,
+            &mut KeyboardInteractiveState::default(),
+            &[prompt("Verification code:", false)],
+        );
+        assert_eq!(answers, vec![String::new()]);
+    }
+
+    #[test]
+    fn terminal_auto_sudo_answers_sudo_password() {
+        let mut auto = TerminalAutoSudo::new(Arc::new(RwLock::new(terminal_auth())));
+        assert_eq!(
+            auto.observe("[sudo] password for user: "),
+            Some((AutoSudoKind::Password, "pw".to_string()))
+        );
+        // A shell prompt resets the auth sequence.
+        assert_eq!(auto.observe("user@host:~$ "), None);
+        // Direct sudo prompts keep working after the reset.
+        assert_eq!(
+            auto.observe("We trust you... [sudo] password for user:"),
+            Some((AutoSudoKind::Password, "pw".to_string()))
+        );
+    }
+
+    #[test]
+    fn terminal_auto_sudo_requires_hints_for_generic_otp_prompts() {
+        // Without a custom hint, generic OTP prompts stay untouched.
+        let mut auto = TerminalAutoSudo::new(Arc::new(RwLock::new(terminal_auth())));
+        assert_eq!(auto.observe("Verification code: "), None);
+
+        // With a hint but password_then_otp mode, a standalone OTP prompt is
+        // still skipped: the password must come first.
+        let mut hinted = terminal_auth();
+        hinted.totp_prompt_hint = "verification code".into();
+        let mut auto = TerminalAutoSudo::new(Arc::new(RwLock::new(hinted.clone())));
+        assert_eq!(auto.observe("sudo: verification code: "), None);
+
+        // password_plus_otp hosts ask for the OTP directly.
+        hinted.flow_mode = Some(AuthFlowMode::PasswordPlusOtp);
+        let mut auto = TerminalAutoSudo::new(Arc::new(RwLock::new(hinted)));
+        assert_eq!(
+            auto.observe("sudo: verification code: "),
+            Some((AutoSudoKind::Totp, "654321".to_string()))
+        );
+        // The OTP is only answered once per auth sequence.
+        assert_eq!(auto.observe("sudo: verification code: "), None);
+    }
+
+    #[test]
+    fn terminal_auto_sudo_answers_totp_after_sudo_password() {
+        let mut auth = terminal_auth();
+        auth.totp_prompt_hint = "verification code".into();
+        let mut auto = TerminalAutoSudo::new(Arc::new(RwLock::new(auth)));
+        assert_eq!(
+            auto.observe("[sudo] password for user: "),
+            Some((AutoSudoKind::Password, "pw".to_string()))
+        );
+        assert_eq!(
+            auto.observe("verification code: "),
+            Some((AutoSudoKind::Totp, "654321".to_string()))
+        );
+        // Shell prompt closes the sequence and re-arms everything.
+        assert_eq!(auto.observe("user@host:~$ "), None);
+        assert_eq!(
+            auto.observe("[sudo] password for user: "),
+            Some((AutoSudoKind::Password, "pw".to_string()))
+        );
+    }
+
+    #[test]
+    fn terminal_auto_sudo_without_password_stays_silent() {
+        let mut auth = terminal_auth();
+        auth.password = String::new();
+        let mut auto = TerminalAutoSudo::new(Arc::new(RwLock::new(auth)));
+        assert_eq!(auto.observe("[sudo] password for user: "), None);
+    }
+
+    #[test]
+    fn shell_prompt_detection_matches_last_line() {
+        assert!(has_shell_prompt("output line\nuser@host:~$ "));
+        assert!(has_shell_prompt("root@host:~# "));
+        assert!(!has_shell_prompt("[sudo] password for user:"));
+        assert!(!has_shell_prompt(""));
+    }
+
+    #[test]
+    fn parses_server_metrics_output() {
+        let output = "\
+hostname=web-01
+kernel=6.1.0-18-amd64
+loadavg=0.28 0.42 0.35 1/887 23456
+uptime=987654.32 456789.01
+nproc=8
+--mem--
+MemTotal:       16308856 kB
+MemFree:        1234567 kB
+MemAvailable:   12000000 kB
+SwapTotal:      2047996 kB
+SwapFree:       2047996 kB
+--cpu--
+cpu  100 0 200 8000 40 0 0 0 0 0
+cpu  200 0 300 8100 40 0 0 0 0 0
+--df--
+/dev/sda1 51469868 23456780 25879924 48% /
+tmpfs 8154428 0 8154428 0% /dev/shm
+/dev/sdb1 103080888 53456780 44349988 55% /data
+";
+        let metrics = parse_metrics_output(output);
+        assert_eq!(metrics["hostname"], "web-01");
+        assert_eq!(metrics["cpu"]["cores"], 8);
+        assert_eq!(metrics["cpu"]["load1"], 0.28);
+        assert_eq!(metrics["uptimeSeconds"], 987654);
+        // busy delta = (200-100)+(300-200) = 200; total delta = 200+100 = 300 → 66.7%
+        assert_eq!(metrics["cpu"]["percent"], 66.7);
+        assert_eq!(metrics["memory"]["totalBytes"], 16_308_856_u64 * 1024);
+        assert_eq!(
+            metrics["memory"]["usedBytes"],
+            (16_308_856_u64 - 12_000_000) * 1024
+        );
+        assert_eq!(metrics["memory"]["swapUsedBytes"], 0);
+        let disks = metrics["disks"].as_array().unwrap();
+        assert_eq!(disks.len(), 3);
+        assert_eq!(disks[1]["mount"], "/dev/shm");
+        assert_eq!(disks[2]["percentUsed"], 55.0);
+    }
+
+    #[test]
+    fn parses_disk_usage_for_a_path() {
+        let usage = parse_disk_usage(
+            "Filesystem     1024-blocks      Used Available Capacity Mounted on\n/dev/sda1         51469868  23456780  25879924      48% /",
+        )
+        .unwrap();
+        assert_eq!(usage["filesystem"], "/dev/sda1");
+        assert_eq!(usage["mount"], "/");
+        assert_eq!(usage["totalBytes"], 51_469_868_u64 * 1024);
+        assert_eq!(usage["percentUsed"], 48.0);
+        assert!(parse_disk_usage("no output").is_none());
+    }
+
+    #[test]
+    fn shell_quotes_paths() {
+        assert_eq!(shell_quote("/var/log/it's"), "'/var/log/it'\\''s'");
+    }
+
+    #[test]
+    fn keepalive_failure_step_stops_after_two_consecutive_failures() {
+        // Success resets the counter.
+        assert_eq!(keepalive_failure_step(0, true), Some(0));
+        assert_eq!(keepalive_failure_step(1, true), Some(0));
+        // First failure keeps the loop alive, second one stops it.
+        assert_eq!(keepalive_failure_step(0, false), Some(1));
+        assert_eq!(keepalive_failure_step(1, false), None);
+    }
+
+    #[test]
+    fn totp_replay_window_covers_the_one_step_slack() {
+        // A 30s code valid until T stays blocked until T + one period.
+        assert_eq!(totp_replay_window_expiry(1_000, 30), 1_030);
+        assert_eq!(totp_replay_window_expiry(60, 90), 150);
+        assert!(is_totp_in_replay_window(1_030, 1_030));
+        assert!(!is_totp_in_replay_window(1_031, 1_030));
+        assert!(is_totp_in_replay_window(500, 1_030));
+    }
+
+    #[test]
+    fn take_totp_answer_skips_recommitted_codes_within_window() {
+        let auth = SudoAuth {
+            password: "pw".into(),
+            totp_secrets: parse_totp_secrets("654321"),
+            ..Default::default()
+        };
+        let first = auth.take_totp_answer().expect("first submission");
+        assert_eq!(first, "654321");
+        let error = auth.take_totp_answer().expect_err("replay must be skipped");
+        assert!(
+            error.contains("already submitted") && error.contains("replay window"),
+            "{error}"
+        );
+        // answer_for routes through the same guard, so prompts inside the
+        // window get no answer instead of a duplicated injection.
+        assert_eq!(auth.answer_for(PromptKind::Totp), None);
+    }
+
+    #[test]
+    fn committed_otp_state_shares_across_clones() {
+        let auth = SudoAuth {
+            totp_secrets: parse_totp_secrets("654321"),
+            ..Default::default()
+        };
+        assert!(auth.take_totp_answer().is_ok());
+        let clone = auth.clone();
+        let error = clone
+            .take_totp_answer()
+            .expect_err("clone shares the state");
+        assert!(error.contains("already submitted"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    #[test]
+    fn parses_multiple_totp_secrets_across_separators() {
+        let secrets = parse_totp_secrets("JBSWY3DPEHPK3PXP\nGEZDGNBVGY3TQOJQ; 123456\r\n");
+        assert_eq!(secrets.len(), 3);
+        assert!(parse_totp_secrets("  \n; ").is_empty());
+    }
+
+    #[test]
+    fn rotating_totp_avoids_reusing_the_same_code() {
+        let auth = SudoAuth {
+            password: "pw".into(),
+            totp_secrets: parse_totp_secrets("JBSWY3DPEHPK3PXP\nGEZDGNBVGY3TQOJQ"),
+            ..Default::default()
+        };
+        let first = auth.current_totp_selection().expect("code").code;
+        let second = auth.current_totp_selection().expect("code").code;
+        assert_ne!(
+            first, second,
+            "same-window second answer must use the other secret"
+        );
+        // Once every candidate is used we fall back instead of failing.
+        let third = auth.current_totp_selection().expect("code").code;
+        assert!(third == first || third == second);
+    }
+
+    #[test]
+    fn terminal_auto_sudo_reads_settings_updates_live() {
+        let shared = Arc::new(RwLock::new(terminal_auth_for("pw1")));
+        let mut auto = TerminalAutoSudo::new(shared.clone());
+        assert_eq!(
+            auto.observe("[sudo] password for user: "),
+            Some((AutoSudoKind::Password, "pw1".to_string()))
+        );
+        assert_eq!(auto.observe("user@host:~$ "), None);
+
+        // Runtime settings update takes effect without recreating anything.
+        shared
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .password = "pw2".to_string();
+        assert_eq!(
+            auto.observe("[sudo] password for user: "),
+            Some((AutoSudoKind::Password, "pw2".to_string()))
+        );
+    }
+
+    fn terminal_auth_for(password: &str) -> SudoAuth {
+        SudoAuth {
+            password: password.to_string(),
+            totp_secrets: parse_totp_secrets("654321"),
+            ..Default::default()
+        }
+    }
+}

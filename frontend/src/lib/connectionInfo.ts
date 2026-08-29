@@ -1,0 +1,26 @@
+// 连接信息面板的展示辅助（只读）：延迟数值来自 ssh/exec echo 往返计时，
+// 认证方式名称来自 ssh/sessions/list 的 authMethod（仅方法名，无凭据）。
+// 这里只负责格式化，纯函数。
+
+/** 毫秒延迟 → "12 ms"；无测量值或非法输入返回 "–"。超过 1s 保留一位小数。 */
+export function formatLatency(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "–";
+  if (ms < 1) return "<1 ms";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+export const KNOWN_AUTH_METHODS = ["password", "private-key", "private-key-password", "agent", "none"] as const;
+export type KnownAuthMethod = (typeof KNOWN_AUTH_METHODS)[number];
+
+/** 认证方式展示标签：已知方法名走 translate 本地化，未知值原样展示，空缺返回占位符。 */
+export function formatAuthMethodLabel(
+  method: string | null | undefined,
+  translate: (method: KnownAuthMethod) => string,
+  placeholder = "–",
+): string {
+  const value = typeof method === "string" ? method.trim() : "";
+  if (!value) return placeholder;
+  if ((KNOWN_AUTH_METHODS as readonly string[]).includes(value)) return translate(value as KnownAuthMethod);
+  return value;
+}

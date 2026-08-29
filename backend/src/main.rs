@@ -1,0 +1,810 @@
+mod exec;
+mod host_key;
+mod keys;
+mod mcp;
+mod metrics;
+mod model;
+mod sftp_copy;
+mod sftp_ext;
+mod ssh;
+mod sudo_fs;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use dbx_plugin_sdk::{
+    PluginEmitter, PluginError, PluginHandler, PluginMetadata, PluginServer, PluginTransport,
+    RequestContext,
+};
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+use tokio::runtime::Runtime;
+
+use crate::model::{path_from_sftp_uri, SessionOpenRequest, StoredConnection, MAX_TRANSFER_SIZE};
+use crate::ssh::{connection_id_param, filesystem_path, PromptDecision, SshRuntime};
+
+struct Plugin {
+    runtime: Runtime,
+    ssh: Arc<SshRuntime>,
+    mcp: Arc<mcp::McpState>,
+}
+
+impl Plugin {
+    fn new() -> Result<Self, String> {
+        let data_dir = plugin_data_dir();
+        std::fs::create_dir_all(&data_dir).map_err(|error| {
+            format!(
+                "Failed to create plugin data directory {}: {error}",
+                data_dir.display()
+            )
+        })?;
+        let runtime =
+            Runtime::new().map_err(|error| format!("Failed to create async runtime: {error}"))?;
+        let ssh = Arc::new(SshRuntime::new(data_dir));
+        Ok(Self {
+            runtime,
+            mcp: Arc::new(mcp::McpState::shared(ssh.clone())),
+            ssh,
+        })
+    }
+
+    fn handle_request(
+        &self,
+        method: &str,
+        params: Value,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        match method {
+            "connection/test" => {
+                let connection = StoredConnection::from_lifecycle_params(&params)?;
+                let operation_id = operation_id(&params);
+                self.runtime.block_on(self.ssh.test_connection(
+                    &connection,
+                    &operation_id,
+                    emitter.clone(),
+                ))?;
+                Ok(
+                    json!({ "success": true, "message": "SSH handshake, host-key verification, and authentication succeeded" }),
+                )
+            }
+            "connection/connect" => {
+                let connection = StoredConnection::from_lifecycle_params(&params)?;
+                self.ssh.store_connection(connection)?;
+                Ok(json!({ "success": true }))
+            }
+            "connection/disconnect" => {
+                let connection_id = params
+                    .get("connection")
+                    .and_then(|value| value.get("id"))
+                    .and_then(Value::as_str)
+                    .ok_or("Missing connection id")?;
+                self.runtime
+                    .block_on(self.ssh.disconnect_connection(connection_id))?;
+                Ok(json!({ "success": true }))
+            }
+            "ssh/session/open" => {
+                let operation_id = operation_id(&params);
+                let request: SessionOpenRequest = parse(params)?;
+                self.runtime.block_on(self.ssh.open_session(
+                    &request.connection_id,
+                    &request.workbench_id,
+                    request.cols,
+                    request.rows,
+                    &operation_id,
+                    emitter.clone(),
+                ))
+            }
+            "ssh/session/attach" => {
+                let connection_id = required_string(&params, "connectionId")?;
+                let workbench_id = required_string(&params, "workbenchId")?;
+                let after_sequence = params
+                    .get("afterSequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                self.runtime.block_on(self.ssh.attach_session(
+                    connection_id,
+                    workbench_id,
+                    after_sequence,
+                    emitter,
+                ))
+            }
+            "ssh/session/close" => {
+                let session_id = required_string(&params, "sessionId")?;
+                self.runtime.block_on(self.ssh.close_session(session_id))?;
+                Ok(json!({ "success": true }))
+            }
+            "ssh/exec" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let command = required_string(&params, "command")?;
+                let sudo = params.get("sudo").and_then(Value::as_bool).unwrap_or(false);
+                let timeout_secs = params.get("timeoutSecs").and_then(Value::as_u64);
+                let exec_id = params.get("execId").and_then(Value::as_str);
+                self.runtime.block_on(self.ssh.exec(
+                    session_id,
+                    exec_id,
+                    command,
+                    sudo,
+                    timeout_secs,
+                ))
+            }
+            "ssh/exec/cancel" => {
+                let exec_id = required_string(&params, "execId")?;
+                self.ssh.cancel_exec(exec_id)?;
+                Ok(json!({ "success": true }))
+            }
+            "ssh/terminal/resize" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let cols = required_u32(&params, "cols")?;
+                let rows = required_u32(&params, "rows")?;
+                self.runtime
+                    .block_on(self.ssh.resize_terminal(session_id, cols, rows))?;
+                Ok(json!({ "success": true }))
+            }
+            "ssh/terminal/directoryTracking" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let enabled = params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.runtime
+                    .block_on(self.ssh.set_directory_tracking(session_id, enabled))?;
+                Ok(json!({ "success": true }))
+            }
+            "ssh/terminal/replay" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let after_sequence = params
+                    .get("afterSequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let replay = self.runtime.block_on(self.ssh.replay_terminal(
+                    session_id,
+                    after_sequence,
+                    emitter,
+                ))?;
+                Ok(replay)
+            }
+            "workbench/close" => {
+                let workbench_id = required_string(&params, "workbenchId")?;
+                self.runtime
+                    .block_on(self.ssh.close_workbench(workbench_id))?;
+                Ok(json!({ "success": true }))
+            }
+            "ssh/host-key/resolve" | "connection/challenge/resolve" => {
+                let challenge_id = required_string(&params, "challengeId")?;
+                let operation_id = required_string(&params, "operationId")?;
+                let accept = params
+                    .get("accept")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let remember = params
+                    .get("remember")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.runtime.block_on(self.ssh.prompts.resolve(
+                    challenge_id,
+                    operation_id,
+                    PromptDecision { accept, remember },
+                ))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/home" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = self.runtime.block_on(self.ssh.sftp_home(session_id))?;
+                Ok(json!({ "path": path }))
+            }
+            "sftp/list" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let entries = self
+                    .runtime
+                    .block_on(self.ssh.sftp_list_path(session_id, path))?;
+                Ok(json!({ "entries": entries }))
+            }
+            "sftp/read" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let offset = optional_u64(&params, "offset", 0);
+                let max_bytes = bounded_bytes(&params, "maxBytes", 256 * 1024);
+                let (data, truncated) = self
+                    .runtime
+                    .block_on(self.ssh.sftp_read_path(session_id, path, offset, max_bytes))?;
+                Ok(json!({ "dataBase64": BASE64_STANDARD.encode(data), "truncated": truncated }))
+            }
+            "sftp/createDirectory" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(self.ssh.sftp_create_directory(session_id, path))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/rename" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let source = required_string(&params, "sourcePath")?;
+                let target = required_string(&params, "targetPath")?;
+                self.runtime
+                    .block_on(self.ssh.sftp_rename(session_id, source, target))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/chmod" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let mode = params
+                    .get("mode")
+                    .and_then(|value| {
+                        value
+                            .as_str()
+                            .and_then(|text| u32::from_str_radix(text, 8).ok())
+                            .or_else(|| value.as_u64().and_then(|v| u32::try_from(v).ok()))
+                    })
+                    .filter(|value| *value <= 0o7777)
+                    .ok_or("Mode must be an octal value up to 7777")?;
+                self.runtime
+                    .block_on(self.ssh.sftp_chmod(session_id, path, mode))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/diskUsage" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(self.ssh.sftp_disk_usage(session_id, path))
+            }
+            "sftp/stat" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(sftp_ext::stat(&self.ssh, session_id, path))
+            }
+            "sftp/exists" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let exists = self
+                    .runtime
+                    .block_on(sftp_ext::exists(&self.ssh, session_id, path))?;
+                Ok(json!({ "exists": exists }))
+            }
+            "sftp/touch" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(sftp_ext::touch(&self.ssh, session_id, path))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/write" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let remote_path = required_string(&params, "remotePath")?;
+                let data_base64 = required_string(&params, "dataBase64")?;
+                self.runtime.block_on(sftp_ext::write_file(
+                    &self.ssh,
+                    session_id,
+                    remote_path,
+                    data_base64,
+                ))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/archive" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let source_paths = params
+                    .get("sourcePaths")
+                    .and_then(Value::as_array)
+                    .ok_or("Missing sourcePaths")?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| "sourcePaths must be strings".to_string())
+                    })
+                    .collect::<Result<Vec<String>, String>>()?;
+                let archive_path = required_string(&params, "archivePath")?;
+                self.runtime.block_on(sftp_ext::archive(
+                    &self.ssh,
+                    session_id,
+                    &source_paths,
+                    archive_path,
+                ))
+            }
+            "sftp/extract" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let archive_path = required_string(&params, "archivePath")?;
+                let destination_path = required_string(&params, "destinationPath")?;
+                let overwrite = params
+                    .get("overwrite")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.runtime.block_on(sftp_ext::extract(
+                    &self.ssh,
+                    session_id,
+                    archive_path,
+                    destination_path,
+                    overwrite,
+                ))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/copy" => {
+                let session_id = self.filesystem_session(&params)?;
+                self.runtime.block_on(sftp_copy::run(
+                    &self.ssh,
+                    &session_id,
+                    sftp_copy::CopyOp::Copy,
+                    &params,
+                ))
+            }
+            "sftp/move" => {
+                let session_id = self.filesystem_session(&params)?;
+                self.runtime.block_on(sftp_copy::run(
+                    &self.ssh,
+                    &session_id,
+                    sftp_copy::CopyOp::Move,
+                    &params,
+                ))
+            }
+            "ssh/metrics" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let cached = params
+                    .get("cached")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.runtime.block_on(self.ssh.metrics(session_id, cached))
+            }
+            "mcp/tools" => Ok(mcp::tool_definitions()),
+            "mcp/call" => self.runtime.block_on(self.mcp.call_dbx(&params)),
+            "mcp/settings/get" => Ok(self.mcp.settings_get()),
+            "mcp/settings/set" => self.mcp.settings_set(&params),
+            "ssh/settings/get" => {
+                let session_id = required_string(&params, "sessionId")?;
+                self.runtime.block_on(self.ssh.settings_get(session_id))
+            }
+            "ssh/settings/set" => {
+                let session_id = required_string(&params, "sessionId")?;
+                self.runtime
+                    .block_on(self.ssh.settings_set(session_id, &params))
+            }
+            "sudo/stat" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(sudo_fs::stat(&self.ssh, session_id, &path))
+            }
+            "sudo/exists" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let exists = self
+                    .runtime
+                    .block_on(sudo_fs::exists(&self.ssh, session_id, &path))?;
+                Ok(json!({ "exists": exists }))
+            }
+            "sudo/touch" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(sudo_fs::touch(&self.ssh, session_id, &path))?;
+                Ok(json!({ "success": true }))
+            }
+            "sudo/listDir" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(sudo_fs::list_dir(&self.ssh, session_id, &path))
+            }
+            "sudo/readFile" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let offset = optional_u64(&params, "offset", 0);
+                let length = optional_u64(&params, "length", 0);
+                self.runtime.block_on(sudo_fs::read_file(
+                    &self.ssh, session_id, &path, offset, length,
+                ))
+            }
+            "sudo/writeFile" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let data_base64 = required_string(&params, "dataBase64")?;
+                self.runtime.block_on(sudo_fs::write_file(
+                    &self.ssh,
+                    session_id,
+                    &path,
+                    data_base64,
+                ))?;
+                Ok(json!({ "success": true }))
+            }
+            "sudo/mkdir" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(sudo_fs::mkdir(&self.ssh, session_id, &path))?;
+                Ok(json!({ "success": true }))
+            }
+            "sudo/remove" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(sudo_fs::remove(&self.ssh, session_id, &path))?;
+                Ok(json!({ "success": true }))
+            }
+            "sudo/removeAll" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                self.runtime
+                    .block_on(sudo_fs::remove_all(&self.ssh, session_id, &path))?;
+                Ok(json!({ "success": true }))
+            }
+            "sudo/chmod" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let mode = required_string(&params, "mode")?;
+                self.runtime
+                    .block_on(sudo_fs::chmod(&self.ssh, session_id, &path, &mode))?;
+                Ok(json!({ "success": true }))
+            }
+            "sudo/rename" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let source = required_string(&params, "sourcePath")?;
+                let target = required_string(&params, "targetPath")?;
+                self.runtime
+                    .block_on(sudo_fs::rename(&self.ssh, session_id, &source, &target))?;
+                Ok(json!({ "success": true }))
+            }
+            "keys/discover" => {
+                let keys = keys::discover()?;
+                Ok(json!({ "keys": keys }))
+            }
+            "ssh/knownHosts/list" => Ok(keys::list_known_hosts(&plugin_data_dir())?),
+            "ssh/knownHosts/remove" => {
+                let host = required_string(&params, "host")?;
+                let port = params
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(22);
+                let removed = keys::remove_known_host(&plugin_data_dir(), host, port)?;
+                Ok(json!({ "success": true, "removed": removed }))
+            }
+            "sftp/delete" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let path = required_string(&params, "path")?;
+                let recursive = params
+                    .get("recursive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.runtime
+                    .block_on(self.ssh.sftp_delete(session_id, path, recursive))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/upload/start" => {
+                let session_id = required_string(&params, "sessionId")?.to_string();
+                let remote_path = required_string(&params, "remotePath")?.to_string();
+                let size = params
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .ok_or("Missing upload size")?;
+                self.runtime.block_on(
+                    self.ssh
+                        .start_upload(session_id, remote_path, size, emitter),
+                )
+            }
+            "sftp/upload/finish" => {
+                let task_id = required_string(&params, "taskId")?;
+                self.runtime
+                    .block_on(self.ssh.finish_upload(task_id, emitter))
+            }
+            "sftp/download/start" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let remote_path = required_string(&params, "remotePath")?;
+                self.runtime
+                    .block_on(self.ssh.start_download(session_id, remote_path, emitter))
+            }
+            "sftp/download/next" => {
+                let task_id = required_string(&params, "taskId")?;
+                let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.runtime
+                    .block_on(self.ssh.download_chunk(task_id, offset as u64, emitter))
+            }
+            "sftp/download/finish" => {
+                self.ssh
+                    .complete_download(required_string(&params, "taskId")?, emitter)?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/transfer/cancel" => {
+                self.ssh
+                    .cancel_transfer(required_string(&params, "taskId")?, emitter)?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/transfer/list" => self
+                .ssh
+                .transfer_list(required_string(&params, "sessionId")?),
+            "sftp/transfer/status" => self
+                .ssh
+                .transfer_status(required_string(&params, "taskId")?),
+            "filesystem/list" => self.filesystem_list(params),
+            "filesystem/read" => self.filesystem_read(params),
+            "filesystem/write" => self.filesystem_write(params),
+            "filesystem/createDirectory" => self.filesystem_create_directory(params),
+            "filesystem/delete" => self.filesystem_delete(params),
+            "filesystem/rename" => self.filesystem_rename(params),
+            "ssh/host-key/check" => {
+                let connection_id = required_string(&params, "connectionId")?;
+                self.runtime
+                    .block_on(self.ssh.check_host_key(connection_id))
+            }
+            "ssh/sessions/list" => Ok(self.runtime.block_on(self.ssh.list_sessions())),
+            "ssh/status" => Ok(json!({
+                "ok": true,
+                "plugin": "io.dbx.ssh",
+                "maxTransferSize": MAX_TRANSFER_SIZE
+            })),
+            _ => Err(format!("Method not found: {method}")),
+        }
+    }
+
+    fn filesystem_session(&self, params: &Value) -> Result<String, String> {
+        if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
+            return Ok(session_id.to_string());
+        }
+        let connection_id = connection_id_param(params)?;
+        self.runtime
+            .block_on(self.ssh.session_id_for_connection(connection_id))
+    }
+
+    fn filesystem_list(&self, params: Value) -> Result<Value, String> {
+        let session_id = self.filesystem_session(&params)?;
+        let path = filesystem_path(&params)?;
+        let entries = self
+            .runtime
+            .block_on(self.ssh.sftp_list_path(&session_id, &path))?;
+        Ok(json!({ "entries": entries }))
+    }
+
+    fn filesystem_read(&self, params: Value) -> Result<Value, String> {
+        let session_id = self.filesystem_session(&params)?;
+        let path = filesystem_path(&params)?;
+        let offset = optional_u64(&params, "offset", 0);
+        let max_bytes = bounded_bytes(&params, "maxBytes", 256 * 1024);
+        let (data, truncated) = self.runtime.block_on(self.ssh.sftp_read_path(
+            &session_id,
+            &path,
+            offset,
+            max_bytes,
+        ))?;
+        Ok(json!({
+            "dataBase64": BASE64_STANDARD.encode(data),
+            "contentType": content_type(&path),
+            "truncated": truncated
+        }))
+    }
+
+    fn filesystem_write(&self, params: Value) -> Result<Value, String> {
+        let session_id = self.filesystem_session(&params)?;
+        let path = filesystem_path(&params)?;
+        let data = BASE64_STANDARD
+            .decode(required_string(&params, "dataBase64")?)
+            .map_err(|error| format!("Invalid base64 file data: {error}"))?;
+        let create = params
+            .get("create")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let overwrite = params
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.runtime.block_on(self.ssh.sftp_write_path(
+            &session_id,
+            &path,
+            &data,
+            create,
+            overwrite,
+        ))?;
+        Ok(json!({ "success": true }))
+    }
+
+    fn filesystem_create_directory(&self, params: Value) -> Result<Value, String> {
+        let session_id = self.filesystem_session(&params)?;
+        let path = filesystem_path(&params)?;
+        self.runtime
+            .block_on(self.ssh.sftp_create_directory(&session_id, &path))?;
+        Ok(json!({ "success": true }))
+    }
+
+    fn filesystem_delete(&self, params: Value) -> Result<Value, String> {
+        let session_id = self.filesystem_session(&params)?;
+        let path = filesystem_path(&params)?;
+        let recursive = params
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.runtime
+            .block_on(self.ssh.sftp_delete(&session_id, &path, recursive))?;
+        Ok(json!({ "success": true }))
+    }
+
+    fn filesystem_rename(&self, params: Value) -> Result<Value, String> {
+        let session_id = self.filesystem_session(&params)?;
+        let source = required_string(&params, "sourceUri").and_then(path_from_sftp_uri)?;
+        let target = required_string(&params, "targetUri").and_then(path_from_sftp_uri)?;
+        self.runtime
+            .block_on(self.ssh.sftp_rename(&session_id, &source, &target))?;
+        Ok(json!({ "success": true }))
+    }
+}
+
+impl PluginHandler for Plugin {
+    fn handle(
+        &self,
+        _context: RequestContext,
+        method: &str,
+        params: Value,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, PluginError> {
+        self.handle_request(method, params, emitter)
+            .map_err(to_plugin_error)
+    }
+
+    fn handle_binary(
+        &self,
+        channel: &str,
+        data: Vec<u8>,
+        emitter: &PluginEmitter,
+    ) -> Result<(), PluginError> {
+        if let Some(session_id) = channel.strip_prefix("ssh/terminal/in/") {
+            if data.len() < 8 {
+                return Err(to_plugin_error(
+                    "SSH terminal input is missing its sequence".to_string(),
+                ));
+            }
+            let sequence =
+                u64::from_be_bytes(data[..8].try_into().map_err(|_| {
+                    to_plugin_error("Invalid SSH terminal input sequence".to_string())
+                })?);
+            self.ssh
+                .write_terminal(session_id, data[8..].to_vec())
+                .map_err(to_plugin_error)?;
+            emitter.event(
+                "ssh/terminal/inputAck",
+                json!({ "sessionId": session_id, "sequence": sequence }),
+            )?;
+            return Ok(());
+        }
+        if let Some(task_id) = channel.strip_prefix("sftp/upload/") {
+            return self
+                .ssh
+                .append_upload(task_id, &data, emitter)
+                .map_err(to_plugin_error);
+        }
+        Err(PluginError::new(
+            -32601,
+            format!("Unknown binary channel: {channel}"),
+        ))
+    }
+}
+
+fn parse<T: DeserializeOwned>(value: Value) -> Result<T, String> {
+    serde_json::from_value(value).map_err(|error| format!("Invalid request parameters: {error}"))
+}
+
+fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("Missing {key}"))
+}
+
+/// Host API 1.1 passes `operationId` to correlate connection lifecycle calls;
+/// on Host API 1.0 it is absent, so a locally generated id is used instead.
+/// The id only needs to stay stable between a challenge prompt and its resolve.
+fn operation_id(params: &Value) -> String {
+    params
+        .get("operationId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn required_u32(params: &Value, key: &str) -> Result<u32, String> {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("Invalid {key}"))
+}
+
+fn bounded_bytes(params: &Value, key: &str, default: usize) -> usize {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(default)
+        .clamp(1, 1024 * 1024)
+}
+
+/// Reads an optional non-negative integer parameter, falling back to the
+/// default when the key is absent or not a `u64` (negative/invalid).
+fn optional_u64(params: &Value, key: &str, default: u64) -> u64 {
+    params.get(key).and_then(Value::as_u64).unwrap_or(default)
+}
+
+fn content_type(path: &str) -> &'static str {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "txt" | "md" | "log" | "json" | "yaml" | "yml" | "toml" | "rs" | "ts" | "js" => {
+            "text/plain"
+        }
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "application/octet-stream",
+    }
+}
+
+fn to_plugin_error(error: String) -> PluginError {
+    PluginError::new(-32000, error)
+}
+
+fn plugin_data_dir() -> PathBuf {
+    std::env::var_os("DBX_PLUGIN_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("dbx-plugin-data")
+                .join("io.dbx.ssh")
+        })
+}
+
+fn main() -> std::io::Result<()> {
+    // MCP stdio mode: expose SSH/SFTP tools to MCP clients over JSON-RPC
+    // instead of running the DBX plugin server.
+    if std::env::args().any(|arg| arg == "--mcp") {
+        return mcp::run_mcp_stdio(plugin_data_dir());
+    }
+    let plugin = Plugin::new().map_err(std::io::Error::other)?;
+    let metadata = PluginMetadata::new("io.dbx.ssh", env!("CARGO_PKG_VERSION"))
+        .with_capability("connections")
+        .with_capability("events")
+        .with_capability("binary")
+        .with_capability("filesystem");
+    PluginServer::new(metadata, plugin)
+        .transport(PluginTransport::Framed)
+        .worker_threads(4)
+        .serve()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_byte_limits_are_bounded() {
+        assert_eq!(bounded_bytes(&json!({}), "maxBytes", 12), 12);
+        assert_eq!(bounded_bytes(&json!({ "maxBytes": 0 }), "maxBytes", 12), 1);
+        assert_eq!(
+            bounded_bytes(&json!({ "maxBytes": 99_999_999 }), "maxBytes", 12),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn optional_u64_falls_back_on_missing_or_invalid() {
+        assert_eq!(optional_u64(&json!({}), "offset", 0), 0);
+        assert_eq!(optional_u64(&json!({ "offset": 4096 }), "offset", 0), 4096);
+        // Negative numbers and non-numeric values fall back to the default.
+        assert_eq!(optional_u64(&json!({ "offset": -3 }), "offset", 0), 0);
+        assert_eq!(optional_u64(&json!({ "offset": "later" }), "offset", 7), 7);
+        assert_eq!(optional_u64(&json!({ "offset": null }), "offset", 7), 7);
+    }
+
+    #[test]
+    fn password_is_not_in_workbench_status() {
+        let value = json!({ "ok": true, "plugin": "io.dbx.ssh" });
+        assert!(!value.to_string().contains("password"));
+    }
+}

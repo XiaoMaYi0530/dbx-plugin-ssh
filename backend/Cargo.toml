@@ -1,0 +1,32 @@
+[package]
+name = "dbx-plugin-ssh"
+version = "0.2.5"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+base64 = "0.22"
+data-encoding = "2"
+dbx-plugin-sdk = "0.1.0"
+hmac = "0.12"
+russh = "0.60"
+russh-sftp = "2.3.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+pageant = "0.2"
+
+# The SDK is consumed from the local DBX host checkout; crates.io does not
+# carry it. Adjust the path when the host repo lives elsewhere.
+[patch.crates-io]
+dbx-plugin-sdk = { path = "../../../dbx-plugin-host-worktree/plugins/sdk/rust/dbx-plugin-sdk" }
+
+[dev-dependencies]
+tempfile = "3"
