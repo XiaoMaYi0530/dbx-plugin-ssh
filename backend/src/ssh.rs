@@ -29,8 +29,8 @@ use crate::exec::{
 use crate::host_key::{HostKeyState, HostKeyVerifier};
 use crate::model::{
     normalize_remote_path, path_from_sftp_uri, sftp_uri, AuthenticationMethod, SftpEntry,
-    StoredConnection, TerminalFrame, TerminalStream, MAX_TRANSFER_SIZE, TERMINAL_REPLAY_LIMIT,
-    TRANSFER_CHUNK_SIZE,
+    StoredConnection, SudoSource, TerminalFrame, TerminalStream, MAX_TRANSFER_SIZE,
+    TERMINAL_REPLAY_LIMIT, TRANSFER_CHUNK_SIZE,
 };
 use crate::sudo_profiles;
 
@@ -61,6 +61,26 @@ fn resolved_sudo_auth(
         sudo_profiles::apply_profile(&mut auth, profile, &connection.password);
     }
     auth
+}
+
+/// The Quick Sudo profile in effect under the connection's declared source
+/// (form field `sudo_source`): "global" resolves the form profile reference
+/// first (id or exact name) and falls back to the persisted workbench
+/// binding; "custom" keeps only the binding overlay (legacy parity with
+/// 0.4.x, where a workbench binding owned the source); "off" never promotes
+/// a profile. Unresolvable references degrade to no profile instead of
+/// failing the connection.
+fn effective_sudo_profile(
+    connection: &StoredConnection,
+    store: &sudo_profiles::SudoProfileStore,
+) -> Option<sudo_profiles::SudoProfile> {
+    match connection.sudo_source {
+        SudoSource::Off => None,
+        SudoSource::Custom => sudo_profiles::bound_profile(store, &connection.id).cloned(),
+        SudoSource::Global => sudo_profiles::find_by_ref(store, connection.sudo_profile_ref.trim())
+            .or_else(|| sudo_profiles::bound_profile(store, &connection.id))
+            .cloned(),
+    }
 }
 
 /// How the next SSH hop is reached: a fresh TCP connection, or a
@@ -782,7 +802,7 @@ impl SshRuntime {
         let replay = Arc::new(AsyncMutex::new(ReplayBuffer::default()));
         let bound_profile = {
             let store = sudo_profiles::load_store(&self.data_dir);
-            sudo_profiles::bound_profile(&store, &connection.id).cloned()
+            effective_sudo_profile(&connection, &store)
         };
         let orchestration = Arc::new(RwLock::new(resolved_sudo_auth(
             &connection,
@@ -790,7 +810,7 @@ impl SshRuntime {
         )));
         // In-terminal Quick Sudo: answers sudo password / 2FA prompts while
         // the user keeps typing normal commands (ported from tiny-rdm).
-        let mut auto_sudo = (connection.quick_sudo && !connection.read_only)
+        let mut auto_sudo = (connection.sudo_enabled() && !connection.read_only)
             .then(|| exec::TerminalAutoSudo::new(orchestration.clone()))
             .filter(exec::TerminalAutoSudo::is_useful);
         let entry = Arc::new(SessionEntry {
@@ -1543,7 +1563,7 @@ impl SshRuntime {
                 .get(&session.connection_id)
                 .cloned()
                 .ok_or("Connection is not active; reopen it from DBX".to_string())?;
-            if !connection.quick_sudo {
+            if !connection.sudo_enabled() {
                 return Err("Quick Sudo is disabled for this connection".to_string());
             }
             Some(connection)
@@ -1565,7 +1585,7 @@ impl SshRuntime {
             let store = sudo_profiles::load_store(&self.data_dir);
             sudo_profiles::effective_use_pty(
                 connection.sudo_use_pty,
-                sudo_profiles::bound_profile(&store, &connection.id),
+                effective_sudo_profile(connection, &store).as_ref(),
             )
         })
         .unwrap_or(false);
@@ -2262,20 +2282,26 @@ impl SshRuntime {
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
         let store = sudo_profiles::load_store(&self.data_dir);
-        let bound = sudo_profiles::bound_profile(&store, &session.connection_id);
+        let profile = connection
+            .as_ref()
+            .and_then(|connection| effective_sudo_profile(connection, &store));
         Ok(json!({
-            "quickSudo": connection.as_ref().map(|c| c.quick_sudo).unwrap_or(true),
+            "quickSudo": connection.as_ref().map(|c| c.sudo_enabled()).unwrap_or(true),
+            "sudoSource": connection
+                .as_ref()
+                .map(|c| c.sudo_source.name())
+                .unwrap_or("custom"),
             "sudoUsePty": sudo_profiles::effective_use_pty(
                 connection.as_ref().map(|c| c.sudo_use_pty).unwrap_or(false),
-                bound,
+                profile.as_ref(),
             ),
             "sudoPasswordSet": !auth.password.is_empty(),
             "totpConfigured": auth.totp_configured(),
             "authFlowMode": auth.flow_mode.map(flow_mode_name).unwrap_or("password_then_otp"),
             "passwordPromptHint": auth.password_prompt_hint,
             "totpPromptHint": auth.totp_prompt_hint,
-            "quickSudoProfileId": bound.map(|p| p.id.clone()).unwrap_or_default(),
-            "quickSudoProfileName": bound.map(|p| p.name.clone()).unwrap_or_default(),
+            "quickSudoProfileId": profile.as_ref().map(|p| p.id.clone()).unwrap_or_default(),
+            "quickSudoProfileName": profile.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
             "agentTerminalMode": self.agent_terminal_mode(&session.connection_id).name(),
         }))
     }
@@ -2294,11 +2320,11 @@ impl SshRuntime {
     pub async fn settings_set(&self, session_id: &str, updates: &Value) -> Result<Value, String> {
         let session = self.session(session_id).await?;
         let connection_id = session.connection_id.clone();
-        if let Some(profile_id) = updates
+        let binding_update = updates
             .get("quickSudoProfileId")
             .and_then(Value::as_str)
-            .map(str::to_string)
-        {
+            .map(str::to_string);
+        if let Some(profile_id) = binding_update.clone() {
             // Validate and persist before touching anything else, so an
             // unknown profile leaves the request without side effects.
             let mut store = sudo_profiles::load_store(&self.data_dir);
@@ -2354,7 +2380,26 @@ impl SshRuntime {
                 .map_err(|_| "Connection registry is poisoned".to_string())?;
             if let Some(connection) = connections.get_mut(&connection_id) {
                 if let Some(value) = updates.get("quickSudo").and_then(Value::as_bool) {
-                    connection.quick_sudo = value;
+                    // Session toggle: off wins outright; re-enabling an off
+                    // connection returns to this connection's own values.
+                    connection.sudo_source = match (value, connection.sudo_source) {
+                        (false, _) => SudoSource::Off,
+                        (true, SudoSource::Off) => SudoSource::Custom,
+                        (true, source) => source,
+                    };
+                }
+                // A binding change doubles as a source change: picking a
+                // profile switches the connection to "global"; clearing it
+                // falls back to this connection's own values ("custom"),
+                // while an explicit "off" stays off.
+                if let Some(profile_id) = binding_update.clone() {
+                    if profile_id.is_empty() {
+                        if connection.sudo_source == SudoSource::Global {
+                            connection.sudo_source = SudoSource::Custom;
+                        }
+                    } else {
+                        connection.sudo_source = SudoSource::Global;
+                    }
                 }
                 if let Some(value) = updates.get("sudoUsePty").and_then(Value::as_bool) {
                     connection.sudo_use_pty = value;
@@ -2505,8 +2550,8 @@ impl SshRuntime {
             let Some(connection) = connection else {
                 continue;
             };
-            let profile = sudo_profiles::bound_profile(&store, &entry.connection_id);
-            let auth = resolved_sudo_auth(&connection, profile);
+            let profile = effective_sudo_profile(&connection, &store);
+            let auth = resolved_sudo_auth(&connection, profile.as_ref());
             let mut orchestration = entry
                 .orchestration
                 .write()
@@ -3583,6 +3628,62 @@ mod tests {
         let frames = replay.after(1);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].sequence, 2);
+    }
+
+    /// 连接表单的 sudo_source 三选一决定生效的全局配置：off 从不提升；
+    /// custom 只沿用工作台绑定（0.4.x 兼容）；global 先按表单引用解析，
+    /// 再回落绑定；引用无法解析时退化为无配置而不是失败连接。
+    #[test]
+    fn effective_sudo_profile_follows_declared_source() {
+        let parse = |external_config: Value| {
+            StoredConnection::from_lifecycle_params(&serde_json::json!({
+                "connection": {
+                    "id": "conn-src",
+                    "host": "example.com",
+                    "port": 22,
+                    "username": "user",
+                    "password": "login",
+                    "external_config": external_config
+                }
+            }))
+            .unwrap()
+        };
+        let mut store = sudo_profiles::SudoProfileStore::default();
+        let (profile, _) = sudo_profiles::save_profile(
+            &mut store,
+            &serde_json::json!({ "name": "ops", "sudoPassword": "p" }),
+        )
+        .unwrap();
+        store
+            .bindings
+            .insert("conn-src".to_string(), profile.id.clone());
+
+        let off = parse(serde_json::json!({ "sudo_source": "off" }));
+        assert!(effective_sudo_profile(&off, &store).is_none());
+
+        let custom = parse(serde_json::json!({ "sudo_source": "custom" }));
+        assert_eq!(
+            effective_sudo_profile(&custom, &store).unwrap().id,
+            profile.id
+        );
+
+        let global_ref =
+            parse(serde_json::json!({ "sudo_source": "global", "sudo_profile": "ops" }));
+        assert_eq!(
+            effective_sudo_profile(&global_ref, &store).unwrap().id,
+            profile.id
+        );
+        let global_empty = parse(serde_json::json!({ "sudo_source": "global" }));
+        assert_eq!(
+            effective_sudo_profile(&global_empty, &store).unwrap().id,
+            profile.id
+        );
+
+        // 引用未知配置时回落绑定；绑定也移除后退化为无配置。
+        let ghost = parse(serde_json::json!({ "sudo_source": "global", "sudo_profile": "ghost" }));
+        assert_eq!(effective_sudo_profile(&ghost, &store).unwrap().id, profile.id);
+        store.bindings.remove("conn-src");
+        assert!(effective_sudo_profile(&ghost, &store).is_none());
     }
 
     /// Stress test: 5 MiB of continuous terminal output through the 2 MiB

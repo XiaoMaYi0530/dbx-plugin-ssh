@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "publisher": "xynanan",
   "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
   "icon": "assets/plugin.svg",
@@ -181,12 +181,39 @@
           "description": "Keepalive probe interval; 3 missed probes disconnect the session. 0 disables probes."
         },
         {
-          "key": "quick_sudo",
-          "label": "Quick Sudo",
-          "type": "boolean",
+          "key": "sudo_source",
+          "label": "Sudo credential source",
+          "type": "select",
           "binding": "config",
-          "default": true,
-          "description": "Pipe the sudo password automatically and answer 2FA/TOTP prompts in the terminal and command dialog. Ignored on read-only connections."
+          "default": "custom",
+          "options": [
+            {
+              "value": "custom",
+              "label": "Custom (this connection)"
+            },
+            {
+              "value": "global",
+              "label": "Global Quick Sudo profile"
+            },
+            {
+              "value": "off",
+              "label": "Off"
+            }
+          ],
+          "description": "Where sudo credentials come from: this connection's own values, a shared global profile, or disabled. Ignored on read-only connections."
+        },
+        {
+          "key": "sudo_profile",
+          "label": "Quick Sudo profile",
+          "type": "text",
+          "binding": "config",
+          "visible_when": {
+            "field": "sudo_source",
+            "one_of": [
+              "global"
+            ]
+          },
+          "description": "Name or id of the global Quick Sudo profile. Run the 'Global Quick Sudo profiles' action below to list them; leave empty to use the workbench binding."
         },
         {
           "key": "sudo_password",
@@ -194,9 +221,9 @@
           "type": "password",
           "binding": "secret",
           "visible_when": {
-            "field": "quick_sudo",
+            "field": "sudo_source",
             "one_of": [
-              "true"
+              "custom"
             ]
           },
           "description": "Password piped to sudo; leave empty to reuse the login password."
@@ -251,12 +278,12 @@
           "binding": "config",
           "default": false,
           "visible_when": {
-            "field": "quick_sudo",
+            "field": "sudo_source",
             "one_of": [
-              "true"
+              "custom"
             ]
           },
-          "description": "Some PAM stacks only prompt correctly with a TTY."
+          "description": "Some PAM stacks only prompt correctly with a TTY. A bound global profile overrides this with its own preference."
         },
         {
           "key": "read_only",
@@ -360,8 +387,16 @@
             "keepalive_interval_secs": {
               "label": "Intervalo de keepalive (segundos)"
             },
-            "quick_sudo": {
-              "label": "Quick sudo"
+            "sudo_source": {
+              "label": "Origen de credenciales sudo",
+              "options": {
+                "custom": "Personalizado (esta conexión)",
+                "global": "Perfil Quick Sudo global",
+                "off": "Desactivado"
+              }
+            },
+            "sudo_profile": {
+              "label": "Perfil Quick Sudo"
             },
             "sudo_password": {
               "label": "Contraseña de sudo (override)"
@@ -444,6 +479,17 @@
             "agent_socket": {
               "label": "Socket agent"
             },
+            "sudo_source": {
+              "label": "Origine delle credenziali sudo",
+              "options": {
+                "custom": "Personalizzato (questa connessione)",
+                "global": "Profilo Quick Sudo globale",
+                "off": "Disattivato"
+              }
+            },
+            "sudo_profile": {
+              "label": "Profilo Quick Sudo"
+            },
             "read_only": {
               "label": "Sola lettura"
             }
@@ -513,8 +559,16 @@
             "keepalive_interval_secs": {
               "label": "Keepalive 間隔（秒）"
             },
-            "quick_sudo": {
-              "label": "Quick sudo（自動昇格）"
+            "sudo_source": {
+              "label": "sudo 認証情報ソース",
+              "options": {
+                "custom": "カスタム（この接続）",
+                "global": "グローバル Quick Sudo プロファイル",
+                "off": "オフ"
+              }
+            },
+            "sudo_profile": {
+              "label": "Quick Sudo プロファイル"
             },
             "sudo_password": {
               "label": "sudo パスワード（上書き）"
@@ -597,6 +651,17 @@
             "agent_socket": {
               "label": "Socket do agente"
             },
+            "sudo_source": {
+              "label": "Origem das credenciais sudo",
+              "options": {
+                "custom": "Personalizado (esta conexão)",
+                "global": "Perfil Quick Sudo global",
+                "off": "Desativado"
+              }
+            },
+            "sudo_profile": {
+              "label": "Perfil Quick Sudo"
+            },
             "read_only": {
               "label": "Somente leitura"
             }
@@ -666,8 +731,16 @@
             "keepalive_interval_secs": {
               "label": "Keepalive 间隔（秒）"
             },
-            "quick_sudo": {
-              "label": "Quick Sudo（自动提权）"
+            "sudo_source": {
+              "label": "Sudo 凭据来源",
+              "options": {
+                "custom": "自定义（本连接）",
+                "global": "全局 Quick Sudo 配置",
+                "off": "关闭"
+              }
+            },
+            "sudo_profile": {
+              "label": "Quick Sudo 配置名"
             },
             "sudo_password": {
               "label": "sudo 密码覆盖"
@@ -756,8 +829,16 @@
             "keepalive_interval_secs": {
               "label": "Keepalive 間隔（秒）"
             },
-            "quick_sudo": {
-              "label": "Quick Sudo（自動提權）"
+            "sudo_source": {
+              "label": "Sudo 憑據來源",
+              "options": {
+                "custom": "自訂（本連線）",
+                "global": "全域 Quick Sudo 設定",
+                "off": "關閉"
+              }
+            },
+            "sudo_profile": {
+              "label": "Quick Sudo 設定名稱"
             },
             "sudo_password": {
               "label": "sudo 密碼覆寫"

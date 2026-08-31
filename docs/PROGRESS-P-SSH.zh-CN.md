@@ -432,3 +432,23 @@ cargo 170 tests / vitest 68 tests / 容器 smoke_fs 44·smoke_mcp all green。
 新 e2e 套件：`scripts/e2e_agent_terminal.py`（26 场景，容器 26/26、vagrant
 25/25+SKIP 全绿）与 `scripts/e2e_agent_app_bridge.py`（T1-T5）。T5（转发 shell
 状态复用偶发空输出）仍在排查，手动探针证明变量持久化正常。
+
+## 2026-08-31 连接表单 sudo 来源三选一 + 宿主保存校验修复（0.4.2）
+
+1. **连接保存报 "Agent socket has an invalid value type"**：根因在宿主——
+   `hktkosl1186` 等连接的 `external_config.agent_socket` 等字段存了 JSON
+   `null`（旧对话框构建遗留），宿主 `validate_plugin_field_type` 对 text
+   字段只认字符串，test/connect 全被拒。修复宿主 worktree
+   `crates/dbx-core/src/plugins/host.rs`：校验前把 null 视为未填写
+   （`value.filter(|v| !v.is_null())`），附单测
+   `tolerates_stored_null_config_values_for_type_check`（cargo +1.97.1 过，
+   host 依赖要求 ≥1.91，需 `cargo +1.97.1`）。**宿主 app 需重打包生效**。
+2. **连接表单选不到全局 Quick Sudo**：manifest `quick_sudo` 布尔升级为
+   `sudo_source` 三选一（off / custom / global）+ `sudo_profile` 引用字段，
+   `visible_when` 联动（custom 才显示本连接密码/PTY，global 才显示配置
+   引用）；后端 `SudoSource` 解析兼容旧布尔，`effective_sudo_profile` 统一
+   会话引导 / exec 门禁 / PTY / settings 的配置解析；`settings/set` 绑定
+   变化联动 source，`settings/get` 新增 `sudoSource`。单测 3 个新用例 +
+   manifest 一致性用例更新；七语文案补齐（es/it/ja/pt-BR/zh-CN/zh-TW）。
+   协议/对标/实施文档同步（PROTOCOL §运行时设置/§sudo、FEATURE_PARITY、
+   IMPL_PLAN_QUICK_SUDO §11）。

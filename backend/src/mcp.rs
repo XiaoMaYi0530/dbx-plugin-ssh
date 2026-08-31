@@ -24,7 +24,7 @@ use crate::app_bridge;
 use crate::exec::{self, AuthFlowMode, Hints, SudoAuth};
 use crate::host_key::HostKeyVerifier;
 use crate::mcp_safety::{self, CommandRisk};
-use crate::model::{AuthenticationMethod, JumpHost, StoredConnection};
+use crate::model::{AuthenticationMethod, JumpHost, StoredConnection, SudoSource};
 use crate::sftp_copy;
 use crate::ssh::{SshClient, SshRuntime, NO_TERMINAL_SESSION_MESSAGE};
 use crate::sudo_profiles;
@@ -1500,10 +1500,18 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        quick_sudo: arguments
+        // MCP keeps its own quickSudoProfile resolution (explicit arguments
+        // win), so the stored connection carries the plain on/off source.
+        sudo_source: if arguments
             .get("quickSudo")
             .and_then(Value::as_bool)
-            .unwrap_or(true),
+            .unwrap_or(true)
+        {
+            SudoSource::Custom
+        } else {
+            SudoSource::Off
+        },
+        sudo_profile_ref: String::new(),
         sudo_use_pty: false,
         password_prompt_hint: arguments
             .get("passwordPromptHint")

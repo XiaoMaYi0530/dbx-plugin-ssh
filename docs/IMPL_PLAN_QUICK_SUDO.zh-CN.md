@@ -194,3 +194,27 @@
 
 里程碑 M6：action_summary 纯函数 + main.rs 接线 + manifest actions 七语 +
 smoke 用例 + `dbx-plugin package` schema 校验。
+
+## 11. 增补：连接表单 sudo 来源三选一（2026-08-31，随 0.4.2）
+
+用户反馈"连接选不到全局 quick sudo"。0.3.x 的来源选择（工作台绑定 +
+`quick_sudo` 布尔）对连接表单不可见。本次把来源选择搬上连接表单：
+
+- manifest 字段：`quick_sudo` 布尔 → `sudo_source` select（`custom` 本连接 /
+  `global` 全局配置 / `off` 停用，默认 `custom`）；新增 `sudo_profile` text
+  （仅 `global` 时 `visible_when` 显示：全局配置名称或 id，留空回落工作台
+  绑定）；`sudo_password` / `sudo_use_pty` 改为仅 `custom` 时显示。
+- 解析（model.rs `SudoSource`）：显式 `sudo_source` 优先；缺省/空/未知值按
+  旧 `quick_sudo` 布尔映射（true→custom、false→off），存量连接行为不变。
+- 生效配置（ssh.rs `effective_sudo_profile`）：`off` 永不提升；`custom` 沿用
+  工作台绑定（兼容 0.3.x）；`global` 先按 `sudo_profile` 引用（id 或精确名
+  称）解析、回落工作台绑定；都无则退化为本连接凭据，不失败连接。
+- `ssh/settings/set`：`quickSudoProfileId` 挑选 → `sudo_source=global`，
+  解除 → `global` 回落 `custom`；`quickSudo` 开关映射 `off`/`custom`（保持
+  global 不被开关覆盖）。`ssh/settings/get` 新增 `sudoSource`。
+- 兼容：旧连接的 `quick_sudo` 键残留无害（显式 source 优先）；工作台设置
+  弹窗与 MCP `quickSudoProfile` 语义不变。
+- 已知怪癖：旧连接（无 `sudo_source`）打开表单时 select 显示默认值
+  `custom`，与 `quick_sudo=false` 连接的实际生效值（off）不一致——宿主表单
+  不支持条件默认值，保存一次即显式化；连接实际行为始终由解析层的旧布尔
+  映射决定，不受表单显示影响。

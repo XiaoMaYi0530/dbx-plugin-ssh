@@ -54,6 +54,46 @@ impl AuthenticationMethod {
     }
 }
 
+/// Where sudo credentials come from (connection form `sudo_source`): the
+/// connection's own values ("custom"), a global Quick Sudo profile
+/// ("global", resolved from `sudo_profile_ref` or the workbench binding),
+/// or disabled ("off"). Legacy 0.4.x connections without the field map from
+/// the old `quick_sudo` boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SudoSource {
+    Off,
+    Custom,
+    Global,
+}
+
+impl SudoSource {
+    /// `sudo_source` wins whenever it is present and recognized; absent,
+    /// empty, or unknown values fall back to the legacy `quick_sudo` flag so
+    /// existing connections keep their behavior.
+    pub fn parse(value: Option<&str>, legacy_quick_sudo: bool) -> Self {
+        match value.map(str::trim) {
+            Some("off") => Self::Off,
+            Some("global") => Self::Global,
+            Some("custom") => Self::Custom,
+            _ => {
+                if legacy_quick_sudo {
+                    Self::Custom
+                } else {
+                    Self::Off
+                }
+            }
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Custom => "custom",
+            Self::Global => "global",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredConnection {
     pub id: String,
@@ -73,10 +113,12 @@ pub struct StoredConnection {
     pub read_only: bool,
     /// Quick Sudo orchestration: sudo password override, TOTP secret, and
     /// prompt hints. Secrets come from `connection_secrets`, tuning from
-    /// `external_config`.
+    /// `external_config`. `sudo_source` selects the credential source and
+    /// `sudo_profile_ref` names the global profile when the source is global.
     pub sudo_password: String,
     pub totp_secret: String,
-    pub quick_sudo: bool,
+    pub sudo_source: SudoSource,
+    pub sudo_profile_ref: String,
     pub sudo_use_pty: bool,
     pub password_prompt_hint: String,
     pub totp_prompt_hint: String,
@@ -195,7 +237,8 @@ impl JumpHost {
             read_only: false,
             sudo_password: String::new(),
             totp_secret: self.totp_secret.clone(),
-            quick_sudo: true,
+            sudo_source: SudoSource::Custom,
+            sudo_profile_ref: String::new(),
             sudo_use_pty: false,
             password_prompt_hint: self.password_prompt_hint.clone(),
             totp_prompt_hint: self.totp_prompt_hint.clone(),
@@ -206,6 +249,12 @@ impl JumpHost {
 }
 
 impl StoredConnection {
+    /// Quick Sudo is active unless the source is explicitly off; read-only
+    /// connections gate it separately (see `ssh.rs`).
+    pub fn sudo_enabled(&self) -> bool {
+        self.sudo_source != SudoSource::Off
+    }
+
     pub fn from_lifecycle_params(params: &Value) -> Result<Self, String> {
         let connection = params
             .get("connection")
@@ -252,10 +301,20 @@ impl StoredConnection {
         let password_prompt_hint = optional_string(external_config, "password_prompt_hint");
         let totp_prompt_hint = optional_string(external_config, "totp_prompt_hint");
         let auth_flow_mode = optional_string(external_config, "auth_flow_mode");
-        let quick_sudo = external_config
+        // Legacy 0.4.x flag: only consulted when `sudo_source` is absent, so
+        // a re-saved connection (stale `quick_sudo` left behind) follows the
+        // explicit source chosen on the form.
+        let legacy_quick_sudo = external_config
             .and_then(|config| config.get("quick_sudo"))
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let sudo_source = SudoSource::parse(
+            external_config
+                .and_then(|config| config.get("sudo_source"))
+                .and_then(Value::as_str),
+            legacy_quick_sudo,
+        );
+        let sudo_profile_ref = optional_string(external_config, "sudo_profile");
         let sudo_use_pty = external_config
             .and_then(|config| config.get("sudo_use_pty"))
             .and_then(Value::as_bool)
@@ -313,7 +372,8 @@ impl StoredConnection {
                     .unwrap_or(false),
             sudo_password,
             totp_secret,
-            quick_sudo,
+            sudo_source,
+            sudo_profile_ref,
             sudo_use_pty,
             password_prompt_hint,
             totp_prompt_hint,
@@ -618,7 +678,8 @@ mod tests {
             "agent_socket",
             "connect_timeout_secs",
             "keepalive_interval_secs",
-            "quick_sudo",
+            "sudo_source",
+            "sudo_profile",
             "sudo_password",
             "totp_secret",
             "auth_flow_mode",
@@ -670,8 +731,10 @@ mod tests {
             ["private-key", "private-key-password"]
         );
 
-        // quick-sudo 覆盖簇只在 quick_sudo 开启时可见；2FA 编排字段（totp_secret/
-        // auth_flow_mode/hints）服务登录期 keyboard-interactive，必须保持常显。
+        // sudo 覆盖簇跟随表单选定的凭据来源（sudo_source）：自定义模式下才
+        // 出现本连接密码/PTY；global 模式出现全局配置引用；2FA 编排字段
+        // （totp_secret/auth_flow_mode/hints）服务登录期 keyboard-interactive，
+        // 必须保持常显。
         let visible_when = |key: &str| -> Option<(String, Vec<String>)> {
             fields
                 .iter()
@@ -690,13 +753,21 @@ mod tests {
                     )
                 })
         };
-        for key in ["sudo_password", "sudo_use_pty"] {
-            assert_eq!(
-                visible_when(key),
-                Some(("quick_sudo".to_string(), vec!["true".to_string()])),
-                "{key} must stay gated on quick_sudo"
-            );
-        }
+        assert_eq!(
+            visible_when("sudo_password"),
+            Some(("sudo_source".to_string(), vec!["custom".to_string()])),
+            "sudo_password must stay gated on sudo_source=custom"
+        );
+        assert_eq!(
+            visible_when("sudo_use_pty"),
+            Some(("sudo_source".to_string(), vec!["custom".to_string()])),
+            "sudo_use_pty must stay gated on sudo_source=custom"
+        );
+        assert_eq!(
+            visible_when("sudo_profile"),
+            Some(("sudo_source".to_string(), vec!["global".to_string()])),
+            "sudo_profile must show only for sudo_source=global"
+        );
         for key in ["totp_secret", "auth_flow_mode", "password_prompt_hint", "totp_prompt_hint"] {
             assert!(visible_when(key).is_none(), "{key} must stay always-visible (login-time 2FA)");
         }
@@ -742,6 +813,72 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(blank.sudo_password, "   ");
+    }
+
+    #[test]
+    fn sudo_source_maps_three_modes_with_legacy_fallback() {
+        let parse = |external_config: serde_json::Value| {
+            StoredConnection::from_lifecycle_params(&serde_json::json!({
+                "connection": {
+                    "id": "sudo-source",
+                    "host": "example.com",
+                    "port": 22,
+                    "username": "user",
+                    "password": "login",
+                    "external_config": external_config
+                }
+            }))
+            .unwrap()
+        };
+
+        // 表单三选一：off / custom / global（global 附带全局配置引用，trim 后生效）。
+        assert_eq!(
+            parse(serde_json::json!({ "sudo_source": "off" })).sudo_source,
+            SudoSource::Off
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "sudo_source": "custom" })).sudo_source,
+            SudoSource::Custom
+        );
+        let global = parse(serde_json::json!({
+            "sudo_source": "global",
+            "sudo_profile": " ops "
+        }));
+        assert_eq!(global.sudo_source, SudoSource::Global);
+        assert_eq!(global.sudo_profile_ref, "ops");
+        assert!(global.sudo_enabled());
+        assert!(!parse(serde_json::json!({ "sudo_source": "off" })).sudo_enabled());
+
+        // 旧连接无 sudo_source：由 quick_sudo 布尔映射，保持原行为。
+        assert_eq!(
+            parse(serde_json::json!({ "quick_sudo": true })).sudo_source,
+            SudoSource::Custom
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "quick_sudo": false })).sudo_source,
+            SudoSource::Off
+        );
+        assert_eq!(parse(serde_json::json!({})).sudo_source, SudoSource::Custom);
+
+        // 显式 sudo_source 优先于遗留 quick_sudo（新表单保存后旧键残留）。
+        assert_eq!(
+            parse(serde_json::json!({ "sudo_source": "off", "quick_sudo": true })).sudo_source,
+            SudoSource::Off
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "sudo_source": "custom", "quick_sudo": false })).sudo_source,
+            SudoSource::Custom
+        );
+
+        // 空值/未知值回落 legacy。
+        assert_eq!(
+            parse(serde_json::json!({ "sudo_source": "", "quick_sudo": false })).sudo_source,
+            SudoSource::Off
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "sudo_source": "bogus", "quick_sudo": true })).sudo_source,
+            SudoSource::Custom
+        );
     }
 
     #[test]
@@ -1051,7 +1188,8 @@ mod manifest_contract_tests {
             "agent_socket",
             "connect_timeout_secs",
             "keepalive_interval_secs",
-            "quick_sudo",
+            "sudo_source",
+            "sudo_profile",
             "sudo_use_pty",
             "read_only",
             "auth_flow_mode",
@@ -1092,24 +1230,35 @@ mod manifest_contract_tests {
         );
     }
 
-    /// Visible-when pairing: pure Quick Sudo knobs hide while quick_sudo is
-    /// off; the 2FA quartet stays visible because login-time
-    /// keyboard-interactive auth consumes it regardless of quick_sudo.
+    /// Visible-when pairing: pure Quick Sudo knobs follow the form's sudo
+    /// source selection; the 2FA quartet stays visible because login-time
+    /// keyboard-interactive auth consumes it regardless of the sudo source.
     #[test]
     fn quick_sudo_visibility_pairing() {
         for key in ["sudo_password", "sudo_use_pty"] {
             let entry = field(key);
             assert_eq!(
                 condition_field(&entry, "visible_when"),
-                Some("quick_sudo"),
-                "{key} must be gated on quick_sudo"
+                Some("sudo_source"),
+                "{key} must be gated on sudo_source"
             );
             assert_eq!(
                 condition_one_of(&entry, "visible_when"),
-                Some(vec!["true".to_string()]),
-                "{key} must be visible only while quick_sudo is true"
+                Some(vec!["custom".to_string()]),
+                "{key} must be visible only while sudo_source is custom"
             );
         }
+        let profile = field("sudo_profile");
+        assert_eq!(
+            condition_field(&profile, "visible_when"),
+            Some("sudo_source"),
+            "sudo_profile must be gated on sudo_source"
+        );
+        assert_eq!(
+            condition_one_of(&profile, "visible_when"),
+            Some(vec!["global".to_string()]),
+            "sudo_profile must be visible only while sudo_source is global"
+        );
         for key in [
             "totp_secret",
             "auth_flow_mode",
@@ -1118,7 +1267,7 @@ mod manifest_contract_tests {
         ] {
             assert!(
                 field(key)["visible_when"].is_null(),
-                "{key} must stay visible: login-time 2FA uses it without quick_sudo"
+                "{key} must stay visible: login-time 2FA uses it without quick sudo"
             );
         }
     }
@@ -1135,7 +1284,7 @@ mod manifest_contract_tests {
             ("authentication", Value::from("password")),
             ("connect_timeout_secs", Value::from(15)),
             ("keepalive_interval_secs", Value::from(30)),
-            ("quick_sudo", Value::from(true)),
+            ("sudo_source", Value::from("custom")),
             ("sudo_use_pty", Value::from(false)),
             ("auth_flow_mode", Value::from("password_then_otp")),
             ("read_only", Value::from(false)),
@@ -1158,7 +1307,7 @@ mod manifest_contract_tests {
                     "authentication": "password",
                     "connect_timeout_secs": 15,
                     "keepalive_interval_secs": 30,
-                    "quick_sudo": true,
+                    "sudo_source": "custom",
                     "sudo_use_pty": false,
                     "auth_flow_mode": "password_then_otp",
                     "read_only": false
@@ -1169,7 +1318,7 @@ mod manifest_contract_tests {
         assert_eq!(connection.authentication, AuthenticationMethod::Password);
         assert_eq!(connection.connect_timeout_secs, 15);
         assert_eq!(connection.keepalive_interval_secs, 30);
-        assert!(connection.quick_sudo);
+        assert!(connection.sudo_enabled());
         assert!(!connection.sudo_use_pty);
         assert_eq!(connection.auth_flow_mode, "password_then_otp");
         assert!(!connection.read_only);
