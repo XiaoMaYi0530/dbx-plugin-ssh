@@ -129,3 +129,217 @@ tooltipDuration/tooltipDirectory`、`sftpBatch.progress`。既有“七语 key �
 4. OTP e2e 依赖 shim 模拟 sudo 前端（Alpine sudo 无 PAM 的替代）；若未来测试镜像换用带 PAM 的发行版，
    可将 shim 相态替换为 `pam_google_authenticator` 真栈，用例结构无需变化。
 5. 全部改动未 git 提交（硬性约束），请主会话审阅 diff 后统一收口。
+
+---
+
+## 7. 文件管理器交互轮补录（2026-08-30）
+
+用户反馈 SFTP"丢了预览和编辑"，复核结论：预览/编辑/压缩解压链路均在，但交互门槛
+造成功能体感丢失（详见 `FEATURE_PARITY.zh-CN.md`「文件管理器交互轮」节）。纯前端改动：
+
+- `frontend/src/lib/textSniff.ts`（新建）+ `textSniff.spec.ts`（6 用例）：
+  `looksBinary` 纯函数——NUL 字节即判二进制；否则按无效 UTF-8（U+FFFD）与
+  非文本控制字符（放行 TAB/LF/VT/FF/CR/ESC）占比 > 10% 判定；空块判文本。
+- `frontend/src/App.vue`：
+  - `openEntry` 重排：图片 MIME 保留 → 已知二进制扩展名直接提示不打开 →
+    > 1 MiB confirm 询问（取消即不动）→ 打开前 8 KiB 嗅探兜底 → 预览；
+    白名单 `PREVIEWABLE_EXTENSIONS` 与 `isPreviewable` / `containsNullByte` 删除。
+  - 截断预览（大文件确认后只读头部）：`previewBinary` ref 换为 `previewTruncated`，
+    `previewEditableAllowed` 增加 `!previewTruncated`——修复截断态编辑保存
+    整文件被头部覆盖的数据丢失 bug；弹窗标题徽标改显截断提示。
+  - `archiveEntry` 放开单文件压缩；右键菜单预览/压缩条件同步放宽。
+- `frontend/src/lib/i18n.ts`：七语新增 `binaryFile.notOpen`、
+  `previewDialog.tooLargeConfirm` / `truncated`（原 `binaryFile.badge` 弃用删除；
+  组名 `previewDialog` 避让既有 `preview` 字符串键）。
+- `frontend/src/style.css`：`.preview-binary-badge` → `.preview-truncated-badge`。
+
+验证：`pnpm typecheck` 0 错误；`pnpm test` vitest 3 spec **57/57**（51 → 57）；
+`scripts/build.sh` 全绿，出包 `io.dbx.ssh-0.2.6-darwin-arm64.dbxp`。
+后端零改动，无新增协议方法：无新 smoke 用例（既有 smoke_fs 的
+`sftp/write + sftp/read round-trip` 等继续覆盖底层通道），安装后按惯例对安装副本
+复跑双冒烟。遗留：预览解码对 GBK/GB18030 等非 UTF-8 文本仍按 UTF-8 容错显示
+（与此前一致，未引入转码）；zip 格式压缩/解压仍不做（协议文档明确仅 tar 系）。
+
+## 8. Quick Sudo 全局配置集中管理（2026-08-30）
+
+需求：多套全局 quick sudo 配置集中管理，单连接可选「全局配置」或「本连接自输入」，
+UI 与 MCP 双通道支持 quick sudo / auto sudo。设计与契约见
+`docs/IMPL_PLAN_QUICK_SUDO.zh-CN.md`（推翻 FEATURE_PARITY L41 既有「不做」结论）。
+
+- `backend/src/sudo_profiles.rs`（新建）：`<plugin_data_dir>/quick-sudo-profiles.json`
+  版本化存储（`profiles` + `bindings`，0600，tmp+rename 原子写，损坏按空库），
+  CRUD/名称唯一（大小写不敏感）/上限 20/视图永不回显密钥；
+  `apply_profile`（字段级覆盖，空配置密码回退登录密码）与 `effective_use_pty`。
+- `backend/src/exec.rs`：`AuthFlowMode::name()`（canonical 名），
+  `ssh.rs::flow_mode_name` 改为委托。
+- `backend/src/ssh.rs`：`resolved_sudo_auth`（绑定 profile 整体覆盖连接来源）；
+  `open_session` 编排、`exec` use_pty、`settings_get`（新增 `quickSudoProfileId` /
+  `quickSudoProfileName`）、`settings_set`（`quickSudoProfileId` 持久化绑定 +
+  存活会话热更新）；`profiles_list` / `profiles_save` / `profiles_delete` +
+  `refresh_bound_sessions`（配置改动即时热更新绑定会话，保留 OTP 防重放记账）。
+- `backend/src/main.rs`：注册 `sudo/profiles/list|save|delete`。
+- `backend/src/mcp.rs`：新增 `ssh_quick_sudo_profiles_list/save/delete` 工具；
+  `ssh_exec_sudo` 支持可选 `quickSudoProfile`（id 或精确名称；引用在任何连接 I/O
+  前解析，未知名称快速报错；调用内联凭据显式给出时优先）。
+- `frontend/src/App.vue`：设置弹窗新增「sudo 凭据来源」select（本连接 / 全局配置）
+  + 绑定摘要行 + 隐藏本连接凭据字段（总开关保留）；全局配置管理弹窗
+  （列表/新建/编辑/删除，删除走 confirm，密钥仅提交时发送、永不回显）。
+- `frontend/src/lib/i18n.ts`：supplemental 七语全补 20 键
+  （`settingsCredentialSource`、`profiles*` 等）；`style.css` 三个小样式类。
+- `scripts/smoke_fs_test.py`：quick sudo profiles 组 7 用例（list 初始 / save 创建 /
+  重复名拒绝 / 空密码更新保持密钥 / list 不回显 / settings 绑定与解除 / delete+幂等）。
+- `scripts/smoke_mcp.py`：MCP 通道 save/list/delete 回环 + `ssh_exec_sudo` schema
+  断言 `quickSudoProfile` + 未知引用快速报错（默认二进制路径同步改为
+  `backend/target/release/dbx-plugin-ssh`，对齐 test.sh）。
+
+验证：`cargo test` **140 passed / 0 failed**（基线 128 → 140：sudo_profiles 12 +
+MCP 回环）；`pnpm typecheck` 0 错误；`pnpm test` vitest 3 spec **58/58**（§7 基线 57/57）；`smoke_fs_test.py` **PASS 24 / SKIP 0 / FAIL 0**（真机容器）；
+`smoke_mcp.py` **all green（22 tools）**。版本 `0.2.9` → `0.3.0`
+（manifest.json + backend/Cargo.toml）。
+
+安全评估：全局配置密钥落盘为插件数据目录明文 JSON（0600）——为「凭据走 secret
+binding 不持久化」红线的显式例外（宿主 secret binding 仅支持连接级字段、无全局命名
+凭据通道；与 tiny-rdm 未启用 local-vault 档等价），已在 IMPL_PLAN §0/§9 记录权衡，
+存储层收敛于 sudo_profiles 单模块，后续可替换 OS keyring。密钥仅在 list/save/get
+以布尔位呈现，不进日志、不参与 shell 拼接。
+
+### §8.1 入口补强：工具栏直达 + 连接表单动作桩（2026-08-30 晚）
+
+反馈：「没有看到 quick sudo 的全局设置」——原入口埋在工作台设置弹窗里。核查宿主
+二进制确认贡献点枚举仅 `connection-provider` / `workbench` / `filesystem-provider`，
+**不存在插件级独立设置页**；但 `connection-provider` 支持 `actions`（连接表单动作，
+宿主点击后调 `connection/action {action, id}`，插件回 `{message, fieldValues}`）。
+
+- `frontend/src/App.vue`：工作台工具栏 Quick Sudo 开关旁新增钥匙按钮
+  （KeyRound）直达全局配置管理弹窗（管理操作本就无会话依赖）。
+- `ssh/manifest.json`：`connection-provider.actions` 新增 `quick-sudo-profiles`
+  （`variant: outline`、`when: always`、`requires_valid_form: false`、
+  `timeout_ms: 10000`）+ 六语 label/description；schema 经打包 CLI 宿主同款
+  校验通过。
+- 后端：`sudo_profiles::action_summary`（纯函数，密钥只报 set/not-set）+
+  `SshRuntime::profiles_action_summary` + `main.rs` 注册 `connection/action`
+  （未知动作报错）。摘要含全局配置清单与当前连接绑定状态，并提示完整管理入口
+  在工作台。
+- `scripts/smoke_fs_test.py`：`connection/action` 用例（清单含 profile、绑定行、
+  未知动作拒绝；置于 delete 用例之前执行）。
+
+验证：`cargo test` **141 passed**（+action_summary）；前端 typecheck/58 不变；
+`smoke_fs_test.py` **PASS 25 / SKIP 0 / FAIL 0**；`smoke_mcp.py` all green；
+`dbx-plugin package .` schema 校验通过出包 `io.dbx.ssh-0.3.2-darwin-arm64.dbxp`
+（manifest 与 Cargo.toml 同步 0.3.1 → 0.3.2）。
+
+## 9. MCP 完善与 ZCode 接入（2026-08-30 晚）
+
+需求：完善 ssh 的 MCP 工具面并接入 ZCode 实测。对标 tiny-rdm 演化版 MCP CTL
+工具面后补齐缺口（`SFTPTransfer` / `sftpPwd`），并确认 ZCode 客户端接入路径。
+
+- `backend/src/mcp.rs`：新增三工具（22 → **25**）——
+  - `sftp_upload`：本地文件 → 远端（单文件）。本地侧校验（可读、≤`maxUploadBytes`）
+    **先于拨号**；远端已存在需 `overwrite=true`。
+  - `sftp_download`：远端 → 本地路径（单文件）。本地目标已存在需 `overwrite=true`、
+    父目录自动创建，均先于拨号；远端先 stat 快速失败，再 `take(limit+1)` 硬上限
+    （防无尺寸/边读边涨），≤`maxDownloadBytes`。
+  - `sftp_pwd`：`canonicalize(".")` 返回登录家目录（与工作台 `sftp/home` 同源）。
+  - **连接池语义修正**：传输工具移出 `run_tool` 兜底 `drop_connection`——本地/远端
+    校验类拒绝（"already exists"、超限、是目录）不是传输故障，不清池；仅真正
+    SFTP I/O 错误主动 drop 触发下次重连（此前 `sftp_write_file` 拒绝也会清池，
+    同族问题留待后续统一，本轮不动存量行为）。
+  - `sftp_upload` 加入只读连接写门控（`is_write_tool`）；`sftp_download` 保持只读
+    放行（远端只读不写）。
+  - 顺带：`model.rs` 去除重复 `#[test]` 属性（历史告警，一用例曾计两次）。
+- `scripts/smoke_mcp.py`：
+  - EXPECTED_TOOLS 补齐 25（含此前漏断言的 `sftp_copy`/`sftp_move`）；
+  - 新增离线组：transfer 工具本地校验先于拨号（缺文件读失败 / 父目录是文件时
+    mkdir 失败，均零拨号快速报错）；
+  - 新增 `--host` 真机回环段：test_connection → exec（结果断言）→ metrics →
+    pwd → list_dir → upload→`sha256sum` 远端比对→download→本地 SHA-256 比对→
+    二次 download 拒绝 → 清理 → close；凭据走 `--password` 或
+    `DBX_SSH_SMOKE_PASSWORD` 环境变量（新代码不落盘凭据）。
+- 文档：`MCP.zh-CN.md`（工具一览 19→25、传输工具语义、**ZCode stdio 接入段**）、
+  `FEATURE_PARITY.zh-CN.md`（新增 MCP 传输对标行）。PROTOCOL 无新增方法不动。
+
+验证：`cargo test` **141 passed / 0 failed**（140 去重基线 + 1 新增 transfer
+校验用例；去重前的 142 含 model.rs 双计）；`smoke_mcp.py` 离线 all green（25
+tools）；真机回环（dbx-ssh-test 容器 127.0.0.1:2222）all green。ZCode 接入：
+用户级 `~/.zcode/cli/config.json` `mcp.servers.dbx-ssh`（stdio，`--mcp`），
+重启会话后 `mcp__dbx-ssh__*` 工具可用；详见 `MCP.zh-CN.md` 接入段。
+
+## 10. MCP 生产误操作防范（2026-08-31）
+
+需求：MCP 调用方是 LLM，生产环境误操作代价与人工敲错相同。给 exec 工具加
+三层安全门，全部在任何网络 I/O 之前（真机验证记录见本节末）。
+
+- `backend/src/mcp_safety.rs`（新增）：命令风险分级器 `assess_command` →
+  `ReadOnly`（白名单巡检命令，含管道组合）/ `Destructive(reason)`（灾难模式）/
+  `Unknown`（其余，白名单语义：识别不了 = 不放行）。
+  - 只读白名单：ls/cat/df/du/ps/journalctl/docker ps/git log 等无条件动词 +
+    systemctl/docker/git/kubectl/ip/service 子命令表 + find/crontab/journalctl
+    特判（`-delete`/`-exec`、`-r`/`-e`、`--vacuum` 拦）；`timeout/nice/env`
+    等包装器与 `FOO=bar` 前缀解包后再评估内层命令；重定向与 `$(...)` 一律
+    Unknown；`sudo X` 仅评破坏性、永不计白名单。
+  - 灾难模式：递归 rm 深层系统根（≤2 层路径；`/tmp`、`/var/tmp` 例外的常规
+    清理不拦）、mkfs/fdisk/wipefs 系、`dd of=/dev/…`、`> /dev/sdX`、
+    shutdown/reboot/init 0/6、fork 炸弹、`chmod/chown -R` 系统根、
+    /etc/passwd|shadow|sudoers|fstab 与 /boot/ 覆盖删除、docker prune、
+    `find -delete`、`kill -9 -1`、SQL DROP DATABASE/TABLE。
+  - 刻意保守：引号不做完整解析（引号内 `;` 仍切分，只会降级不会放行）、
+    `2>&1` fd 复制中性化后不误伤 `ps aux 2>&1 | grep`。
+- `backend/src/mcp.rs`：`call_tool` 三层门——① 只读连接（DBX lifecycle
+  read_only 或 `DBX_SSH_MCP_READ_ONLY=1` 全局开关）拒绝写类工具；② 只读连接
+  上 `ssh_exec` 走白名单（此前 ssh_exec 完全绕过只读门，本次收紧）；③ 灾难
+  命令要求 `confirmDestructive: true`，只读连接直接拒绝且确认位不可覆盖。
+  两 exec 工具 schema 增 `confirmDestructive` 参数并在描述中说明门语义。
+- `scripts/smoke_mcp.py`：离线组 destructive 无确认拒绝/带确认过门（错误信息
+  断言门序先于凭据校验）；真机段 destructive 拒绝；新增
+  `read_only_server_section`——第二个进程以 `DBX_SSH_MCP_READ_ONLY=1` 启动，
+  断言写工具拒绝、巡检命令过门、未知命令白名单拒绝、确认位不可覆盖。
+- 文档：`MCP.zh-CN.md` 新增「生产环境误操作防范」节（三层门 + 全局开关 +
+  保守偏差说明）、工具一览补安全语义；`PROTOCOL.zh-CN.md` MCP 通道段补
+  安全门一行。manifest/Cargo.toml 0.3.3 → 0.3.4。
+
+验证：`cargo test` **150 passed / 0 failed**（+9 mcp_safety 单测 +2 门禁
+集成用例）；`smoke_mcp.py` all green（含真机 dbx-ssh-test 容器 live 段：
+destructive gate / read-only server gate 两节新增输出）。另对 DBX 内 vagrant
+真实连接（192.168.33.11）完成 25 工具实测 + 磁盘清理演练（根分区 75%→72%），
+清理所用命令（`rm -rf /root/.cache/*`、`journalctl --vacuum`、`truncate` 日志
+截断）均落在 Unknown 档不误拦，验证白名单分级与真实运维操作兼容。
+
+## 2026-08-31 AI 终端同步执行（agent terminal mode，0.3.4 → 0.4.0）
+
+上游需求：AI/MCP 命令在终端 UI 同步执行——过程完整可见、可中断、可审批、可人工
+介入（教学/接管语义）。设计经用户确认四决策：仅 MCP/AI 命令路由；分级审批；
+无终端会话报错引导；超时返回部分输出命令继续跑。实施计划：
+`docs/IMPL_PLAN_AGENT_TERMINAL.zh-CN.md`（后端/前端并行 agent 实施，主会话接线）。
+
+- `backend/src/agent_terminal.rs`（新）：`AgentTerminalMode`（off/auto/strict）、
+  `CommandRisk`、`decide` 策略矩阵、`sanitize_command`（剥 C0 控制、留 `\n`/`\t`，
+  杜绝 AI 命令内嵌 `\x03`/`\x1b`）、`strip_ansi`（CSI/OSC 状态机）、
+  `TerminalRecorder`（1 MiB 有界缓冲、提示符回归 + 300ms 静默收尾、回显/尾提示符
+  尽力剥离）。9 个单测。
+- `backend/src/ssh.rs`：`agent_modes` 连接级内存存储 + settings get/set 新字段
+  `agentTerminalMode`；会话 `agent_recorder` 槽挂进 PTY 读循环（auto_sudo.observe
+  同位）；`exec_in_terminal`（sanitize → notice 事件 → PTY 键盘写入注入 → 50ms
+  轮询收尾 → finish 事件 → `{output, exitCode: null, mode: "terminal", incomplete,
+  interrupted}`）；审批挑战管理（`ssh/agent/prompt` 事件 + 120s 默认超时即拒绝 +
+  一次性挑战 + `resolve_agent_challenge`）。
+- `backend/src/mcp.rs`：`ssh_exec_tool` 路由分支（既有只读/灾难门之后）——
+  `runInTerminal` 显式值优先、缺省按连接模式、Off 行为与响应结构不变；stdio
+  模式传 `runInTerminal:true` 报错；`call_dbx` 透传 emitter（事件通道）；
+  两 exec 工具 schema 增 `runInTerminal`。
+- `backend/src/main.rs`：`mod agent_terminal`、`ssh/agent/resolve` 方法臂、
+  `mcp/call` 传 emitter。
+- 前端：`lib/agentTerminal.ts`（类型/三档/倒计时纯函数 + spec）、App.vue 审批
+  弹窗（复用 host-key 骨架：可编辑命令 textarea + 风险徽标 + 倒计时）、执行横幅
+  + 中断按钮（`sendTerminalBytes(\x03)` 复用既有 PTY 通道）、设置弹窗三档 select；
+  i18n 20 键 × 七语。
+- smoke：`smoke_mcp.py` stdio `runInTerminal` 拒绝负例 + schema 断言；
+  `smoke_fs_test.py` 新增 agent terminal 组（模式 round-trip / 无会话引导错误 /
+  auto 低危路由执行 / strict 审批 approve / deny 拒绝），事件回调驱动审批。
+- 文档：PROTOCOL 新增「AI 终端同步执行」节 + RPC 表 `ssh/agent/resolve` 行 +
+  settings 字段；MCP.zh-CN.md 新增「AI 终端同步执行」节 + 工具表补参数；
+  manifest/Cargo.toml 0.4.0。
+
+已知限制（协议文档已记）：多行命令按行执行；全屏 TUI 无提示符回归走超时路径
+（`incomplete: true`，命令留终端人工接管）；回显剥离尽力而为；sudo+终端路径
+不注入密码（交给终端 auto-sudo 状态机或人工）。stdio `--mcp` 模式不路由
+（与工作台不同进程）。

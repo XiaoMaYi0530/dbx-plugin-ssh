@@ -1,13 +1,16 @@
+mod agent_terminal;
 mod exec;
 mod host_key;
 mod keys;
 mod mcp;
+mod mcp_safety;
 mod metrics;
 mod model;
 mod sftp_copy;
 mod sftp_ext;
 mod ssh;
 mod sudo_fs;
+mod sudo_profiles;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -349,9 +352,19 @@ impl Plugin {
                 self.runtime.block_on(self.ssh.metrics(session_id, cached))
             }
             "mcp/tools" => Ok(mcp::tool_definitions()),
-            "mcp/call" => self.runtime.block_on(self.mcp.call_dbx(&params)),
+            "mcp/call" => self
+                .runtime
+                .block_on(self.mcp.call_dbx(&params, emitter.clone())),
             "mcp/settings/get" => Ok(self.mcp.settings_get()),
             "mcp/settings/set" => self.mcp.settings_set(&params),
+            "ssh/agent/resolve" => {
+                let challenge_id = required_string(&params, "challengeId")?;
+                let decision = required_string(&params, "decision")?;
+                let command = params.get("command").and_then(Value::as_str);
+                self.ssh
+                    .resolve_agent_challenge(challenge_id, decision, command)?;
+                Ok(json!({ "success": true }))
+            }
             "ssh/settings/get" => {
                 let session_id = required_string(&params, "sessionId")?;
                 self.runtime.block_on(self.ssh.settings_get(session_id))
@@ -445,6 +458,22 @@ impl Plugin {
                 self.runtime
                     .block_on(sudo_fs::rename(&self.ssh, session_id, &source, &target))?;
                 Ok(json!({ "success": true }))
+            }
+            "sudo/profiles/list" => Ok(self.ssh.profiles_list()),
+            "sudo/profiles/save" => self.runtime.block_on(self.ssh.profiles_save(&params)),
+            "sudo/profiles/delete" => {
+                let id = required_string(&params, "id")?;
+                self.runtime.block_on(self.ssh.profiles_delete(id))
+            }
+            "connection/action" => {
+                let action = required_string(&params, "action")?;
+                match action {
+                    "quick-sudo-profiles" => {
+                        let connection_id = params.get("id").and_then(Value::as_str);
+                        Ok(self.ssh.profiles_action_summary(connection_id))
+                    }
+                    other => Err(format!("Unknown connection action: {other}")),
+                }
             }
             "keys/discover" => {
                 let keys = keys::discover()?;

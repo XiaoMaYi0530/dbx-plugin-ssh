@@ -16,6 +16,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/host-key/resolve` | 处理工作台内的主机密钥确认 |
 | `ssh/exec` | 在会话连接上执行远程命令，可选 Quick Sudo 提权 |
 | `ssh/exec/cancel` | 中止进行中的远程命令（按 `execId`） |
+| `ssh/agent/resolve` | 处理 AI 终端同步执行的命令审批（按 `challengeId`，一次性） |
 | `ssh/metrics` | 采集服务器指标（CPU/内存/负载/磁盘（含 inode 使用率）+ 网络接口速率 + Top CPU/内存进程，只读命令；`cached: true` 返回上次快照） |
 | `ssh/host-key/check` | 连接维度主机密钥预检（探针三态：已知 / 变更 / 未知，不发认证） |
 | `ssh/settings/get`、`ssh/settings/set` | 读取/运行时更新 Quick Sudo 编排设置 |
@@ -35,13 +36,55 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sudo/stat`、`sudo/exists`、`sudo/touch` | sudo 元信息查询与空文件创建 |
 | `sudo/listDir`、`sudo/readFile`、`sudo/writeFile` | sudo 目录浏览与文件读写 |
 | `sudo/mkdir`、`sudo/remove`、`sudo/removeAll`、`sudo/chmod`、`sudo/rename` | sudo 写操作 |
+| `sudo/profiles/list`、`sudo/profiles/save`、`sudo/profiles/delete` | 全局 Quick Sudo 配置管理（多套命名凭据/策略档，插件数据目录持久化，密钥永不回显） |
+| `connection/action` | 连接表单动作（manifest `connection-provider.actions` 声明）：`action=quick-sudo-profiles` 返回全局配置清单与本连接绑定状态的纯文本摘要（`{message, fieldValues}`） |
 | `keys/discover` | 本地 SSH 私钥发现（不返回私钥内容） |
 | `ssh/knownHosts/list`、`ssh/knownHosts/remove` | known_hosts 条目管理（含 `@cert-authority` / `@revoked` 标记条目） |
 | `ssh/sessions/list` | 只读会话清单：sidecar 当前跟踪的活跃会话（对齐 tiny-rdm ListSessions） |
 
 ## 运行时设置
 
-`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文）；`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐 tiny-rdm 每次输出动态 resolve 的语义）；sidecar 重启或重开连接后恢复宿主下发的配置。工作台工具栏提供设置弹窗；宿主连接表单通过 manifest 字段（`quick_sudo`、`sudo_password`、`totp_secret`、`auth_flow_mode`、提示词、`sudo_use_pty`、超时与 keepalive、`jump_hosts`）提供持久化配置入口。
+`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文；另附 `quickSudoProfileId` / `quickSudoProfileName` 报告生效的全局配置绑定，未绑定为空串，以及 `agentTerminalMode`（`off` / `auto` / `strict`，AI 终端同步模式，见下节））；`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`、可选 `agentTerminalMode`（非法值报错，缺省不改变），以及可选 `quickSudoProfileId`（非空须引用存在的全局配置并持久化绑定，空串解除绑定，缺省不改变）。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐 tiny-rdm 每次输出动态 resolve 的语义）；`sudoPassword` 等字段级覆盖是 sidecar 本地值，sidecar 重启或重开连接后恢复宿主下发的配置，而 `quickSudoProfileId` 绑定持久化在插件数据目录、重启保留。`agentTerminalMode` 为连接级内存态（重启回默认 `off`）。工作台工具栏提供设置弹窗；宿主连接表单通过 manifest 字段（`quick_sudo`、`sudo_password`、`totp_secret`、`auth_flow_mode`、提示词、`sudo_use_pty`、超时与 keepalive、`jump_hosts`）提供持久化配置入口。
+
+## AI 终端同步执行（agent terminal mode）
+
+DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` / `ssh_exec_sudo`
+可路由到**用户当前交互 shell**（PTY）执行：命令按键盘写入原文注入（与快速命令栏同
+信任域，无 shell 拼接面；C0 控制字符先剥离），输出经终端录制（提示符回归 + 300ms
+静默判定收尾；1 MiB 有界缓冲，ANSI 剥离后返回）。模式矩阵：
+
+| `agentTerminalMode` | low 风险 | elevated（sudo / 灾难模式命中） |
+| --- | --- | --- |
+| `off`（默认） | 既有隐藏 exec 通道 | 既有隐藏 exec 通道 |
+| `auto` | 直接注入（发 `ssh/agent/notice`） | 审批后注入 |
+| `strict` | 审批后注入 | 审批后注入 |
+
+- 调用级覆盖：工具可选参数 `runInTerminal`（`true` 强制终端路径、`false` 强制隐藏
+  通道、缺省按连接模式）。stdio `--mcp` 模式传 `true` 报错（与工作台不同进程，无 UI）。
+- 无终端会话：报错 `No open terminal session for this connection; open the SSH
+  workbench terminal first`（可见才执行的承诺）。
+- 审批：发 `ssh/agent/prompt` 事件并阻塞等待；`ssh/agent/resolve {challengeId,
+  decision: "approve"|"deny", command?}`（approve 可携带弹窗编辑后的命令原文）；
+  默认 120s（钳 10–300）超时即拒绝；挑战一次性。
+- 收尾：发 `ssh/agent/finish {sessionId, status: "done"|"timeout"|"denied"}`。
+- 响应：终端路径返回 `{output, exitCode: null, mode: "terminal", incomplete,
+  interrupted}`；超时返回已捕获输出且 `incomplete: true`，命令留在终端继续跑、
+  人工可接管（Ctrl+C 复用既有终端通道）。
+- 已知限制：多行命令按行执行；全屏 TUI（vim/top 等）无提示符回归、走超时路径；
+  回显/尾提示符剥离为尽力而为。
+- 既有只读白名单与灾难 `confirmDestructive` 门禁先于路由判定生效，模式不放宽任何门。
+
+## Quick Sudo 全局配置
+
+`sudo/profiles/*` 管理跨连接复用的多套 Quick Sudo 配置（对齐 tiny-rdm 的全局 Manual Sudo + Profile 级 QuickSudo 覆盖），持久化于 `<plugin_data_dir>/quick-sudo-profiles.json`（版本化 JSON：`profiles` + `bindings`，Unix 权限 0600，原子写；损坏按空库处理）。每套配置含：`name`（唯一，trim 后 1–64 字符）、`sudoPassword`、`totpSecret`、`authFlowMode`（`password_only` / `password_plus_otp` / `password_then_otp`）、`passwordPromptHint`、`totpPromptHint`、`sudoUsePty`。上限 20 套。
+
+- `sudo/profiles/list`：返回 `{ profiles: [视图…] }`，按名称排序；视图含 `id`、`name`、`sudoPasswordSet`、`totpConfigured`、`authFlowMode`、提示词、`sudoUsePty`、`createdAt`、`updatedAt`，**永不携带密钥明文**。
+- `sudo/profiles/save`：参数 `id?`（有=更新须存在，无=新建）、`name`、`sudoPassword?` / `totpSecret?`（空串/缺省=保持原值）、`clearSudoPassword?` / `clearTotpSecret?`（true=清除）、其余策略字段可选；返回 `{ profile: 视图, created }`。错误：名称为空/超长/重复（大小写不敏感）、id 不存在、超出上限。
+- `sudo/profiles/delete`：参数 `id`；返回 `{ success, removed }`；级联清理绑定，并对受影响连接的存活会话即时回退到本连接配置。
+- 连接绑定：`ssh/settings/set { sessionId, quickSudoProfileId }` 选择来源（见「运行时设置」）。绑定生效期间该配置**整体覆盖**本连接的 sudo 密码 / TOTP / 提示词 / 认证流 / `sudo_use_pty`（配置密码为空时回退登录密码，而非本连接 sudo 密码）；终端 auto sudo 与 `ssh/exec{sudo:true}` 走同一编排，自动使用所选来源。配置保存/删除即时热更新所有绑定它的存活会话（字段级覆盖，保留 OTP 防重放记账）。
+- MCP 通道：`ssh_quick_sudo_profiles_list` / `ssh_quick_sudo_profiles_save` / `ssh_quick_sudo_profiles_delete` 三个工具与上述方法同构；`ssh_exec_sudo` 支持可选 `quickSudoProfile`（id 或精确名称）引用全局配置作为默认凭据，调用内联 `sudoPassword` / `totpSecret` 显式给出时优先；引用在发起任何连接 I/O 前解析，未知名称快速报错。
+- MCP 安全门（`mcp_safety.rs`）：`ssh_exec` / `ssh_exec_sudo` 在执行前做命令风险分级——只读连接上仅放行白名单巡检命令（`ssh_exec_sudo` 一律拒绝）；命中灾难模式的命令（`rm -rf` 系统根、mkfs/dd 裸设备、shutdown、`/etc/passwd|sudoers` 覆盖、SQL DROP 等）任何连接都要求 `confirmDestructive: true`，只读连接直接拒绝；`DBX_SSH_MCP_READ_ONLY=1` 可把整个 MCP 进程强制只读。详见 `MCP.zh-CN.md` 生产误操作防范节。
+- 入口桩：宿主贡献点仅有 `connection-provider` / `workbench` / `filesystem-provider` 三种，**没有插件级独立设置页**。因此完整管理 UI 挂在工作台（工具栏钥匙按钮直达管理弹窗；来源绑定在设置弹窗「sudo 凭据来源」）；连接表单通过 `connection-provider.actions` 暴露 `quick-sudo-profiles` 动作（`when: always`、`requires_valid_form: false`），点击由宿主调 `connection/action {action, id}`，插件返回配置清单 + 绑定状态的纯文本摘要（不含密钥），作为面板上的可发现桩。
 
 ## 跳板机（ProxyJump）与连接存活
 

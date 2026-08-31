@@ -8,7 +8,7 @@ DBX 的 MCP 服务器（`dbx mcp` 或桌面内置 MCP）内置两个通用插件
 
 | 工具 | 说明 |
 | --- | --- |
-| `dbx_list_plugin_tools` | 列出所有已装插件贡献的 MCP 工具（含本插件的 19 个 SSH/SFTP 工具及其 JSON Schema） |
+| `dbx_list_plugin_tools` | 列出所有已装插件贡献的 MCP 工具（含本插件的 25 个 SSH/SFTP 工具及其 JSON Schema） |
 | `dbx_call_plugin_tool` | 调用插件工具；传 `connectionId` 即引用 DBX 已保存的 SSH 连接，凭据由 DBX 解析转发，**工具参数里不出现任何密码** |
 
 典型调用流（MCP 客户端视角）：
@@ -53,20 +53,98 @@ dbx-plugin-ssh --mcp
 
 此模式下没有 DBX 连接存储，凭据随每次调用内联传入（`host`/`username`/`password` 或 `privateKeyPath`，及 Quick Sudo/2FA 编排字段、`jumpHosts` 跳板链），按 `username@host:port` 进程内池化。未知主机密钥采用 **TOFU 首次信任**（记录后变化仍拒绝）。MCP 模式与 DBX 插件模式互斥：同一进程只运行其中一种。
 
-## 工具一览（19 个，两种方式通用）
+### 接入 ZCode（stdio 客户端）
+
+独立 stdio 模式可直接注册为 ZCode 的 MCP 服务器（本机路径为机器相关配置，
+放用户级 `~/.zcode/cli/config.json` 的 `mcp.servers`，不放工作区共享配置）：
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "dbx-ssh": {
+        "type": "stdio",
+        "command": "/绝对路径/backend/target/release/dbx-plugin-ssh",
+        "args": ["--mcp"]
+      }
+    }
+  }
+}
+```
+
+- 会话启动时自动连接；`tools/list` 即 25 个工具，无需 DBX 在场。
+- 凭据内联传参（或在 DBX 桥模式可用时优先走方式一）；数据目录默认
+  `/tmp/dbx-plugin-data/io.dbx.ssh`，可用 `DBX_PLUGIN_DATA_DIR` 重定向
+  （known_hosts / `mcp-settings.json` / Quick Sudo 全局配置都在其中）。
+- 真机回环验证：`DBX_SSH_SMOKE_PASSWORD=… python3 scripts/smoke_mcp.py
+  --host <host> --port <port> --username <user>`（凭据走环境变量，不落盘）。
+
+## 工具一览（25 个，两种方式通用）
 
 | 工具 | 说明 |
 | --- | --- |
-| `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP |
+| `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」） |
 | `ssh_metrics` | CPU/内存/负载/磁盘/运行时长（只读命令） |
 | `ssh_test_connection` | 验证连通性与认证（含跳板链），返回延迟 |
 | `ssh_list_known_hosts` / `ssh_remove_known_host` | 管理插件 known_hosts（不改系统 `~/.ssh/known_hosts`） |
 | `ssh_close` | 关闭缓存的连接（方式二按连接键；方式一由 sidecar 生命周期管理） |
-| `sftp_list_dir` / `sftp_stat` / `sftp_exists` | 浏览与检查远端路径 |
-| `sftp_read_file` / `sftp_write_file` | 读写远端文件（文本或 base64） |
+| `sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_pwd` | 浏览、检查远端路径与登录家目录 |
+| `sftp_read_file` / `sftp_write_file` | 读写远端文件（文本或 base64，支持 offset 分页） |
+| `sftp_upload` / `sftp_download` | 本地 ↔ 远端单文件传输（受 `maxUploadBytes` / `maxDownloadBytes` 限制；本地路径校验先于拨号，校验拒绝不清连接池） |
 | `sftp_mkdir` / `sftp_remove` / `sftp_rename` / `sftp_chmod` | 目录与文件管理 |
 | `sftp_disk_usage` | 路径所在挂载的磁盘用量 |
 | `sftp_copy` / `sftp_move` | 服务器内复制 / 剪切（`from` 单值或数组 → `toDir`，逐项返回成败） |
+
+## 生产环境误操作防范
+
+MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此 exec 工具在执行前过
+三层安全门（全部在任何网络 I/O 之前，实现见 `backend/src/mcp_safety.rs`）：
+
+1. **只读连接写门**：DBX 连接勾选了"只读"后，写类工具（`ssh_exec_sudo` 与全部
+   sftp 写操作）直接拒绝，与工作台 `ensure_writable` 同源。
+2. **只读命令白名单**：只读连接上的 `ssh_exec` 只放行**可证明只读**的巡检命令
+   （`ls` / `cat` / `df` / `ps` / `systemctl status` / `journalctl` / `docker ps`
+   / `git log` 等，含管道组合；重定向、命令替换、`sudo`、白名单外的动词一律
+   拒绝）。白名单而非黑名单：识别不了 = 不放行。
+3. **危险命令确认**：任何连接（含非只读）上，命中已知灾难模式的命令要求显式
+   `confirmDestructive: true` 才执行；只读连接上直接拒绝、确认位也无法覆盖。
+   覆盖的模式：`rm -rf` 深层系统根（`/`、`/etc`、`/usr` 等 ≤2 层路径；`/tmp`、
+   `/var/tmp` 下的常规清理不拦）、`mkfs`/`fdisk`/`wipefs` 等磁盘格式化、
+   `dd of=/dev/…` 裸设备写入、`> /dev/sdX` 重定向、`shutdown`/`reboot`/`init 0/6`、
+   fork 炸弹、`chmod/chown -R` 系统根、`/etc/passwd|shadow|sudoers|fstab` 与
+   `/boot/` 覆盖或删除、`docker prune`、`find -delete`、`kill -9 -1`、SQL
+   `DROP DATABASE/TABLE`。误判方向刻意保守：拦错只是多要一次确认，放错才是事故。
+
+**进程级只读开关**：以 `DBX_SSH_MCP_READ_ONLY=1` 启动（对 stdio 独立模式即
+`DBX_SSH_MCP_READ_ONLY=1 dbx-plugin-ssh --mcp`）后，整个进程强制走只读门——
+给生产环境开一个"只能看不能改"的 MCP 入口，操作员级开关、工具无法自行关闭。
+
+分类器不做 shell 完整解析（引号内 `;` 仍会切分、`$(...)` 与重定向按 Unknown
+处理），所有偏差方向都是"更严"：最坏情况是把可放行的命令降级拒绝，不会放行
+更危险的命令。新增只读动词/危险模式请同步 `mcp_safety.rs` 的表与单测。
+
+## AI 终端同步执行（runInTerminal）
+
+`ssh_exec` / `ssh_exec_sudo` 均接受可选 `runInTerminal: boolean`，把命令路由到
+**用户当前打开的终端 UI**（工作台 PTY 交互 shell）执行——命令回显在终端、输出
+实时可见、人可随时打字或 Ctrl+C 介入，AI 拿到录制捕获的输出文本
+（`{output, exitCode: null, mode: "terminal", incomplete, interrupted}`）。
+
+- **仅 DBX 内嵌桥（方式一）生效**：stdio 独立模式与工作台不同进程、无 UI，
+  传 `true` 直接报错 `runInTerminal requires the DBX embedded bridge`。
+- 该连接没有打开的终端会话时报错引导（"open the SSH workbench terminal first"），
+  不回退到隐藏执行——可见才执行是该模式的承诺。
+- 连接级默认行为由工作台设置 `agentTerminalMode` 决定（`off` 默认不路由 /
+  `auto` 分级审批 / `strict` 每条必审，协议见 PROTOCOL「AI 终端同步执行」）；
+  `runInTerminal` 显式值优先于连接模式。
+- 审批：`auto` 下 elevated（sudo / 灾难命中）与 `strict` 下全部命令会触发工作台
+  弹窗（完整命令原文 + 风险徽标 + 倒计时，默认 120s 超时即拒绝）；AI 侧表现为
+  明确的 denied/timed out 错误。
+- sudo + 终端路径不注入密码：`sudo …` 原文进用户 shell，密码/TOTP 由终端内
+  auto-sudo 自动应答（已配置时）或人工输入。
+
+既有只读白名单、灾难 `confirmDestructive`、进程级只读开关先于路由判定生效，
+`runInTerminal` 不放宽任何安全门。
 
 ## 与 tiny-rdm mcpctl 的关系
 

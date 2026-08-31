@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.2.5",
+  "version": "0.4.0",
   "publisher": "xynanan",
   "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
   "icon": "assets/plugin.svg",
@@ -269,6 +269,17 @@
       ],
       "workbench": "io.dbx.ssh.workbench",
       "filesystem_provider": "io.dbx.ssh.files",
+      "actions": [
+        {
+          "id": "quick-sudo-profiles",
+          "label": "Global Quick Sudo profiles",
+          "description": "Show the shared global Quick Sudo profiles and this connection's binding.",
+          "variant": "outline",
+          "when": "always",
+          "requires_valid_form": false,
+          "timeout_ms": 10000
+        }
+      ],
       "capabilities": [
         "test",
         "connect",
@@ -373,6 +384,12 @@
             "read_only": {
               "label": "Solo lectura"
             }
+          },
+          "actions": {
+            "quick-sudo-profiles": {
+              "label": "Perfiles Quick Sudo globales",
+              "description": "Muestra los perfiles Quick Sudo globales y el enlace de esta conexión."
+            }
           }
         },
         "io.dbx.ssh.workbench": {
@@ -429,6 +446,12 @@
             },
             "read_only": {
               "label": "Sola lettura"
+            }
+          },
+          "actions": {
+            "quick-sudo-profiles": {
+              "label": "Profili Quick Sudo globali",
+              "description": "Mostra i profili Quick Sudo globali e il collegamento di questa connessione."
             }
           }
         },
@@ -514,6 +537,12 @@
             "read_only": {
               "label": "読み取り専用"
             }
+          },
+          "actions": {
+            "quick-sudo-profiles": {
+              "label": "グローバル Quick Sudo プロファイル",
+              "description": "グローバル Quick Sudo プロファイルとこの接続の紐付けを表示します。"
+            }
           }
         },
         "io.dbx.ssh.workbench": {
@@ -570,6 +599,12 @@
             },
             "read_only": {
               "label": "Somente leitura"
+            }
+          },
+          "actions": {
+            "quick-sudo-profiles": {
+              "label": "Perfis Quick Sudo globais",
+              "description": "Mostra os perfis Quick Sudo globais e o vínculo desta conexão."
             }
           }
         },
@@ -655,6 +690,12 @@
             "read_only": {
               "label": "只读"
             }
+          },
+          "actions": {
+            "quick-sudo-profiles": {
+              "label": "全局 Quick Sudo 配置",
+              "description": "查看共享的全局 Quick Sudo 配置及本连接的绑定状态。"
+            }
           }
         },
         "io.dbx.ssh.workbench": {
@@ -738,6 +779,12 @@
             },
             "read_only": {
               "label": "唯讀"
+            }
+          },
+          "actions": {
+            "quick-sudo-profiles": {
+              "label": "全域 Quick Sudo 設定",
+              "description": "檢視共用的全域 Quick Sudo 設定及本連線的綁定狀態。"
             }
           }
         },

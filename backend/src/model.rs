@@ -713,7 +713,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn sudo_password_is_a_credential_and_keeps_edge_whitespace() {
         // 第 3 轮对抗审查遗留项：跳板/私钥口令已原样读取，sudo_password 同样
         // 不在解析层 trim（首尾空格是合法密码字符）；纯空白语义由

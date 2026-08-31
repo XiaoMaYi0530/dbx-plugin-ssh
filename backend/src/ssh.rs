@@ -20,6 +20,9 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::agent_terminal::{
+    self, AgentDecision, AgentTerminalMode, CommandRisk, TerminalRecorder,
+};
 use crate::exec::{
     self, AuthFlowMode, ExecOutcome, Hints, SudoAuth, PLAIN_EXEC_TIMEOUT, SUDO_EXEC_TIMEOUT,
 };
@@ -29,6 +32,7 @@ use crate::model::{
     StoredConnection, TerminalFrame, TerminalStream, MAX_TRANSFER_SIZE, TERMINAL_REPLAY_LIMIT,
     TRANSFER_CHUNK_SIZE,
 };
+use crate::sudo_profiles;
 
 /// Resolves the Quick Sudo / 2FA orchestration settings for a connection.
 fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
@@ -43,6 +47,20 @@ fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
                 .then(|| AuthFlowMode::parse(&connection.auth_flow_mode)),
         },
     )
+}
+
+/// Resolved Quick Sudo source for one connection: the connection's own
+/// credential pipeline, overridden wholesale by the globally bound profile
+/// when one is bound ("select a global config or use this connection's own").
+fn resolved_sudo_auth(
+    connection: &StoredConnection,
+    profile: Option<&sudo_profiles::SudoProfile>,
+) -> SudoAuth {
+    let mut auth = sudo_auth_for(connection);
+    if let Some(profile) = profile {
+        sudo_profiles::apply_profile(&mut auth, profile, &connection.password);
+    }
+    auth
 }
 
 /// How the next SSH hop is reached: a fresh TCP connection, or a
@@ -65,6 +83,17 @@ impl DialTarget {
 const DIRECTORY_HANDSHAKE_LIMIT: usize = 64 * 1024;
 const DIRECTORY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const REMOTE_SHELL_DETECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Error shown when a terminal-routed agent command finds no live workbench
+/// PTY for its connection; the wording doubles as user guidance.
+pub(crate) const NO_TERMINAL_SESSION_MESSAGE: &str =
+    "No open terminal session for this connection; open the SSH workbench terminal first";
+
+/// Default wait for an agent approval decision, clamped to the 10-300
+/// seconds band (the same shape as the exec timeout clamps).
+const AGENT_APPROVAL_DEFAULT_SECS: u64 = 120;
+const AGENT_APPROVAL_MIN_SECS: u64 = 10;
+const AGENT_APPROVAL_MAX_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PromptDecision {
@@ -523,6 +552,10 @@ struct SessionEntry {
     terminal_tx: mpsc::Sender<TerminalCommand>,
     replay: Arc<AsyncMutex<ReplayBuffer>>,
     sftp: AsyncMutex<Option<Arc<AsyncMutex<SftpSession>>>>,
+    /// Output recorder installed while an agent command runs in this
+    /// session's PTY (`exec_in_terminal`); `None` outside such a run. Fed
+    /// by the read loop at the same point as the auto-sudo observer.
+    agent_recorder: Arc<Mutex<Option<TerminalRecorder>>>,
 }
 
 struct UploadState {
@@ -622,6 +655,12 @@ pub struct SshRuntime {
     metrics_cache: Mutex<HashMap<String, CachedMetrics>>,
     /// In-flight remote command executions, cancellable by exec id.
     exec_tasks: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// Per-connection AI terminal mode (`agentTerminalMode`), in-memory like
+    /// the Quick Sudo field overrides: a sidecar restart resets it to `off`.
+    agent_modes: Mutex<HashMap<String, AgentTerminalMode>>,
+    /// One-shot approval challenges for terminal-routed agent commands;
+    /// each entry is removed as soon as it is resolved.
+    agent_challenges: Mutex<HashMap<String, oneshot::Sender<AgentDecision>>>,
     /// Trust-on-first-use for unknown host keys (MCP stdio mode).
     auto_trust: bool,
     pub prompts: PromptBroker,
@@ -645,6 +684,8 @@ impl SshRuntime {
             sudo_keepalive: Arc::new(Mutex::new(HashMap::new())),
             metrics_cache: Mutex::new(HashMap::new()),
             exec_tasks: Mutex::new(HashMap::new()),
+            agent_modes: Mutex::new(HashMap::new()),
+            agent_challenges: Mutex::new(HashMap::new()),
             auto_trust: false,
             prompts: PromptBroker::default(),
             data_dir,
@@ -731,7 +772,14 @@ impl SshRuntime {
         let session_id = Uuid::new_v4().to_string();
         let (terminal_tx, mut terminal_rx) = mpsc::channel(256);
         let replay = Arc::new(AsyncMutex::new(ReplayBuffer::default()));
-        let orchestration = Arc::new(RwLock::new(sudo_auth_for(&connection)));
+        let bound_profile = {
+            let store = sudo_profiles::load_store(&self.data_dir);
+            sudo_profiles::bound_profile(&store, &connection.id).cloned()
+        };
+        let orchestration = Arc::new(RwLock::new(resolved_sudo_auth(
+            &connection,
+            bound_profile.as_ref(),
+        )));
         // In-terminal Quick Sudo: answers sudo password / 2FA prompts while
         // the user keeps typing normal commands (ported from tiny-rdm).
         let mut auto_sudo = (connection.quick_sudo && !connection.read_only)
@@ -750,6 +798,7 @@ impl SshRuntime {
             terminal_tx,
             replay: replay.clone(),
             sftp: AsyncMutex::new(None),
+            agent_recorder: Arc::new(Mutex::new(None)),
         });
         self.sessions
             .write()
@@ -828,6 +877,14 @@ impl SshRuntime {
                                     "sessionId": task_id,
                                     "kind": if kind == exec::AutoSudoKind::Totp { "otp" } else { "password" },
                                 }));
+                            }
+                            // Agent terminal capture: feed the recorder
+                            // installed by `exec_in_terminal` so the AI sees
+                            // what the terminal shows.
+                            if let Ok(mut slot) = entry.agent_recorder.lock() {
+                                if let Some(recorder) = slot.as_mut() {
+                                    recorder.observe(&String::from_utf8_lossy(&data));
+                                }
                             }
                         }
                         let Some(data) = directory_filter.filter(&data) else { continue; };
@@ -1491,10 +1548,14 @@ impl SshRuntime {
         let handle = session.handle.clone();
         let command = command.to_string();
 
-        let use_pty = connection
-            .as_ref()
-            .map(|connection| connection.sudo_use_pty)
-            .unwrap_or(false);
+        let use_pty = connection.as_ref().map(|connection| {
+            let store = sudo_profiles::load_store(&self.data_dir);
+            sudo_profiles::effective_use_pty(
+                connection.sudo_use_pty,
+                sudo_profiles::bound_profile(&store, &connection.id),
+            )
+        })
+        .unwrap_or(false);
         let run = async move {
             let outcome = if sudo {
                 exec::exec_with_sudo(&handle, &orchestration, &command, timeout, use_pty).await?
@@ -1556,6 +1617,247 @@ impl SshRuntime {
             "output": outcome.output,
             "exitCode": outcome.exit_code,
         })
+    }
+
+    /// Agent terminal mode for a connection; unknown connections read `off`.
+    pub fn agent_terminal_mode(&self, connection_id: &str) -> AgentTerminalMode {
+        self.agent_modes
+            .lock()
+            .ok()
+            .and_then(|modes| modes.get(connection_id).copied())
+            .unwrap_or(AgentTerminalMode::Off)
+    }
+
+    fn set_agent_terminal_mode(&self, connection_id: &str, mode: AgentTerminalMode) {
+        if let Ok(mut modes) = self.agent_modes.lock() {
+            modes.insert(connection_id.to_string(), mode);
+        }
+    }
+
+    /// Runs an AI/MCP command inside the session's interactive PTY: the
+    /// command is typed into the user's terminal (visible, interruptible),
+    /// the output is captured by a session-level recorder, and the captured
+    /// text is returned once a fresh prompt settles. On timeout the partial
+    /// output is returned with `incomplete: true` and the command keeps
+    /// running in the terminal for the user to take over.
+    pub async fn exec_in_terminal(
+        &self,
+        session_id: &str,
+        tool: &str,
+        command: &str,
+        risk: CommandRisk,
+        timeout_secs: Option<u64>,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or(NO_TERMINAL_SESSION_MESSAGE.to_string())?;
+        // Strip control characters so the injected text cannot drive the
+        // terminal or the auto-sudo state machine (same trust domain as the
+        // quick-command bar: raw keyboard input, no shell quoting surface).
+        let command = agent_terminal::sanitize_command(command)?;
+        let timeout = Duration::from_secs(
+            timeout_secs
+                .unwrap_or(PLAIN_EXEC_TIMEOUT.as_secs())
+                .clamp(5, 300),
+        );
+
+        // Install the recorder before injecting so no output is lost.
+        {
+            let mut slot = session
+                .agent_recorder
+                .lock()
+                .map_err(|_| "Terminal recorder is poisoned".to_string())?;
+            let mut recorder = TerminalRecorder::default();
+            recorder.arm();
+            *slot = Some(recorder);
+        }
+        let _ = emitter.event(
+            "ssh/agent/notice",
+            json!({
+                "sessionId": session_id,
+                "tool": tool,
+                "command": command,
+                "risk": risk.name(),
+            }),
+        );
+
+        // Inject like the quick-command bar: raw text plus a carriage
+        // return on the session's PTY input queue.
+        let payload = format!("{command}\r").into_bytes();
+        if let Err(error) = session.terminal_tx.send(TerminalCommand::Input(payload)).await {
+            if let Ok(mut slot) = session.agent_recorder.lock() {
+                *slot = None;
+            }
+            return Err(format!("SSH terminal is closed: {error}"));
+        }
+
+        // Poll the recorder: prompt-seen plus 300ms of silence, or deadline.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let timed_out = loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let settled = session
+                .agent_recorder
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(TerminalRecorder::is_settled))
+                .unwrap_or(false);
+            if settled {
+                break false;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break true;
+            }
+        };
+
+        // Always remove the recorder; the read loop skips the empty slot.
+        let recorder = session
+            .agent_recorder
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let output = match recorder {
+            Some(mut recorder) => {
+                if timed_out {
+                    // Force the capture closed; the command keeps running in
+                    // the terminal and the AI gets the partial output.
+                    recorder.finish();
+                }
+                recorder.take_output(&command)
+            }
+            None => String::new(),
+        };
+
+        let _ = emitter.event(
+            "ssh/agent/finish",
+            json!({
+                "sessionId": session_id,
+                "status": if timed_out { "timeout" } else { "done" },
+            }),
+        );
+
+        // exitCode stays null without shell integration: the AI judges from
+        // the output text. `interrupted` is reserved for the workbench
+        // interrupt button and stays false on this path.
+        Ok(json!({
+            "output": output,
+            "exitCode": null,
+            "mode": "terminal",
+            "incomplete": timed_out,
+            "interrupted": false,
+        }))
+    }
+
+    /// Raises an approval challenge for a terminal-routed agent command:
+    /// emits `ssh/agent/prompt`, then waits for `ssh/agent/resolve`.
+    /// Returns the (possibly user-edited) command on approval; denial or
+    /// timeout returns `Err` and emits `ssh/agent/finish{status:"denied"}`.
+    pub(crate) async fn request_agent_approval(
+        &self,
+        session_id: &str,
+        tool: &str,
+        command: &str,
+        risk: CommandRisk,
+        timeout_secs: Option<u64>,
+        emitter: &PluginEmitter,
+    ) -> Result<String, String> {
+        let wait = Duration::from_secs(
+            timeout_secs
+                .unwrap_or(AGENT_APPROVAL_DEFAULT_SECS)
+                .clamp(AGENT_APPROVAL_MIN_SECS, AGENT_APPROVAL_MAX_SECS),
+        );
+        let challenge_id = Uuid::new_v4().to_string();
+        let (sender, receiver) = oneshot::channel();
+        if let Ok(mut challenges) = self.agent_challenges.lock() {
+            challenges.insert(challenge_id.clone(), sender);
+        }
+        let raised = emitter.event(
+            "ssh/agent/prompt",
+            json!({
+                "challengeId": challenge_id,
+                "sessionId": session_id,
+                "tool": tool,
+                "command": command,
+                "risk": risk.name(),
+                "requestedAt": unix_now_secs(),
+                "timeoutSecs": wait.as_secs(),
+            }),
+        );
+        if let Err(error) = raised {
+            // Nobody can approve without the prompt; fail fast instead of
+            // letting the challenge run into its timeout.
+            if let Ok(mut challenges) = self.agent_challenges.lock() {
+                challenges.remove(&challenge_id);
+            }
+            return Err(format!("Failed to raise the approval prompt: {}", error.message));
+        }
+        let decision = match tokio::time::timeout(wait, receiver).await {
+            Ok(Ok(decision)) => Some(decision),
+            // Timeout or dropped sender both mean "no user decision".
+            Ok(Err(_)) | Err(_) => {
+                // Expire the challenge so a late resolve reports not found.
+                if let Ok(mut challenges) = self.agent_challenges.lock() {
+                    challenges.remove(&challenge_id);
+                }
+                None
+            }
+        };
+        let _ = emitter.event(
+            "ssh/agent/finish",
+            json!({ "sessionId": session_id, "status": "denied" }),
+        );
+        match decision {
+            Some(AgentDecision::Approve { command: edited }) => {
+                let edited = edited.filter(|text| !text.trim().is_empty());
+                Ok(edited.unwrap_or_else(|| command.to_string()))
+            }
+            Some(AgentDecision::Deny) => {
+                Err("Command not run: user denied the terminal execution".to_string())
+            }
+            None => Err("Command not run: approval timed out waiting for the user".to_string()),
+        }
+    }
+
+    /// Resolves a pending agent approval challenge (`ssh/agent/resolve`).
+    /// One-shot: the challenge is removed from the registry before the
+    /// decision is delivered, so a repeat resolve reports not found.
+    /// `decision` is "approve" or "deny"; `command` carries the edited
+    /// command text from the approval dialog (approve only).
+    pub fn resolve_agent_challenge(
+        &self,
+        challenge_id: &str,
+        decision: &str,
+        command: Option<&str>,
+    ) -> Result<(), String> {
+        let approved = match decision {
+            "approve" => true,
+            "deny" => false,
+            other => {
+                return Err(format!(
+                    "agent decision must be \"approve\" or \"deny\"; got '{other}'"
+                ))
+            }
+        };
+        let sender = self
+            .agent_challenges
+            .lock()
+            .map_err(|_| "Agent challenge registry is poisoned".to_string())?
+            .remove(challenge_id)
+            .ok_or("Agent challenge was not found or already resolved")?;
+        let decision = if approved {
+            AgentDecision::Approve {
+                command: command.map(str::to_string),
+            }
+        } else {
+            AgentDecision::Deny
+        };
+        sender
+            .send(decision)
+            .map_err(|_| "Agent challenge is no longer waiting".to_string())
     }
 
     /// Starts a per-connection `sudo -nv` refresh loop after a successful
@@ -1889,14 +2191,22 @@ impl SshRuntime {
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
+        let store = sudo_profiles::load_store(&self.data_dir);
+        let bound = sudo_profiles::bound_profile(&store, &session.connection_id);
         Ok(json!({
             "quickSudo": connection.as_ref().map(|c| c.quick_sudo).unwrap_or(true),
-            "sudoUsePty": connection.as_ref().map(|c| c.sudo_use_pty).unwrap_or(false),
+            "sudoUsePty": sudo_profiles::effective_use_pty(
+                connection.as_ref().map(|c| c.sudo_use_pty).unwrap_or(false),
+                bound,
+            ),
             "sudoPasswordSet": !auth.password.is_empty(),
             "totpConfigured": auth.totp_configured(),
             "authFlowMode": auth.flow_mode.map(flow_mode_name).unwrap_or("password_then_otp"),
             "passwordPromptHint": auth.password_prompt_hint,
             "totpPromptHint": auth.totp_prompt_hint,
+            "quickSudoProfileId": bound.map(|p| p.id.clone()).unwrap_or_default(),
+            "quickSudoProfileName": bound.map(|p| p.name.clone()).unwrap_or_default(),
+            "agentTerminalMode": self.agent_terminal_mode(&session.connection_id).name(),
         }))
     }
 
@@ -1904,10 +2214,40 @@ impl SshRuntime {
     /// connection and every live session of that connection immediately
     /// (terminal auto-answer and exec re-read the shared orchestration).
     /// Values are sidecar-local; reopening the connection from DBX restores
-    /// the host-provided configuration.
+    /// the host-provided configuration. `quickSudoProfileId` switches the
+    /// credential source between this connection's own values ("") and a
+    /// globally bound Quick Sudo profile; the binding is persisted in the
+    /// plugin data directory, so it survives sidecar restarts. While a
+    /// profile is bound it owns the credential source wholesale — per-field
+    /// updates still land on the stored connection but live sessions follow
+    /// the profile.
     pub async fn settings_set(&self, session_id: &str, updates: &Value) -> Result<Value, String> {
         let session = self.session(session_id).await?;
         let connection_id = session.connection_id.clone();
+        if let Some(profile_id) = updates
+            .get("quickSudoProfileId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            // Validate and persist before touching anything else, so an
+            // unknown profile leaves the request without side effects.
+            let mut store = sudo_profiles::load_store(&self.data_dir);
+            sudo_profiles::set_binding(
+                &mut store,
+                &connection_id,
+                (!profile_id.is_empty()).then(|| profile_id.as_str()),
+            )?;
+            sudo_profiles::save_store(&self.data_dir, &store)?;
+        }
+        // AI terminal mode: validated strictly before anything else mutates,
+        // so an unknown value leaves the request without side effects.
+        if let Some(raw) = updates.get("agentTerminalMode") {
+            let text = raw
+                .as_str()
+                .ok_or("agentTerminalMode must be a string (off|auto|strict)")?;
+            let mode = AgentTerminalMode::parse_exact(text)?;
+            self.set_agent_terminal_mode(&connection_id, mode);
+        }
         let login_password = {
             let connections = self
                 .connections
@@ -2001,7 +2341,112 @@ impl SshRuntime {
                 auth.flow_mode = (!value.is_empty()).then(|| AuthFlowMode::parse(&value));
             }
         }
+        // A binding change owns the live sessions' credential source: rebuild
+        // their orchestration from the now-effective source (the per-field
+        // updates above still landed on the stored connection for later).
+        // Clearing the binding rebuilds too, so sessions immediately fall
+        // back to the connection's own values.
+        if updates
+            .get("quickSudoProfileId")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            self.refresh_bound_sessions(std::slice::from_ref(&connection_id))
+                .await;
+        }
         self.settings_get(session_id).await
+    }
+
+    /// `sudo/profiles/list`: every global Quick Sudo profile as a
+    /// secret-free view.
+    pub fn profiles_list(&self) -> Value {
+        let store = sudo_profiles::load_store(&self.data_dir);
+        json!({ "profiles": sudo_profiles::list_views(&store) })
+    }
+
+    /// `sudo/profiles/save`: create or update a global profile, then hot
+    /// reload every live session bound to it.
+    pub async fn profiles_save(&self, params: &Value) -> Result<Value, String> {
+        let mut store = sudo_profiles::load_store(&self.data_dir);
+        let (profile, created) = sudo_profiles::save_profile(&mut store, params)?;
+        sudo_profiles::save_store(&self.data_dir, &store)?;
+        let bound: Vec<String> = store
+            .bindings
+            .iter()
+            .filter(|(_, bound_id)| bound_id.as_str() == profile.id.as_str())
+            .map(|(connection_id, _)| connection_id.clone())
+            .collect();
+        self.refresh_bound_sessions(&bound).await;
+        Ok(json!({
+            "profile": sudo_profiles::profile_view(&profile),
+            "created": created,
+        }))
+    }
+
+    /// `sudo/profiles/delete`: remove a global profile (bindings cascade)
+    /// and drop the override from every live session that used it.
+    pub async fn profiles_delete(&self, id: &str) -> Result<Value, String> {
+        let mut store = sudo_profiles::load_store(&self.data_dir);
+        let bound: Vec<String> = store
+            .bindings
+            .iter()
+            .filter(|(_, bound_id)| bound_id.as_str() == id)
+            .map(|(connection_id, _)| connection_id.clone())
+            .collect();
+        let removed = sudo_profiles::delete_profile(&mut store, id);
+        if removed {
+            sudo_profiles::save_store(&self.data_dir, &store)?;
+            self.refresh_bound_sessions(&bound).await;
+        }
+        Ok(json!({ "success": true, "removed": removed }))
+    }
+
+    /// `connection/action` with action `quick-sudo-profiles`: a plain-text
+    /// summary rendered by the host on the connection form panel — the
+    /// discoverable stub for global Quick Sudo management (the manager UI
+    /// itself lives in the workbench, which the message points to).
+    pub fn profiles_action_summary(&self, connection_id: Option<&str>) -> Value {
+        let store = sudo_profiles::load_store(&self.data_dir);
+        json!({
+            "message": sudo_profiles::action_summary(&store, connection_id),
+            "fieldValues": null,
+        })
+    }
+
+    /// Rebuilds the Quick Sudo auth of every live session of the given
+    /// connections from the current registry state plus each connection's
+    /// bound profile. Field-by-field assignment keeps each auth's OTP usage
+    /// bookkeeping intact.
+    async fn refresh_bound_sessions(&self, connection_ids: &[String]) {
+        if connection_ids.is_empty() {
+            return;
+        }
+        let store = sudo_profiles::load_store(&self.data_dir);
+        let sessions = self.sessions.read().await;
+        for entry in sessions.values() {
+            if !connection_ids.iter().any(|id| id == &entry.connection_id) {
+                continue;
+            }
+            let connection = self
+                .connections
+                .read()
+                .ok()
+                .and_then(|registry| registry.get(&entry.connection_id).cloned());
+            let Some(connection) = connection else {
+                continue;
+            };
+            let profile = sudo_profiles::bound_profile(&store, &entry.connection_id);
+            let auth = resolved_sudo_auth(&connection, profile);
+            let mut orchestration = entry
+                .orchestration
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            orchestration.password = auth.password;
+            orchestration.totp_secrets = auth.totp_secrets;
+            orchestration.password_prompt_hint = auth.password_prompt_hint;
+            orchestration.totp_prompt_hint = auth.totp_prompt_hint;
+            orchestration.flow_mode = auth.flow_mode;
+        }
     }
 
     pub async fn start_upload(
@@ -2579,11 +3024,7 @@ impl SshRuntime {
 }
 
 fn flow_mode_name(mode: AuthFlowMode) -> &'static str {
-    match mode {
-        AuthFlowMode::PasswordOnly => "password_only",
-        AuthFlowMode::PasswordPlusOtp => "password_plus_otp",
-        AuthFlowMode::PasswordThenOtp => "password_then_otp",
-    }
+    mode.name()
 }
 
 fn method_offered(result: &AuthResult, kind: MethodKind) -> bool {
@@ -3248,5 +3689,78 @@ mod tests {
             host_key_unreachable_response("SSH connection to h:22 timed out".to_string());
         assert_eq!(unreachable["state"], "unreachable");
         assert_eq!(unreachable["error"], "SSH connection to h:22 timed out");
+    }
+
+    #[test]
+    fn agent_terminal_mode_store_round_trips_per_connection() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+        // Unknown connections read the default off.
+        assert_eq!(
+            runtime.agent_terminal_mode("conn-1"),
+            AgentTerminalMode::Off
+        );
+        runtime.set_agent_terminal_mode("conn-1", AgentTerminalMode::parse("auto"));
+        runtime.set_agent_terminal_mode("conn-2", AgentTerminalMode::Strict);
+        assert_eq!(
+            runtime.agent_terminal_mode("conn-1"),
+            AgentTerminalMode::Auto
+        );
+        assert_eq!(
+            runtime.agent_terminal_mode("conn-2"),
+            AgentTerminalMode::Strict
+        );
+        assert_eq!(
+            runtime.agent_terminal_mode("conn-3"),
+            AgentTerminalMode::Off
+        );
+    }
+
+    #[test]
+    fn agent_challenges_resolve_once_and_report_unknown() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+
+        // Unknown / already resolved challenges are refused.
+        assert!(runtime.resolve_agent_challenge("ghost", "approve", None).is_err());
+
+        // Approve delivers the (possibly edited) command once, then the
+        // challenge is gone. The registry guard is dropped before each
+        // resolve so the std Mutex never re-enters on the same thread.
+        let (sender, receiver) = oneshot::channel();
+        runtime
+            .agent_challenges
+            .lock()
+            .expect("challenges")
+            .insert("c-1".to_string(), sender);
+        runtime
+            .resolve_agent_challenge("c-1", "approve", Some("echo edited"))
+            .expect("resolve");
+        let decision = tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(receiver)
+            .expect("decision");
+        assert_eq!(
+            decision,
+            AgentDecision::Approve {
+                command: Some("echo edited".to_string())
+            }
+        );
+        assert!(runtime.resolve_agent_challenge("c-1", "approve", None).is_err());
+
+        // Deny decisions and unknown decision names are handled too.
+        let (sender, receiver) = oneshot::channel();
+        runtime
+            .agent_challenges
+            .lock()
+            .expect("challenges")
+            .insert("c-2".to_string(), sender);
+        runtime.resolve_agent_challenge("c-2", "deny", None).expect("resolve");
+        let decision = tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(receiver)
+            .expect("decision");
+        assert_eq!(decision, AgentDecision::Deny);
+        assert!(runtime.resolve_agent_challenge("c-2", "maybe", None).is_err());
     }
 }

@@ -61,8 +61,10 @@ import { commandMarkerTooltip, formatCommandDuration, Osc633CommandParser, runni
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress, type BatchProgressState } from "./lib/sftpBatchProgress";
 import { describeWorkbenchSessionStatus, type WorkbenchSessionStatus } from "./lib/sessionStatus";
 import { sanitizeCommandOutput } from "./lib/terminalOutputText";
+import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI } from "./lib/appearance";
+import { AGENT_MODES, approvalRemainingSecs, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload } from "./lib/agentTerminal";
 import type { SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { workbenchMessage } from "./lib/i18n";
 import TextPreview from "./components/TextPreview.vue";
@@ -186,6 +188,25 @@ interface SshSettings {
   authFlowMode: string;
   passwordPromptHint: string;
   totpPromptHint: string;
+  // 全局 quick sudo 配置来源（空串 = 使用本连接自己的凭据）。
+  quickSudoProfileId?: string;
+  quickSudoProfileName?: string;
+  // AI 终端同步执行模式（连接级；off 默认 / auto 分级 / strict 全审）。
+  agentTerminalMode?: string;
+}
+
+// 全局 quick sudo 配置视图：密钥永不回显，只有已设置布尔位。
+interface SudoProfileView {
+  id: string;
+  name: string;
+  sudoPasswordSet: boolean;
+  totpConfigured: boolean;
+  authFlowMode: string;
+  passwordPromptHint: string;
+  totpPromptHint: string;
+  sudoUsePty: boolean;
+  createdAt: number;
+  updatedAt: number;
 }
 
 interface DiskUsage {
@@ -223,11 +244,11 @@ interface McpSizeSettings {
 type SftpColumn = "size" | "modified" | "permissions";
 type SftpSortColumn = "name" | "size" | "modified";
 
-const PREVIEWABLE_EXTENSIONS = new Set(["bash", "bat", "c", "cfg", "cmd", "conf", "cpp", "css", "csv", "go", "h", "hpp", "htm", "html", "ini", "java", "js", "json", "log", "md", "properties", "ps1", "py", "rs", "scss", "sh", "sql", "toml", "ts", "tsx", "txt", "vue", "xml", "yaml", "yml", "zsh"]);
 const IMAGE_MIME_BY_EXTENSION: Record<string, string> = { png: "png", jpg: "jpeg", jpeg: "jpeg", gif: "gif", webp: "webp", svg: "svg+xml", bmp: "bmp", ico: "x-icon" };
-// Only consulted before the NUL-byte scan; extension-less or mislabeled files are
-// still caught by the content check after sftp/read.
+// 已知二进制扩展名在双击时直接提示不打开；无后缀/改名文件由打开前的内容嗅探兜底。
 const BINARY_PREVIEW_EXTENSIONS = new Set(["7z", "bin", "bz2", "class", "dll", "dmg", "dylib", "exe", "gz", "iso", "jar", "lz4", "o", "obj", "otf", "pdf", "pyc", "rar", "so", "tar", "tif", "tiff", "ttf", "war", "woff", "woff2", "xz", "zip", "zst"]);
+// 打开预览前先读该字节数做二进制嗅探（looksBinary），避免向编辑器灌入乱码。
+const SNIFF_CHUNK_BYTES = 8 * 1024;
 const MAX_INLINE_PREVIEW_BYTES = 1024 * 1024;
 const MAX_DIRECT_WRITE_BYTES = 4 * 1024 * 1024;
 const MIB = 1024 * 1024;
@@ -269,6 +290,12 @@ const selectedPath = ref("");
 const loadingFiles = ref(false);
 const hostKeyPrompt = ref<HostKeyPrompt>();
 const rememberHostKey = ref(true);
+// AI 终端同步执行：审批挑战 / 执行横幅状态（ssh/agent/* 事件仅当前会话生效）。
+const agentPrompt = ref<AgentPromptPayload>();
+const agentPromptCommand = ref("");
+const agentPromptRemaining = ref(0);
+const agentPromptExpired = ref(false);
+const agentRunning = ref<AgentNoticePayload>();
 const splitRatio = ref(58);
 const paneOrder = ref<SshWorkbenchPaneOrder>("terminal-left");
 const followDirectory = ref(false);
@@ -294,7 +321,8 @@ const previewImageZoomed = ref(false);
 // Baseline snapshot of the content when it was opened (or last saved); the
 // dirty marker compares the live draft against it.
 const previewBaseline = ref("");
-const previewBinary = ref(false);
+// 仅加载了文件头部（大文件确认预览）时置位：预览只读，禁止保存以免整文件覆盖。
+const previewTruncated = ref(false);
 const sudoMode = ref(false);
 const quickSudo = ref(false);
 const quickSudoSubmitting = ref(false);
@@ -355,7 +383,31 @@ const settingsDraft = reactive({
   authFlowMode: "password_then_otp",
   passwordPromptHint: "",
   totpPromptHint: "",
+  quickSudoProfileId: "",
+  agentTerminalMode: "off",
 });
+// 全局 quick sudo 配置集中管理：列表与编辑弹窗状态（密钥只在提交时发送）。
+const sudoProfiles = ref<SudoProfileView[]>([]);
+const sudoProfilesLoading = ref(false);
+const sudoProfilesError = ref("");
+const profilesOpen = ref(false);
+const profileEditing = ref(false);
+const profileSaving = ref(false);
+const profileDraftHadPassword = ref(false);
+const profileDraftHadTotp = ref(false);
+const profileDraft = reactive({
+  id: "",
+  name: "",
+  sudoPassword: "",
+  totpSecret: "",
+  authFlowMode: "password_then_otp",
+  passwordPromptHint: "",
+  totpPromptHint: "",
+  sudoUsePty: false,
+});
+const boundProfile = computed(
+  () => sudoProfiles.value.find((profile) => profile.id === settingsDraft.quickSudoProfileId),
+);
 const chmodTarget = ref<SftpEntry>();
 const chmodDraft = ref("");
 const chmodSubmitting = ref(false);
@@ -447,6 +499,7 @@ let binaryInputChain = Promise.resolve();
 let terminalInputSequence = 0;
 let noticeTimer = 0;
 let commandMarkerTimer = 0;
+let agentPromptTimer = 0;
 let zmodemSentry: ZmodemSentry | null = null;
 let zmodemSession: ZmodemSession | null = null;
 let pendingZmodemFiles: File[] = [];
@@ -508,6 +561,12 @@ watch(reconnectPending, (pending) => {
 });
 const commandOutputText = computed(() => (commandResult.value ? sanitizeCommandOutput(commandResult.value.output) : ""));
 const quickSudoTitle = computed(() => `${t("quickSudo.label")}: ${quickSudo.value ? t("quickSudo.on") : t("quickSudo.off")}\n${t("quickSudo.hint")}`);
+// AI 终端同步模式下拉随档位变化的说明文案（off/auto/strict 三键 hint）。
+const agentTerminalModeHint = computed(() => t(
+  settingsDraft.agentTerminalMode === "auto" ? "agentTerminalAutoHint"
+  : settingsDraft.agentTerminalMode === "strict" ? "agentTerminalStrictHint"
+  : "agentTerminalOffHint",
+));
 // Hover tooltip for the terminal command marker strip: full command, exit
 // code, duration and working directory (localized, multi-line).
 const commandMarkerDetails = computed(() => commandMarkerTooltip(
@@ -577,7 +636,9 @@ const visibleEntries = computed(() => filterSftpEntries(sortedEntries.value, sft
 const selectedEntries = computed(() => entries.value.filter((entry) => selectedUris.value.includes(entry.uri)));
 const currentPathHistory = computed(() => pathHistories[connectionId.value] || []);
 const previewDirty = computed(() => previewEditable.value && previewDraft.value !== previewBaseline.value);
-const previewEditableAllowed = computed(() => canWrite.value && previewMode.value === "text" && !previewBinary.value && previewSize.value <= MAX_DIRECT_WRITE_BYTES);
+// 编辑保存走 sftp/write 整文件覆写：只有完整加载（未截断）且不超直写上限的
+// 文本才允许进入编辑，否则保存会把未加载部分丢掉。
+const previewEditableAllowed = computed(() => canWrite.value && previewMode.value === "text" && !previewTruncated.value && previewSize.value <= MAX_DIRECT_WRITE_BYTES);
 const mcpInputsValid = computed(() => [mcpDraft.readMiB, mcpDraft.uploadMiB, mcpDraft.downloadMiB]
   .every((value) => /^\d+$/.test(value.trim()) && Number.parseInt(value.trim(), 10) > 0));
 
@@ -1120,6 +1181,20 @@ function handleEvent(event: DbxPluginEvent) {
     }
     return;
   }
+  if (event.method === "ssh/agent/prompt" && event.params.sessionId === session.value?.sessionId) {
+    startAgentPrompt(event.params as unknown as AgentPromptPayload);
+    return;
+  }
+  if (event.method === "ssh/agent/notice" && event.params.sessionId === session.value?.sessionId) {
+    agentRunning.value = event.params as unknown as AgentNoticePayload;
+    return;
+  }
+  if (event.method === "ssh/agent/finish" && event.params.sessionId === session.value?.sessionId) {
+    const payload = event.params as unknown as AgentFinishPayload;
+    agentRunning.value = undefined;
+    showNotice(t(payload.status === "denied" ? "agentDenied" : "agentFinished"));
+    return;
+  }
   if (event.method === "sftp/upload/ack") {
     const taskId = String(event.params.taskId || "");
     const waiter = uploadAckWaiters.get(taskId);
@@ -1165,6 +1240,9 @@ async function openSession(forceNew = false) {
   // A session opened over a stale one must not inherit a stuck ZMODEM
   // overlay (zmodemBusy would keep swallowing terminal input).
   cancelZmodemUpload();
+  // 同理不继承上一个会话的 AI 审批弹窗 / 执行横幅。
+  dismissAgentPrompt();
+  agentRunning.value = undefined;
   terminalState.value = "connecting";
   terminalError.value = "";
   reconnectPending.value = false;
@@ -1248,6 +1326,8 @@ async function closeSession(updateStatus = true) {
   session.value = undefined;
   activeTerminalSessionId = "";
   quickSudo.value = false;
+  dismissAgentPrompt();
+  agentRunning.value = undefined;
   // Closing mid-ZMODEM aborts the transfer silently instead of leaving the
   // busy overlay and the dead sentry attached to the workbench.
   cancelZmodemUpload();
@@ -1290,6 +1370,63 @@ async function resolveHostKey(accept: boolean) {
   } catch (cause) {
     showError(cause, "terminal");
   }
+}
+
+// ---------------------------------------------------------------------------
+// AI 终端同步执行（agent terminal mode）：审批挑战 + 执行横幅
+// ---------------------------------------------------------------------------
+
+// 审批挑战：250ms tick 重算剩余秒，到 0 自动收起并标记 expired（后端超时同样拒绝）。
+function startAgentPrompt(payload: AgentPromptPayload) {
+  stopAgentPromptTimer();
+  agentPrompt.value = payload;
+  agentPromptCommand.value = payload.command;
+  agentPromptExpired.value = false;
+  const tick = () => {
+    if (!agentPrompt.value) return;
+    agentPromptRemaining.value = approvalRemainingSecs(agentPrompt.value, Date.now());
+    if (agentPromptRemaining.value <= 0) {
+      agentPromptExpired.value = true;
+      dismissAgentPrompt();
+    }
+  };
+  tick();
+  agentPromptTimer = window.setInterval(tick, 250);
+}
+
+function stopAgentPromptTimer() {
+  if (agentPromptTimer) {
+    window.clearInterval(agentPromptTimer);
+    agentPromptTimer = 0;
+  }
+}
+
+function dismissAgentPrompt() {
+  stopAgentPromptTimer();
+  agentPrompt.value = undefined;
+  agentPromptCommand.value = "";
+  agentPromptRemaining.value = 0;
+}
+
+// 审批语义对齐 host-key 挑战：先收起弹窗再 resolve（挑战一次性，重复 resolve 报错）；
+// 批准时提交编辑后的命令（所见即所执行）。
+async function resolveAgentPrompt(decision: "approve" | "deny") {
+  const prompt = agentPrompt.value;
+  if (!prompt) return;
+  const command = agentPromptCommand.value;
+  dismissAgentPrompt();
+  try {
+    const payload: Record<string, unknown> = { challengeId: prompt.challengeId, decision };
+    if (decision === "approve") payload.command = command;
+    await window.dbxPlugin.invoke("ssh/agent/resolve", payload);
+  } catch (cause) {
+    showError(cause, "terminal");
+  }
+}
+
+// 中断 AI 正在终端执行的命令：复用 PTY 输入通道发送 Ctrl+C（0x03，对齐快速命令写入语义）。
+function interruptAgentRun() {
+  sendTerminalBytes(new Uint8Array([3]));
 }
 
 async function loadHome() {
@@ -1444,16 +1581,23 @@ async function openEntry(entry: SftpEntry) {
     await openImagePreview(entry, IMAGE_MIME_BY_EXTENSION[imagePreviewExtension(entry.name)]);
     return;
   }
-  // Size-0 files have nothing to sniff: always open them in the text editor so
-  // their content can be created from scratch. Anything else unpreviewable downloads.
-  if (!isPreviewable(entry) && (entry.size || 0) > 0) {
-    await downloadEntry(entry);
+  const size = entry.size || 0;
+  // 已知二进制扩展名：不打开，直接提示（无需先读内容）。
+  if (size > 0 && hasBinaryExtension(entry.name)) {
+    showNotice(t("binaryFile.notOpen", { name: entry.name }));
+    return;
+  }
+  // 大文件先询问：确认后仍预览，但只加载头部且只读。
+  if (size > MAX_INLINE_PREVIEW_BYTES && !window.confirm(t("previewDialog.tooLargeConfirm", { name: entry.name, size: formatBytes(size), limit: formatBytes(MAX_INLINE_PREVIEW_BYTES) }))) return;
+  // 内容嗅探兜底：无后缀或改名的二进制文件在打开前拦下。
+  if (size > 0 && (await remoteFileLooksBinary(entry))) {
+    showNotice(t("binaryFile.notOpen", { name: entry.name }));
     return;
   }
   previewMode.value = "text";
   previewImageUrl.value = "";
   previewImageZoomed.value = false;
-  previewBinary.value = false;
+  previewTruncated.value = false;
   previewOpen.value = true;
   previewLoading.value = true;
   previewTitle.value = entry.name;
@@ -1469,6 +1613,7 @@ async function openEntry(entry: SftpEntry) {
       ? await window.dbxPlugin.invoke<{ dataBase64: string; truncated: boolean }>("sudo/readFile", {
           sessionId: session.value?.sessionId,
           path: pathFromUri(entry.uri),
+          offset: 0,
           length: MAX_INLINE_PREVIEW_BYTES,
         })
       : await window.dbxPlugin.invoke<{ dataBase64: string; truncated: boolean }>("sftp/read", {
@@ -1476,14 +1621,9 @@ async function openEntry(entry: SftpEntry) {
           path: pathFromUri(entry.uri),
           maxBytes: MAX_INLINE_PREVIEW_BYTES,
         });
-    if (result.truncated) {
-      previewOpen.value = false;
-      await downloadEntry(entry);
-      return;
-    }
-    const bytes = window.dbxPlugin.decodeBase64(result.dataBase64);
-    previewBinary.value = hasBinaryExtension(entry.name) || containsNullByte(bytes);
-    previewText.value = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    // 截断 = 只展示了文件头部：保持只读（保存会整文件覆写，丢掉未加载部分）。
+    previewTruncated.value = result.truncated;
+    previewText.value = new TextDecoder("utf-8", { fatal: false }).decode(window.dbxPlugin.decodeBase64(result.dataBase64));
     previewBaseline.value = previewText.value;
   } catch (cause) {
     previewText.value = cause instanceof Error ? cause.message : String(cause);
@@ -1493,9 +1633,33 @@ async function openEntry(entry: SftpEntry) {
   }
 }
 
+// 预览前的二进制嗅探：读头部 SNIFF_CHUNK_BYTES 字节交给 looksBinary 判定。
+// 嗅探失败不拦预览，交给正式读取报错。
+async function remoteFileLooksBinary(entry: SftpEntry) {
+  const sessionId = session.value?.sessionId;
+  if (!sessionId) return false;
+  try {
+    const result = sudoMode.value
+      ? await window.dbxPlugin.invoke<{ dataBase64: string }>("sudo/readFile", {
+          sessionId,
+          path: pathFromUri(entry.uri),
+          offset: 0,
+          length: SNIFF_CHUNK_BYTES,
+        })
+      : await window.dbxPlugin.invoke<{ dataBase64: string }>("sftp/read", {
+          sessionId,
+          path: pathFromUri(entry.uri),
+          maxBytes: SNIFF_CHUNK_BYTES,
+        });
+    return looksBinary(window.dbxPlugin.decodeBase64(result.dataBase64));
+  } catch {
+    return false;
+  }
+}
+
 async function openImagePreview(entry: SftpEntry, mime: string) {
   previewMode.value = "image";
-  previewBinary.value = false;
+  previewTruncated.value = false;
   previewImageUrl.value = "";
   previewImageZoomed.value = false;
   previewOpen.value = true;
@@ -1543,15 +1707,6 @@ function isImagePreviewable(entry: SftpEntry) {
 
 function hasBinaryExtension(name: string) {
   return BINARY_PREVIEW_EXTENSIONS.has(fileExtension(name));
-}
-
-function containsNullByte(bytes: Uint8Array) {
-  return bytes.includes(0);
-}
-
-function isPreviewable(entry: SftpEntry) {
-  if ((entry.size || 0) > MAX_INLINE_PREVIEW_BYTES) return false;
-  return PREVIEWABLE_EXTENSIONS.has(fileExtension(entry.name));
 }
 
 function confirmDiscardPreviewEdits() {
@@ -1628,7 +1783,8 @@ function archiveDirectoryName(name: string) {
 
 async function archiveEntry(entry: SftpEntry) {
   const sessionId = session.value?.sessionId;
-  if (!sessionId || archiveBusy.value || entry.kind !== "directory") return;
+  // 目录与单文件都可压缩（sftp/archive 支持任意路径列表）。
+  if (!sessionId || archiveBusy.value) return;
   fileMenu.value = undefined;
   archiveBusy.value = true;
   const archiveName = `${entry.name}.tar.gz`;
@@ -2605,6 +2761,7 @@ async function openSettings() {
   void loadKnownHosts();
   void loadLocalKeys();
   void loadMcpSettings();
+  void loadSudoProfiles();
   try {
     const meta = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/get", { sessionId: session.value?.sessionId });
     settingsMeta.value = meta;
@@ -2613,12 +2770,138 @@ async function openSettings() {
     settingsDraft.authFlowMode = meta.authFlowMode || "password_then_otp";
     settingsDraft.passwordPromptHint = meta.passwordPromptHint || "";
     settingsDraft.totpPromptHint = meta.totpPromptHint || "";
+    settingsDraft.quickSudoProfileId = meta.quickSudoProfileId || "";
+    const agentMode = meta.agentTerminalMode;
+    settingsDraft.agentTerminalMode = agentMode && (AGENT_MODES as readonly string[]).includes(agentMode) ? agentMode : "off";
     settingsDraft.sudoPassword = "";
     settingsDraft.totpSecret = "";
   } catch (cause) {
     showError(cause);
   } finally {
     settingsLoading.value = false;
+  }
+}
+
+async function loadSudoProfiles() {
+  sudoProfilesLoading.value = true;
+  sudoProfilesError.value = "";
+  try {
+    const result = await window.dbxPlugin.invoke<{ profiles: SudoProfileView[] }>("sudo/profiles/list", {});
+    sudoProfiles.value = result.profiles;
+  } catch (cause) {
+    sudoProfiles.value = [];
+    sudoProfilesError.value = settingsErrorOf(cause);
+  } finally {
+    sudoProfilesLoading.value = false;
+  }
+}
+
+function flowModeLabel(mode: string) {
+  if (mode === "password_only") return t("flowOnly");
+  if (mode === "password_plus_otp") return t("flowPlusOtp");
+  return t("flowThenOtp");
+}
+
+function profileSummary(profile: SudoProfileView) {
+  return [
+    `${t("settingsSudoPassword")}: ${profile.sudoPasswordSet ? t("settingsConfigured") : "—"}`,
+    `${t("settingsTotp")}: ${profile.totpConfigured ? t("settingsConfigured") : "—"}`,
+    t("settingsFlowMode") + ": " + flowModeLabel(profile.authFlowMode),
+    profile.sudoUsePty ? t("settingsUsePty") : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function resetProfileDraft() {
+  profileDraft.id = "";
+  profileDraft.name = "";
+  profileDraft.sudoPassword = "";
+  profileDraft.totpSecret = "";
+  profileDraft.authFlowMode = "password_then_otp";
+  profileDraft.passwordPromptHint = "";
+  profileDraft.totpPromptHint = "";
+  profileDraft.sudoUsePty = false;
+  profileDraftHadPassword.value = false;
+  profileDraftHadTotp.value = false;
+}
+
+function openProfilesManager() {
+  profilesOpen.value = true;
+  profileEditing.value = false;
+  resetProfileDraft();
+  void loadSudoProfiles();
+}
+
+function startProfileCreate() {
+  resetProfileDraft();
+  profileEditing.value = true;
+}
+
+function startProfileEdit(profile: SudoProfileView) {
+  resetProfileDraft();
+  profileDraft.id = profile.id;
+  profileDraft.name = profile.name;
+  profileDraft.authFlowMode = profile.authFlowMode || "password_then_otp";
+  profileDraft.passwordPromptHint = profile.passwordPromptHint || "";
+  profileDraft.totpPromptHint = profile.totpPromptHint || "";
+  profileDraft.sudoUsePty = profile.sudoUsePty;
+  profileDraftHadPassword.value = profile.sudoPasswordSet;
+  profileDraftHadTotp.value = profile.totpConfigured;
+  profileEditing.value = true;
+}
+
+async function saveProfileDraft() {
+  if (profileSaving.value) return;
+  const name = profileDraft.name.trim();
+  if (!name) {
+    sudoProfilesError.value = t("profilesNameRequired");
+    return;
+  }
+  profileSaving.value = true;
+  sudoProfilesError.value = "";
+  try {
+    const payload: Record<string, unknown> = {
+      authFlowMode: profileDraft.authFlowMode,
+      passwordPromptHint: profileDraft.passwordPromptHint,
+      totpPromptHint: profileDraft.totpPromptHint,
+      sudoUsePty: profileDraft.sudoUsePty,
+    };
+    if (profileDraft.id) payload.id = profileDraft.id;
+    payload.name = name;
+    if (profileDraft.sudoPassword) payload.sudoPassword = profileDraft.sudoPassword;
+    if (profileDraft.totpSecret.trim()) payload.totpSecret = profileDraft.totpSecret;
+    await window.dbxPlugin.invoke("sudo/profiles/save", payload);
+    profileEditing.value = false;
+    resetProfileDraft();
+    await loadSudoProfiles();
+    await refreshSettingsMeta();
+    showNotice(t("profilesSaved"));
+  } catch (cause) {
+    sudoProfilesError.value = settingsErrorOf(cause);
+  } finally {
+    profileSaving.value = false;
+  }
+}
+
+async function removeProfile(profile: SudoProfileView) {
+  if (!window.confirm(t("profilesDeleteConfirm", { name: profile.name }))) return;
+  try {
+    await window.dbxPlugin.invoke("sudo/profiles/delete", { id: profile.id });
+    if (settingsDraft.quickSudoProfileId === profile.id) settingsDraft.quickSudoProfileId = "";
+    await loadSudoProfiles();
+    await refreshSettingsMeta();
+    showNotice(t("profilesDeleted"));
+  } catch (cause) {
+    sudoProfilesError.value = settingsErrorOf(cause);
+  }
+}
+
+/// 全局配置或其绑定变化后，刷新设置弹窗的只读摘要（会话内即时生效）。
+async function refreshSettingsMeta() {
+  if (!settingsOpen.value || !session.value) return;
+  try {
+    settingsMeta.value = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/get", { sessionId: session.value.sessionId });
+  } catch {
+    // 摘要刷新失败不打断主流程；重新打开设置时会再次加载。
   }
 }
 
@@ -2713,6 +2996,8 @@ async function saveSettings() {
       authFlowMode: settingsDraft.authFlowMode,
       passwordPromptHint: settingsDraft.passwordPromptHint,
       totpPromptHint: settingsDraft.totpPromptHint,
+      quickSudoProfileId: settingsDraft.quickSudoProfileId,
+      agentTerminalMode: settingsDraft.agentTerminalMode,
     };
     if (settingsDraft.sudoPassword) updates.sudoPassword = settingsDraft.sudoPassword;
     if (settingsDraft.totpSecret.trim()) updates.totpSecret = settingsDraft.totpSecret;
@@ -2943,6 +3228,7 @@ onBeforeUnmount(() => {
   window.clearTimeout(zoomNoticeTimer);
   window.clearInterval(metricsTimer);
   stopCommandMarkerTick();
+  stopAgentPromptTimer();
   resolvePasteConfirm(false);
   if (terminalHost.value) {
     if (terminalPasteHandler) terminalHost.value.removeEventListener("paste", terminalPasteHandler, true);
@@ -2989,6 +3275,7 @@ onBeforeUnmount(() => {
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
         <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting'" @click="reconnect"><PlugZap /></button>
         <button class="icon-button icon-emerald" :class="{ 'is-active': quickSudo }" :title="quickSudoTitle" :aria-pressed="quickSudo" :disabled="!connected" @click="toggleQuickSudo"><ShieldCheck /></button>
+        <button class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
         <label class="follow-directory-control" :title="t('followTerminal')">
           <button class="switch-control" type="button" role="switch" :aria-checked="followDirectory" :disabled="!connected" @click="setDirectoryTracking(!followDirectory)"><span /></button>
           <span>{{ t("followTerminal") }}</span>
@@ -3106,6 +3393,12 @@ onBeforeUnmount(() => {
           <span v-else class="marker-text">{{ t("terminalCommand.hint") }}</span>
           <span v-if="commandMarker.cwd" class="marker-cwd mono">{{ commandMarker.cwd }}</span>
         </div>
+        <div v-if="agentRunning" class="agent-run-banner">
+          <Loader2 class="spinning" />
+          <span class="agent-run-text">{{ t("agentRunningBanner") }}</span>
+          <code class="agent-run-command mono" :title="agentRunning.command">{{ agentRunning.command }}</code>
+          <button class="agent-interrupt" @click="interruptAgentRun">{{ t("agentInterrupt") }}</button>
+        </div>
         <div v-if="zmodemBusy" class="zmodem-status">
           <Loader2 class="spinning" />
           <span>{{ zmodemState === "waiting" ? t("zmodemWaiting") : t("zmodemUploading", { name: zmodemFileName, percent: zmodemPercent }) }}</span>
@@ -3218,14 +3511,14 @@ onBeforeUnmount(() => {
     </nav>
 
     <nav v-if="fileMenu" class="context-menu" :style="{ left: fileMenu.x + 'px', top: fileMenu.y + 'px' }" @click.stop>
-      <button v-if="fileMenu.entry.kind === 'directory' || isPreviewable(fileMenu.entry) || isImagePreviewable(fileMenu.entry)" @click="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</button>
+      <button v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @click="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</button>
       <button v-if="fileMenu.entry.kind === 'file'" @click="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</button>
       <button :disabled="!canWrite" @click="beginRename(fileMenu.entry); fileMenu = undefined"><Pencil />{{ t("rename") }}</button>
       <button @click="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</button>
       <button :disabled="!canWrite" @click="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</button>
       <button :disabled="!canWrite" @click="beginChmod(fileMenu.entry)"><Lock />{{ t("permissionsEdit") }}</button>
       <button @click="openAttributes(fileMenu.entry)"><Info />{{ t("sftpAttrs.action") }}</button>
-      <button v-if="fileMenu.entry.kind === 'directory'" :disabled="!canWrite || archiveBusy" @click="archiveEntry(fileMenu.entry)"><Archive />{{ t("archive.action") }}</button>
+      <button v-if="fileMenu.entry.kind === 'directory' || (fileMenu.entry.kind === 'file' && !isArchiveName(fileMenu.entry.name))" :disabled="!canWrite || archiveBusy" @click="archiveEntry(fileMenu.entry)"><Archive />{{ t("archive.action") }}</button>
       <button v-if="fileMenu.entry.kind === 'file' && isArchiveName(fileMenu.entry.name)" :disabled="!canWrite || archiveBusy" @click="extractEntry(fileMenu.entry)"><PackageOpen />{{ t("extract.action") }}</button>
       <hr />
       <button class="danger" :disabled="!canWrite" @click="deleteTarget = fileMenu.entry; fileMenu = undefined"><Trash2 />{{ t("delete") }}</button>
@@ -3237,7 +3530,7 @@ onBeforeUnmount(() => {
           <h2>
             {{ previewTitle }}
             <span v-if="previewDirty" class="preview-dirty"><span class="preview-dirty-dot" />{{ t("editSave.unsaved") }}</span>
-            <span v-else-if="previewBinary" class="preview-binary-badge">{{ t("binaryFile.badge") }}</span>
+            <span v-else-if="previewTruncated" class="preview-truncated-badge">{{ t("previewDialog.truncated", { limit: formatBytes(MAX_INLINE_PREVIEW_BYTES), size: formatBytes(previewSize) }) }}</span>
           </h2>
           <div v-if="previewEditableAllowed" class="preview-actions">
             <template v-if="!previewEditable">
@@ -3453,10 +3746,22 @@ onBeforeUnmount(() => {
         <div class="settings-body">
           <div v-if="settingsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
           <template v-else>
+            <label class="settings-field">
+              <span>{{ t("settingsCredentialSource") }}</span>
+              <span class="credential-source-row">
+                <select v-model="settingsDraft.quickSudoProfileId">
+                  <option value="">{{ t("profileSourceConnection") }}</option>
+                  <option v-for="profile in sudoProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}</option>
+                </select>
+                <button class="link-button" @click="openProfilesManager">{{ t("profilesManage") }}</button>
+              </span>
+            </label>
+            <p v-if="boundProfile" class="muted settings-note">{{ t("profilesBoundSummary", { name: boundProfile.name }) }} · {{ profileSummary(boundProfile) }}</p>
             <label class="quick-sudo-control">
               <button class="switch-control" type="button" role="switch" :aria-checked="settingsDraft.quickSudo" @click="settingsDraft.quickSudo = !settingsDraft.quickSudo"><span /></button>
               <span>{{ t("settingsQuickSudo") }}</span>
             </label>
+            <template v-if="!boundProfile">
             <label class="settings-field">
               <span>{{ t("settingsSudoPassword") }}</span>
               <input v-model="settingsDraft.sudoPassword" type="password" autocomplete="off" :placeholder="settingsMeta?.sudoPasswordSet ? t('settingsConfigured') : t('settingsSudoPasswordPlaceholder')" />
@@ -3485,7 +3790,18 @@ onBeforeUnmount(() => {
               <button class="switch-control" type="button" role="switch" :aria-checked="settingsDraft.sudoUsePty" @click="settingsDraft.sudoUsePty = !settingsDraft.sudoUsePty"><span /></button>
               <span>{{ t("settingsUsePty") }}</span>
             </label>
+            </template>
+            <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }} <button class="link-button" @click="loadSudoProfiles">{{ t("refresh") }}</button></p>
             <p class="muted settings-note">{{ t("settingsNote") }}</p>
+
+            <h3 class="settings-section-title">{{ t("agentTerminalSection") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("agentTerminalMode") }}</span>
+              <select v-model="settingsDraft.agentTerminalMode">
+                <option v-for="mode in AGENT_MODES" :key="mode" :value="mode">{{ t(`agentTerminal${mode === "off" ? "Off" : mode === "auto" ? "Auto" : "Strict"}`) }}</option>
+              </select>
+            </label>
+            <p class="muted settings-note">{{ agentTerminalModeHint }}</p>
           </template>
 
           <h3 class="settings-section-title">{{ t("knownHosts.title") }}</h3>
@@ -3546,6 +3862,73 @@ onBeforeUnmount(() => {
         </footer>
       </article>
     </section>
+
+    <section v-if="profilesOpen" class="modal-backdrop" @mousedown.self="profilesOpen = false">
+      <article class="modal settings-modal">
+        <header><h2>{{ t("profilesTitle") }}</h2><button class="icon-button" @click="profilesOpen = false"><X /></button></header>
+        <div class="settings-body">
+          <p class="muted">{{ t("profilesHint") }}</p>
+          <div v-if="sudoProfilesLoading && !sudoProfiles.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+          <div v-else-if="!sudoProfiles.length" class="empty compact">{{ t("profilesEmpty") }}</div>
+          <ul v-else class="settings-list">
+            <li v-for="profile in sudoProfiles" :key="profile.id">
+              <div class="settings-list-main">
+                <strong>{{ profile.name }}</strong>
+                <span class="muted">{{ profileSummary(profile) }}</span>
+              </div>
+              <span class="settings-list-actions">
+                <button class="icon-button" :title="t('profilesEdit')" @click="startProfileEdit(profile)"><Pencil /></button>
+                <button class="icon-button" :title="t('profilesDelete')" @click="removeProfile(profile)"><Trash2 /></button>
+              </span>
+            </li>
+          </ul>
+          <p class="muted">{{ t("profilesLimit", { count: sudoProfiles.length, limit: 20 }) }}</p>
+          <button v-if="!profileEditing" class="link-button" @click="startProfileCreate">{{ t("profilesAdd") }}</button>
+
+          <template v-if="profileEditing">
+            <h3 class="settings-section-title">{{ profileDraft.id ? t("profilesEdit") : t("profilesAdd") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("profilesName") }}</span>
+              <input v-model="profileDraft.name" spellcheck="false" :placeholder="t('profilesNamePlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("profilesPassword") }}</span>
+              <input v-model="profileDraft.sudoPassword" type="password" autocomplete="off" :placeholder="profileDraftHadPassword ? t('profilesPasswordKeep') : t('settingsSudoPasswordPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("profilesTotp") }}</span>
+              <textarea v-model="profileDraft.totpSecret" rows="2" spellcheck="false" :placeholder="profileDraftHadTotp ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsFlowMode") }}</span>
+              <select v-model="profileDraft.authFlowMode">
+                <option value="password_then_otp">{{ t("flowThenOtp") }}</option>
+                <option value="password_plus_otp">{{ t("flowPlusOtp") }}</option>
+                <option value="password_only">{{ t("flowOnly") }}</option>
+              </select>
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsPasswordHint") }}</span>
+              <input v-model="profileDraft.passwordPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsTotpHint") }}</span>
+              <input v-model="profileDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+            </label>
+            <label class="quick-sudo-control">
+              <button class="switch-control" type="button" role="switch" :aria-checked="profileDraft.sudoUsePty" @click="profileDraft.sudoUsePty = !profileDraft.sudoUsePty"><span /></button>
+              <span>{{ t("settingsUsePty") }}</span>
+            </label>
+            <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
+            <footer class="profiles-form-actions">
+              <button @click="profileEditing = false; resetProfileDraft(); sudoProfilesError = ''">{{ t("cancel") }}</button>
+              <button class="primary-button" :disabled="profileSaving || !profileDraft.name.trim()" @click="saveProfileDraft"><Loader2 v-if="profileSaving" class="spinning" />{{ t("save") }}</button>
+            </footer>
+          </template>
+        </div>
+        <footer><button @click="profilesOpen = false">{{ t("close") }}</button></footer>
+      </article>
+    </section>
     <section v-if="hostKeyPrompt" class="modal-backdrop">
       <article class="modal host-key-modal">
         <header><h2>Verify SSH host key</h2></header>
@@ -3553,6 +3936,22 @@ onBeforeUnmount(() => {
         <dl><dt>Server</dt><dd>{{ hostKeyPrompt.host }}:{{ hostKeyPrompt.port }}</dd><dt>Key type</dt><dd>{{ hostKeyPrompt.keyType }}</dd><dt>Fingerprint</dt><dd class="fingerprint">{{ hostKeyPrompt.fingerprint }}</dd></dl>
         <label class="remember"><input v-model="rememberHostKey" type="checkbox" /> Remember this key</label>
         <footer><button @click="resolveHostKey(false)">Reject</button><button class="primary-button" @click="resolveHostKey(true)">Trust and connect</button></footer>
+      </article>
+    </section>
+
+    <section v-if="agentPrompt" class="modal-backdrop">
+      <article class="modal agent-prompt-modal">
+        <header><h2>{{ t("agentPromptTitle") }}</h2></header>
+        <div class="agent-prompt-meta">
+          <span>{{ t("agentPromptSource") }} <code class="mono">{{ agentPrompt.tool }}</code></span>
+          <span class="agent-risk-badge" :class="agentPrompt.risk === 'elevated' ? 'elevated' : 'low'">{{ agentPrompt.risk === "elevated" ? t("agentPromptRiskElevated") : t("agentPromptRiskLow") }}</span>
+        </div>
+        <label class="agent-prompt-command">
+          <span>{{ t("agentPromptCommandLabel") }}</span>
+          <textarea v-model="agentPromptCommand" class="mono" rows="3" spellcheck="false" />
+        </label>
+        <p class="muted agent-prompt-countdown">{{ t("agentPromptTimeoutHint", { seconds: Math.ceil(agentPromptRemaining) }) }}</p>
+        <footer><button @click="resolveAgentPrompt('deny')">{{ t("agentPromptDeny") }}</button><button class="primary-button" @click="resolveAgentPrompt('approve')">{{ t("agentPromptApprove") }}</button></footer>
       </article>
     </section>
 
@@ -3653,4 +4052,21 @@ onBeforeUnmount(() => {
 .connection-info-grid dd { display: flex; min-width: 0; align-items: center; gap: 8px; margin: 0; overflow-wrap: anywhere; }
 .connection-info-grid .task-error { font-size: 10px; }
 .connection-info-grid .link-button { flex: 0 0 auto; align-self: center; font-size: 10px; }
+
+/* AI 终端同步执行：执行横幅（终端底部，避开命令标记条）+ 审批弹窗 */
+.agent-run-banner { position: absolute; z-index: 3; right: 8px; bottom: 36px; left: 8px; display: flex; align-items: center; gap: 8px; border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border)); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 92%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); font-size: 11px; }
+.agent-run-banner svg { width: 14px; height: 14px; flex: 0 0 14px; }
+.agent-run-text { flex: 0 0 auto; color: var(--foreground); }
+.agent-run-command { min-width: 0; flex: 1; overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
+.agent-interrupt { flex: 0 0 auto; height: 22px; border: 1px solid var(--border); border-radius: 4px; padding: 0 8px; background: var(--background); color: var(--destructive); font-size: 11px; cursor: pointer; }
+.agent-interrupt:hover { background: var(--accent); }
+.agent-prompt-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; font-size: 12px; }
+.agent-risk-badge { flex: 0 0 auto; border-radius: 999px; padding: 2px 8px; font-size: 10px; font-weight: 600; letter-spacing: .02em; }
+.agent-risk-badge.low { border: 1px solid var(--border); background: var(--accent); color: var(--muted-foreground); }
+.agent-risk-badge.elevated { border: 1px solid color-mix(in srgb, var(--destructive) 55%, transparent); background: color-mix(in srgb, var(--destructive) 12%, transparent); color: var(--destructive); }
+.agent-prompt-command { display: flex; flex-direction: column; gap: 5px; padding: 4px 0 8px; font-size: 12px; }
+.agent-prompt-command span { color: var(--muted-foreground); }
+.agent-prompt-command textarea { width: 100%; resize: vertical; border: 1px solid var(--border); border-radius: 5px; padding: 6px 8px; background: var(--background); color: var(--foreground); font-family: var(--terminal-font-family); font-size: 12px; }
+.agent-prompt-command textarea:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); outline: none; }
+.agent-prompt-countdown { padding-bottom: 10px; }
 </style>

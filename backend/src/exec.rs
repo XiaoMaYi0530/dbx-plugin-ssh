@@ -68,6 +68,16 @@ impl AuthFlowMode {
         }
     }
 
+    /// Canonical protocol name (as stored in Quick Sudo profiles and
+    /// reported by `ssh/settings/get`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PasswordOnly => "password_only",
+            Self::PasswordPlusOtp => "password_plus_otp",
+            Self::PasswordThenOtp => "password_then_otp",
+        }
+    }
+
     fn allows_otp_after_password(self) -> bool {
         match self {
             Self::PasswordOnly => false,

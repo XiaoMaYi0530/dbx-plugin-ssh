@@ -294,6 +294,11 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .settings-list-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; font-size: 12px; }
 .settings-list-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .settings-key-icon { width: 14px; height: 14px; flex: 0 0 14px; color: var(--muted-foreground); }
+/* 全局 quick sudo 配置：来源选择行、列表操作列、内联表单操作列。 */
+.credential-source-row { display: flex; flex: 1; align-items: center; gap: 8px; min-width: 0; }
+.credential-source-row select { flex: 1; min-width: 0; }
+.settings-list-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+.profiles-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin: 4px 0 0; }
 .mcp-limits { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .mcp-limits input { width: 100%; }
 .settings-body .link-button { display: inline-flex; align-items: center; gap: 5px; }
@@ -308,7 +313,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 /* Unsaved-changes marker and binary badge in the preview header */
 .preview-dirty { display: inline-flex; align-items: center; gap: 5px; margin-left: 8px; border-radius: 999px; padding: 1px 7px; background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary); font-size: 10px; font-weight: 500; vertical-align: middle; }
 .preview-dirty-dot { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: currentColor; }
-.preview-binary-badge { margin-left: 8px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; color: var(--muted-foreground); font-size: 10px; font-weight: 500; vertical-align: middle; }
+.preview-truncated-badge { margin-left: 8px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; color: var(--muted-foreground); font-size: 10px; font-weight: 500; vertical-align: middle; }
 
 /* Image preview: checkerboard backdrop that follows the active theme variables */
 .preview-image-stage { display: flex; min-height: 0; flex: 1; overflow: auto; border-radius: 4px; background: repeating-conic-gradient(color-mix(in srgb, var(--muted-foreground) 22%, var(--background)) 0% 25%, var(--background) 0% 50%) 0 0 / 20px 20px; }

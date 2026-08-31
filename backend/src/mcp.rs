@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use dbx_plugin_sdk::PluginEmitter;
 use russh::client::Handle;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
@@ -18,12 +19,14 @@ use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
+use crate::agent_terminal::{self, AgentTerminalMode};
 use crate::exec::{self, AuthFlowMode, Hints, SudoAuth};
 use crate::host_key::HostKeyVerifier;
+use crate::mcp_safety::{self, CommandRisk};
 use crate::model::{AuthenticationMethod, JumpHost, StoredConnection};
 use crate::sftp_copy;
-use crate::ssh::SshClient;
-use crate::ssh::SshRuntime;
+use crate::ssh::{SshClient, SshRuntime, NO_TERMINAL_SESSION_MESSAGE};
+use crate::sudo_profiles;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -204,6 +207,17 @@ pub struct McpState {
     /// MCP size preferences, mirrored to `limits_path` on every change.
     limits: RwLock<McpLimits>,
     limits_path: PathBuf,
+    /// Operator-level kill switch: `DBX_SSH_MCP_READ_ONLY` forces every
+    /// tool call (bridge and standalone alike) through the read-only gates.
+    global_read_only: bool,
+}
+
+/// Truthy values accepted for `DBX_SSH_MCP_READ_ONLY`.
+fn env_read_only() -> bool {
+    matches!(
+        std::env::var("DBX_SSH_MCP_READ_ONLY").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "on")
+    )
 }
 
 impl McpState {
@@ -216,6 +230,7 @@ impl McpState {
             dbx_connections: AsyncRwLock::new(HashMap::new()),
             limits: RwLock::new(limits),
             limits_path,
+            global_read_only: env_read_only(),
         }
     }
 
@@ -230,6 +245,7 @@ impl McpState {
             dbx_connections: AsyncRwLock::new(HashMap::new()),
             limits: RwLock::new(limits),
             limits_path,
+            global_read_only: env_read_only(),
         }
     }
 
@@ -300,7 +316,9 @@ impl McpState {
                     .unwrap_or_default()
                     .to_string();
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                self.call_tool(&name, &arguments).await
+                // stdio mode has no event emitter: `runInTerminal` routing
+                // is unavailable and `runInTerminal: true` is refused.
+                self.call_tool(&name, &arguments, None).await
             }
             other => Err(format!("Method not found: {other}")),
         };
@@ -320,21 +338,72 @@ impl McpState {
         })
     }
 
-    async fn call_tool(&self, name: &str, arguments: &Value) -> Result<Value, String> {
-        // Read-only gate: write-class tools must be rejected when the DBX
-        // connection they reference was opened read-only, mirroring the
-        // workbench `ensure_writable` gate. Inline (standalone --mcp) calls
-        // carry no read-only flag, so only registered DBX connections gate.
-        if is_write_tool(name) && self.registered_connection_is_read_only(arguments).await {
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: &Value,
+        emitter: Option<&PluginEmitter>,
+    ) -> Result<Value, String> {
+        // Safety gates, ordered cheapest-first and all evaluated before any
+        // network I/O:
+        // 1. Read-only gate: write-class tools are rejected when the DBX
+        //    connection they reference was opened read-only (mirroring the
+        //    workbench `ensure_writable` gate) or the operator forced the
+        //    whole server read-only via DBX_SSH_MCP_READ_ONLY.
+        // 2. Read-only command whitelist: `ssh_exec` stays available on
+        //    read-only connections, but only for provably read-only
+        //    commands (ls, df, systemctl status, ...).
+        // 3. Destructive-command confirmation: recognized catastrophic
+        //    patterns require an explicit confirmDestructive: true on every
+        //    connection (and are refused outright on read-only ones).
+        let read_only = self.connection_is_read_only(arguments).await;
+        if is_write_tool(name) && read_only {
             return Err(format!(
                 "Tool {name} is a write operation and the connection is read-only"
             ));
         }
-        let text = self.run_tool(name, arguments).await?;
+        if matches!(name, "ssh_exec" | "ssh_exec_sudo") {
+            let command = required_str(arguments, "command")?;
+            match mcp_safety::assess_command(command) {
+                CommandRisk::Destructive(reason) if read_only => {
+                    return Err(format!(
+                        "Refused on read-only connection ({reason}): {command}"
+                    ));
+                }
+                CommandRisk::Destructive(reason) => {
+                    let confirmed = arguments
+                        .get("confirmDestructive")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !confirmed {
+                        return Err(format!(
+                            "Command looks destructive ({reason}): {command}. \
+                             Retry with confirmDestructive: true if this is intended."
+                        ));
+                    }
+                }
+                CommandRisk::Unknown if name == "ssh_exec" && read_only => {
+                    return Err(format!(
+                        "Connection is read-only and the command is not recognized \
+                         as read-only: {command}. Only inspection commands (ls, cat, \
+                         df, ps, systemctl status, journalctl, docker ps, ...) pass."
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let text = self.run_tool(name, arguments, emitter).await?;
         Ok(json!({
             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&text).unwrap_or_default() }],
             "isError": false,
         }))
+    }
+
+    /// True when the call must pass the read-only gates: either the DBX
+    /// connection it references was registered read-only, or the operator
+    /// flipped the process-wide `DBX_SSH_MCP_READ_ONLY` kill switch.
+    async fn connection_is_read_only(&self, arguments: &Value) -> bool {
+        self.global_read_only || self.registered_connection_is_read_only(arguments).await
     }
 
     /// True when the arguments reference a DBX-registered connection that was
@@ -355,9 +424,30 @@ impl McpState {
             .unwrap_or(false)
     }
 
-    async fn run_tool(&self, name: &str, arguments: &Value) -> Result<Value, String> {
+    async fn run_tool(
+        &self,
+        name: &str,
+        arguments: &Value,
+        emitter: Option<&PluginEmitter>,
+    ) -> Result<Value, String> {
         match name {
             "ssh_close" => self.ssh_close(arguments).await,
+            // Local↔remote transfers validate their local side before any
+            // connection I/O; validation refusals must keep the pooled
+            // connection (they are not transport failures), so these tools
+            // own their drop-on-transport-error semantics instead of the
+            // blanket cleanup below.
+            "sftp_upload" => self.sftp_upload_tool(arguments).await,
+            "sftp_download" => self.sftp_download_tool(arguments).await,
+            // Global Quick Sudo profile management: local config reads and
+            // writes through the shared runtime store (not remote writes, so
+            // these stay outside the read-only tool gate).
+            "ssh_quick_sudo_profiles_list" => Ok(self.runtime.profiles_list()),
+            "ssh_quick_sudo_profiles_save" => self.runtime.profiles_save(arguments).await,
+            "ssh_quick_sudo_profiles_delete" => {
+                let id = required_str(arguments, "id")?;
+                self.runtime.profiles_delete(id).await
+            }
             "ssh_test_connection" => {
                 let connection = stored_connection_from_arguments(arguments)?;
                 let started = std::time::Instant::now();
@@ -417,7 +507,9 @@ impl McpState {
             }
             _ => {
                 let result = match name {
-                    "ssh_exec" | "ssh_exec_sudo" => self.ssh_exec_tool(name, arguments).await,
+                    "ssh_exec" | "ssh_exec_sudo" => {
+                        self.ssh_exec_tool(name, arguments, emitter).await
+                    }
                     "ssh_metrics" => {
                         let connection = self.connection(arguments).await?;
                         exec::collect_metrics(&connection).await
@@ -446,15 +538,70 @@ impl McpState {
         }
     }
 
-    async fn ssh_exec_tool(&self, name: &str, arguments: &Value) -> Result<Value, String> {
+    async fn ssh_exec_tool(
+        &self,
+        name: &str,
+        arguments: &Value,
+        emitter: Option<&PluginEmitter>,
+    ) -> Result<Value, String> {
         let command = required_str(arguments, "command")?;
         let timeout_secs = arguments
             .get("timeoutSecs")
             .and_then(Value::as_u64)
             .map(|secs| Duration::from_secs(secs.clamp(5, 300)));
+        // A quickSudoProfile reference is resolved (and validated) before any
+        // connection I/O so unknown ids/names fail fast.
+        let sudo_profile = if name == "ssh_exec_sudo" {
+            let store = sudo_profiles::load_store(&self.runtime.data_dir());
+            resolve_profile_reference(&store, arguments)?
+        } else {
+            None
+        };
+        // Agent terminal routing (agent terminal mode plan §1): only the DBX
+        // embedded bridge carries an emitter plus a lifecycle connectionId;
+        // every other caller stays on the hidden exec channel below.
+        let run_in_terminal = arguments
+            .get("runInTerminal")
+            .and_then(Value::as_bool);
+        let connection_id = arguments
+            .get("connectionId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        match (emitter, connection_id) {
+            (Some(emitter), Some(connection_id)) => {
+                let mode = self.runtime.agent_terminal_mode(connection_id);
+                // An explicit runInTerminal wins; the connection mode decides
+                // when it is absent. Off keeps the existing path untouched.
+                let route = run_in_terminal.unwrap_or(mode != AgentTerminalMode::Off);
+                if route {
+                    return self
+                        .ssh_exec_terminal_tool(
+                            name,
+                            command,
+                            connection_id,
+                            timeout_secs,
+                            emitter,
+                        )
+                        .await;
+                }
+            }
+            (None, _) if run_in_terminal == Some(true) => {
+                return Err("runInTerminal requires the DBX embedded bridge".to_string());
+            }
+            (Some(_), None) if run_in_terminal == Some(true) => {
+                return Err(
+                    "runInTerminal requires a lifecycle connectionId from the DBX embedded bridge"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
         let connection = self.connection(arguments).await?;
         if name == "ssh_exec_sudo" {
-            let auth = sudo_auth(arguments);
+            let mut auth = sudo_auth(arguments);
+            if let Some(profile) = &sudo_profile {
+                apply_profile_fallbacks(&mut auth, profile);
+            }
             exec::exec_with_sudo(
                 &connection,
                 &auth,
@@ -472,6 +619,59 @@ impl McpState {
             )
             .await
             .map(|outcome| json!({ "output": outcome.output, "exitCode": outcome.exit_code }))
+        }
+    }
+
+    /// Terminal-routed `ssh_exec` / `ssh_exec_sudo`: resolves the
+    /// connection's live workbench PTY, applies the §1 approval matrix
+    /// (sudo and catastrophic mcp_safety hits are elevated), then types the
+    /// command into the terminal and captures the output.
+    async fn ssh_exec_terminal_tool(
+        &self,
+        name: &str,
+        command: &str,
+        connection_id: &str,
+        timeout_secs: Option<Duration>,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        let mode = self.runtime.agent_terminal_mode(connection_id);
+        let risk = if name == "ssh_exec_sudo" {
+            // Sudo runs through the user's terminal where the auto-sudo
+            // state machine or a human answers the password prompt.
+            agent_terminal::CommandRisk::Elevated
+        } else {
+            match mcp_safety::assess_command(command) {
+                mcp_safety::CommandRisk::Destructive(_) => {
+                    agent_terminal::CommandRisk::Elevated
+                }
+                _ => agent_terminal::CommandRisk::Low,
+            }
+        };
+        let timeout = timeout_secs.map(|duration| duration.as_secs());
+        // Both routing outcomes need the connection's live workbench PTY;
+        // a missing one gets the guidance error instead of the runtime's
+        // generic wording.
+        let session_id = self
+            .runtime
+            .session_id_for_connection(connection_id)
+            .await
+            .map_err(|_| NO_TERMINAL_SESSION_MESSAGE.to_string())?;
+        match agent_terminal::decide(mode, risk) {
+            agent_terminal::RoutingDecision::Run => {
+                self.runtime
+                    .exec_in_terminal(&session_id, name, command, risk, timeout, emitter)
+                    .await
+            }
+            agent_terminal::RoutingDecision::Prompt => {
+                let approved = self
+                    .runtime
+                    .request_agent_approval(&session_id, name, command, risk, None, emitter)
+                    .await?;
+                self.runtime
+                    .exec_in_terminal(&session_id, name, &approved, risk, timeout, emitter)
+                    .await
+            }
+            agent_terminal::RoutingDecision::Deny(reason) => Err(reason.to_string()),
         }
     }
 
@@ -524,6 +724,16 @@ impl McpState {
                 let sftp = entry.sftp().await?;
                 let exists = sftp.lock().await.metadata(path).await.is_ok();
                 Ok(json!({ "path": path, "exists": exists }))
+            }
+            "sftp_pwd" => {
+                let sftp = entry.sftp().await?;
+                let home = sftp
+                    .lock()
+                    .await
+                    .canonicalize(".")
+                    .await
+                    .map_err(sftp_error)?;
+                Ok(json!({ "home": home }))
             }
             "sftp_read_file" => {
                 let path = required_str(arguments, "path")?;
@@ -697,6 +907,151 @@ impl McpState {
         }
     }
 
+    /// `sftp_upload`: transfers one local file to the remote server. The
+    /// local side is validated (readable, within the configured
+    /// `maxUploadBytes`) before any connection I/O so bad paths fail fast;
+    /// those refusals leave the pooled connection untouched. SFTP transport
+    /// errors drop the cached connection so the next call reconnects.
+    async fn sftp_upload_tool(&self, arguments: &Value) -> Result<Value, String> {
+        let local_path = required_str(arguments, "localPath")?;
+        let remote_path = required_str(arguments, "remotePath")?;
+        let overwrite = arguments
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let data = std::fs::read(local_path)
+            .map_err(|error| format!("Cannot read local file {local_path}: {error}"))?;
+        let upload_limit = self.size_limits().max_upload_bytes;
+        if data.len() as u64 > upload_limit {
+            return Err(format!(
+                "Local file {local_path} is {} bytes and exceeds the MCP upload limit of \
+                 {upload_limit} bytes (adjust maxUploadBytes via mcp/settings/set)",
+                data.len()
+            ));
+        }
+        let outcome = self
+            .upload_via_sftp(arguments, local_path, remote_path, &data, overwrite)
+            .await;
+        if outcome.is_err() {
+            self.drop_connection(arguments).await;
+        }
+        outcome
+    }
+
+    async fn upload_via_sftp(
+        &self,
+        arguments: &Value,
+        local_path: &str,
+        remote_path: &str,
+        data: &[u8],
+        overwrite: bool,
+    ) -> Result<Value, String> {
+        self.connection(arguments).await?;
+        let mut guard = self.connections.write().await;
+        let entry = guard
+            .get_mut(&connection_pool_key(arguments))
+            .ok_or("Connection is not established")?;
+        let sftp = entry.sftp().await?;
+        if !overwrite && sftp.lock().await.metadata(remote_path).await.is_ok() {
+            return Err(format!(
+                "Remote path already exists: {remote_path} (pass overwrite=true to replace)"
+            ));
+        }
+        let mut file = sftp.lock().await.create(remote_path).await.map_err(sftp_error)?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, data)
+            .await
+            .map_err(|error| format!("SFTP write failed: {error}"))?;
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .map_err(|error| format!("SFTP write flush failed: {error}"))?;
+        Ok(json!({ "localPath": local_path, "remotePath": remote_path, "bytes": data.len() }))
+    }
+
+    /// `sftp_download`: transfers one remote file to a local path. The local
+    /// target is validated before dialing (those refusals keep the pooled
+    /// connection); the remote size is checked against the configured
+    /// `maxDownloadBytes` and transport errors drop the cached connection.
+    async fn sftp_download_tool(&self, arguments: &Value) -> Result<Value, String> {
+        let local_path = required_str(arguments, "localPath")?;
+        let remote_path = required_str(arguments, "remotePath")?;
+        let overwrite = arguments
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let local = Path::new(local_path);
+        if local.exists() && !overwrite {
+            return Err(format!(
+                "Local path already exists: {local_path} (pass overwrite=true to replace)"
+            ));
+        }
+        if let Some(parent) = local
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!("Cannot create local directory {}: {error}", parent.display())
+            })?;
+        }
+        let outcome = self
+            .download_via_sftp(arguments, remote_path, local_path)
+            .await;
+        if outcome.is_err() {
+            self.drop_connection(arguments).await;
+        }
+        outcome
+    }
+
+    async fn download_via_sftp(
+        &self,
+        arguments: &Value,
+        remote_path: &str,
+        local_path: &str,
+    ) -> Result<Value, String> {
+        self.connection(arguments).await?;
+        let download_limit = self.size_limits().max_download_bytes;
+        let mut guard = self.connections.write().await;
+        let entry = guard
+            .get_mut(&connection_pool_key(arguments))
+            .ok_or("Connection is not established")?;
+        let sftp = entry.sftp().await?;
+        let metadata = sftp
+            .lock()
+            .await
+            .metadata(remote_path)
+            .await
+            .map_err(sftp_error)?;
+        if metadata.is_dir() {
+            return Err(format!(
+                "{remote_path} is a directory; sftp_download transfers a single file"
+            ));
+        }
+        if let Some(size) = metadata.size {
+            if size > download_limit {
+                return Err(format!(
+                    "Remote file {remote_path} is {size} bytes and exceeds the MCP download \
+                     limit of {download_limit} bytes (adjust maxDownloadBytes via mcp/settings/set)"
+                ));
+            }
+        }
+        let file = sftp.lock().await.open(remote_path).await.map_err(sftp_error)?;
+        // `take` is the hard cap for files that reported no size (or grew
+        // between stat and open); the stat check above is only the fast path.
+        let mut data = Vec::new();
+        file.take(download_limit.saturating_add(1))
+            .read_to_end(&mut data)
+            .await
+            .map_err(|error| format!("SFTP read failed: {error}"))?;
+        if data.len() as u64 > download_limit {
+            return Err(format!(
+                "Remote file {remote_path} exceeds the MCP download limit of {download_limit} \
+                 bytes (adjust maxDownloadBytes via mcp/settings/set)"
+            ));
+        }
+        std::fs::write(local_path, &data)
+            .map_err(|error| format!("Cannot write local file {local_path}: {error}"))?;
+        Ok(json!({ "remotePath": remote_path, "localPath": local_path, "bytes": data.len() }))
+    }
+
     async fn ssh_close(&self, arguments: &Value) -> Result<Value, String> {
         let pool_id = connection_pool_key(arguments);
         let entry = self.connections.write().await.remove(&pool_id);
@@ -773,8 +1128,20 @@ impl McpState {
     /// `mcp/call` entry used by the DBX MCP bridge (`dbx_call_plugin_tool`):
     /// registers the forwarded connection lifecycle payload, then dispatches
     /// the tool with a `connectionId` reference so credentials never travel
-    /// inline with tool arguments.
-    pub async fn call_dbx(&self, params: &Value) -> Result<Value, String> {
+    /// inline with tool arguments. The emitter enables the agent terminal
+    /// routing (`runInTerminal` / `agentTerminalMode`); stdio mode passes
+    /// `None` and stays on the hidden exec channel.
+    pub async fn call_dbx(&self, params: &Value, emitter: PluginEmitter) -> Result<Value, String> {
+        self.call_dbx_with(params, Some(emitter)).await
+    }
+
+    /// Emitter-less variant; tests (and the stdio path semantics) use it to
+    /// exercise lifecycle registration without a bridge emitter.
+    pub(crate) async fn call_dbx_with(
+        &self,
+        params: &Value,
+        emitter: Option<PluginEmitter>,
+    ) -> Result<Value, String> {
         let tool = required_str(params, "tool")?.to_string();
         let mut arguments = params
             .get("arguments")
@@ -793,7 +1160,7 @@ impl McpState {
                 map.insert("connectionId".to_string(), json!(connection.id));
             }
         }
-        self.call_tool(&tool, &arguments).await
+        self.call_tool(&tool, &arguments, emitter.as_ref()).await
     }
 }
 
@@ -866,13 +1233,17 @@ fn connection_pool_key(arguments: &Value) -> String {
 
 /// Tools that mutate remote state and must be rejected on read-only
 /// connections (mirrors the workbench `ensure_writable` / sudo-exec gates).
-/// Plain `ssh_exec` stays allowed: it is the non-interactive shell already
-/// available to read-only sessions, like the workbench terminal.
+/// Plain `ssh_exec` is not listed: on read-only connections it is gated by
+/// the read-only command whitelist in `call_tool` instead, so inspection
+/// commands (`df`, `systemctl status`, ...) stay available. Like the
+/// workbench read-only terminal, `sudo` execution is always refused.
+/// `sftp_download` stays allowed too: it only reads the remote side.
 fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
         "ssh_exec_sudo"
             | "sftp_write_file"
+            | "sftp_upload"
             | "sftp_mkdir"
             | "sftp_remove"
             | "sftp_rename"
@@ -880,6 +1251,47 @@ fn is_write_tool(name: &str) -> bool {
             | "sftp_copy"
             | "sftp_move"
     )
+}
+
+/// Resolves the optional `quickSudoProfile` argument (id or exact name)
+/// before any connection I/O, so unknown references fail fast instead of
+/// dialing first.
+fn resolve_profile_reference(
+    store: &sudo_profiles::SudoProfileStore,
+    arguments: &Value,
+) -> Result<Option<sudo_profiles::SudoProfile>, String> {
+    let Some(reference) = arguments
+        .get("quickSudoProfile")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    sudo_profiles::find_by_ref(store, reference)
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| format!("Quick Sudo profile '{reference}' not found"))
+}
+
+/// Fills auth gaps from a resolved global Quick Sudo profile: fields the
+/// caller set explicitly always win; unset fields fall back to the profile.
+fn apply_profile_fallbacks(auth: &mut SudoAuth, profile: &sudo_profiles::SudoProfile) {
+    if auth.password.is_empty() && !profile.sudo_password.trim().is_empty() {
+        auth.password = profile.sudo_password.trim().to_string();
+    }
+    if auth.totp_secrets.is_empty() {
+        auth.totp_secrets = exec::parse_totp_secrets(&profile.totp_secret);
+    }
+    if auth.password_prompt_hint.is_empty() {
+        auth.password_prompt_hint = exec::sanitize_prompt_hint(&profile.password_prompt_hint);
+    }
+    if auth.totp_prompt_hint.is_empty() {
+        auth.totp_prompt_hint = exec::sanitize_prompt_hint(&profile.totp_prompt_hint);
+    }
+    if auth.flow_mode.is_none() {
+        auth.flow_mode = Some(AuthFlowMode::parse(&profile.auth_flow_mode));
+    }
 }
 
 fn sudo_auth(arguments: &Value) -> SudoAuth {
@@ -1088,19 +1500,30 @@ pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "ssh_exec",
-            "description": "Run a non-interactive remote shell command over SSH. Quick Sudo orchestration is NOT applied; use ssh_exec_sudo for privileged commands.",
+            "description": "Run a non-interactive remote shell command over SSH. Quick Sudo orchestration is NOT applied; use ssh_exec_sudo for privileged commands. Commands matching catastrophic patterns (disk formatting, recursive system deletes, shutdown, raw device writes, SQL DROP) require confirmDestructive: true; on read-only connections only whitelisted inspection commands (ls, cat, df, ps, systemctl status, journalctl, docker ps, ...) are allowed.",
             "inputSchema": {
                 "type": "object",
-                "properties": connection_properties(&[("command", "string", "Shell command to execute"), ("timeoutSecs", "integer", "Execution timeout in seconds (5-300)")]),
+                "properties": connection_properties(&[
+                    ("command", "string", "Shell command to execute"),
+                    ("timeoutSecs", "integer", "Execution timeout in seconds (5-300)"),
+                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
+                    ("runInTerminal", "boolean", "Run inside the user's open workbench terminal so the command and its output are visible and interruptible; only effective through the DBX embedded bridge (true fails in stdio mode)"),
+                ]),
                 "required": ["command"],
             },
         },
         {
             "name": "ssh_exec_sudo",
-            "description": "Run a remote shell command with sudo. The sudo password is piped over stdin and 2FA/TOTP prompts are answered automatically when totpSecret is configured.",
+            "description": "Run a remote shell command with sudo. The sudo password is piped over stdin and 2FA/TOTP prompts are answered automatically when a TOTP secret is available (inline arguments, or a shared global Quick Sudo profile referenced by quickSudoProfile; explicit arguments win). Commands matching catastrophic patterns require confirmDestructive: true; refused outright on read-only connections.",
             "inputSchema": {
                 "type": "object",
-                "properties": connection_properties(&[("command", "string", "Shell command to execute with sudo"), ("timeoutSecs", "integer", "Execution timeout in seconds (5-300)")]),
+                "properties": connection_properties(&[
+                    ("command", "string", "Shell command to execute with sudo"),
+                    ("timeoutSecs", "integer", "Execution timeout in seconds (5-300)"),
+                    ("quickSudoProfile", "string", "Global Quick Sudo profile id or exact name supplying sudo password/TOTP/prompt defaults"),
+                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
+                    ("runInTerminal", "boolean", "Run inside the user's open workbench terminal so the command and its output are visible and interruptible; only effective through the DBX embedded bridge (true fails in stdio mode)"),
+                ]),
                 "required": ["command"],
             },
         },
@@ -1145,6 +1568,42 @@ pub fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "ssh_quick_sudo_profiles_list",
+            "description": "List the plugin's global Quick Sudo profiles: named sudo password/TOTP/prompt presets reusable across connections. Secrets are reported as configured flags only, never as values.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "ssh_quick_sudo_profiles_save",
+            "description": "Create or update a global Quick Sudo profile (supply id to update). Empty sudoPassword/totpSecret keep the stored values; clearSudoPassword/clearTotpSecret remove them. Returns the profile without secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Profile id to update; omit to create" },
+                    "name": { "type": "string", "description": "Unique display name (max 64 characters)" },
+                    "sudoPassword": { "type": "string", "description": "Sudo password; empty keeps the stored one" },
+                    "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32 key, or static code); empty keeps the stored one" },
+                    "clearSudoPassword": { "type": "boolean", "description": "Set true to remove the stored sudo password" },
+                    "clearTotpSecret": { "type": "boolean", "description": "Set true to remove the stored TOTP secret" },
+                    "authFlowMode": { "type": "string", "enum": ["password_only", "password_plus_otp", "password_then_otp"] },
+                    "passwordPromptHint": { "type": "string" },
+                    "totpPromptHint": { "type": "string" },
+                    "sudoUsePty": { "type": "boolean", "description": "Request a PTY for sudo executions using this profile" },
+                },
+                "required": ["name"],
+            },
+        },
+        {
+            "name": "ssh_quick_sudo_profiles_delete",
+            "description": "Delete a global Quick Sudo profile by id. Connections bound to it fall back to their own sudo configuration.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Profile id" },
+                },
+                "required": ["id"],
+            },
+        },
+        {
             "name": "sftp_list_dir",
             "description": "List a remote directory over SFTP.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"] },
@@ -1158,6 +1617,29 @@ pub fn tool_definitions() -> Value {
             "name": "sftp_exists",
             "description": "Check whether a remote path exists.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"] },
+        },
+        {
+            "name": "sftp_pwd",
+            "description": "Return the remote login user's home directory (canonicalized absolute path over SFTP).",
+            "inputSchema": { "type": "object", "properties": connection_properties(&[]), "required": required_connection() },
+        },
+        {
+            "name": "sftp_upload",
+            "description": "Upload a local file to the remote server over SFTP (single file, no directory recursion). The local file must be readable by the MCP server process; size is capped by the configured maxUploadBytes.",
+            "inputSchema": { "type": "object", "properties": connection_properties(&[
+                ("localPath", "string", "Local file path to upload"),
+                ("remotePath", "string", "Remote file path to create"),
+                ("overwrite", "boolean", "Set true to replace an existing remote file"),
+            ]), "required": ["localPath", "remotePath"] },
+        },
+        {
+            "name": "sftp_download",
+            "description": "Download a remote file to a local path over SFTP (single file). Remote size is capped by the configured maxDownloadBytes; missing local parent directories are created.",
+            "inputSchema": { "type": "object", "properties": connection_properties(&[
+                ("remotePath", "string", "Remote file path to download"),
+                ("localPath", "string", "Local target file path"),
+                ("overwrite", "boolean", "Set true to replace an existing local file"),
+            ]), "required": ["remotePath", "localPath"] },
         },
         {
             "name": "sftp_read_file",
@@ -1269,9 +1751,13 @@ mod tests {
             "ssh_test_connection",
             "ssh_list_known_hosts",
             "ssh_remove_known_host",
+            "ssh_quick_sudo_profiles_list",
+            "ssh_quick_sudo_profiles_save",
+            "ssh_quick_sudo_profiles_delete",
             "sftp_list_dir",
             "sftp_stat",
             "sftp_exists",
+            "sftp_pwd",
             "sftp_read_file",
             "sftp_write_file",
             "sftp_mkdir",
@@ -1281,6 +1767,8 @@ mod tests {
             "sftp_copy",
             "sftp_move",
             "sftp_disk_usage",
+            "sftp_upload",
+            "sftp_download",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -1296,6 +1784,29 @@ mod tests {
             .unwrap();
         let props = read["inputSchema"]["properties"].as_object().unwrap();
         assert!(props.contains_key("offset"), "sftp_read_file lacks offset");
+        // Transfer tools expose the local/remote path pair and overwrite knob.
+        for tool_name in ["sftp_upload", "sftp_download"] {
+            let tool = tools.iter().find(|t| t["name"] == tool_name).unwrap();
+            let props = tool["inputSchema"]["properties"].as_object().unwrap();
+            assert!(props.contains_key("localPath"), "{tool_name} lacks localPath");
+            assert!(props.contains_key("remotePath"), "{tool_name} lacks remotePath");
+            assert!(props.contains_key("overwrite"), "{tool_name} lacks overwrite");
+        }
+        let sudo = tools.iter().find(|t| t["name"] == "ssh_exec_sudo").unwrap();
+        let sudo_props = sudo["inputSchema"]["properties"].as_object().unwrap();
+        assert!(
+            sudo_props.contains_key("quickSudoProfile"),
+            "ssh_exec_sudo lacks quickSudoProfile"
+        );
+        // Both exec tools advertise the terminal routing knob.
+        for tool_name in ["ssh_exec", "ssh_exec_sudo"] {
+            let tool = tools.iter().find(|t| t["name"] == tool_name).unwrap();
+            let props = tool["inputSchema"]["properties"].as_object().unwrap();
+            assert!(
+                props.contains_key("runInTerminal"),
+                "{tool_name} lacks runInTerminal"
+            );
+        }
         let metrics = tools.iter().find(|t| t["name"] == "ssh_metrics").unwrap();
         assert!(metrics["description"]
             .as_str()
@@ -1320,12 +1831,12 @@ mod tests {
         let missing = state
             .dispatch(json!({
                 "jsonrpc": "2.0", "id": 9, "method": "tools/call",
-                "params": { "name": "ssh_exec", "arguments": { "host": "example.com", "username": "u" } },
+                "params": { "name": "sftp_upload", "arguments": { "host": "example.com", "username": "u" } },
             }))
             .await
             .unwrap();
         let text = missing["error"]["message"].as_str().unwrap();
-        assert!(text.contains("command"), "unexpected error: {text}");
+        assert!(text.contains("localPath"), "unexpected error: {text}");
 
         let no_password = state
             .dispatch(json!({
@@ -1336,6 +1847,145 @@ mod tests {
             .unwrap();
         let message = no_password["error"]["message"].as_str().unwrap_or_default();
         assert!(message.contains("password"), "unexpected error: {message}");
+    }
+
+    #[tokio::test]
+    async fn transfer_tools_validate_the_local_side_before_dialing() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = McpState::new(directory.path().join("data"));
+        let remote = json!({ "host": "203.0.113.1", "username": "u", "password": "p" });
+        let merge = |mut base: Value, extra: Value| {
+            for (key, value) in extra.as_object().unwrap() {
+                base[key.as_str()] = value.clone();
+            }
+            base
+        };
+
+        // A missing local file fails before any connection attempt.
+        let missing_file = state
+            .run_tool(
+                "sftp_upload",
+                &merge(
+                    remote.clone(),
+                    json!({ "localPath": "/no/such/file.bin", "remotePath": "/tmp/x" }),
+                ),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            missing_file.contains("Cannot read local file"),
+            "unexpected error: {missing_file}"
+        );
+
+        // The upload cap follows the configured maxUploadBytes.
+        let local_file = directory.path().join("payload.bin");
+        std::fs::write(&local_file, vec![0u8; 64]).unwrap();
+        state
+            .settings_set(&json!({ "maxUploadBytes": 8 }))
+            .unwrap();
+        let too_big = state
+            .run_tool(
+                "sftp_upload",
+                &merge(
+                    remote.clone(),
+                    json!({ "localPath": local_file.display().to_string(), "remotePath": "/tmp/x" }),
+                ),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            too_big.contains("upload limit"),
+            "unexpected error: {too_big}"
+        );
+
+        // An existing local target refuses to be replaced without overwrite.
+        let existing_target = directory.path().join("already-here.txt");
+        std::fs::write(&existing_target, "keep").unwrap();
+        let refused = state
+            .run_tool(
+                "sftp_download",
+                &merge(
+                    remote,
+                    json!({
+                        "remotePath": "/tmp/remote.txt",
+                        "localPath": existing_target.display().to_string(),
+                    }),
+                ),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            refused.contains("Local path already exists"),
+            "unexpected error: {refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_sudo_profiles_roundtrip_without_echoing_secrets() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbx-mcp-profiles-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = McpState::new(dir.clone());
+        // Test-only secret assembled at runtime (never a real credential).
+        let secret = format!("test-{}", uuid::Uuid::new_v4());
+
+        let saved = state
+            .run_tool(
+                "ssh_quick_sudo_profiles_save",
+                &json!({
+                    "name": "ops",
+                    "sudoPassword": secret,
+                    "totpSecret": "JBSWY3DPEHPK3PXP",
+                    "authFlowMode": "password_plus_otp",
+                    "sudoUsePty": true,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved["created"], true);
+        assert_eq!(saved["profile"]["sudoPasswordSet"], true);
+        assert_eq!(saved["profile"]["totpConfigured"], true);
+
+        let listed = state
+            .run_tool("ssh_quick_sudo_profiles_list", &json!({}), None)
+            .await
+            .unwrap();
+        let rendered = listed.to_string();
+        assert!(!rendered.contains(&secret), "secret leaked: {rendered}");
+        assert!(rendered.contains("\"sudoPasswordSet\":true"));
+
+        // Duplicate names are rejected, unknown references report clearly.
+        let duplicate = state
+            .run_tool("ssh_quick_sudo_profiles_save", &json!({ "name": "OPS" }), None)
+            .await;
+        assert!(duplicate.unwrap_err().contains("already in use"));
+        let missing = resolve_profile_reference(
+            &sudo_profiles::load_store(&dir),
+            &json!({ "quickSudoProfile": "ghost" }),
+        );
+        assert!(missing.unwrap_err().contains("not found"));
+
+        let id = saved["profile"]["id"].as_str().unwrap().to_string();
+        let removed = state
+            .run_tool("ssh_quick_sudo_profiles_delete", &json!({ "id": id }), None)
+            .await
+            .unwrap();
+        assert_eq!(removed["removed"], true);
+        let listed = state
+            .run_tool("ssh_quick_sudo_profiles_list", &json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(listed["profiles"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1516,6 +2166,193 @@ mod tests {
         let reloaded = McpState::new(directory.path().to_path_buf());
         assert_eq!(reloaded.settings_get(), ceilings);
     }
+
+    #[tokio::test]
+    async fn destructive_commands_require_explicit_confirmation() {
+        let state = state();
+        // Refused without the flag; the refusal happens before credential
+        // validation (no "password" complaint), proving the gate ordering.
+        let refused = state
+            .dispatch(json!({
+                "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+                "params": { "name": "ssh_exec", "arguments": {
+                    "host": "203.0.113.1", "username": "u",
+                    "command": "mkfs.ext4 /dev/sda1",
+                }},
+            }))
+            .await
+            .unwrap();
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains("confirmDestructive"), "unexpected: {message}");
+        assert!(!message.contains("password"), "gate must fire first: {message}");
+
+        // With the flag the gate passes and the call proceeds to parameter
+        // validation (missing password), proving it was not blocked.
+        let gated_through = state
+            .dispatch(json!({
+                "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+                "params": { "name": "ssh_exec", "arguments": {
+                    "host": "203.0.113.1", "username": "u",
+                    "command": "mkfs.ext4 /dev/sda1",
+                    "confirmDestructive": true,
+                }},
+            }))
+            .await
+            .unwrap();
+        let message = gated_through["error"]["message"].as_str().unwrap();
+        assert!(message.contains("password"), "unexpected: {message}");
+
+        // The same gate covers the sudo tool, and pipelines leak through
+        // chain segments.
+        for tool in ["ssh_exec_sudo"] {
+            let chained = state
+                .dispatch(json!({
+                    "jsonrpc": "2.0", "id": 32, "method": "tools/call",
+                    "params": { "name": tool, "arguments": {
+                        "host": "203.0.113.1", "username": "u",
+                        "command": "uptime && shutdown -h now",
+                    }},
+                }))
+                .await
+                .unwrap();
+            let message = chained["error"]["message"].as_str().unwrap();
+            assert!(message.contains("confirmDestructive"), "unexpected: {message}");
+        }
+    }
+
+    /// Without the DBX embedded bridge (no emitter), `runInTerminal: true`
+    /// is refused with guidance instead of silently running hidden, and the
+    /// read-only/destructive gates keep firing before the routing branch.
+    #[tokio::test]
+    async fn run_in_terminal_requires_the_embedded_bridge() {
+        let state = state();
+
+        let refused = state
+            .run_tool(
+                "ssh_exec",
+                &json!({ "host": "h", "username": "u", "command": "echo hi", "runInTerminal": true }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            refused.contains("runInTerminal requires the DBX embedded bridge"),
+            "unexpected: {refused}"
+        );
+
+        // The same refusal covers the sudo tool; runInTerminal absent or
+        // false keeps the existing hidden-channel behavior (which then fails
+        // on the missing password, proving the route was not taken).
+        let sudo = state
+            .run_tool(
+                "ssh_exec_sudo",
+                &json!({ "host": "h", "username": "u", "command": "uptime", "runInTerminal": true }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            sudo.contains("runInTerminal requires the DBX embedded bridge"),
+            "unexpected: {sudo}"
+        );
+        let hidden = state
+            .run_tool(
+                "ssh_exec",
+                &json!({ "host": "h", "username": "u", "command": "echo hi", "runInTerminal": false }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            !hidden.contains("runInTerminal"),
+            "false must keep the hidden channel: {hidden}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_connection_gates_writes_and_unknown_commands() {        let state = McpState::shared(Arc::new(SshRuntime::new(
+            std::env::temp_dir().join("dbx-mcp-readonly-test"),
+        )));
+        let lifecycle = json!({
+            "connection": {
+                "id": "conn-readonly",
+                "name": "Prod bastion",
+                "host": "192.0.2.10",
+                "port": 22,
+                "username": "ops",
+                "password": "secret",
+                "external_config": { "authentication": "password", "read_only": true },
+            },
+            "runtime": { "host": "192.0.2.10", "port": 22 },
+            "operationId": "op-ro",
+        });
+
+        // Write-class tools are rejected on sight.
+        for tool in ["sftp_write_file", "ssh_exec_sudo"] {
+            let error = state
+                .call_dbx_with(
+                    &json!({
+                        "tool": tool,
+                        "arguments": { "command": "uptime", "path": "/tmp/x", "content": "y" },
+                        "lifecycle": lifecycle,
+                    }),
+                    None,
+                )
+                .await
+                .err()
+                .expect("write tool must be refused on a read-only connection");
+            assert!(error.contains("read-only"), "unexpected: {error}");
+        }
+
+        // ssh_exec survives only for provably read-only commands: an
+        // unrecognized mutating command is refused by the whitelist (before
+        // any dialing), while a destructive pattern is refused outright.
+        let unknown = state
+            .call_dbx_with(
+                &json!({
+                    "tool": "ssh_exec",
+                    "arguments": { "command": "systemctl restart nginx" },
+                    "lifecycle": lifecycle,
+                }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(unknown.contains("not recognized"), "unexpected: {unknown}");
+
+        let destructive = state
+            .call_dbx_with(
+                &json!({
+                    "tool": "ssh_exec",
+                    "arguments": { "command": "rm -rf /etc" },
+                    "lifecycle": lifecycle,
+                }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(destructive.contains("Refused on read-only"), "unexpected: {destructive}");
+
+        // confirmDestructive cannot override a read-only connection.
+        let confirmed = state
+            .call_dbx_with(
+                &json!({
+                    "tool": "ssh_exec",
+                    "arguments": { "command": "rm -rf /etc", "confirmDestructive": true },
+                    "lifecycle": lifecycle,
+                }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(confirmed.contains("Refused on read-only"), "unexpected: {confirmed}");
+    }
 }
 
 #[cfg(test)]
@@ -1544,8 +2381,9 @@ mod dbx_bridge_tests {
 
         // A tool that needs no connection runs right away.
         let listed = state
-            .call_dbx(
+            .call_dbx_with(
                 &json!({ "tool": "ssh_list_known_hosts", "arguments": {}, "lifecycle": lifecycle }),
+                None,
             )
             .await
             .unwrap();
@@ -1558,7 +2396,7 @@ mod dbx_bridge_tests {
         // gets past credential resolution (it fails on the missing command
         // parameter, proving connectionId routing works end to end).
         let err = state
-            .call_dbx(&json!({ "tool": "ssh_exec", "arguments": {} }))
+            .call_dbx_with(&json!({ "tool": "ssh_exec", "arguments": {} }), None)
             .await
             .err()
             .unwrap();
@@ -1571,11 +2409,14 @@ mod dbx_bridge_tests {
             std::env::temp_dir().join("dbx-mcp-bridge-test-2"),
         )));
         let err = state
-            .call_dbx(&json!({
-                "tool": "ssh_exec",
-                "arguments": { "command": "true" },
-                "lifecycle": { "connection": { "id": "x", "username": "u", "password": "p" } },
-            }))
+            .call_dbx_with(
+                &json!({
+                    "tool": "ssh_exec",
+                    "arguments": { "command": "true" },
+                    "lifecycle": { "connection": { "id": "x", "username": "u", "password": "p" } },
+                }),
+                None,
+            )
             .await
             .err()
             .unwrap();

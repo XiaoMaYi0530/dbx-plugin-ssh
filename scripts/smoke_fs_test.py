@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -320,6 +321,114 @@ def main() -> None:
                     raise
             print(f"    removed {sudo_dir}")
 
+        # -- quick sudo profiles group (local config store, session-less) -------
+
+        profile_state: dict = {}
+        # 测试专用密钥：运行时拼装，绝不使用真实凭据。
+        profile_secret = f"smoke-{uuid.uuid4().hex}"
+
+        def case_profiles_list_initial():
+            result = req("sudo/profiles/list", {})
+            if "profiles" not in result:
+                raise AssertionError(f"missing profiles key: {json.dumps(result)[:160]}")
+            print(f"    {len(result['profiles'])} profile(s) initially")
+
+        def case_profiles_save_create():
+            result = req("sudo/profiles/save", {
+                "name": "smoke-ops",
+                "sudoPassword": profile_secret,
+                "totpSecret": "JBSWY3DPEHPK3PXP",
+                "authFlowMode": "password_plus_otp",
+                "sudoUsePty": True,
+            })
+            profile = result.get("profile") or {}
+            profile_state["id"] = profile.get("id")
+            if result.get("created") is not True:
+                raise AssertionError(f"want created=true: {json.dumps(result)[:160]}")
+            if profile.get("sudoPasswordSet") is not True or profile.get("totpConfigured") is not True:
+                raise AssertionError(f"secret flags missing: {json.dumps(profile)[:160]}")
+            if profile_secret in json.dumps(result):
+                raise AssertionError("save response echoed the secret")
+
+        def case_profiles_duplicate_name():
+            error = None
+            try:
+                req("sudo/profiles/save", {"name": "SMOKE-OPS"})
+            except SidecarError as raised:
+                error = str(raised)
+                if missing_method(raised) is not None:
+                    raise
+            if error is None:
+                raise AssertionError("duplicate name was accepted")
+            if "already in use" not in error:
+                raise AssertionError(f"unexpected duplicate error: {error}")
+
+        def case_profiles_update_keeps_secret():
+            profile_id = profile_state.get("id")
+            if not profile_id:
+                raise AssertionError("no profile id from create case")
+            result = req("sudo/profiles/save", {
+                "id": profile_id,
+                "name": "smoke-ops",
+                "sudoPassword": "",
+                "sudoUsePty": True,
+            })
+            profile = result.get("profile") or {}
+            if profile.get("sudoPasswordSet") is not True:
+                raise AssertionError("blank sudoPassword dropped the stored secret")
+            if profile.get("sudoUsePty") is not True:
+                raise AssertionError("sudoUsePty not updated")
+
+        def case_profiles_list_hides_secrets():
+            result = req("sudo/profiles/list", {})
+            if profile_secret in json.dumps(result):
+                raise AssertionError("list response echoed the secret")
+            names = [profile.get("name") for profile in result.get("profiles") or []]
+            if "smoke-ops" not in names:
+                raise AssertionError(f"smoke-ops missing from list: {names}")
+
+        def case_profiles_settings_binding():
+            profile_id = profile_state.get("id")
+            if not profile_id:
+                raise AssertionError("no profile id from create case")
+            bound = req("ssh/settings/set", {"sessionId": session_id, "quickSudoProfileId": profile_id})
+            if bound.get("quickSudoProfileId") != profile_id:
+                raise AssertionError(f"binding not reported: {json.dumps(bound)[:160]}")
+            if bound.get("quickSudoProfileName") != "smoke-ops":
+                raise AssertionError(f"binding name missing: {json.dumps(bound)[:160]}")
+            cleared = req("ssh/settings/set", {"sessionId": session_id, "quickSudoProfileId": ""})
+            if cleared.get("quickSudoProfileId"):
+                raise AssertionError(f"binding not cleared: {json.dumps(cleared)[:160]}")
+
+        def case_profiles_delete():
+            profile_id = profile_state.get("id")
+            if not profile_id:
+                raise AssertionError("no profile id from create case")
+            removed = req("sudo/profiles/delete", {"id": profile_id})
+            if removed.get("removed") is not True:
+                raise AssertionError(f"want removed=true: {json.dumps(removed)[:160]}")
+            again = req("sudo/profiles/delete", {"id": profile_id})
+            if again.get("removed") is not False:
+                raise AssertionError(f"repeat delete should be a no-op: {json.dumps(again)[:160]}")
+
+        def case_connection_action_profiles():
+            result = req("connection/action",
+                         {"action": "quick-sudo-profiles", "id": connection_id})
+            message = result.get("message") or ""
+            if "smoke-ops" not in message:
+                raise AssertionError(f"action message missing profile: {message[:200]}")
+            if "uses its own sudo configuration" not in message:
+                raise AssertionError(f"action message missing binding line: {message[:200]}")
+            unknown = None
+            try:
+                req("connection/action", {"action": "no-such-action"})
+            except SidecarError as raised:
+                unknown = str(raised)
+                if missing_method(raised) is not None:
+                    raise
+            if unknown is None or "Unknown connection action" not in unknown:
+                raise AssertionError(f"unknown action not rejected: {unknown}")
+
         # -- keys group ------------------------------------------------------------
 
         def case_keys_discover():
@@ -334,6 +443,100 @@ def main() -> None:
             result = req("ssh/knownHosts/list", {})
             entries = result.get("entries") or []
             print(f"    {len(entries)} known-host entries")
+
+        # -- agent terminal group ----------------------------------------------
+
+        # A second registered connection with no open terminal session drives
+        # the "no open terminal session" guidance error.
+        agent_conn_id = "smoke-fs-agent-conn"
+        agent_connection = dict(connection, id=agent_conn_id, name="smoke-fs-agent")
+
+        def call_tool_embedded(tool: str, arguments: dict, connection_id: str = connection_id,
+                               on_event=None, timeout: float = 90.0) -> dict:
+            """Drive the DBX embedded bridge path (mcp/call + lifecycle).
+
+            Tool results arrive MCP-style wrapped in content[0].text; tool
+            errors surface as RPC errors (SidecarError) from mcp/call.
+            """
+            params = {
+                "tool": tool,
+                "arguments": arguments,
+                "lifecycle": lifecycle_params(dict(agent_connection, id=connection_id,
+                                                   name=connection_id)),
+            }
+            result = client.request("mcp/call", params, timeout=timeout, on_event=on_event)
+            if result.get("isError"):
+                raise SidecarError(str(result))
+            return json.loads(result["content"][0]["text"])
+
+        def approve_agent_prompt(event: dict) -> dict | None:
+            if event.get("method") != "ssh/agent/prompt":
+                return None
+            params = event.get("params", {})
+            print(f"    agent approval: risk={params.get('risk')} "
+                  f"command={str(params.get('command'))[:60]!r}")
+            return {"method": "ssh/agent/resolve",
+                    "params": {"challengeId": params["challengeId"], "decision": "approve"}}
+
+        def deny_agent_prompt(event: dict) -> dict | None:
+            if event.get("method") != "ssh/agent/prompt":
+                return None
+            return {"method": "ssh/agent/resolve",
+                    "params": {"challengeId": event["params"]["challengeId"],
+                               "decision": "deny"}}
+
+        def case_agent_mode_roundtrip():
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "auto"})
+            got = req("ssh/settings/get", {"sessionId": session_id}).get("agentTerminalMode")
+            if got != "auto":
+                raise AssertionError(f"agentTerminalMode={got!r}, want 'auto'")
+
+        def case_agent_no_session_error():
+            try:
+                call_tool_embedded("ssh_exec", {"command": "echo smoke", "runInTerminal": True},
+                                   connection_id=agent_conn_id)
+            except SidecarError as error:
+                message = str(error)
+                if "No open terminal session" not in message:
+                    raise AssertionError(f"unexpected error: {message}")
+                print(f"    guidance error ok: {message[:90]}")
+                return
+            raise AssertionError("terminal exec without a session unexpectedly succeeded")
+
+        def case_agent_terminal_exec():
+            marker = f"agent-terminal-ok-{int(time.time())}"
+            result = call_tool_embedded("ssh_exec", {"command": f"echo {marker}"})
+            if result.get("mode") != "terminal":
+                raise AssertionError(f"mode={result.get('mode')!r}, want 'terminal'")
+            if marker not in str(result.get("output", "")):
+                raise AssertionError(f"output missing marker: {str(result.get('output'))[:200]}")
+            if result.get("incomplete") is not False:
+                raise AssertionError(f"incomplete={result.get('incomplete')!r}, want False")
+            print(f"    routed output: {str(result.get('output'))[:80]!r}")
+
+        def case_agent_strict_approval():
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "strict"})
+            marker = f"agent-approved-{int(time.time())}"
+            result = call_tool_embedded("ssh_exec", {"command": f"echo {marker}"},
+                                        on_event=approve_agent_prompt)
+            if marker not in str(result.get("output", "")):
+                raise AssertionError(f"approved exec output missing marker: "
+                                     f"{str(result.get('output'))[:200]}")
+
+        def case_agent_deny():
+            marker = f"agent-denied-{int(time.time())}"
+            try:
+                call_tool_embedded("ssh_exec", {"command": f"echo {marker}"},
+                                   on_event=deny_agent_prompt)
+            except SidecarError as error:
+                if "denied" not in str(error):
+                    raise AssertionError(f"unexpected deny error: {error}")
+                print(f"    denied as expected: {str(error)[:80]}")
+            else:
+                raise AssertionError("denied command unexpectedly succeeded")
+            finally:
+                req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "off"})
+
 
         report = Report()
         print("\n--- sftp_ext group ---")
@@ -362,9 +565,38 @@ def main() -> None:
         report.run("sudo/removeAll .sudo-test", "sudo/removeAll", case_sudo_remove_all,
                    needs="sudo/mkdir .sudo-test")
 
+        print("\n--- quick sudo profiles group ---")
+        report.run("sudo/profiles/list initial", "sudo/profiles/list", case_profiles_list_initial)
+        report.run("sudo/profiles/save create", "sudo/profiles/save", case_profiles_save_create)
+        report.run("sudo/profiles/save duplicate name rejected", "sudo/profiles/save",
+                   case_profiles_duplicate_name, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/save update keeps secret", "sudo/profiles/save",
+                   case_profiles_update_keeps_secret, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/list hides secrets", "sudo/profiles/list",
+                   case_profiles_list_hides_secrets, needs="sudo/profiles/save create")
+        report.run("ssh/settings binds profile", "ssh/settings/set",
+                   case_profiles_settings_binding, needs="sudo/profiles/save create")
+        report.run("connection/action quick-sudo-profiles", "connection/action",
+                   case_connection_action_profiles, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/delete + repeat", "sudo/profiles/delete",
+                   case_profiles_delete, needs="sudo/profiles/save create")
+
         print("\n--- keys group ---")
         report.run("keys/discover", "keys/discover", case_keys_discover)
         report.run("ssh/knownHosts/list", "ssh/knownHosts/list", case_known_hosts)
+
+        print("\n--- agent terminal group ---")
+        report.run("agent mode settings round-trip", "ssh/settings/set", case_agent_mode_roundtrip)
+        report.run("connection/connect agent conn", "connection/connect",
+                   lambda: req("connection/connect", lifecycle_params(agent_connection)))
+        report.run("agent exec without session errors with guidance", "mcp/call",
+                   case_agent_no_session_error, needs="connection/connect agent conn")
+        report.run("agent terminal exec routes to PTY", "mcp/call", case_agent_terminal_exec,
+                   needs="agent mode settings round-trip")
+        report.run("agent strict approval approve", "mcp/call", case_agent_strict_approval,
+                   needs="agent terminal exec routes to PTY")
+        report.run("agent strict approval deny", "mcp/call", case_agent_deny,
+                   needs="agent strict approval approve")
 
         step("cleanup leftovers")
         for path, recursive in ((touch_path, False), (write_path, False),
