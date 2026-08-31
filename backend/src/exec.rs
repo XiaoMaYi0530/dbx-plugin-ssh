@@ -159,6 +159,12 @@ impl SudoAuth {
         !self.totp_secrets.is_empty()
     }
 
+    /// True when the auth can answer something (a sudo password or a TOTP
+    /// secret); drives whether the in-terminal watcher is attached.
+    pub fn useful(&self) -> bool {
+        !self.password.is_empty() || self.totp_configured()
+    }
+
     fn flow_mode(&self) -> AuthFlowMode {
         self.flow_mode.unwrap_or(AuthFlowMode::PasswordThenOtp)
     }
@@ -1160,14 +1166,6 @@ impl TerminalAutoSudo {
         }
     }
 
-    pub fn is_useful(&self) -> bool {
-        let auth = self
-            .auth
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
-        !auth.password.is_empty() || auth.totp_configured()
-    }
-
     /// Feeds one terminal output chunk and returns the answer to type back
     /// (without the carriage return), if any prompt was answered.
     pub fn observe(&mut self, chunk: &str) -> Option<(AutoSudoKind, String)> {
@@ -1795,6 +1793,49 @@ mod rotation_tests {
         assert_eq!(
             auto.observe("[sudo] password for user: "),
             Some((AutoSudoKind::Password, "pw2".to_string()))
+        );
+    }
+
+    #[test]
+    fn sudo_auth_usefulness_drives_watcher_attach() {
+        // No password and no TOTP: the connection cannot answer anything.
+        assert!(!SudoAuth::default().useful());
+        assert!(terminal_auth_for("").useful(), "TOTP alone is enough");
+        assert!(terminal_auth_for("pw").useful());
+    }
+
+    /// A watcher never attached for a credential-less session (key-auth
+    /// connect, nothing configured yet) must start answering once the user
+    /// configures Quick Sudo at runtime — sync re-arms it from the updated
+    /// shared auth instead of staying detached for the session's lifetime.
+    #[test]
+    fn terminal_auto_sudo_arms_after_late_configuration() {
+        let shared = Arc::new(RwLock::new(SudoAuth::default()));
+        // Pre-configuration: sync sees a useless auth and keeps no watcher,
+        // so nothing answers the prompt.
+        assert!(!shared.read().unwrap().useful());
+        let mut watcher: Option<TerminalAutoSudo> = None;
+        assert_eq!(
+            watcher
+                .as_mut()
+                .and_then(|auto| auto.observe("[sudo] password for user: ")),
+            None
+        );
+
+        // The user saves a sudo password + hint while the terminal is open;
+        // sync_auto_sudo re-arms the watcher from the updated shared auth.
+        {
+            let mut auth = shared.write().unwrap();
+            auth.password = "late-pw".to_string();
+            auth.password_prompt_hint = "password for".to_string();
+        }
+        assert!(shared.read().unwrap().useful());
+        watcher = Some(TerminalAutoSudo::new(shared.clone()));
+        assert_eq!(
+            watcher
+                .as_mut()
+                .and_then(|auto| auto.observe("[sudo] password for user: ")),
+            Some((AutoSudoKind::Password, "late-pw".to_string()))
         );
     }
 

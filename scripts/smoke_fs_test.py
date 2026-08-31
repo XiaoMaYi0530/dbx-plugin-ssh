@@ -397,6 +397,21 @@ def main() -> None:
             if "smoke-ops" not in names:
                 raise AssertionError(f"smoke-ops missing from list: {names}")
 
+        def case_profiles_options():
+            result = req("sudo/profiles/options", {})
+            options = result.get("options")
+            if not isinstance(options, list):
+                raise AssertionError(f"missing options list: {json.dumps(result)[:160]}")
+            if profile_secret in json.dumps(result):
+                raise AssertionError("options response echoed the secret")
+            profile_id = profile_state.get("id")
+            match = next((entry for entry in options if entry.get("value") == profile_id), None)
+            if match is None:
+                raise AssertionError(f"created profile missing from options: {json.dumps(result)[:200]}")
+            if match.get("label") != "smoke-ops":
+                raise AssertionError(f"option label mismatch: {json.dumps(match)}")
+            print(f"    {len(options)} option(s) for the connection-form dropdown")
+
         def case_profiles_settings_binding():
             profile_id = profile_state.get("id")
             if not profile_id:
@@ -814,6 +829,8 @@ def main() -> None:
                    case_profiles_update_keeps_secret, needs="sudo/profiles/save create")
         report.run("sudo/profiles/list hides secrets", "sudo/profiles/list",
                    case_profiles_list_hides_secrets, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/options dropdown payload", "sudo/profiles/options",
+                   case_profiles_options, needs="sudo/profiles/save create")
         report.run("ssh/settings binds profile", "ssh/settings/set",
                    case_profiles_settings_binding, needs="sudo/profiles/save create")
         report.run("connection/action quick-sudo-profiles", "connection/action",

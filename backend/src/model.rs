@@ -734,7 +734,7 @@ mod tests {
         // sudo 覆盖簇跟随表单选定的凭据来源（sudo_source）：自定义模式下才
         // 出现本连接密码/PTY；global 模式出现全局配置引用；2FA 编排字段
         // （totp_secret/auth_flow_mode/hints）服务登录期 keyboard-interactive，
-        // 必须保持常显。
+        // global 模式下整体由全局配置接管故隐藏，off/custom 模式仍常显。
         let visible_when = |key: &str| -> Option<(String, Vec<String>)> {
             fields
                 .iter()
@@ -769,7 +769,11 @@ mod tests {
             "sudo_profile must show only for sudo_source=global"
         );
         for key in ["totp_secret", "auth_flow_mode", "password_prompt_hint", "totp_prompt_hint"] {
-            assert!(visible_when(key).is_none(), "{key} must stay always-visible (login-time 2FA)");
+            assert_eq!(
+                visible_when(key),
+                Some(("sudo_source".to_string(), vec!["custom".to_string(), "off".to_string()])),
+                "{key} must hide under sudo_source=global (the bound profile owns the whole credential source) and stay visible otherwise"
+            );
         }
     }
 
@@ -1231,8 +1235,10 @@ mod manifest_contract_tests {
     }
 
     /// Visible-when pairing: pure Quick Sudo knobs follow the form's sudo
-    /// source selection; the 2FA quartet stays visible because login-time
-    /// keyboard-interactive auth consumes it regardless of the sudo source.
+    /// source selection; the 2FA quartet hides under `global` (the bound
+    /// profile owns the whole credential source, login-time
+    /// keyboard-interactive included) and stays visible for custom/off where
+    /// the connection's own values still serve login-time 2FA.
     #[test]
     fn quick_sudo_visibility_pairing() {
         for key in ["sudo_password", "sudo_use_pty"] {
@@ -1265,9 +1271,15 @@ mod manifest_contract_tests {
             "password_prompt_hint",
             "totp_prompt_hint",
         ] {
-            assert!(
-                field(key)["visible_when"].is_null(),
-                "{key} must stay visible: login-time 2FA uses it without quick sudo"
+            assert_eq!(
+                condition_field(&field(key), "visible_when"),
+                Some("sudo_source"),
+                "{key} must be gated on sudo_source"
+            );
+            assert_eq!(
+                condition_one_of(&field(key), "visible_when"),
+                Some(vec!["custom".to_string(), "off".to_string()]),
+                "{key} must hide under global (profile owns the source) and stay visible for custom/off"
             );
         }
     }

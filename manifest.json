@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "publisher": "xynanan",
   "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
   "icon": "assets/plugin.svg",
@@ -207,13 +207,14 @@
           "label": "Quick Sudo profile",
           "type": "text",
           "binding": "config",
+          "options_action": "sudo/profiles/options",
           "visible_when": {
             "field": "sudo_source",
             "one_of": [
               "global"
             ]
           },
-          "description": "Name or id of the global Quick Sudo profile. Run the 'Global Quick Sudo profiles' action below to list them; leave empty to use the workbench binding."
+          "description": "Pick the global Quick Sudo profile to bind; falls back to the workbench binding when empty. Hosts without dynamic options show a text field (profile name or id)."
         },
         {
           "key": "sudo_password",
@@ -233,6 +234,13 @@
           "label": "TOTP secrets",
           "type": "textarea",
           "binding": "secret",
+          "visible_when": {
+            "field": "sudo_source",
+            "one_of": [
+              "custom",
+              "off"
+            ]
+          },
           "description": "One secret per line: otpauth:// URI, base32 key, or a static code. Rotating selection avoids reusing a code in the same window. Also answers login-time keyboard-interactive 2FA."
         },
         {
@@ -241,6 +249,13 @@
           "type": "select",
           "binding": "config",
           "default": "password_then_otp",
+          "visible_when": {
+            "field": "sudo_source",
+            "one_of": [
+              "custom",
+              "off"
+            ]
+          },
           "options": [
             {
               "value": "password_then_otp",
@@ -262,6 +277,13 @@
           "label": "Password prompt hint",
           "type": "text",
           "binding": "config",
+          "visible_when": {
+            "field": "sudo_source",
+            "one_of": [
+              "custom",
+              "off"
+            ]
+          },
           "description": "Custom substring that identifies password prompts (e.g. 'identity token')."
         },
         {
@@ -269,6 +291,13 @@
           "label": "OTP prompt hint",
           "type": "text",
           "binding": "config",
+          "visible_when": {
+            "field": "sudo_source",
+            "one_of": [
+              "custom",
+              "off"
+            ]
+          },
           "description": "Custom substring that identifies OTP prompts (e.g. 'duo passcode')."
         },
         {
@@ -740,7 +769,7 @@
               }
             },
             "sudo_profile": {
-              "label": "Quick Sudo 配置名"
+              "label": "Quick Sudo 配置"
             },
             "sudo_password": {
               "label": "sudo 密码覆盖"
@@ -838,7 +867,7 @@
               }
             },
             "sudo_profile": {
-              "label": "Quick Sudo 設定名稱"
+              "label": "Quick Sudo 設定"
             },
             "sudo_password": {
               "label": "sudo 密碼覆寫"

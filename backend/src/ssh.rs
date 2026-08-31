@@ -569,6 +569,11 @@ struct SessionEntry {
     /// Live Quick Sudo / 2FA orchestration, updatable at runtime through
     /// `ssh/settings/set` and shared by the terminal and exec paths.
     orchestration: Arc<RwLock<SudoAuth>>,
+    /// In-terminal Quick Sudo watcher. Shared so `sync_auto_sudo` can attach
+    /// or detach it at runtime (a password configured after the session was
+    /// opened, or the Quick Sudo toggle, must apply without reconnecting);
+    /// the read loop re-locks it on every output chunk.
+    auto_sudo: Arc<Mutex<Option<exec::TerminalAutoSudo>>>,
     terminal_tx: mpsc::Sender<TerminalCommand>,
     replay: Arc<AsyncMutex<ReplayBuffer>>,
     sftp: AsyncMutex<Option<Arc<AsyncMutex<SftpSession>>>>,
@@ -809,10 +814,9 @@ impl SshRuntime {
             bound_profile.as_ref(),
         )));
         // In-terminal Quick Sudo: answers sudo password / 2FA prompts while
-        // the user keeps typing normal commands (ported from tiny-rdm).
-        let mut auto_sudo = (connection.sudo_enabled() && !connection.read_only)
-            .then(|| exec::TerminalAutoSudo::new(orchestration.clone()))
-            .filter(exec::TerminalAutoSudo::is_useful);
+        // the user keeps typing normal commands (ported from tiny-rdm). The
+        // watcher is attached here and re-synced on every runtime settings
+        // update, so configuring Quick Sudo after connecting still arms it.
         let entry = Arc::new(SessionEntry {
             connection_id: connection.id.clone(),
             workbench_id: workbench_id.to_string(),
@@ -823,12 +827,14 @@ impl SshRuntime {
             handle,
             jump_chain,
             orchestration: orchestration.clone(),
+            auto_sudo: Arc::new(Mutex::new(None)),
             terminal_tx,
             replay: replay.clone(),
             sftp: AsyncMutex::new(None),
             agent_recorder: Arc::new(Mutex::new(None)),
             agent_exec_lock: Arc::new(AsyncMutex::new(())),
         });
+        Self::sync_auto_sudo(&entry, &connection);
         self.sessions
             .write()
             .await
@@ -895,9 +901,13 @@ impl SshRuntime {
                             _ => continue,
                         };
                         if stream == TerminalStream::Stdout {
-                            if let Some((kind, answer)) = auto_sudo
+                            let auto_answer = entry
+                                .auto_sudo
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
                                 .as_mut()
-                                .and_then(|auto| auto.observe(&String::from_utf8_lossy(&data)))
+                                .and_then(|auto| auto.observe(&String::from_utf8_lossy(&data)));
+                            if let Some((kind, answer)) = auto_answer
                             {
                                 let mut payload = answer.into_bytes();
                                 payload.push(b'\r');
@@ -2424,16 +2434,17 @@ impl SshRuntime {
 
         // Apply to every live session of the connection, field by field so
         // in-flight OTP usage bookkeeping survives unrelated updates.
-        let sessions = self
+        let session_entries: Vec<Arc<SessionEntry>> = self
             .sessions
             .read()
             .await
-            .iter()
-            .filter(|(_, entry)| entry.connection_id == connection_id)
-            .map(|(_, entry)| entry.orchestration.clone())
-            .collect::<Vec<_>>();
-        for orchestration in sessions {
-            let mut auth = orchestration
+            .values()
+            .filter(|entry| entry.connection_id == connection_id)
+            .cloned()
+            .collect();
+        for entry in &session_entries {
+            let mut auth = entry
+                .orchestration
                 .write()
                 .unwrap_or_else(|poison| poison.into_inner());
             if let Some(value) = optional_string("sudoPassword") {
@@ -2454,6 +2465,19 @@ impl SshRuntime {
             }
             if let Some(value) = optional_string("authFlowMode") {
                 auth.flow_mode = (!value.is_empty()).then(|| AuthFlowMode::parse(&value));
+            }
+        }
+        // Credential/flag changes can arm or disarm the in-terminal watcher:
+        // a password configured after connecting must start answering.
+        if let Some(connection) = self
+            .connections
+            .read()
+            .map_err(|_| "Connection registry is poisoned".to_string())?
+            .get(&connection_id)
+            .cloned()
+        {
+            for entry in &session_entries {
+                Self::sync_auto_sudo(entry, &connection);
             }
         }
         // A binding change owns the live sessions' credential source: rebuild
@@ -2477,6 +2501,26 @@ impl SshRuntime {
     pub fn profiles_list(&self) -> Value {
         let store = sudo_profiles::load_store(&self.data_dir);
         json!({ "profiles": sudo_profiles::list_views(&store) })
+    }
+
+    /// `sudo/profiles/options`: secret-free select options for the host
+    /// connection form (`sudo_profile` field declares this as its
+    /// `options_action`). Value is the profile id (what `sudo_profile_ref`
+    /// stores); the label is the human-readable name. Hosts without
+    /// `options_action` support never call this and keep the text fallback.
+    pub fn profiles_options(&self) -> Value {
+        let store = sudo_profiles::load_store(&self.data_dir);
+        json!({
+            "options": sudo_profiles::list_views(&store)
+                .into_iter()
+                .map(|view| {
+                    json!({
+                        "value": view["id"],
+                        "label": view["name"],
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
     }
 
     /// `sudo/profiles/save`: create or update a global profile, then hot
@@ -2528,6 +2572,31 @@ impl SshRuntime {
         })
     }
 
+    /// Re-arms or disarms a session's in-terminal Quick Sudo watcher from the
+    /// connection's current state: Quick Sudo on, connection writable, and
+    /// the resolved auth actually holding a credential (password or TOTP).
+    /// Runs at session open and after every runtime settings/profile update,
+    /// so a password configured after connecting still starts answering
+    /// prompts without a reconnect. Re-arming starts from fresh prompt state,
+    /// which matches the user having just changed the configuration.
+    fn sync_auto_sudo(entry: &SessionEntry, connection: &StoredConnection) {
+        let useful = entry
+            .orchestration
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .useful();
+        let attach = connection.sudo_enabled() && !connection.read_only && useful;
+        let mut watcher = entry
+            .auto_sudo
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if attach && watcher.is_none() {
+            *watcher = Some(exec::TerminalAutoSudo::new(entry.orchestration.clone()));
+        } else if !attach && watcher.is_some() {
+            *watcher = None;
+        }
+    }
+
     /// Rebuilds the Quick Sudo auth of every live session of the given
     /// connections from the current registry state plus each connection's
     /// bound profile. Field-by-field assignment keeps each auth's OTP usage
@@ -2552,15 +2621,19 @@ impl SshRuntime {
             };
             let profile = effective_sudo_profile(&connection, &store);
             let auth = resolved_sudo_auth(&connection, profile.as_ref());
-            let mut orchestration = entry
-                .orchestration
-                .write()
-                .unwrap_or_else(|poison| poison.into_inner());
-            orchestration.password = auth.password;
-            orchestration.totp_secrets = auth.totp_secrets;
-            orchestration.password_prompt_hint = auth.password_prompt_hint;
-            orchestration.totp_prompt_hint = auth.totp_prompt_hint;
-            orchestration.flow_mode = auth.flow_mode;
+            {
+                let mut orchestration = entry
+                    .orchestration
+                    .write()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                orchestration.password = auth.password;
+                orchestration.totp_secrets = auth.totp_secrets;
+                orchestration.password_prompt_hint = auth.password_prompt_hint;
+                orchestration.totp_prompt_hint = auth.totp_prompt_hint;
+                orchestration.flow_mode = auth.flow_mode;
+            }
+            // A binding switch can arm or disarm the terminal watcher too.
+            Self::sync_auto_sudo(entry, &connection);
         }
     }
 
@@ -3727,6 +3800,39 @@ mod tests {
         let (temporary, backup) = remote_transfer_paths("/home/user/file.txt", "task").unwrap();
         assert_eq!(temporary, "/home/user/.dbx-upload-task.part");
         assert_eq!(backup, "/home/user/.dbx-upload-task.backup");
+    }
+
+    /// `sudo/profiles/options` backs the connection form's dynamic dropdown:
+    /// value = profile id (what `sudo_profile` stores), label = display name,
+    /// sorted like the listings, and never any secret field.
+    #[test]
+    fn profile_options_expose_id_name_pairs_without_secrets() {
+        let dir = std::env::temp_dir().join(format!("dbx-profile-options-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = SshRuntime::new(dir.clone());
+        let mut store = sudo_profiles::SudoProfileStore::default();
+        let (_, _) = sudo_profiles::save_profile(
+            &mut store,
+            &json!({ "name": "zeta", "sudoPassword": "secret-z" }),
+        )
+        .unwrap();
+        let (alpha, _) = sudo_profiles::save_profile(
+            &mut store,
+            &json!({ "name": "alpha", "sudoPassword": "secret-a" }),
+        )
+        .unwrap();
+        sudo_profiles::save_store(&dir, &store).unwrap();
+
+        let payload = runtime.profiles_options();
+        let options = payload["options"].as_array().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["label"], json!("alpha"));
+        assert_eq!(options[0]["value"], json!(alpha.id));
+        assert_eq!(options[1]["label"], json!("zeta"));
+        let rendered = serde_json::to_string(&payload).unwrap();
+        assert!(!rendered.contains("secret-z") && !rendered.contains("secret-a"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -461,6 +461,7 @@ impl Plugin {
                 Ok(json!({ "success": true }))
             }
             "sudo/profiles/list" => Ok(self.ssh.profiles_list()),
+            "sudo/profiles/options" => Ok(self.ssh.profiles_options()),
             "sudo/profiles/save" => self.runtime.block_on(self.ssh.profiles_save(&params)),
             "sudo/profiles/delete" => {
                 let id = required_string(&params, "id")?;
