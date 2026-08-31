@@ -20,6 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use crate::agent_terminal::{self, AgentTerminalMode};
+use crate::app_bridge;
 use crate::exec::{self, AuthFlowMode, Hints, SudoAuth};
 use crate::host_key::HostKeyVerifier;
 use crate::mcp_safety::{self, CommandRisk};
@@ -317,7 +318,8 @@ impl McpState {
                     .to_string();
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                 // stdio mode has no event emitter: `runInTerminal` routing
-                // is unavailable and `runInTerminal: true` is refused.
+                // goes through the DBX app's local TCP bridge inside
+                // `ssh_exec_tool` (the None-emitter arm).
                 self.call_tool(&name, &arguments, None).await
             }
             other => Err(format!("Method not found: {other}")),
@@ -393,6 +395,13 @@ impl McpState {
             }
         }
         let text = self.run_tool(name, arguments, emitter).await?;
+        // The app-bridge forward returns the app's MCP content envelope
+        // verbatim (`app_bridge::call_plugin_tool`); wrapping again would
+        // bury the app's answer one JSON level deeper, so an already
+        // enveloped result passes through untouched.
+        if text.get("content").is_some() && text.get("isError").is_some() {
+            return Ok(text);
+        }
         Ok(json!({
             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&text).unwrap_or_default() }],
             "isError": false,
@@ -586,7 +595,19 @@ impl McpState {
                 }
             }
             (None, _) if run_in_terminal == Some(true) => {
-                return Err("runInTerminal requires the DBX embedded bridge".to_string());
+                // stdio mode forwards through the DBX app's local TCP bridge:
+                // the app opens the connection's workbench tab and runs the
+                // tool on its own sidecar, so the command lands in the app's
+                // visible terminal.
+                let Some(connection_id) = connection_id else {
+                    return Err(
+                        "runInTerminal needs a saved DBX connection: pass connectionId (the connection must exist in the DBX app) so the command can run in the app's visible terminal"
+                            .to_string(),
+                    );
+                };
+                return self
+                    .ssh_exec_app_bridge(name, connection_id, arguments, timeout_secs)
+                    .await;
             }
             (Some(_), None) if run_in_terminal == Some(true) => {
                 return Err(
@@ -626,6 +647,28 @@ impl McpState {
     /// connection's live workbench PTY, applies the §1 approval matrix
     /// (sudo and catastrophic mcp_safety hits are elevated), then types the
     /// command into the terminal and captures the output.
+    /// Polls `session_id_for_connection` until the workbench PTY shows up or
+    /// `wait` elapses, so a just-triggered workbench auto-open can win the
+    /// race against the first terminal-routed command.
+    async fn wait_for_connection_session(
+        &self,
+        connection_id: &str,
+        wait: Duration,
+    ) -> Result<String, String> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match self.runtime.session_id_for_connection(connection_id).await {
+                Ok(session_id) => return Ok(session_id),
+                Err(error) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     async fn ssh_exec_terminal_tool(
         &self,
         name: &str,
@@ -639,6 +682,10 @@ impl McpState {
             // Sudo runs through the user's terminal where the auto-sudo
             // state machine or a human answers the password prompt.
             agent_terminal::CommandRisk::Elevated
+        } else if mcp_safety::runs_under_sudo(command) {
+            // An inline `sudo …` is privilege escalation too, even when the
+            // inner verb is harmless: teaching mode must approve it.
+            agent_terminal::CommandRisk::Elevated
         } else {
             match mcp_safety::assess_command(command) {
                 mcp_safety::CommandRisk::Destructive(_) => {
@@ -648,24 +695,44 @@ impl McpState {
             }
         };
         let timeout = timeout_secs.map(|duration| duration.as_secs());
-        // Both routing outcomes need the connection's live workbench PTY;
-        // a missing one gets the guidance error instead of the runtime's
-        // generic wording.
+        // `ssh_exec_sudo` must type its `sudo` prefix into the terminal or
+        // the escalation silently disappears (this path has no separate sudo
+        // orchestration — the terminal's auto-sudo state machine answers the
+        // prompt the prefixed command raises). Idempotent, so a prefix kept
+        // through the approval dialog round-trips unchanged; an inline
+        // `sudo …` from `ssh_exec` already carries it and stays untouched.
+        // Shadowing here also puts the prefixed text on the approval prompt,
+        // so what the user approves is exactly what gets typed.
+        let command = if name == "ssh_exec_sudo" {
+            agent_terminal::sudo_command_text(command)
+        } else {
+            command.to_string()
+        };
+        // Both routing outcomes need the connection's live workbench PTY.
+        // The DBX app bridge opens the workbench tab right before forwarding,
+        // so the PTY session may take a moment to appear: poll briefly before
+        // falling back to the guidance error.
         let session_id = self
-            .runtime
-            .session_id_for_connection(connection_id)
+            .wait_for_connection_session(connection_id, Duration::from_secs(20))
             .await
             .map_err(|_| NO_TERMINAL_SESSION_MESSAGE.to_string())?;
+        // Serialize concurrent agent commands on the same session: the guard
+        // is intentionally held across the approval wait and the whole run —
+        // that IS the serialization, so a second command queues behind an
+        // in-flight approval instead of interleaving keystrokes with it on
+        // the shared PTY. The lock is per-session, so different connections
+        // still execute in parallel (no global lock here on purpose).
+        let _exec_guard = self.runtime.agent_exec_guard(&session_id).await?;
         match agent_terminal::decide(mode, risk) {
             agent_terminal::RoutingDecision::Run => {
                 self.runtime
-                    .exec_in_terminal(&session_id, name, command, risk, timeout, emitter)
+                    .exec_in_terminal(&session_id, name, &command, risk, timeout, emitter)
                     .await
             }
             agent_terminal::RoutingDecision::Prompt => {
                 let approved = self
                     .runtime
-                    .request_agent_approval(&session_id, name, command, risk, None, emitter)
+                    .request_agent_approval(&session_id, name, &command, risk, None, emitter)
                     .await?;
                 self.runtime
                     .exec_in_terminal(&session_id, name, &approved, risk, timeout, emitter)
@@ -673,6 +740,26 @@ impl McpState {
             }
             agent_terminal::RoutingDecision::Deny(reason) => Err(reason.to_string()),
         }
+    }
+
+    /// stdio-mode terminal forwarding: relays the exec tool call to the DBX
+    /// app's local TCP bridge, which opens the connection's workbench tab and
+    /// runs the tool on the app's own sidecar — the same process as the
+    /// visible terminal. The 200 body is already MCP-content wrapped and is
+    /// returned verbatim (`call_tool` passes it through untouched); failures
+    /// keep the bridge error and add reconnect guidance.
+    async fn ssh_exec_app_bridge(
+        &self,
+        name: &str,
+        connection_id: &str,
+        arguments: &Value,
+        timeout_secs: Option<Duration>,
+    ) -> Result<Value, String> {
+        app_bridge::ensure_app_bridge(app_bridge::DEFAULT_ENSURE_WAIT).await?;
+        let timeout = timeout_secs.unwrap_or(Duration::from_secs(300));
+        app_bridge::call_plugin_tool(connection_id, name, arguments.clone(), timeout)
+            .await
+            .map_err(|error| format!("{error}. Open the connection in DBX and retry"))
     }
 
     async fn sftp_tool(&self, name: &str, arguments: &Value) -> Result<Value, String> {
@@ -1130,7 +1217,8 @@ impl McpState {
     /// the tool with a `connectionId` reference so credentials never travel
     /// inline with tool arguments. The emitter enables the agent terminal
     /// routing (`runInTerminal` / `agentTerminalMode`); stdio mode passes
-    /// `None` and stays on the hidden exec channel.
+    /// `None` and only leaves the hidden exec channel for `runInTerminal`
+    /// calls, which forward to the DBX app's local TCP bridge.
     pub async fn call_dbx(&self, params: &Value, emitter: PluginEmitter) -> Result<Value, String> {
         self.call_dbx_with(params, Some(emitter)).await
     }
@@ -1507,7 +1595,7 @@ pub fn tool_definitions() -> Value {
                     ("command", "string", "Shell command to execute"),
                     ("timeoutSecs", "integer", "Execution timeout in seconds (5-300)"),
                     ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
-                    ("runInTerminal", "boolean", "Run inside the user's open workbench terminal so the command and its output are visible and interruptible; only effective through the DBX embedded bridge (true fails in stdio mode)"),
+                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app)"),
                 ]),
                 "required": ["command"],
             },
@@ -1522,7 +1610,7 @@ pub fn tool_definitions() -> Value {
                     ("timeoutSecs", "integer", "Execution timeout in seconds (5-300)"),
                     ("quickSudoProfile", "string", "Global Quick Sudo profile id or exact name supplying sudo password/TOTP/prompt defaults"),
                     ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
-                    ("runInTerminal", "boolean", "Run inside the user's open workbench terminal so the command and its output are visible and interruptible; only effective through the DBX embedded bridge (true fails in stdio mode)"),
+                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app)"),
                 ]),
                 "required": ["command"],
             },
@@ -2220,11 +2308,12 @@ mod tests {
         }
     }
 
-    /// Without the DBX embedded bridge (no emitter), `runInTerminal: true`
-    /// is refused with guidance instead of silently running hidden, and the
+    /// In stdio mode (no emitter), `runInTerminal: true` needs a saved DBX
+    /// connectionId to forward through the app bridge; without one it is
+    /// refused with guidance instead of silently running hidden, and the
     /// read-only/destructive gates keep firing before the routing branch.
     #[tokio::test]
-    async fn run_in_terminal_requires_the_embedded_bridge() {
+    async fn run_in_terminal_stdio_requires_a_connection_id() {
         let state = state();
 
         let refused = state
@@ -2237,7 +2326,7 @@ mod tests {
             .err()
             .unwrap();
         assert!(
-            refused.contains("runInTerminal requires the DBX embedded bridge"),
+            refused.contains("runInTerminal needs a saved DBX connection"),
             "unexpected: {refused}"
         );
 
@@ -2254,7 +2343,7 @@ mod tests {
             .err()
             .unwrap();
         assert!(
-            sudo.contains("runInTerminal requires the DBX embedded bridge"),
+            sudo.contains("runInTerminal needs a saved DBX connection"),
             "unexpected: {sudo}"
         );
         let hidden = state

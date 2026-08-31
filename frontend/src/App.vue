@@ -47,7 +47,7 @@ import {
 } from "@lucide/vue";
 import type { Detection as ZmodemDetection, Session as ZmodemSession, Sentry as ZmodemSentry } from "zmodem.js";
 import { Osc7DirectoryParser } from "./lib/terminalDirectoryTracking";
-import { describeReconnectCountdown, shouldReattachTerminal, terminalReconnectDelay, type ReconnectCountdown } from "./lib/terminalReconnect";
+import { describeReconnectCountdown, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
@@ -64,7 +64,7 @@ import { sanitizeCommandOutput } from "./lib/terminalOutputText";
 import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI } from "./lib/appearance";
-import { AGENT_MODES, approvalRemainingSecs, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload } from "./lib/agentTerminal";
+import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload } from "./lib/agentTerminal";
 import type { SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { workbenchMessage } from "./lib/i18n";
 import TextPreview from "./components/TextPreview.vue";
@@ -290,8 +290,9 @@ const selectedPath = ref("");
 const loadingFiles = ref(false);
 const hostKeyPrompt = ref<HostKeyPrompt>();
 const rememberHostKey = ref(true);
-// AI 终端同步执行：审批挑战 / 执行横幅状态（ssh/agent/* 事件仅当前会话生效）。
-const agentPrompt = ref<AgentPromptPayload>();
+// AI 终端同步执行：审批挑战队列 / 执行横幅状态（ssh/agent/* 事件仅当前会话生效）。
+// 跨会话并发审批按 challengeId 排队，弹窗一次只渲染队首（后端同会话已串行化）。
+const agentPromptQueue = ref<AgentPromptPayload[]>([]);
 const agentPromptCommand = ref("");
 const agentPromptRemaining = ref(0);
 const agentPromptExpired = ref(false);
@@ -493,6 +494,8 @@ let resizeTimer = 0;
 let reconnectTimer = 0;
 let reconnectAttempt = 0;
 let disposed = false;
+const OPEN_RETRY_MAX = 3;
+let openRetryAttempt = 0;
 let lastSequence = 0;
 let replayInFlight = false;
 let binaryInputChain = Promise.resolve();
@@ -1175,6 +1178,17 @@ function handleEvent(event: DbxPluginEvent) {
   }
   if (event.method === "ssh/session/state" && event.params.sessionId === session.value?.sessionId) {
     if (event.params.state === "disconnected") {
+      // Transport dropped (network flap, server restart): auto-reconnect with
+      // a bounded backoff ladder instead of parking on a dead terminal.
+      if (!disposed && reconnectAttempt < TERMINAL_RECONNECT_DELAYS.length) {
+        const delay = terminalReconnectDelay(reconnectAttempt++);
+        terminalState.value = "connecting";
+        reconnectPending.value = true;
+        reconnectTimer = window.setTimeout(() => {
+          if (!disposed) void openSession();
+        }, delay);
+        return;
+      }
       terminalState.value = "disconnected";
       reconnectPending.value = false;
       terminalError.value = t("transportDisconnected");
@@ -1182,7 +1196,7 @@ function handleEvent(event: DbxPluginEvent) {
     return;
   }
   if (event.method === "ssh/agent/prompt" && event.params.sessionId === session.value?.sessionId) {
-    startAgentPrompt(event.params as unknown as AgentPromptPayload);
+    agentPromptQueue.value = enqueueAgentPrompt(agentPromptQueue.value, event.params as unknown as AgentPromptPayload);
     return;
   }
   if (event.method === "ssh/agent/notice" && event.params.sessionId === session.value?.sessionId) {
@@ -1237,11 +1251,15 @@ async function openSession(forceNew = false) {
   if (!connectionId.value || !workbenchId.value) return;
   window.clearTimeout(reconnectTimer);
   reconnectAttempt = 0;
+  // Boot-time tab restore can race the host's plugin activation and fail the
+  // very first ssh/session/open; a bounded retry self-heals the restored
+  // terminal instead of parking it on a manual reconnect button.
+  openRetryAttempt = 0;
   // A session opened over a stale one must not inherit a stuck ZMODEM
   // overlay (zmodemBusy would keep swallowing terminal input).
   cancelZmodemUpload();
-  // 同理不继承上一个会话的 AI 审批弹窗 / 执行横幅。
-  dismissAgentPrompt();
+  // 同理不继承上一个会话的 AI 审批队列 / 执行横幅（切换会话清空全部排队挑战）。
+  clearAgentPrompts();
   agentRunning.value = undefined;
   terminalState.value = "connecting";
   terminalError.value = "";
@@ -1249,13 +1267,18 @@ async function openSession(forceNew = false) {
   resetCommandMarker();
   if (forceNew && session.value) await closeSession(false);
   createTerminal();
+  // A retry is only worth it for fast failures (boot-restore races with
+  // plugin activation). A real dial failure takes tens of seconds — retrying
+  // those just turns one error into minutes of spinner.
+  const attemptStarted = Date.now();
+  const attemptTimeoutMs = openRetryAttempt === 0 ? 120_000 : 30_000;
   try {
     const info = await window.dbxPlugin.invoke<SessionInfo>("ssh/session/open", {
       connectionId: connectionId.value,
       workbenchId: workbenchId.value,
       cols: terminal?.cols || 120,
       rows: terminal?.rows || 32,
-    }, { timeoutMs: 120_000 });
+    }, { timeoutMs: attemptTimeoutMs });
     activeTerminalSessionId = info.sessionId;
     session.value = info;
     lastSequence = 0;
@@ -1268,6 +1291,17 @@ async function openSession(forceNew = false) {
     if (!replay.complete) throw new Error(t("sessionUnrecoverable"));
     await afterSessionConnected();
   } catch (cause) {
+    if (disposed) return;
+    const attemptMs = Date.now() - attemptStarted;
+    if (openRetryAttempt < OPEN_RETRY_MAX && attemptMs < 8_000) {
+      openRetryAttempt += 1;
+      terminalState.value = "connecting";
+      const delayMs = 2000 * openRetryAttempt;
+      reconnectTimer = window.setTimeout(() => {
+        if (!disposed) void openSession(false);
+      }, delayMs);
+      return;
+    }
     terminalState.value = "error";
     activeTerminalSessionId = "";
     showError(cause, "terminal");
@@ -1303,6 +1337,16 @@ async function attachSession(sessionId: string) {
       return;
     }
     const delay = terminalReconnectDelay(reconnectAttempt++);
+    // Once the backoff ladder is exhausted, the stored session is gone for
+    // good (e.g. the app was killed while the tab was open): re-attaching a
+    // dead session id can never succeed, so fall back to a fresh open.
+    if (reconnectAttempt > TERMINAL_RECONNECT_DELAYS.length) {
+      reconnectAttempt = 0;
+      reconnectPending.value = false;
+      reconnectTimer = window.setTimeout(() => void openSession(true), delay);
+      terminalError.value = t("reattachingTerminal");
+      return;
+    }
     reconnectNextAt = Date.now() + delay;
     reconnectDelayMs = delay;
     reconnectPending.value = true;
@@ -1326,7 +1370,7 @@ async function closeSession(updateStatus = true) {
   session.value = undefined;
   activeTerminalSessionId = "";
   quickSudo.value = false;
-  dismissAgentPrompt();
+  clearAgentPrompts();
   agentRunning.value = undefined;
   // Closing mid-ZMODEM aborts the transfer silently instead of leaving the
   // busy overlay and the dead sentry attached to the workbench.
@@ -1376,15 +1420,25 @@ async function resolveHostKey(accept: boolean) {
 // AI 终端同步执行（agent terminal mode）：审批挑战 + 执行横幅
 // ---------------------------------------------------------------------------
 
-// 审批挑战：250ms tick 重算剩余秒，到 0 自动收起并标记 expired（后端超时同样拒绝）。
-function startAgentPrompt(payload: AgentPromptPayload) {
+// 审批队列：弹窗只渲染队首；队首变化（入队到空队列、出队露出下一个）时经 watch
+// 重置可编辑命令与 250ms tick 倒计时。倒计时基于队首 requestedAt + timeoutSecs
+// 绝对期限，到 0 仅出队队首并标记 expired（后端超时同样拒绝）；排队中已到期的
+// 挑战会在露出为队首的首次 tick 即被跳过出队。
+const agentPromptHead = computed(() => agentPromptQueue.value[0]);
+
+watch(agentPromptHead, (head) => {
   stopAgentPromptTimer();
-  agentPrompt.value = payload;
-  agentPromptCommand.value = payload.command;
+  if (!head) {
+    agentPromptCommand.value = "";
+    agentPromptRemaining.value = 0;
+    return;
+  }
+  agentPromptCommand.value = head.command;
   agentPromptExpired.value = false;
   const tick = () => {
-    if (!agentPrompt.value) return;
-    agentPromptRemaining.value = approvalRemainingSecs(agentPrompt.value, Date.now());
+    const current = agentPromptHead.value;
+    if (!current) return;
+    agentPromptRemaining.value = approvalRemainingSecs(current, Date.now());
     if (agentPromptRemaining.value <= 0) {
       agentPromptExpired.value = true;
       dismissAgentPrompt();
@@ -1392,7 +1446,7 @@ function startAgentPrompt(payload: AgentPromptPayload) {
   };
   tick();
   agentPromptTimer = window.setInterval(tick, 250);
-}
+});
 
 function stopAgentPromptTimer() {
   if (agentPromptTimer) {
@@ -1401,17 +1455,25 @@ function stopAgentPromptTimer() {
   }
 }
 
+// 出队队首（超时 / 审批后调用）：队列自动露出下一个，watch 重启其倒计时。
 function dismissAgentPrompt() {
+  const head = agentPromptHead.value;
+  if (!head) return;
+  agentPromptQueue.value = dropAgentPrompt(agentPromptQueue.value, head.challengeId);
+}
+
+// 清空整个审批队列（会话切换 / 关闭时不继承旧会话的排队挑战）。
+function clearAgentPrompts() {
   stopAgentPromptTimer();
-  agentPrompt.value = undefined;
+  agentPromptQueue.value = [];
   agentPromptCommand.value = "";
   agentPromptRemaining.value = 0;
 }
 
-// 审批语义对齐 host-key 挑战：先收起弹窗再 resolve（挑战一次性，重复 resolve 报错）；
+// 审批语义对齐 host-key 挑战：先出队再 resolve（挑战一次性，重复 resolve 报错）；
 // 批准时提交编辑后的命令（所见即所执行）。
 async function resolveAgentPrompt(decision: "approve" | "deny") {
-  const prompt = agentPrompt.value;
+  const prompt = agentPromptHead.value;
   if (!prompt) return;
   const command = agentPromptCommand.value;
   dismissAgentPrompt();
@@ -3939,12 +4001,12 @@ onBeforeUnmount(() => {
       </article>
     </section>
 
-    <section v-if="agentPrompt" class="modal-backdrop">
+    <section v-if="agentPromptHead" class="modal-backdrop">
       <article class="modal agent-prompt-modal">
         <header><h2>{{ t("agentPromptTitle") }}</h2></header>
         <div class="agent-prompt-meta">
-          <span>{{ t("agentPromptSource") }} <code class="mono">{{ agentPrompt.tool }}</code></span>
-          <span class="agent-risk-badge" :class="agentPrompt.risk === 'elevated' ? 'elevated' : 'low'">{{ agentPrompt.risk === "elevated" ? t("agentPromptRiskElevated") : t("agentPromptRiskLow") }}</span>
+          <span>{{ t("agentPromptSource") }} <code class="mono">{{ agentPromptHead.tool }}</code></span>
+          <span class="agent-risk-badge" :class="agentPromptHead.risk === 'elevated' ? 'elevated' : 'low'">{{ agentPromptHead.risk === "elevated" ? t("agentPromptRiskElevated") : t("agentPromptRiskLow") }}</span>
         </div>
         <label class="agent-prompt-command">
           <span>{{ t("agentPromptCommandLabel") }}</span>

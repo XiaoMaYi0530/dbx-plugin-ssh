@@ -48,3 +48,33 @@ export function approvalRemainingSecs(
   const remaining = payload.requestedAt + payload.timeoutSecs - nowMs / 1000;
   return remaining > 0 ? remaining : 0;
 }
+
+/**
+ * 审批挑战队列助手：跨会话并发审批排队（后端同会话已串行化，前端弹窗一次只渲染队首）。
+ * 均为不可变语义——始终返回新数组，从不修改入参。
+ */
+
+/** 按 challengeId 去重追加：已存在则不追加（返回等价浅拷贝），否则追加到队尾。 */
+export function enqueueAgentPrompt<Q extends { challengeId: string }>(
+  queue: readonly Q[],
+  payload: Q,
+): Q[] {
+  if (queue.some((item) => item.challengeId === payload.challengeId)) return [...queue];
+  return [...queue, payload];
+}
+
+/** 移除指定 challengeId 的挑战；未命中返回等价浅拷贝。 */
+export function dropAgentPrompt<Q extends { challengeId: string }>(
+  queue: readonly Q[],
+  challengeId: string,
+): Q[] {
+  return queue.filter((item) => item.challengeId !== challengeId);
+}
+
+/** 按 challengeId 查找队列中的挑战。 */
+export function findAgentPrompt<Q extends { challengeId: string }>(
+  queue: readonly Q[],
+  challengeId: string,
+): Q | undefined {
+  return queue.find((item) => item.challengeId === challengeId);
+}

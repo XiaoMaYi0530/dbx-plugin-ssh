@@ -135,6 +135,25 @@ pub fn sanitize_command(command: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Terminal text injected for an `ssh_exec_sudo` tool call. The tool *means*
+/// "run this with sudo", but the terminal path types raw text into the user's
+/// shell, so the `sudo` prefix must be part of the injected command or the
+/// privilege escalation is silently lost. Idempotent: a command already
+/// carrying the prefix (inline from the AI, or edited in by the approval
+/// dialog) is returned unchanged so `sudo sudo` can never happen. The prefix
+/// lands on the first line only — multi-line commands execute line by line,
+/// which is a known limitation of the injection path. An empty command
+/// degrades to a bare `sudo ` here; emptiness is rejected upstream by
+/// [`sanitize_command`], so this function never has to police it.
+pub fn sudo_command_text(command: &str) -> String {
+    let first_line = command.lines().next().unwrap_or_default().trim_start();
+    if first_line.starts_with("sudo ") || first_line == "sudo" {
+        command.to_string()
+    } else {
+        format!("sudo {command}")
+    }
+}
+
 /// Removes ANSI escape sequences: CSI, OSC/DCS-style string sequences
 /// (BEL or `ESC \` terminated), and other two-byte ESC sequences.
 /// Incomplete sequences at the end of the input are swallowed.
@@ -195,6 +214,10 @@ pub enum RecorderState {
 /// "command finished".
 pub const SILENCE_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Fallback silence for shells without local echo: after this much quiet
+/// following a prompt, the capture settles even without a seen echo.
+pub const ECHO_FALLBACK_SILENCE: Duration = Duration::from_secs(2);
+
 /// Cap of the raw capture buffer (newest output wins).
 const RECORDER_BUFFER_CAP: usize = 1024 * 1024;
 /// Cap of the rolling tail used for prompt detection, kept small so the
@@ -217,8 +240,13 @@ pub struct TerminalRecorder {
     buffer: String,
     tail: String,
     prompt_seen: bool,
+    echo_seen: bool,
     last_chunk_at: Option<Instant>,
     silence_debounce: Duration,
+    /// Fragment of the injected command whose echo proves the shell actually
+    /// started executing it (guards against settling on the login banner
+    /// prompt before the typed command was processed).
+    echo_fragment: String,
 }
 
 impl Default for TerminalRecorder {
@@ -228,20 +256,27 @@ impl Default for TerminalRecorder {
             buffer: String::new(),
             tail: String::new(),
             prompt_seen: false,
+            echo_seen: false,
             last_chunk_at: None,
             silence_debounce: SILENCE_DEBOUNCE,
+            echo_fragment: String::new(),
         }
     }
 }
 
 impl TerminalRecorder {
-    /// Starts a fresh capture, discarding any previous content.
-    pub fn arm(&mut self) {
+    /// Starts a fresh capture, discarding any previous content. The
+    /// `echo_fragment` (a slice of the injected command) gates settling: a
+    /// prompt-silence without the command's echo means the shell has not
+    /// processed the injection yet.
+    pub fn arm(&mut self, echo_fragment: &str) {
         self.state = RecorderState::Capturing;
         self.buffer.clear();
         self.tail.clear();
         self.prompt_seen = false;
+        self.echo_seen = false;
         self.last_chunk_at = None;
+        self.echo_fragment = echo_fragment.chars().take(32).collect();
     }
 
     /// Feeds one chunk of PTY output. Returns the recorder state; a chunk
@@ -262,21 +297,31 @@ impl TerminalRecorder {
         if exec::has_shell_prompt(&strip_ansi(&self.tail)) {
             self.prompt_seen = true;
         }
+        if !self.echo_seen && !self.echo_fragment.is_empty() && self.tail.contains(&self.echo_fragment)
+        {
+            self.echo_seen = true;
+        }
         self.last_chunk_at = Some(Instant::now());
         self.state
     }
 
-    /// True when a prompt was seen since arming and the terminal has been
-    /// silent for at least [`SILENCE_DEBOUNCE`] (or the capture was forced
-    /// closed with [`TerminalRecorder::finish`]).
+    /// True when the command's echo was seen, a prompt followed and the
+    /// terminal went silent for [`SILENCE_DEBOUNCE`]. As a fallback for
+    /// shells without local echo, a long [`ECHO_FALLBACK_SILENCE`] silence
+    /// after a prompt settles too; [`TerminalRecorder::finish`] forces the
+    /// capture closed regardless.
     pub fn is_settled(&self) -> bool {
         match self.state {
             RecorderState::Settled => true,
             RecorderState::Capturing => {
+                let silence = self
+                    .last_chunk_at
+                    .is_some_and(|at| at.elapsed() >= self.silence_debounce);
+                let long_silence = self
+                    .last_chunk_at
+                    .is_some_and(|at| at.elapsed() >= ECHO_FALLBACK_SILENCE);
                 self.prompt_seen
-                    && self
-                        .last_chunk_at
-                        .is_some_and(|at| at.elapsed() >= self.silence_debounce)
+                    && ((self.echo_seen && silence) || long_silence)
             }
             RecorderState::Idle => false,
         }
@@ -434,7 +479,7 @@ mod tests {
         let mut recorder = TerminalRecorder::default();
         assert_eq!(recorder.observe("ignored"), RecorderState::Idle);
 
-        recorder.arm();
+        recorder.arm("echo dbx-agent-marker");
         assert_eq!(recorder.observe("echo dbx-agent-marker\r\n"), RecorderState::Capturing);
         assert!(!recorder.is_settled(), "no prompt seen yet");
         assert_eq!(recorder.observe("out-a\r\nout-b\r\n"), RecorderState::Capturing);
@@ -452,7 +497,7 @@ mod tests {
     #[test]
     fn recorder_finish_forces_the_capture_closed() {
         let mut recorder = TerminalRecorder::default();
-        recorder.arm();
+        recorder.arm("never echoed");
         recorder.observe("partial output without any prompt");
         assert!(!recorder.is_settled());
         recorder.finish();
@@ -464,7 +509,7 @@ mod tests {
     #[test]
     fn recorder_buffer_stays_bounded_and_keeps_the_newest_output() {
         let mut recorder = TerminalRecorder::default();
-        recorder.arm();
+        recorder.arm("echo not-present");
         // 1.5 MiB total: the head must be evicted, the tail must survive.
         let chunk = "x".repeat(4096);
         for _ in 0..384 {
@@ -489,8 +534,38 @@ mod tests {
     #[test]
     fn take_output_handles_multiline_echo_and_blank_padding() {
         let mut recorder = TerminalRecorder::default();
-        recorder.arm();
+        recorder.arm("echo first");
         recorder.observe("root@host:/# echo first\r\nline1\r\n\r\nroot@host:/# ");
         assert_eq!(recorder.take_output("echo first"), "line1");
+    }
+
+    #[test]
+    fn sudo_command_text_never_duplicates_an_existing_prefix() {
+        // Already prefixed: returned untouched (no `sudo sudo`).
+        assert_eq!(sudo_command_text("sudo whoami"), "sudo whoami");
+        assert_eq!(sudo_command_text("sudo -E ls -la"), "sudo -E ls -la");
+        // Leading whitespace on the first line still counts as prefixed; the
+        // original text passes through and `sanitize_command` trims it later.
+        assert_eq!(sudo_command_text("  sudo id"), "  sudo id");
+        // Bare `sudo` is a prefix too, not a command to wrap again.
+        assert_eq!(sudo_command_text("sudo"), "sudo");
+    }
+
+    #[test]
+    fn sudo_command_text_prefixes_plain_commands_first_line_only() {
+        assert_eq!(sudo_command_text("whoami"), "sudo whoami");
+        // The prefix lands on the first line only; the remainder is left as
+        // typed because multi-line input executes line by line (known
+        // limitation of the injection path).
+        assert_eq!(sudo_command_text("whoami\nid"), "sudo whoami\nid");
+        // A `sudo` on a later line does not count as prefixed: the first
+        // line decides, otherwise the intended command would be lost.
+        assert_eq!(
+            sudo_command_text("echo hi\nsudo id"),
+            "sudo echo hi\nsudo id"
+        );
+        // Empty input is rejected upstream by `sanitize_command`; here it
+        // degrades to a bare prefix instead of panicking.
+        assert_eq!(sudo_command_text(""), "sudo ");
     }
 }

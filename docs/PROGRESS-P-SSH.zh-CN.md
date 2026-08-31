@@ -343,3 +343,92 @@ destructive gate / read-only server gate 两节新增输出）。另对 DBX 内 
 （`incomplete: true`，命令留终端人工接管）；回显剥离尽力而为；sudo+终端路径
 不注入密码（交给终端 auto-sudo 状态机或人工）。stdio `--mcp` 模式不路由
 （与工作台不同进程）。
+
+### 增补：vagrant 真机教学模式验证 + sudo 前缀风险修复（同日）
+
+对真实 vagrant 连接（192.168.33.11，parallels ubuntu，password/private-key 认证）
+完成教学模式端到端 9 场景验证：auto 模式低危路由（`uname -sr` → notice 事件 +
+输出捕获）、sudo 提权审批（elevated → approve → root）、strict deny/approve、
+人工 Ctrl+C 介入（3.3s 返回 vs 30s sleep，命令未跑完、shell 状态保留）、超时
+`incomplete:true` 后人工接管（`\x03` 终止残留 sleep 后 shell 可用）、模式恢复。
+
+验证中发现并修复一个风险缺口：路由分级此前只把 `ssh_exec_sudo` **工具**计为
+elevated，`ssh_exec` 命令文本内联 `sudo …`（如 `sudo whoami`）被判 Low 直接执行、
+绕过审批。修复：`mcp_safety::runs_under_sudo()`（复用既有分段/env 前缀解包逻辑，
+任一顶层段首动词为 sudo 即真）接入 `ssh_exec_terminal_tool` 风险计算 → 内联
+sudo 一律 elevated 必审，对齐 IMPL_PLAN §1「sudo 一律 elevated」。+1 单测
+（162 passed）。容器 smoke 回归 31/31 全绿。
+
+### 增补：自动唤起 DBX app 的完整可视链路（同日晚，宿主配合改动）
+
+用户验收反馈：教学模式应当"自动唤起 DBX.app → 自动打开对应终端 → 命令在终端上
+可见执行"。查明宿主三层缺位并补齐（宿主仓 `dbx-plugin-host-worktree` 本地改动，
+未提交）：
+
+1. **宿主 `src-tauri/src/commands/mcp_bridge.rs`**：TCP 桥新增 `POST
+   /call-plugin-tool`——按 `connection_id` 解析已保存连接 → emit
+   `mcp-open-connection-workbench` 事件 → `connection_params_standalone` 构造
+   lifecycle → 在 **app 自己的 plugin_host**（与工作台同一 sidecar 进程）上
+   `invoke("mcp/call")`，结果原路返回。超时上限 600s（容纳审批）。
+2. **宿主前端 `apps/desktop/src/composables/useTauriEvents.ts`**：监听
+   `mcp-open-connection-workbench` → `queryStore.openPluginConnection`
+   （内部去重、ensureConnected、挂工作台）→ 聚焦窗口。
+3. **插件 `backend/src/app_bridge.rs`（新）**：stdio 模式 `runInTerminal:true`
+   时转发到 app 桥——端口文件 `<app-data>/mcp-bridge-port`（`DBX_APP_DATA_DIR`
+   重定向），缺失则 `open -a DBX.app`（`DBX_APP_LAUNCH_CMD` 可自定义）唤起并
+   500ms 轮询 30s；手写最小 HTTP POST（零新依赖）；读超时 = 调用超时 + 150s
+   审批余量。`mcp.rs` 内嵌路径另加 `wait_for_connection_session`（20s 轮询，
+   解决"标签尚在打开、PTY 未就绪"竞态）。
+
+e2e（隔离 app-data + 宿主 debug bundle + 已保存 vagrant 连接）：stdio
+`ssh_exec{runInTerminal, connectionId:"vagrant"}` → app 唤起/工作台自动打开 →
+命令在可见终端执行 → AI 拿到 `{mode:"terminal", output:"agent-visible-…\nLinux
+5.4.0-216-generic"}`，1.3s 返回，cargo 166 tests 全绿。连接种子需
+`db_type:"plugin"` + `plugin_id` + `plugin_connection_provider` +
+`plugin_connection_type:"ssh"` 四个绑定字段。宿主 tauri debug 构建末尾的
+updater 签名报错（缺 `TAURI_SIGNING_PRIVATE_KEY`）不影响 .app 产物。
+
+### 增补：教学模式并发语义与完整测试覆盖（同日夜）
+
+针对「并发命令 / 连接复用」的系统化补强，三处实现 + 覆盖扩展：
+
+1. **同会话并发串行化**：`SessionEntry.agent_exec_lock`（tokio AsyncMutex，
+   OwnedMutexGuard 跨审批+执行全程持有，`mcp.rs::ssh_exec_terminal_tool` 取锁）——
+   并发 AI 命令在同会话上确定性排队，recorder 与 PTY 输入零交叉污染；刻意不做
+   全局锁，跨连接仍并行。
+2. **ssh_exec_sudo 终端注入修复**：`agent_terminal::sudo_command_text`——终端路径
+   注入 `sudo <command>`（已带前缀不重复；审批弹窗显示注入原文，所见即所执行，
+   用户编辑后的文本不二次套前缀）。修复提权在终端路径被静默丢失的 bug。
+3. **前端审批队列**：`agentPromptQueue` + `enqueueAgentPrompt/dropAgentPrompt/
+   findAgentPrompt` 纯函数——跨会话并发审批排队逐个处理，队首倒计时基于绝对期限
+   自动轮转；同 challengeId 去重。
+
+测试覆盖扩展（smoke_fs agent 组新增 12 用例，44/44 全绿）：
+shell 状态复用（export/cd 跨调用持久）、同会话并发 batch（`sidecar_client.
+request_batch` 单 pump 多 outstanding id，A/B 输出零交叉）、跨连接并行（4.3s
+< 串行 8s，锁非全局）、2MiB 输出有界捕获、ANSI 剥离、多行逐行执行、
+runInTerminal:false 回归隐藏通道、ssh_exec_sudo 审批链到 root（终端 auto-sudo
+自动应答编排密码）、超时 incomplete → Ctrl+C 恢复、人工 Ctrl+C 介入 2.4s 返回、
+smoke_mcp 增桥不可达负例（`DBX_APP_LAUNCH_CMD=:` 快速失败路径）。
+cargo 170 tests / vitest 68 tests / 容器 smoke_fs 44·smoke_mcp all green。
+
+### 增补：断线重连死循环 + 侧栏状态一致性修复（同日晚二）
+
+用户报障两则，修复：
+1. **断线后无自动重连/转圈不停**：`ssh/session/state disconnected` 分支原样只改
+   状态等人手点；现改为有界自动重连梯（500/1000/2000/5000ms 共 4 次，失败落回
+   手动重连按钮，不收敛不死循环）。`openSession` 的自愈重试限定"快速失败"
+   （<8s，启动竞态特征），重试超时降 30s——真拨号失败不再连续转圈数分钟。
+   `attachSession` 退避梯耗尽后回退 `openSession(true)`（原实现永远 attach 死
+   sessionId，app 被杀重启后终端永久卡重连）。
+2. **侧栏状态与 SSH 实际状态不一致**：`ssh/session/state` 事件补 `connectionId`；
+   宿主 `connectionStore` 新增 `markConnectionOffline`（轻量：翻侧栏离线、清
+   loading，不关标签不拆池），`useTauriEvents` 监听 `dbx-plugin-event` 转发通道
+   驱动它——PTY 掉线即刻反映到左侧树。
+另修：批准路径误发 `finish{denied}`（前端横幅闪错）；执行中关闭会话现返回
+"SSH terminal session was closed…"而非伪装超时；僵尸会话注入 send 加 5s 上限；
+`app_bridge::ensure_app_bridge` 先 TCP 探测端口再返回（杀进程后过期端口文件不再
+永久指错），std io 客户端 `McpStdioClient` 入库 sidecar_client.py（select 超时）。
+新 e2e 套件：`scripts/e2e_agent_terminal.py`（26 场景，容器 26/26、vagrant
+25/25+SKIP 全绿）与 `scripts/e2e_agent_app_bridge.py`（T1-T5）。T5（转发 shell
+状态复用偶发空输出）仍在排查，手动探针证明变量持久化正常。

@@ -14,7 +14,10 @@ Spawns the sidecar with --mcp and verifies, against the real process:
      confirmDestructive (gate fires before credential validation), and a
      second server started with DBX_SSH_MCP_READ_ONLY=1 enforces the
      read-only gates process-wide (write tools refused, ssh_exec limited
-     to whitelisted inspection commands, confirmation cannot override).
+     to whitelisted inspection commands, confirmation cannot override),
+  8. the stdio app-bridge path failing with an actionable error when the
+     DBX app has not published its bridge port (empty app-data dir, no-op
+     launch command — no UI, no SSH server involved).
 
 With --host (plus --username/--password, or the DBX_SSH_SMOKE_PASSWORD
 environment variable) a live section additionally runs a real round-trip
@@ -333,7 +336,7 @@ def main() -> None:
             }},
         })
         bridge_error = recv(proc, 20)["error"]["message"]
-        assert "runInTerminal requires the DBX embedded bridge" in bridge_error, \
+        assert "runInTerminal needs a saved DBX connection" in bridge_error, \
             f"unexpected error: {bridge_error}"
         print("runInTerminal stdio refusal ok")
 
@@ -400,6 +403,7 @@ def main() -> None:
             proc.stdin.close()
         proc.wait(timeout=10)
     read_only_server_section(args)
+    bridge_unreachable_section(args)
     print("MCP smoke: all green")
 
 
@@ -442,6 +446,41 @@ def read_only_server_section(args: argparse.Namespace) -> None:
         override = expect_error("rm -rf /etc", arguments={"confirmDestructive": True})
         assert "Refused on read-only" in override, override
         print("read-only server gate ok (DBX_SSH_MCP_READ_ONLY=1)")
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait(timeout=10)
+
+
+def bridge_unreachable_section(args: argparse.Namespace) -> None:
+    """Third sidecar pointed at an empty app-data dir: stdio
+    `ssh_exec{runInTerminal:true}` must go down the app-bridge ensure path
+    (launch attempt is the no-op `:` command, so no UI pops up) and come back
+    with the actionable "DBX app bridge" error — no SSH server, no network
+    beyond the local port-file poll. The ensure poll runs the full app-start
+    budget (30s) before the error, which is exactly the behavior under test.
+    """
+    app_data = tempfile.mkdtemp(prefix="smoke-mcp-appdata-")
+    env = dict(os.environ, DBX_APP_DATA_DIR=app_data, DBX_APP_LAUNCH_CMD=":")
+    proc = subprocess.Popen(
+        [args.binary, "--mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env,
+    )
+    try:
+        send(proc, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {}},
+        })
+        recv(proc, 1)
+        send(proc, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "ssh_exec", "arguments": {
+                "connectionId": "no-such-connection", "command": "true",
+                "runInTerminal": True,
+            }},
+        })
+        error = recv(proc, 2)["error"]["message"]
+        assert "DBX app bridge" in error, f"unexpected error: {error}"
+        print("app-bridge unreachable error ok (DBX app bridge …)")
     finally:
         if proc.stdin:
             proc.stdin.close()

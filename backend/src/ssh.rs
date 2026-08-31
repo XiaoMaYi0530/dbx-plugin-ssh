@@ -556,6 +556,14 @@ struct SessionEntry {
     /// session's PTY (`exec_in_terminal`); `None` outside such a run. Fed
     /// by the read loop at the same point as the auto-sudo observer.
     agent_recorder: Arc<Mutex<Option<TerminalRecorder>>>,
+    /// Serializes agent-terminal executions on this session: two concurrent
+    /// MCP commands must not interleave keystrokes on the same PTY or
+    /// overwrite each other's recorder. Deliberately per-session (runs on
+    /// different connections stay parallel) and deliberately held across the
+    /// approval wait too — the wait is part of the serialization so an
+    /// un-approved command cannot be raced by a second one. `Arc`-wrapped so
+    /// a run can hold an owned guard across awaits.
+    agent_exec_lock: Arc<AsyncMutex<()>>,
 }
 
 struct UploadState {
@@ -799,6 +807,7 @@ impl SshRuntime {
             replay: replay.clone(),
             sftp: AsyncMutex::new(None),
             agent_recorder: Arc::new(Mutex::new(None)),
+            agent_exec_lock: Arc::new(AsyncMutex::new(())),
         });
         self.sessions
             .write()
@@ -913,7 +922,11 @@ impl SshRuntime {
             .await;
             let _ = emitter.event(
                 "ssh/session/state",
-                json!({ "sessionId": task_id, "state": "disconnected" }),
+                json!({
+                    "sessionId": task_id,
+                    "connectionId": entry.connection_id,
+                    "state": "disconnected"
+                }),
             );
             sessions.write().await.remove(&task_id);
         });
@@ -1634,6 +1647,21 @@ impl SshRuntime {
         }
     }
 
+    /// Acquires the session's agent-execution lock for the caller. The owned
+    /// guard is returned so `ssh_exec_terminal_tool` can hold it across the
+    /// approval wait and the whole run — holding across `await` is the
+    /// deliberate serialization (a queued command must wait out an in-flight
+    /// approval, not race it). Per-session by design: different connections
+    /// keep running in parallel.
+    pub(crate) async fn agent_exec_guard(
+        &self,
+        session_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        let session = self.session(session_id).await?;
+        let lock = Arc::clone(&session.agent_exec_lock);
+        Ok(lock.lock_owned().await)
+    }
+
     /// Runs an AI/MCP command inside the session's interactive PTY: the
     /// command is typed into the user's terminal (visible, interruptible),
     /// the output is captured by a session-level recorder, and the captured
@@ -1666,14 +1694,18 @@ impl SshRuntime {
                 .clamp(5, 300),
         );
 
-        // Install the recorder before injecting so no output is lost.
+        // Install the recorder before injecting so no output is lost. The
+        // first line of the command gates settling: without its echo the
+        // recorder would settle on the login-banner prompt before the shell
+        // even processed the injection (boot-restore race).
+        let echo_fragment = command.lines().next().unwrap_or_default().trim().to_string();
         {
             let mut slot = session
                 .agent_recorder
                 .lock()
                 .map_err(|_| "Terminal recorder is poisoned".to_string())?;
             let mut recorder = TerminalRecorder::default();
-            recorder.arm();
+            recorder.arm(&echo_fragment);
             *slot = Some(recorder);
         }
         let _ = emitter.event(
@@ -1687,19 +1719,41 @@ impl SshRuntime {
         );
 
         // Inject like the quick-command bar: raw text plus a carriage
-        // return on the session's PTY input queue.
+        // return on the session's PTY input queue. The send is bounded so a
+        // zombie session (dead read loop, full queue) cannot park the agent
+        // call forever.
         let payload = format!("{command}\r").into_bytes();
-        if let Err(error) = session.terminal_tx.send(TerminalCommand::Input(payload)).await {
-            if let Ok(mut slot) = session.agent_recorder.lock() {
-                *slot = None;
+        let injected = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.terminal_tx.send(TerminalCommand::Input(payload)),
+        )
+        .await;
+        match injected {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if let Ok(mut slot) = session.agent_recorder.lock() {
+                    *slot = None;
+                }
+                return Err(format!("SSH terminal is closed: {error}"));
             }
-            return Err(format!("SSH terminal is closed: {error}"));
+            Err(_) => {
+                if let Ok(mut slot) = session.agent_recorder.lock() {
+                    *slot = None;
+                }
+                return Err(
+                    "SSH terminal is not accepting input (session unresponsive)".to_string(),
+                );
+            }
         }
 
         // Poll the recorder: prompt-seen plus 300ms of silence, or deadline.
+        // A closed session (workbench tab closed mid-run) ends the wait with
+        // a dedicated error instead of masquerading as a timeout.
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut poll_cycles = 0usize;
         let timed_out = loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
+            poll_cycles += 1;
             let settled = session
                 .agent_recorder
                 .lock()
@@ -1708,6 +1762,18 @@ impl SshRuntime {
                 .unwrap_or(false);
             if settled {
                 break false;
+            }
+            if poll_cycles % 20 == 0 && !self.sessions.read().await.contains_key(session_id) {
+                if let Ok(mut slot) = session.agent_recorder.lock() {
+                    slot.take();
+                }
+                let _ = emitter.event(
+                    "ssh/agent/finish",
+                    json!({ "sessionId": session_id, "status": "timeout" }),
+                );
+                return Err(
+                    "SSH terminal session was closed while the command was running".to_string(),
+                );
             }
             if tokio::time::Instant::now() >= deadline {
                 break true;
@@ -1806,19 +1872,23 @@ impl SshRuntime {
                 None
             }
         };
+        // Approved: the follow-up notice/finish pair comes from
+        // exec_in_terminal — emitting "denied" here would flash the workbench
+        // banner state for a command that is about to run.
+        if let Some(AgentDecision::Approve { command: edited }) = decision {
+            let edited = edited.filter(|text| !text.trim().is_empty());
+            return Ok(edited.unwrap_or_else(|| command.to_string()));
+        }
         let _ = emitter.event(
             "ssh/agent/finish",
             json!({ "sessionId": session_id, "status": "denied" }),
         );
         match decision {
-            Some(AgentDecision::Approve { command: edited }) => {
-                let edited = edited.filter(|text| !text.trim().is_empty());
-                Ok(edited.unwrap_or_else(|| command.to_string()))
-            }
             Some(AgentDecision::Deny) => {
                 Err("Command not run: user denied the terminal execution".to_string())
             }
             None => Err("Command not run: approval timed out waiting for the user".to_string()),
+            Some(AgentDecision::Approve { .. }) => unreachable!("handled above"),
         }
     }
 
@@ -3762,5 +3832,42 @@ mod tests {
             .expect("decision");
         assert_eq!(decision, AgentDecision::Deny);
         assert!(runtime.resolve_agent_challenge("c-2", "maybe", None).is_err());
+    }
+
+    #[test]
+    fn agent_exec_lock_admits_one_holder_then_queues() {
+        // Structural test for the per-session agent-execution lock: one
+        // holder excludes a second contender and release lets it through.
+        // The await-based acquisition itself (`agent_exec_guard`, held across
+        // approval + run) is exercised by the container smoke's concurrent
+        // pair, which needs a live PTY. `blocking_lock` is fine here — the
+        // test runs outside any tokio runtime.
+        let lock = Arc::new(AsyncMutex::new(()));
+        let held = lock.clone();
+        let guard = held.blocking_lock();
+        assert!(
+            lock.try_lock().is_err(),
+            "a second agent command must queue behind the running one"
+        );
+        drop(guard);
+        assert!(
+            lock.try_lock().is_ok(),
+            "release must admit the next agent command"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_exec_guard_reports_unknown_sessions() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+        let error = runtime
+            .agent_exec_guard("no-such-session")
+            .await
+            .err()
+            .expect("unknown session must be refused");
+        assert!(
+            error.contains("not found") || error.contains("expired"),
+            "unexpected error: {error}"
+        );
     }
 }

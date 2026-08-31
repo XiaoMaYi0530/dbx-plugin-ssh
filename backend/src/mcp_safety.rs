@@ -46,6 +46,17 @@ pub fn assess_command(command: &str) -> CommandRisk {
     overall
 }
 
+/// True when any top-level command segment runs under `sudo` (after the same
+/// env-prefix / wrapper unwrapping the classifier applies). Agent terminal
+/// mode treats these as privilege escalation regardless of the inner verb,
+/// so teaching-mode approval covers inline `sudo …`, not just `ssh_exec_sudo`.
+pub fn runs_under_sudo(command: &str) -> bool {
+    let neutralized = neutralize_fd_dups(command);
+    split_segments(&neutralized)
+        .iter()
+        .any(|segment| effective_tokens(segment).first().map(String::as_str) == Some("sudo"))
+}
+
 /// Replaces fd duplications (`2>&1`, `1>&2`, ...) with a neutral token so
 /// the `&` splitter does not shred them; they duplicate fds, not files.
 fn neutralize_fd_dups(command: &str) -> String {
@@ -433,6 +444,17 @@ mod tests {
         read_only("ip addr show eth0");
         read_only("crontab -l");
         read_only("service nginx status");
+    }
+
+    #[test]
+    fn runs_under_sudo_detects_inline_privilege_escalation() {
+        assert!(super::runs_under_sudo("sudo whoami"));
+        assert!(super::runs_under_sudo("sudo -u postgres psql -l"));
+        assert!(super::runs_under_sudo("echo hi && sudo reboot"));
+        assert!(super::runs_under_sudo("FOO=1 sudo id"));
+        assert!(!super::runs_under_sudo("echo sudo is a word here"));
+        assert!(!super::runs_under_sudo("whoami"));
+        assert!(!super::runs_under_sudo("ls && cat /etc/hostname"));
     }
 
     #[test]

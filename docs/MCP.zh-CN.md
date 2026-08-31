@@ -83,7 +83,7 @@ dbx-plugin-ssh --mcp
 
 | 工具 | 说明 |
 | --- | --- |
-| `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」） |
+| `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」）；stdio 模式传 `true` 且带 `connectionId` 时自动转发到运行中的 DBX app（未运行则唤起），在 app 的可见终端里执行 |
 | `ssh_metrics` | CPU/内存/负载/磁盘/运行时长（只读命令） |
 | `ssh_test_connection` | 验证连通性与认证（含跳板链），返回延迟 |
 | `ssh_list_known_hosts` / `ssh_remove_known_host` | 管理插件 known_hosts（不改系统 `~/.ssh/known_hosts`） |
@@ -130,8 +130,11 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
 实时可见、人可随时打字或 Ctrl+C 介入，AI 拿到录制捕获的输出文本
 （`{output, exitCode: null, mode: "terminal", incomplete, interrupted}`）。
 
-- **仅 DBX 内嵌桥（方式一）生效**：stdio 独立模式与工作台不同进程、无 UI，
-  传 `true` 直接报错 `runInTerminal requires the DBX embedded bridge`。
+- **stdio 方式亦可转发**：stdio 模式传 `runInTerminal: true` 时，sidecar 通过 DBX
+  app 的本地 TCP 桥（`<app-data>/mcp-bridge-port`，可用 `DBX_APP_DATA_DIR` 重定向；
+  app 未运行会尝试 `open -a DBX.app` 唤起，可用 `DBX_APP_LAUNCH_CMD` 自定义）把调用
+  转发到 **app 自己的插件 sidecar**——与工作台同一进程，命令出现在 app 终端里。
+  转发要求 `connectionId` 指向 DBX 已保存的连接（凭据由 app 侧解析，不经 stdio 调用方）。
 - 该连接没有打开的终端会话时报错引导（"open the SSH workbench terminal first"），
   不回退到隐藏执行——可见才执行是该模式的承诺。
 - 连接级默认行为由工作台设置 `agentTerminalMode` 决定（`off` 默认不路由 /

@@ -19,7 +19,9 @@ import argparse
 import base64
 import json
 import re
+import struct
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -30,6 +32,11 @@ from sidecar_client import SidecarClient, SidecarError, lifecycle_params
 
 def step(name: str):
     print(f"\n==> {name}")
+
+
+class SkipSignal(Exception):
+    """Raised by a case to skip itself for environmental reasons (e.g. an
+    unstable container sudo configuration) without failing the run."""
 
 
 def fail(message: str, client: SidecarClient | None = None):
@@ -106,6 +113,9 @@ class Report:
             return
         try:
             case()
+        except SkipSignal as reason:
+            print(f"SKIP: {reason}")
+            self.skipped.append((title, str(reason)))
         except SidecarError as error:
             missing = missing_method(error)
             if missing is not None:
@@ -537,6 +547,236 @@ def main() -> None:
             finally:
                 req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "off"})
 
+        # -- agent terminal extension group --------------------------------------
+        # All routed commands below rely on agentTerminalMode=auto, re-armed by
+        # case_agent_shell_state_reuse right after the deny case turned it off.
+
+        # Ctrl-C goes straight into the session PTY exactly like the workbench
+        # interrupt button (binary frames carry a u64 BE sequence prefix).
+        input_seq = [0]
+
+        def send_ctrl_c():
+            input_seq[0] += 1
+            client.send_binary(f"ssh/terminal/in/{session_id}",
+                               struct.pack(">Q", input_seq[0]) + b"\x03")
+
+        def call_tools_embedded_batch(entries: list[tuple[str, dict, str]],
+                                      timeout: float = 90.0) -> list[dict]:
+            """Fire several mcp/call requests through one pump (request_batch).
+
+            entries: [(tool, arguments, connectionId), ...] — same envelope as
+            call_tool_embedded, just batched so the calls overlap server-side.
+            """
+            specs = [{"method": "mcp/call",
+                      "params": {"tool": tool, "arguments": arguments,
+                                 "lifecycle": lifecycle_params(dict(agent_connection,
+                                                                    id=conn, name=conn))},
+                      "timeout": timeout}
+                     for tool, arguments, conn in entries]
+            return client.request_batch(specs, on_event=auto_accept_challenge)
+
+        def tool_result(entry: dict, label: str) -> dict:
+            """Unwrap one batch entry (an mcp/call result) like call_tool_embedded."""
+            if "__error" in entry:
+                raise AssertionError(f"{label} errored: {entry['__error']}")
+            if entry.get("isError"):
+                raise AssertionError(f"{label} failed: {str(entry)[:160]}")
+            return json.loads(entry["content"][0]["text"])
+
+        def case_agent_shell_state_reuse():
+            # Connection reuse: the routed commands land in the SAME
+            # interactive shell, so an export must survive across calls.
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "auto"})
+            got = req("ssh/settings/get", {"sessionId": session_id}).get("agentTerminalMode")
+            if got != "auto":
+                raise AssertionError(f"agentTerminalMode={got!r}, want 'auto'")
+            ts = int(time.time())
+            call_tool_embedded("ssh_exec", {"command": f"export AGENT_SMOKE_TOKEN={ts}"})
+            second = call_tool_embedded("ssh_exec", {"command": "echo $AGENT_SMOKE_TOKEN"})
+            output = str(second.get("output", ""))
+            if str(ts) not in output:
+                raise AssertionError(f"shell state lost between calls: {output[:160]}")
+            print(f"    token survived across calls: {output.strip()[:40]!r}")
+
+        def case_agent_cwd_reuse():
+            call_tool_embedded("ssh_exec", {"command": "cd /tmp && pwd"})
+            second = call_tool_embedded("ssh_exec", {"command": "pwd"})
+            output = str(second.get("output", ""))
+            if "/tmp" not in output:
+                raise AssertionError(f"cwd lost between calls: {output[:160]}")
+            print(f"    cwd survived across calls: {output.strip()[:40]!r}")
+
+        def case_agent_serialized_concurrent():
+            # Two routed commands on the same session: the per-session exec
+            # lock must serialize them (each capture free of the other's
+            # markers) instead of interleaving keystrokes on one PTY.
+            ts = int(time.time())
+            entries = [
+                ("ssh_exec", {"command": f"sleep 6 && echo AONLY-{ts}"}, connection_id),
+                ("ssh_exec", {"command": f"echo BONLY-{ts}"}, connection_id),
+            ]
+            started = time.monotonic()
+            results = call_tools_embedded_batch(entries, timeout=90.0)
+            out_a = str(tool_result(results[0], "serialized A").get("output", ""))
+            out_b = str(tool_result(results[1], "serialized B").get("output", ""))
+            if f"AONLY-{ts}" not in out_a or f"BONLY-{ts}" in out_a:
+                raise AssertionError(f"A capture polluted: {out_a[:160]!r}")
+            if f"BONLY-{ts}" not in out_b or f"AONLY-{ts}" in out_b:
+                raise AssertionError(f"B capture polluted: {out_b[:160]!r}")
+            print(f"    serialized pair clean in {time.monotonic() - started:.1f}s")
+
+        agent_session_state: dict = {}
+
+        def case_open_agent_session():
+            # Second live PTY on the agent connection for cross-connection
+            # parallelism (the connection itself was opened earlier).
+            session = req("ssh/session/open",
+                          {"connectionId": agent_conn_id, "workbenchId": "smoke-fs-agent-wb",
+                           "cols": 120, "rows": 30})
+            agent_session_state["sessionId"] = session.get("sessionId", "smoke-fs-agent-wb")
+            print(f"    agent session {agent_session_state['sessionId']} opened")
+
+        def case_agent_parallel_cross_connection():
+            # Different sessions (different connections) must run in parallel:
+            # 2 x sleep 4 in ~4.5s; a serialized lock would need >= 8s.
+            ts = int(time.time())
+            entries = [
+                ("ssh_exec", {"command": f"sleep 4 && echo P1-{ts}"}, connection_id),
+                ("ssh_exec", {"command": f"sleep 4 && echo P2-{ts}"}, agent_conn_id),
+            ]
+            started = time.monotonic()
+            results = call_tools_embedded_batch(entries, timeout=90.0)
+            elapsed = time.monotonic() - started
+            out_p1 = str(tool_result(results[0], "parallel P1").get("output", ""))
+            out_p2 = str(tool_result(results[1], "parallel P2").get("output", ""))
+            if f"P1-{ts}" not in out_p1:
+                raise AssertionError(f"P1 output missing: {out_p1[:160]!r}")
+            if f"P2-{ts}" not in out_p2:
+                raise AssertionError(f"P2 output missing: {out_p2[:160]!r}")
+            if elapsed >= 7.0:
+                raise AssertionError(f"cross-connection calls took {elapsed:.1f}s "
+                                     f"(serialized would be >= 8s; budget 7s)")
+            print(f"    parallel pair ok in {elapsed:.1f}s (< 7s)")
+
+        def case_agent_large_output_cap():
+            # 2 MiB into the 1 MiB bounded recorder window: the head is
+            # evicted, the capture stays valid and the response normal. The
+            # trailing echo puts the fresh prompt on its own line, otherwise
+            # the best-effort stripper would treat the whole (single-line)
+            # capture as a prompt line and drop it.
+            result = call_tool_embedded("ssh_exec",
+                                        {"command": "head -c 2097152 /dev/zero | tr '\\0' x; echo"},
+                                        timeout=120.0)
+            output = str(result.get("output", ""))
+            if not output.strip():
+                raise AssertionError("empty output for a 2 MiB stream")
+            if result.get("incomplete") is not False:
+                raise AssertionError(f"incomplete={result.get('incomplete')!r}, want False")
+            # Loose bound only (no exact-length assertion): a window that kept
+            # everything would exceed the produced 2 MiB minus overhead.
+            if len(output) > 1536 * 1024:
+                raise AssertionError(f"capture not bounded: {len(output)} bytes")
+            print(f"    captured {len(output)} bytes of the 2 MiB stream (bounded)")
+
+        def case_agent_ansi_stripped():
+            # The escape reaches the shell as printf text (sanitize only strips
+            # raw control bytes from the injected command); the *captured
+            # output* must come back ANSI-free.
+            result = call_tool_embedded("ssh_exec",
+                                        {"command": "printf '\\033[31mREDTEXT\\033[0m\\n'"})
+            output = str(result.get("output", ""))
+            if "REDTEXT" not in output:
+                raise AssertionError(f"output missing REDTEXT: {output[:160]!r}")
+            if "\x1b" in output:
+                raise AssertionError("captured output still contains ESC bytes")
+            print(f"    colored text captured clean: {output.strip()[:40]!r}")
+
+        def case_agent_multiline_runs_line_by_line():
+            # Known limitation, pinned here on purpose: a multi-line command
+            # executes line by line, and both lines' output must be captured.
+            result = call_tool_embedded("ssh_exec", {"command": "echo L1\necho L2"})
+            output = str(result.get("output", ""))
+            if "L1" not in output or "L2" not in output:
+                raise AssertionError(f"multi-line output incomplete: {output[:160]!r}")
+            print(f"    both lines executed: {output.strip()[:60]!r}")
+
+        def case_agent_hidden_channel_opt_out():
+            # runInTerminal:false in auto mode forces the audited hidden exec
+            # channel, whose response carries no mode/incomplete fields.
+            result = call_tool_embedded("ssh_exec",
+                                        {"command": "echo legacy", "runInTerminal": False})
+            if "legacy" not in str(result.get("output", "")):
+                raise AssertionError(f"hidden exec output missing: {str(result)[:160]}")
+            if "mode" in result:
+                raise AssertionError(f"hidden-channel response leaks mode: {result}")
+            print(f"    hidden channel: {str(result.get('output')).strip()[:40]!r}, no mode field")
+
+        def case_agent_sudo_approval_chain():
+            # Approval (elevated) -> terminal injection of `sudo whoami` -> the
+            # terminal's auto-sudo state machine (or NOPASSWD sudo) answers ->
+            # root. An unstable container sudo setup is SKIP, not FAIL.
+            req("ssh/settings/set", {"sessionId": session_id, "sudoPassword": args.password})
+            result = call_tool_embedded("ssh_exec_sudo",
+                                        {"command": "whoami", "runInTerminal": True},
+                                        on_event=approve_agent_prompt)
+            output = str(result.get("output", ""))
+            if "root" not in output:
+                lowered = output.lower()
+                if "sudo" in lowered and ("password" in lowered or "incorrect" in lowered
+                                          or "not in the sudoers" in lowered):
+                    raise SkipSignal(f"container sudo configuration unstable: {output[:120]}")
+                raise AssertionError(f"sudo whoami output missing root: {output[:160]}")
+            print(f"    sudo whoami -> {output.strip()[:40]!r}")
+
+        def case_agent_timeout_incomplete_and_recover():
+            # 5s budget against a 25s command: the AI gets partial output with
+            # incomplete:true while the command keeps running; a Ctrl-C into
+            # the PTY (as the workbench banner button does) clears it and the
+            # shell takes new commands.
+            result = call_tool_embedded("ssh_exec",
+                                        {"command": "sleep 25", "timeoutSecs": 5,
+                                         "runInTerminal": True})
+            if result.get("incomplete") is not True:
+                raise AssertionError(f"incomplete={result.get('incomplete')!r}, want True")
+            send_ctrl_c()
+            recovered = call_tool_embedded("ssh_exec", {"command": "echo recovered"})
+            output = str(recovered.get("output", ""))
+            if "recovered" not in output:
+                raise AssertionError(f"shell not recovered after Ctrl-C: {output[:160]}")
+            print("    incomplete reported, leftover sleep cleared, shell recovered")
+
+        def case_agent_manual_interrupt():
+            # Human-intervention semantics: a Ctrl-C typed into the terminal
+            # (Timer thread writing the PTY input frame is thread-safe — only
+            # the socket write races nothing) aborts the command early.
+            ts = int(time.time())
+            timer = threading.Timer(2.0, send_ctrl_c)
+            timer.start()
+            started = time.monotonic()
+            try:
+                result = call_tool_embedded("ssh_exec",
+                                            {"command": f"sleep 20 && echo NOTDONE-{ts}"})
+            finally:
+                timer.cancel()
+            elapsed = time.monotonic() - started
+            output = str(result.get("output", ""))
+            if f"NOTDONE-{ts}" in output:
+                raise AssertionError("interrupted command still completed")
+            if result.get("incomplete") is not False:
+                raise AssertionError(f"incomplete={result.get('incomplete')!r}, want False")
+            if elapsed >= 15.0:
+                raise AssertionError(f"interrupted call took {elapsed:.1f}s (budget 15s)")
+            print(f"    Ctrl-C returned in {elapsed:.1f}s without NOTDONE")
+
+        def case_agent_settings_restored():
+            restored = req("ssh/settings/set", {"sessionId": session_id,
+                                                "agentTerminalMode": "off",
+                                                "sudoPassword": ""})
+            if restored.get("agentTerminalMode") != "off":
+                raise AssertionError(f"agentTerminalMode={restored.get('agentTerminalMode')!r}, "
+                                     "want 'off'")
+            print("    agentTerminalMode=off, sudo password back to login fallback")
+
 
         report = Report()
         print("\n--- sftp_ext group ---")
@@ -597,8 +837,52 @@ def main() -> None:
                    needs="agent terminal exec routes to PTY")
         report.run("agent strict approval deny", "mcp/call", case_agent_deny,
                    needs="agent strict approval approve")
+        report.run("agent mode re-armed + shell state reused", "ssh/settings/set",
+                   case_agent_shell_state_reuse, needs="agent strict approval deny")
+        report.run("agent cwd reused across calls", "mcp/call", case_agent_cwd_reuse,
+                   needs="agent mode re-armed + shell state reused")
+        report.run("agent same-session concurrency serialized", "mcp/call",
+                   case_agent_serialized_concurrent,
+                   needs="agent cwd reused across calls")
+        report.run("agent second connection terminal opened", "ssh/session/open",
+                   case_open_agent_session,
+                   needs="agent mode re-armed + shell state reused")
+        report.run("agent cross-connection parallelism", "mcp/call",
+                   case_agent_parallel_cross_connection,
+                   needs="agent second connection terminal opened")
+        report.run("agent 2 MiB output stays bounded", "mcp/call",
+                   case_agent_large_output_cap,
+                   needs="agent same-session concurrency serialized")
+        report.run("agent ANSI sequences stripped", "mcp/call", case_agent_ansi_stripped,
+                   needs="agent 2 MiB output stays bounded")
+        report.run("agent multi-line command runs line by line", "mcp/call",
+                   case_agent_multiline_runs_line_by_line,
+                   needs="agent ANSI sequences stripped")
+        report.run("agent runInTerminal=false keeps hidden channel", "mcp/call",
+                   case_agent_hidden_channel_opt_out,
+                   needs="agent multi-line command runs line by line")
+        report.run("agent sudo approval chain reaches root", "mcp/call",
+                   case_agent_sudo_approval_chain,
+                   needs="agent runInTerminal=false keeps hidden channel")
+        report.run("agent timeout returns incomplete then recovers", "mcp/call",
+                   case_agent_timeout_incomplete_and_recover,
+                   needs="agent runInTerminal=false keeps hidden channel")
+        report.run("agent manual Ctrl-C interrupt", "mcp/call", case_agent_manual_interrupt,
+                   needs="agent timeout returns incomplete then recovers")
+        report.run("agent settings restored (off + sudo password cleared)", "ssh/settings/set",
+                   case_agent_settings_restored,
+                   needs="agent mode re-armed + shell state reused")
 
         step("cleanup leftovers")
+        # Best-effort mode/secret restore even when a late case failed: the
+        # sidecar keeps these in memory only, but a clean teardown keeps the
+        # next smoke run's expectations honest.
+        try:
+            client.request("ssh/settings/set", {"sessionId": session_id,
+                                                "agentTerminalMode": "off",
+                                                "sudoPassword": ""})
+        except SidecarError:
+            pass
         for path, recursive in ((touch_path, False), (write_path, False),
                                 (archive_path, False), (extract_dir, True), (sudo_dir, True)):
             try:
@@ -607,8 +891,18 @@ def main() -> None:
                 print(f"    deleted {path}")
             except SidecarError:
                 pass  # already cleaned by its case / not ours / needs sudo
-        client.request("ssh/session/close", {"sessionId": session_id})
-        print("    session closed")
+        try:
+            client.request("ssh/session/close", {"sessionId": session_id})
+            print("    session closed")
+        except SidecarError:
+            pass
+        agent_session_id = agent_session_state.get("sessionId")
+        if agent_session_id:
+            try:
+                client.request("ssh/session/close", {"sessionId": agent_session_id})
+                print("    agent session closed")
+            except SidecarError:
+                pass
 
         client.close()
         step(f"summary ({time.monotonic() - started:.1f}s)")

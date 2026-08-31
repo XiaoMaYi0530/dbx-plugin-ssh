@@ -1,4 +1,5 @@
 mod agent_terminal;
+mod app_bridge;
 mod exec;
 mod host_key;
 mod keys;
