@@ -781,13 +781,17 @@ fn to_plugin_error(error: String) -> PluginError {
 }
 
 fn plugin_data_dir() -> PathBuf {
-    std::env::var_os("DBX_PLUGIN_DATA_DIR")
+    let data_dir = std::env::var_os("DBX_PLUGIN_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             std::env::temp_dir()
                 .join("dbx-plugin-data")
                 .join("io.dbx.ssh")
-        })
+        });
+    // The env var is the plugin's only path input; resolve symlinks and `..`
+    // once at the boundary so every store path below it is canonical.
+    let _ = std::fs::create_dir_all(&data_dir);
+    std::fs::canonicalize(&data_dir).unwrap_or(data_dir)
 }
 
 fn main() -> std::io::Result<()> {

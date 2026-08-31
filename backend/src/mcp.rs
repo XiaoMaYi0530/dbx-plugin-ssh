@@ -1006,8 +1006,10 @@ impl McpState {
             .get("overwrite")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let data = std::fs::read(local_path)
+        let local_source = std::fs::canonicalize(&local_path)
             .map_err(|error| format!("Cannot read local file {local_path}: {error}"))?;
+        let data = std::fs::read(&local_source)
+            .map_err(|error| format!("Cannot read local file {}: {error}", local_source.display()))?;
         let upload_limit = self.size_limits().max_upload_bytes;
         if data.len() as u64 > upload_limit {
             return Err(format!(
@@ -1071,6 +1073,9 @@ impl McpState {
                 "Local path already exists: {local_path} (pass overwrite=true to replace)"
             ));
         }
+        let file_name = local
+            .file_name()
+            .ok_or_else(|| format!("Invalid local path: {local_path}"))?;
         if let Some(parent) = local
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -1079,8 +1084,19 @@ impl McpState {
                 format!("Cannot create local directory {}: {error}", parent.display())
             })?;
         }
+        // Write through the canonical parent (symlinks and `..` resolved by
+        // the OS) re-joined with the requested file name, so the target is
+        // exactly the requested path and never a traversal artifact.
+        let local_target = match local.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            Some(parent) => std::fs::canonicalize(parent)
+                .map_err(|error| {
+                    format!("Cannot resolve local directory {}: {error}", parent.display())
+                })?
+                .join(file_name),
+            None => PathBuf::from(file_name),
+        };
         let outcome = self
-            .download_via_sftp(arguments, remote_path, local_path)
+            .download_via_sftp(arguments, remote_path, local_path, &local_target)
             .await;
         if outcome.is_err() {
             self.drop_connection(arguments).await;
@@ -1093,6 +1109,7 @@ impl McpState {
         arguments: &Value,
         remote_path: &str,
         local_path: &str,
+        local_target: &Path,
     ) -> Result<Value, String> {
         self.connection(arguments).await?;
         let download_limit = self.size_limits().max_download_bytes;
@@ -1134,8 +1151,8 @@ impl McpState {
                  bytes (adjust maxDownloadBytes via mcp/settings/set)"
             ));
         }
-        std::fs::write(local_path, &data)
-            .map_err(|error| format!("Cannot write local file {local_path}: {error}"))?;
+        std::fs::write(local_target, &data)
+            .map_err(|error| format!("Cannot write local file {}: {error}", local_target.display()))?;
         Ok(json!({ "remotePath": remote_path, "localPath": local_path, "bytes": data.len() }))
     }
 

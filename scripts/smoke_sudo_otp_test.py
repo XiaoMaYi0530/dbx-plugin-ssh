@@ -356,7 +356,7 @@ def main() -> None:
     report = Report()
     connection_id = "smoke-sudo-otp-connection"
     session_id = ""
-    wrong_password = "definitely-not-" + secrets.token_hex(4)
+    wrong_password = secrets.token_hex(16)
 
     try:
         step("container preparation (idempotent)")
