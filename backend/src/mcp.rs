@@ -683,6 +683,11 @@ impl McpState {
             let auth = self
                 .resolve_sudo_auth(arguments, sudo_profile, stored)
                 .await?;
+            // The hidden exec channel stays TTY-less on purpose: with a PTY,
+            // each PAM factor read flushes typed-ahead input, so piped
+            // credentials race an unknowable per-host timing; without one,
+            // stdin is a plain pipe and `exec_with_sudo` queues password and
+            // OTP deterministically.
             let connection = self.connection(arguments).await?;
             exec::exec_with_sudo(
                 &connection,

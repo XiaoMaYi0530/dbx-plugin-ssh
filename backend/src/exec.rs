@@ -589,7 +589,11 @@ pub(crate) fn can_respond_to_prompt(
     password_answered: bool,
 ) -> bool {
     match kind {
-        PromptKind::Password => true,
+        // `exec_with_sudo` pipes the password before any prompt is watched
+        // (`password_answered` starts true); answering a visible password
+        // prompt again would queue a second password line and shift every
+        // later OTP answer one read out of position.
+        PromptKind::Password => !password_answered,
         PromptKind::Totp => {
             mode.allows_otp_after_password()
                 && (mode != AuthFlowMode::PasswordThenOtp || password_answered)
@@ -684,14 +688,27 @@ pub async fn exec_with_sudo(
         .await
         .map_err(|error| format!("Failed to start sudo command: {error}"))?;
 
-    // Phase 1: hand sudo the password immediately. Stdin stays open so
-    // follow-up OTP answers can still be written in phase 2.
-    let password_line = format!("{}\n", auth.password);
-    if let Err(error) = channel.data(password_line.as_bytes()).await {
+    // Phase 1: hand sudo the password, with the OTP code (when configured)
+    // queued right behind it - `sudo -S` and its PAM stack read the factors
+    // sequentially from stdin. The exec channel stays TTY-less: with a PTY
+    // each factor read flushes typed-ahead input (termios TCSAFLUSH in the
+    // password readers), so automated writes race an unknowable per-host
+    // timing; a plain pipe queues reliably no matter when the reads happen.
+    let mut payload = format!("{}\n", auth.password).into_bytes();
+    if let Some(code) = auth.totp_answer_logged() {
+        // Already-committed codes inside their replay window are skipped by
+        // the watcher path below instead.
+        let mut otp_line = code.into_bytes();
+        otp_line.push(b'\n');
+        payload.extend_from_slice(&otp_line);
+    }
+    if let Err(error) = channel.data(payload.as_slice()).await {
         return Err(abort_exec_channel(&mut channel, format!("Failed to write sudo password: {error}")).await);
     }
 
-    // Phase 2: watch for follow-up prompts and collect output.
+    // Phase 2: watch for follow-up prompts and collect output. Both factors
+    // were piped, so the watcher only answers hosts that re-prompt and
+    // reports sudo's authentication failures.
     let outcome = match run_to_completion(&mut channel, timeout, Some((auth, use_pty))).await {
         Ok(outcome) => outcome,
         Err(error) => return Err(abort_exec_channel(&mut channel, error).await),
@@ -739,6 +756,11 @@ pub fn is_pre_exec_transport_error(error: &str) -> bool {
 
 type PromptContext<'a> = (&'a SudoAuth, bool);
 
+const SUDO_WAIT_TIMEOUT_MESSAGE: &str = "Timed out waiting for the remote command to finish. The command may \
+     STILL be running on the remote host - check for stray processes or \
+     package-manager locks before retrying; for long jobs start them \
+     detached (ssh_run_bg + ssh_task_status) instead of extending the wait.";
+
 async fn run_to_completion(
     channel: &mut russh::Channel<russh::client::Msg>,
     timeout: Duration,
@@ -756,13 +778,7 @@ async fn run_to_completion(
     while !closed {
         let message = tokio::time::timeout_at(deadline, channel.wait())
             .await
-            .map_err(|_| {
-                "Timed out waiting for the remote command to finish. The command may \
-                 STILL be running on the remote host - check for stray processes or \
-                 package-manager locks before retrying; for long jobs start them \
-                 detached (ssh_run_bg + ssh_task_status) instead of extending the wait."
-                    .to_string()
-            })?;
+            .map_err(|_| SUDO_WAIT_TIMEOUT_MESSAGE.to_string())?;
         let message = match message {
             Some(message) => message,
             None => break,
@@ -1484,6 +1500,22 @@ mod tests {
         assert!(can_respond_to_prompt(
             AuthFlowMode::PasswordOnly,
             PromptKind::Combined,
+            false
+        ));
+    }
+
+    #[test]
+    fn piped_password_is_not_reanswered_on_visible_prompt() {
+        // exec_with_sudo pipes the password before watching prompts; a second
+        // copy would desync the stdin line stream against the OTP answer.
+        assert!(!can_respond_to_prompt(
+            AuthFlowMode::PasswordThenOtp,
+            PromptKind::Password,
+            true
+        ));
+        assert!(can_respond_to_prompt(
+            AuthFlowMode::PasswordThenOtp,
+            PromptKind::Password,
             false
         ));
     }
