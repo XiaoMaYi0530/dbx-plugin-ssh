@@ -64,7 +64,9 @@ profile 分组、全局外观）不重复实现。
 
 2026-08 全量差距复审（tiny-rdm 演化版 MCP CTL 基线）后立项，四个并发工作包：
 A 终端体验（搜索/字体缩放/WebLinks/风险粘贴防护/滚动缓冲 25k）、
-B SFTP 面板（搜索过滤/多选批量/新建文件/属性弹窗/路径历史/sudo 编辑/服务器内复制粘贴）、
+B SFTP 面板（搜索过滤/多选批量/新建文件/属性弹窗/路径历史/sudo 编辑/服务器内复制粘贴；
+0.4.x 增补：面板可收起/打开按钮 + 默认不打开偏好、DBX 重启恢复的
+「Connection is not active」快速失败提示，见 PROGRESS-P-SSH §8.3）、
 C 后端补齐（sftp/copy+move、sudo 时间戳保活、OTP 防重放）、
 D 指标增强（网络接口速率/Top 进程/分区展示）。
 实施细节、文件所有权与验收标准见 `FEATURE_PARITY_BATCH3.zh-CN.md`。

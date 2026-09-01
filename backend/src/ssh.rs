@@ -52,7 +52,7 @@ fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
 /// Resolved Quick Sudo source for one connection: the connection's own
 /// credential pipeline, overridden wholesale by the globally bound profile
 /// when one is bound ("select a global config or use this connection's own").
-fn resolved_sudo_auth(
+pub(crate) fn resolved_sudo_auth(
     connection: &StoredConnection,
     profile: Option<&sudo_profiles::SudoProfile>,
 ) -> SudoAuth {
@@ -70,7 +70,7 @@ fn resolved_sudo_auth(
 /// 0.4.x, where a workbench binding owned the source); "off" never promotes
 /// a profile. Unresolvable references degrade to no profile instead of
 /// failing the connection.
-fn effective_sudo_profile(
+pub(crate) fn effective_sudo_profile(
     connection: &StoredConnection,
     store: &sudo_profiles::SudoProfileStore,
 ) -> Option<sudo_profiles::SudoProfile> {
@@ -2593,6 +2593,14 @@ impl SshRuntime {
         if attach && watcher.is_none() {
             *watcher = Some(exec::TerminalAutoSudo::new(entry.orchestration.clone()));
         } else if !attach && watcher.is_some() {
+            // Disarm transitions are logged so "why didn't the terminal
+            // auto-answer" is diagnosable from the sidecar log alone.
+            eprintln!(
+                "[ssh] terminal auto-sudo disarmed: sudoSource={}, readOnly={}, credentials configured={}",
+                connection.sudo_source.name(),
+                connection.read_only,
+                useful,
+            );
             *watcher = None;
         }
     }

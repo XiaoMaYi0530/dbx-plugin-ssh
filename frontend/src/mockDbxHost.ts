@@ -160,6 +160,11 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { ...settingsState };
   }
   else if (method === "ssh/exec/cancel") result = { success: true };
+  else if (method === "sudo/profiles/list") result = { profiles: [] };
+  else if (method === "sudo/profiles/save" || method === "sudo/profiles/delete") result = { success: true };
+  else if (method === "ssh/knownHosts/list") result = { entries: [] };
+  else if (method === "keys/discover") result = { keys: [] };
+  else if (method === "mcp/settings/get") result = { maxReadBytes: 8 * 1024 * 1024, maxUploadBytes: 64 * 1024 * 1024, maxDownloadBytes: 256 * 1024 * 1024 };
   else result = { success: true };
   return result as T;
 };

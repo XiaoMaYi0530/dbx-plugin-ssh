@@ -719,6 +719,24 @@ async fn abort_exec_channel(
     error
 }
 
+/// True when the failure happened before the remote command could have
+/// started (dead pooled transport, refused channel open): retrying the tool
+/// call cannot double-execute the command. Anything after `channel.exec()`
+/// was accepted is NOT retry-safe (the command may have run server-side), so
+/// those errors stay terminal and the caller decides whether rerunning is
+/// safe.
+pub fn is_pre_exec_transport_error(error: &str) -> bool {
+    const PRE_EXEC_MARKERS: [&str; 4] = [
+        "Failed to open exec channel",
+        "Failed to open sudo channel",
+        "Failed to start command",
+        "Failed to start sudo command",
+    ];
+    PRE_EXEC_MARKERS
+        .iter()
+        .any(|marker| error.contains(marker))
+}
+
 type PromptContext<'a> = (&'a SudoAuth, bool);
 
 async fn run_to_completion(
@@ -738,7 +756,13 @@ async fn run_to_completion(
     while !closed {
         let message = tokio::time::timeout_at(deadline, channel.wait())
             .await
-            .map_err(|_| "Timed out waiting for the remote command to finish".to_string())?;
+            .map_err(|_| {
+                "Timed out waiting for the remote command to finish. The command may \
+                 STILL be running on the remote host - check for stray processes or \
+                 package-manager locks before retrying; for long jobs start them \
+                 detached (ssh_run_bg + ssh_task_status) instead of extending the wait."
+                    .to_string()
+            })?;
         let message = match message {
             Some(message) => message,
             None => break,
@@ -1208,6 +1232,12 @@ impl TerminalAutoSudo {
             .any(|pattern| lower.contains(pattern))
         {
             if auth.password.is_empty() {
+                // Make the silent no-answer case diagnosable: the watcher is
+                // armed but holds no credential (sudo source off/unbound, or
+                // neither the connection nor the login path has a password).
+                eprintln!(
+                    "[ssh] terminal auto-sudo: sudo password prompt detected but no sudo password is configured (check the connection's sudo source / global profile binding)"
+                );
                 return None;
             }
             self.sudo_pending = true;

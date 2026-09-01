@@ -452,3 +452,151 @@ cargo 170 tests / vitest 68 tests / 容器 smoke_fs 44·smoke_mcp all green。
    manifest 一致性用例更新；七语文案补齐（es/it/ja/pt-BR/zh-CN/zh-TW）。
    协议/对标/实施文档同步（PROTOCOL §运行时设置/§sudo、FEATURE_PARITY、
    IMPL_PLAN_QUICK_SUDO §11）。
+
+### §8.2 MCP 直调走声明的 sudo 来源 + 诊断日志（0.4.x 轮增补）
+
+排查 hktkosl1086「终端 sudo -v 不自动输密码 / MCP 直调不走 quick sudo」：
+
+- **MCP 缺口（本轮修复）**：隐藏通道 `ssh_exec_sudo` 此前只从调用参数构建凭据，
+  已保存连接声明的 `sudo_source`（global→表单引用/工作台绑定，custom→连接自身
+  secret，off→拒绝）完全不参与。新增 `resolve_sudo_auth`：声明来源解析为基底
+  凭据 → 调用方显式参数（`sudoPassword`/`totpSecret`/提示词/`authFlowMode`）
+  恒优先 → 每调用 `quickSudoProfile` 引用替换连接声明的 global 配置；`off` 且
+  无显式凭据时按工作台同款门禁拒绝。`resolved_sudo_auth` /
+  `effective_sudo_profile` 放开为 pub(crate) 复用。
+- **诊断日志**：终端 watcher 已挂载但凭据为空时，检测到 sudo 密码提示输出
+  `[ssh] terminal auto-sudo: sudo password prompt detected but no sudo password
+  is configured …`；watcher 解除挂载输出原因（sudoSource/readOnly/凭据是否配置），
+  「为什么不自动应答」可直接看 sidecar 日志定位。
+- 单测：`sudo_auth_resolution_follows_declared_source`（global 生效 / 显式参数
+  优先 / 每调用引用替换声明 / custom 回退登录密码 / off 拒绝与显式放行）。
+
+### §8.3 重启恢复快速失败 + SFTP 面板可收起/默认不打开（纯前端轮）
+
+用户报告两处体验问题，本轮均为前端改动（无新协议方法）：
+
+1. **DBX 重启后恢复的 SSH 工作台长时间转圈**：根因链条——宿主 openTabs
+   持久化恢复 plugin-workbench tab 但**不重放 `connection/connect` 生命周期**
+   （`openTabsStartup` 无 plugin 处理、`openPluginConnection` 不在恢复路径上），
+   sidecar 重启后 `connections` 内存表为空，`ssh/session/open` 立即返回
+   `Connection is not active`；而前端 `openSession` 把一切快速失败当
+   「启动竞态」盲目重试 3 次（2/4/6s 递增），期间状态 pill 持续「连接中」，
+   最终只显示英文原始错误。修复：`terminalReconnect.ts` 新增
+   `isConnectionInactiveError`（匹配 sidecar 稳定错误串，大小写不敏感），
+   `openSession` catch 里命中即**跳过重试直接 error**，错误显示七语
+   `connectionInactive` 文案（指引用户从 DBX 侧边栏重新打开连接再点
+   「重新连接」）。真正的启动竞态（sidecar 未激活等）保留原重试逻辑。
+   宿主 1.1 的 `restored` 标记分支保留（当前宿主未下发，为死代码无害）。
+2. **SFTP 面板增加打开按钮 + 可设置默认不打开**：
+   - 工具栏新增 toggle 按钮（`FolderOpen`/`PanelRightClose` 图标，
+     `sftpPane.open`/`sftpPane.close` 七语 title），收起时终端
+     `flex-basis:100%` 占满（`panes--solo` 类，含窄屏纵向布局覆盖）；
+   - 「自定义列」弹出层新增「默认打开 SFTP 面板」checkbox
+     （`sftpPane.defaultOpen`/`defaultOpenHint`），写 localStorage
+     `ssh-sftp-pane-open`（全局偏好，仅影响新工作台初始态）；
+   - 每工作台开关写入 `workbenchState.sftpPaneOpen`（宿主 1.1 可用时
+     随 tab 恢复；`restoreUiState` 经 `resolveSftpPaneOpen` 解析，
+     损坏值回退全局默认）。纯函数入 `workbenchLayout.ts`
+     （`resolveSftpPaneOpen`/`sanitizeSftpPaneDefaultOpen`）。
+
+单测：workbench.spec.ts +3 用例（inactive 错误识别含反例 / 面板可见性
+解析 / 偏好解析），i18n 七语 key 对齐检查覆盖新增 key；vitest 71 绿 +
+typecheck 过 + build 过 + visual.html 浏览器验证（默认双面板 → 收起 →
+默认偏好关闭 → 刷新后仅终端 → 手动重开）。**剩余风险**：重启恢复场景
+的端到端行为（真实宿主重启 + tab 恢复）未在本轮实测，依赖单测对错误
+分类的覆盖；宿主后续若下发 `restored`，前端已有对应分支。
+
+### §8.4 SFTP 操作归位面板内 + metrics 悬浮卡（纯前端轮）
+
+用户反馈两处工具栏归属/形态问题：
+
+1. **SFTP 专属按钮移入面板 path-toolbar**：Home、刷新、上传、新建文件夹、
+   新建文件 5 个按钮从顶部全局工具栏移入 SFTP 面板路径栏（上级/路径输入
+   之间与历史/粘贴之后），顶部工具栏只留连接/终端级操作（面板开关、字号、
+   重连、Quick Sudo、命令、快速命令、metrics、连接信息、设置、自定义列、
+   传输）。面板收起时按钮随 `v-if` 自然消失，不再出现"按钮在但面板不在"
+   的悬空禁用态。路径输入框加 `min-width:110px` 防挤压；sudo 开关加
+   `.sudo-label` 间距。文案全部复用既有 key，无新增。
+2. **metrics 从阻塞弹窗改为悬浮卡**：`openMetrics` 改 `toggleMetrics`
+   （再点 Gauge 或 X 关闭，按钮带 `is-active` 高亮），渲染从
+   `modal-backdrop` 改为工作台右上角 `.metrics-float`（absolute、z-index 20
+   低于 modal、宽 min(400px,100vw-20px)、内部滚动），不遮挡不阻塞终端与
+   SFTP 操作——点击终端/收起面板/继续操作时卡片保持打开，可边看指标边
+   操作。5s 自动刷新与错误重试逻辑原样保留。
+
+验证：typecheck 过、vitest 71 绿（无新纯函数/文案，无需新用例）、build 过、
+visual.html 浏览器验证（顶部按钮清单、path-toolbar 按钮清单、点终端卡片
+保持、收起面板卡片保持、Gauge 再点关闭、深浅两态截图）。布局 CSS 仅
+`.metrics-float` 系列与 path-toolbar 两处微调。
+
+### §8.5 MCP 长任务/断线恢复三层机制（spawn 并发 + run_bg/status + pre-exec 重试）
+
+真机长任务暴露的问题链：宿主 ~15s 放弃等待（timeoutSecs 形同虚设）→ sidecar
+handler 继续跑满 → 远程命令继续执行；stdio 主循环逐请求 `block_on`（mcp.rs
+`run_mcp_stdio`）导致一个慢命令阻塞后续全部请求（含 `ssh_close`），表现为整
+server 连环 15s 超时直至最长 handler 到期；Agent 误判"超时=没跑"重复下发，
+两个 yum/dnf 互等包管理器锁。三层修复：
+
+1. **stdio 请求并发**：`run_mcp_stdio` 逐请求 `tokio::spawn`（响应经
+   `Mutex<Stdout>` 保行完整，乱序合法），stdin 关闭后 drain 在途请求至多
+   300s 再退出。真机对照：`ssh_exec sleep 15` 运行中 `ping` t+0.0s 即回
+   （旧行为需等 15s）。
+2. **`ssh_run_bg` / `ssh_task_status`**（工具 25→27）：nohup 脱离会话启动 +
+   服务器侧 `/tmp/.dbx-ssh-tasks/<taskId>.log`（含 `EXIT_<code>` 完成标记与
+   `.pid` 存活文件），状态轮询跨断线/跨会话。与 `ssh_exec` 同过危险命令确认
+   门与只读写门（`is_write_tool` + assess 扩展）。
+3. **pre-exec 断线自动重试**：`run_tool` 兜底分支失败丢池照旧；命令启动前的
+   传输错误（`exec::is_pre_exec_transport_error`，通道打开/启动失败类）同一次
+   调用内换新连接重试一次（不可能双执行）；已启动后的错误保持终态。keepalive
+   （30s×3）已有，未改。
+
+配套：`run_to_completion` 超时错误文本加"命令可能仍在远程运行，先查证再重试"；
+`ssh_exec`/`ssh_exec_sudo` 描述与 `timeoutSecs` schema 改为如实描述宿主 ~15s
+上限；`MCP.zh-CN.md` 工具一览 27 个 + 新增「长任务与断线恢复」章节；用户级
+dbx-ssh-sftp-dev skill 增补同名约定章节。
+
+验证：cargo test 181 绿（新增 4：bg/status 输出解析 ×2、只读门/危险门对
+ssh_run_bg 生效 ×2、pre-exec 判定正反例）；clippy 无新告警；
+`smoke_mcp.py --binary target/debug` all green（27 工具、只读进程级开关、
+危险门、app-bridge 拒绝路径均过）；真机 hktkosl1086（RHEL 9.8）三段 smoke：
+run_bg 立即返回 taskId/pid/logPath → 新进程轮询 RUNNING(pidAlive=yes) →
+完成态 DONE + exitCode 0 + started/finished 时间戳精确（12s 任务实测 12s）。
+开发中发现并修复两个自引入问题：`shutdown_timeout` 先取消再等掐死在途任务
+（改 drain），`tokio::time::timeout` 构造期取 Handle::current 需在 block_on
+context 内构造。
+
+剩余风险：七语不涉及（纯 MCP 工具无 UI 文案）；pre-exec 重试无真机断线注入
+（依赖单测正反例）；`ssh_run_bg` 日志不自动清理（刻意保留任务记录，由调用方
+清理）；宿主侧 ~15s 等待上限属宿主行为，本插件只能以描述引导 + bg 工具绕开。
+安装生效需重新打包发版（本轮未动 manifest 版本）。
+
+### §8.5 metrics 卡与 SFTP 共存 + 选中复制/右键粘贴开关（纯前端轮）
+
+用户反馈两处 UI 继续优化：
+
+1. **metrics 悬浮卡移入终端面板内部**：上轮悬浮卡挂在 workbench 右上、
+   宽 400px，会盖住 SFTP 面板（"metrics 和 sftp 不能共存"）。改为挂在
+   `terminal-pane` 内部右上（`top/right 8px`、宽 min(360px, 100%-16px)、
+   `max-height calc(100%-16px)` 内部滚动、z-index 6 低于搜索面板 7）——
+   只遮挡终端一角（随时可关），SFTP 面板完全不被遮挡，收起面板后同样
+   可用。浏览器验证：`cardInTerminalPane=true`、与 sftp-pane 包围盒
+   零重叠。
+2. **新增"选中复制 · 右键粘贴"开关（默认开）**：XShell 风格终端交互。
+   - 纯函数 `lib/terminalInteraction.ts`：`sanitizeSelectCopyEnabled`
+     （localStorage `ssh-terminal-select-copy`，仅显式 "false" 关闭）+
+     `resolveTerminalRightClickAction`（开启且非 Shift → paste，否则 menu）；
+   - App.vue：`terminal.onSelectionChange` 选中即静默写剪贴板（无提示刷屏）；
+     `showTerminalMenu` 右键分流——开启时普通右键直接走 `pasteTerminal`
+     （保留多行/危险命令粘贴确认），**Shift+右键保留完整右键菜单**，关闭
+     时恢复纯菜单行为；切换即生效并持久化，notice 提示当前模式；
+   - 设置弹窗新增「终端交互」区块 + switch（默认 on），七语文案
+     `terminalSelectCopy.{section,label,hint,enabledNotice,disabledNotice}`；
+   - 单测 +2（偏好解析 / 右键分流含 Shift 反例），vitest 73 绿。
+   - 附带：mockDbxHost 补齐 `sudo/profiles/list`、`ssh/knownHosts/list`、
+     `keys/discover`、`mcp/settings/get` 空数据返回（原默认 `{success:true}`
+     导致 fixture 打开设置弹窗时 `undefined.length/find` 渲染错误，纯
+     测试工具问题，不影响真实 sidecar）。
+
+验证：typecheck 过、vitest 73 绿、build 过、visual.html 浏览器验证
+（开关默认 on、切换持久化 localStorage、notice 文案、开启时右键不弹菜单、
+Shift+右键弹菜单、关闭后右键恢复菜单）。

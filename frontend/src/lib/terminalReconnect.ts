@@ -9,6 +9,19 @@ export function shouldReattachTerminal(options: { disposed: boolean; state: "con
   return !options.disposed && options.expectedSessionId === options.currentSessionId && (options.state === "connecting" || options.state === "connected");
 }
 
+/**
+ * Matches the sidecar's stable "Connection is not active" open failure: the
+ * host never delivered this connection's credentials to the sidecar (typical
+ * after DBX restarted and restored the workbench tab without replaying the
+ * connect lifecycle). Retrying cannot succeed until the user reopens the
+ * connection from DBX, so the caller must fail fast instead of cycling the
+ * boot-restore retry ladder.
+ */
+export function isConnectionInactiveError(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : String(cause ?? "");
+  return /Connection is not active/i.test(message);
+}
+
 export interface ReconnectCountdown {
   /** Seconds until the retry fires, clamped at 0. */
   seconds: number;

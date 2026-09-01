@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Osc7DirectoryParser, parseOsc7Path } from "./terminalDirectoryTracking";
-import { describeReconnectCountdown, shouldReattachTerminal, terminalReconnectDelay } from "./terminalReconnect";
+import { describeReconnectCountdown, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay } from "./terminalReconnect";
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress } from "./sftpBatchProgress";
 import { sampleTransferSpeed } from "./transferSpeed";
 import { DANGEROUS_COMMAND_PATTERNS, buildPasteConfirmation, inspect } from "./dangerousCommands";
@@ -8,7 +8,7 @@ import { clampFontSize } from "./terminalZoom";
 import { pushPathHistory, sanitizePathHistories } from "./sftpPathHistory";
 import { formatBytes, formatRate } from "./format";
 import { expandSelection, filterSftpEntries } from "./sftpFileFilters";
-import { getSshWorkbenchSplitLayout } from "./workbenchLayout";
+import { getSshWorkbenchSplitLayout, resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen } from "./workbenchLayout";
 import { commandMarkerTooltip, formatCommandDuration, getOsc633ParserState, parseOsc633StreamChunk, runningCommandElapsedMs } from "./terminalCommandMarkers";
 import { describeWorkbenchSessionStatus, isUsableSshSession, normalizeSshSessionStatus } from "./sessionStatus";
 import { sanitizeCommandOutput, stripCommandEcho, stripHiddenCommandEchoes, stripTerminalControlSequences } from "./terminalOutputText";
@@ -72,6 +72,36 @@ describe("SSH workbench protocol helpers", () => {
     expect(sampled.speed).toBe(2048);
     expect(getSshWorkbenchSplitLayout("sftp-left").flexDirection).toBe("row-reverse");
   });
+
+  it("recognizes the retryable boot race but not the permanent inactive-connection failure", () => {
+    // The sidecar's stable open failure: credentials were never delivered, so
+    // the boot-restore retry ladder must not cycle on it.
+    expect(isConnectionInactiveError(new Error("Connection is not active; reopen it from DBX"))).toBe(true);
+    expect(isConnectionInactiveError("connection is not active")).toBe(true);
+    // Everything else (activation races, dial failures) keeps the retry path.
+    expect(isConnectionInactiveError(new Error("Plugin backend is not running"))).toBe(false);
+    expect(isConnectionInactiveError(new Error("Connection refused by host"))).toBe(false);
+    expect(isConnectionInactiveError(undefined)).toBe(false);
+    expect(isConnectionInactiveError("")).toBe(false);
+  });
+
+  it("resolves the SFTP pane visibility from the workbench state or the global default", () => {
+    expect(resolveSftpPaneOpen({}, true)).toBe(true);
+    expect(resolveSftpPaneOpen({}, false)).toBe(false);
+    // The persisted per-workbench flag wins over the global default.
+    expect(resolveSftpPaneOpen({ sftpPaneOpen: true }, false)).toBe(true);
+    expect(resolveSftpPaneOpen({ sftpPaneOpen: false }, true)).toBe(false);
+    // Corrupted values fall back to the default instead of coercing.
+    expect(resolveSftpPaneOpen({ sftpPaneOpen: "yes" }, true)).toBe(true);
+    expect(resolveSftpPaneOpen({ sftpPaneOpen: 0 }, false)).toBe(false);
+  });
+
+  it("parses the persisted SFTP default-open preference defensively", () => {
+    expect(sanitizeSftpPaneDefaultOpen(null)).toBe(true);
+    expect(sanitizeSftpPaneDefaultOpen("true")).toBe(true);
+    expect(sanitizeSftpPaneDefaultOpen("garbage")).toBe(true);
+    expect(sanitizeSftpPaneDefaultOpen("false")).toBe(false);
+  });
 });
 
 describe("workbench localization", () => {
@@ -99,6 +129,11 @@ describe("workbench localization", () => {
       "sftpQuickPath.title",
       "sftpCopy.copy",
       "sftpPaste.action",
+      "connectionInactive",
+      "sftpPane.open",
+      "sftpPane.close",
+      "sftpPane.defaultOpen",
+      "sftpPane.defaultOpenHint",
     ];
     for (const locale of locales) {
       for (const key of sftpKeys) expect(workbenchMessage(locale, key)).not.toBe(key);

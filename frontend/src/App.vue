@@ -20,6 +20,7 @@ import {
   FileText,
   FileUp,
   Folder,
+  FolderOpen,
   FolderPlus,
   Gauge,
   History,
@@ -30,6 +31,7 @@ import {
   Loader2,
   Lock,
   PackageOpen,
+  PanelRightClose,
   Pencil,
   PlugZap,
   RefreshCw,
@@ -47,7 +49,8 @@ import {
 } from "@lucide/vue";
 import type { Detection as ZmodemDetection, Session as ZmodemSession, Sentry as ZmodemSentry } from "zmodem.js";
 import { Osc7DirectoryParser } from "./lib/terminalDirectoryTracking";
-import { describeReconnectCountdown, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
+import { resolveTerminalRightClickAction, sanitizeSelectCopyEnabled } from "./lib/terminalInteraction";
+import { describeReconnectCountdown, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
@@ -65,7 +68,7 @@ import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI } from "./lib/appearance";
 import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload } from "./lib/agentTerminal";
-import type { SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
+import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { workbenchMessage } from "./lib/i18n";
 import TextPreview from "./components/TextPreview.vue";
 import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
@@ -143,6 +146,7 @@ interface WorkbenchState {
   sudoMode?: boolean;
   splitRatio?: number;
   paneOrder?: SshWorkbenchPaneOrder;
+  sftpPaneOpen?: boolean;
   visibleColumns?: SftpColumn[];
 }
 
@@ -269,6 +273,10 @@ const SFTP_QUICK_PATHS = ["/", "/home", "/tmp", "/etc", "/var", "/root"];
 const COMMAND_HISTORY_KEY = "ssh-command-history";
 const QUICK_COMMANDS_KEY = "ssh-quick-commands";
 const TERMINAL_FONT_SIZE_KEY = "ssh-terminal-font-size";
+// SFTP 面板默认打开偏好：localStorage 全局持久化（"false" = 新工作台仅终端）。
+const SFTP_PANE_OPEN_KEY = "ssh-sftp-pane-open";
+// 终端交互：选中复制 + 右键粘贴（localStorage 全局偏好，默认开，"false" 关闭）。
+const SELECT_COPY_KEY = "ssh-terminal-select-copy";
 
 type TerminalSearchMatchState = "idle" | "match" | "no-match";
 
@@ -299,6 +307,12 @@ const agentPromptExpired = ref(false);
 const agentRunning = ref<AgentNoticePayload>();
 const splitRatio = ref(58);
 const paneOrder = ref<SshWorkbenchPaneOrder>("terminal-left");
+// SFTP 面板可见性：每个工作台即时开关（写入 workbenchState）；
+// 新工作台的初始值取全局"默认打开"偏好（localStorage）。
+const sftpPaneOpen = ref(loadSftpPaneDefaultOpen());
+const sftpPaneDefaultOpen = ref(loadSftpPaneDefaultOpen());
+// 选中复制 + 右键粘贴（终端交互偏好，全局生效，切换即持久化）。
+const termSelectCopy = ref(loadSelectCopyEnabled());
 const followDirectory = ref(false);
 const directoryTrackingSupported = ref<boolean | undefined>();
 const visibleColumns = ref<SftpColumn[]>(["size", "modified"]);
@@ -482,6 +496,7 @@ let pasteConfirmResolver: ((accepted: boolean) => void) | undefined;
 let zoomNoticeTimer = 0;
 let resizeObserver: ResizeObserver | undefined;
 let disposeInput: { dispose(): void } | undefined;
+let disposeSelectionCopy: { dispose(): void } | undefined;
 let unsubscribeEvent: (() => void) | undefined;
 let unsubscribeBinary: (() => void) | undefined;
 let unsubscribeAppearance: (() => void) | undefined;
@@ -612,8 +627,11 @@ const toolbarStyle = computed(() => {
     boxShadow: `inset 0 1px 0 ${colorWithAlpha(color, 0.18)}`,
   };
 });
-const terminalBasis = computed(() => ({ flexBasis: `${splitRatio.value}%` }));
-const orderedPaneClass = computed(() => paneOrder.value === "sftp-left" ? "panes panes--reversed" : "panes");
+const terminalBasis = computed(() => ({ flexBasis: sftpPaneOpen.value ? `${splitRatio.value}%` : "100%" }));
+const orderedPaneClass = computed(() => [
+  paneOrder.value === "sftp-left" ? "panes panes--reversed" : "panes",
+  sftpPaneOpen.value ? "" : "panes--solo",
+].filter(Boolean).join(" "));
 const sortedEntries = computed(() => {
   const direction = sort.value.direction === "asc" ? 1 : -1;
   return [...entries.value].sort((left, right) => {
@@ -655,6 +673,7 @@ function restoreUiState() {
   currentPath.value = typeof state.sftpPath === "string" ? normalizeRemotePath(state.sftpPath) : "/";
   splitRatio.value = typeof state.splitRatio === "number" && state.splitRatio >= 35 && state.splitRatio <= 80 ? state.splitRatio : 58;
   paneOrder.value = state.paneOrder === "sftp-left" ? "sftp-left" : "terminal-left";
+  sftpPaneOpen.value = resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
   followDirectory.value = state.followDirectory === true;
   sudoMode.value = state.sudoMode === true && canWrite.value;
   visibleColumns.value = Array.isArray(state.visibleColumns) ? state.visibleColumns.filter((column): column is SftpColumn => ["size", "modified", "permissions"].includes(column)) : ["size", "modified"];
@@ -670,6 +689,7 @@ function writeWorkbenchState() {
     sudoMode: sudoMode.value,
     splitRatio: splitRatio.value,
     paneOrder: paneOrder.value,
+    sftpPaneOpen: sftpPaneOpen.value,
     visibleColumns: visibleColumns.value,
   }).catch(() => undefined);
 }
@@ -766,6 +786,11 @@ function createTerminal() {
     if (!session.value || zmodemBusy.value) return;
     trackPendingInput(data);
     sendTerminalBytes(new TextEncoder().encode(data));
+  });
+  // 选中复制（可在设置里关闭）：选择一变化即静默写入剪贴板，不弹提示。
+  disposeSelectionCopy = terminal.onSelectionChange(() => {
+    if (!termSelectCopy.value || !terminal?.hasSelection()) return;
+    void window.dbxPlugin.clipboard?.writeText(terminal.getSelection()).catch(() => undefined);
   });
   // 捕获阶段的 paste 监听：拦截 Ctrl+V 之外的所有粘贴路径（浏览器右键菜单等），
   // 统一走风险确认后再写入终端。
@@ -1293,7 +1318,10 @@ async function openSession(forceNew = false) {
   } catch (cause) {
     if (disposed) return;
     const attemptMs = Date.now() - attemptStarted;
-    if (openRetryAttempt < OPEN_RETRY_MAX && attemptMs < 8_000) {
+    // "Connection is not active"（宿主重启恢复工作台但未重放 connect 生命周期）
+    // 重试永远不可能成功：立即失败并用本地化文案指引用户重新打开连接。
+    const inactive = isConnectionInactiveError(cause);
+    if (!inactive && openRetryAttempt < OPEN_RETRY_MAX && attemptMs < 8_000) {
       openRetryAttempt += 1;
       terminalState.value = "connecting";
       const delayMs = 2000 * openRetryAttempt;
@@ -1304,7 +1332,7 @@ async function openSession(forceNew = false) {
     }
     terminalState.value = "error";
     activeTerminalSessionId = "";
-    showError(cause, "terminal");
+    showError(inactive ? new Error(t("connectionInactive")) : cause, "terminal");
   }
 }
 
@@ -1592,6 +1620,49 @@ function togglePaneOrder() {
   paneOrder.value = paneOrder.value === "terminal-left" ? "sftp-left" : "terminal-left";
   persistState();
   void nextTick(scheduleFit);
+}
+
+function toggleSftpPane() {
+  sftpPaneOpen.value = !sftpPaneOpen.value;
+  persistState();
+  void nextTick(scheduleFit);
+}
+
+// 全局偏好只影响新工作台的初始面板状态；当前工作台不被连带切换。
+function toggleSftpPaneDefaultOpen() {
+  sftpPaneDefaultOpen.value = !sftpPaneDefaultOpen.value;
+  try {
+    window.localStorage.setItem(SFTP_PANE_OPEN_KEY, sftpPaneDefaultOpen.value ? "true" : "false");
+  } catch {
+    // localStorage 不可用时偏好仅对当前会话生效。
+  }
+}
+
+function loadSftpPaneDefaultOpen(): boolean {
+  try {
+    return sanitizeSftpPaneDefaultOpen(window.localStorage.getItem(SFTP_PANE_OPEN_KEY));
+  } catch {
+    return true;
+  }
+}
+
+function loadSelectCopyEnabled(): boolean {
+  try {
+    return sanitizeSelectCopyEnabled(window.localStorage.getItem(SELECT_COPY_KEY));
+  } catch {
+    return true;
+  }
+}
+
+// 切换即生效并持久化（纯前端行为，不进连接级 ssh/settings）。
+function toggleSelectCopy() {
+  termSelectCopy.value = !termSelectCopy.value;
+  try {
+    window.localStorage.setItem(SELECT_COPY_KEY, termSelectCopy.value ? "true" : "false");
+  } catch {
+    // localStorage 不可用时偏好仅对当前会话生效。
+  }
+  showNotice(t(termSelectCopy.value ? "terminalSelectCopy.enabledNotice" : "terminalSelectCopy.disabledNotice"));
 }
 
 function startDividerDrag(event: PointerEvent) {
@@ -2774,7 +2845,12 @@ async function refreshMetrics() {
   }
 }
 
-function openMetrics() {
+// 悬浮指标卡：打开即刷新并启动 5s 轮询；不阻塞终端/SFTP 操作，随时开关。
+function toggleMetrics() {
+  if (metricsOpen.value) {
+    closeMetrics();
+    return;
+  }
   metricsOpen.value = true;
   void refreshMetrics();
   window.clearInterval(metricsTimer);
@@ -3136,6 +3212,13 @@ function onZmodemInput(event: Event) {
 
 function showTerminalMenu(event: MouseEvent) {
   event.preventDefault();
+  // 选中复制模式下右键直接粘贴；Shift+右键（或关闭该模式）保留完整菜单。
+  if (resolveTerminalRightClickAction({ selectCopy: termSelectCopy.value, shiftKey: event.shiftKey }) === "paste") {
+    terminalMenu.value = undefined;
+    fileMenu.value = undefined;
+    void pasteTerminal();
+    return;
+  }
   terminalMenu.value = { x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 250) };
   fileMenu.value = undefined;
 }
@@ -3268,7 +3351,7 @@ async function initialize() {
   else await openSession();
 }
 
-watch([splitRatio, paneOrder, followDirectory, sudoMode, visibleColumns], persistState, { deep: true });
+watch([splitRatio, paneOrder, sftpPaneOpen, followDirectory, sudoMode, visibleColumns], persistState, { deep: true });
 
 onMounted(() => {
   document.addEventListener("click", closeMenus);
@@ -3306,6 +3389,7 @@ onBeforeUnmount(() => {
   unsubscribeFileDrop?.();
   resizeObserver?.disconnect();
   disposeInput?.dispose();
+  disposeSelectionCopy?.dispose();
   terminal?.dispose();
   for (const waiter of uploadAckWaiters.values()) {
     window.clearTimeout(waiter.timer);
@@ -3333,6 +3417,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="toolbar-actions">
         <button class="icon-button icon-neutral" :title="paneOrder === 'terminal-left' ? t('moveSftpLeft') : t('moveTerminalLeft')" @click="togglePaneOrder"><ArrowLeftRight /></button>
+        <button class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
         <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting'" @click="reconnect"><PlugZap /></button>
@@ -3343,8 +3428,6 @@ onBeforeUnmount(() => {
           <span>{{ t("followTerminal") }}</span>
         </label>
         <span class="toolbar-separator" aria-hidden="true" />
-        <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
-        <button class="icon-button icon-cyan" :title="t('refresh')" :disabled="!connected || loadingFiles" @click="loadDirectory()"><RefreshCw :class="{ spinning: loadingFiles }" /></button>
         <button class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-amber" :title="t('quickCommands')" :disabled="!connected" @click.stop="toggleQuickMenu"><Zap /></button>
@@ -3370,7 +3453,7 @@ onBeforeUnmount(() => {
             </footer>
           </section>
         </div>
-        <button class="icon-button icon-emerald" :title="t('metrics')" :disabled="!connected" @click="openMetrics"><Gauge /></button>
+        <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-neutral" :title="t('connectionInfo')" @click.stop="toggleConnectionInfo"><Info /></button>
           <section v-if="connectionInfoOpen" class="popover connection-info-popover" @click.stop>
@@ -3395,6 +3478,8 @@ onBeforeUnmount(() => {
           <button class="icon-button icon-violet" :title="t('customizeColumns')" @click.stop="fileMenu = undefined; terminalMenu = undefined; transferPanelOpen = false; columnsOpen = !columnsOpen"><Columns3 /></button>
           <div v-if="columnsOpen" class="popover columns-popover" @click.stop>
             <label v-for="column in (['size', 'modified', 'permissions'] as SftpColumn[])" :key="column"><input type="checkbox" :checked="visibleColumns.includes(column)" @change="toggleColumn(column)" />{{ t(column) }}</label>
+            <hr class="columns-popover-separator" />
+            <label :title="t('sftpPane.defaultOpenHint')"><input type="checkbox" :checked="sftpPaneDefaultOpen" @change="toggleSftpPaneDefaultOpen" />{{ t("sftpPane.defaultOpen") }}</label>
           </div>
         </div>
         <div class="menu-anchor">
@@ -3411,9 +3496,6 @@ onBeforeUnmount(() => {
             </article>
           </section>
         </div>
-        <button class="icon-button icon-teal" :title="t('upload')" :disabled="!connected || !canWrite" @click.stop="chooseUpload"><FileUp /></button>
-        <button class="icon-button icon-amber" :title="t('newFolder')" :disabled="!connected || !canWrite" @click="operationDraft = ''; operationDialog = 'mkdir'"><FolderPlus /></button>
-        <button class="icon-button icon-amber" :title="t('sftpNewFile.action')" :disabled="!connected || !canWrite" @click="openNewFileDialog"><FilePlus /></button>
       </div>
     </header>
 
@@ -3466,13 +3548,84 @@ onBeforeUnmount(() => {
           <span>{{ zmodemState === "waiting" ? t("zmodemWaiting") : t("zmodemUploading", { name: zmodemFileName, percent: zmodemPercent }) }}</span>
           <span v-if="zmodemSpeed">{{ formatBytes(zmodemSpeed) }}/s</span>
         </div>
+        <section v-if="metricsOpen" class="metrics-float">
+          <header>
+            <h2>{{ t("metrics") }}<span v-if="metrics?.hostname" class="metrics-host"> · {{ metrics.hostname }}</span></h2>
+            <button class="icon-button" @click="closeMetrics"><X /></button>
+          </header>
+          <div class="metrics-float-body">
+            <div v-if="metricsLoading && !metrics" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+            <p v-else-if="metricsError" class="task-error">{{ metricsError }} <button class="link-button" @click="refreshMetrics">{{ t("refresh") }}</button></p>
+            <template v-else-if="metrics">
+              <div class="metrics-grid">
+                <div class="metric-card">
+                  <strong>{{ metrics.cpu?.percent ?? "–" }}%</strong>
+                  <span>{{ t("metricsCpu") }}</span>
+                  <small v-if="metrics.cpu?.cores">{{ metrics.cpu.cores }} vCPU · {{ metrics.cpu?.load1 ?? "–" }} / {{ metrics.cpu?.load5 ?? "–" }} / {{ metrics.cpu?.load15 ?? "–" }}</small>
+                </div>
+                <div class="metric-card">
+                  <strong>{{ metrics.memory?.totalBytes ? Math.round(((metrics.memory.usedBytes ?? 0) / metrics.memory.totalBytes) * 100) : "–" }}%</strong>
+                  <span>{{ t("metricsMemory") }}</span>
+                  <small v-if="metrics.memory?.totalBytes">{{ formatBytes(metrics.memory.usedBytes) }} / {{ formatBytes(metrics.memory.totalBytes) }}<template v-if="metrics.memory.swapTotalBytes"> · swap {{ formatBytes(metrics.memory.swapUsedBytes ?? 0) }}</template></small>
+                </div>
+                <div class="metric-card" v-if="metrics.uptimeSeconds != null">
+                  <strong>{{ formatUptime(metrics.uptimeSeconds) }}</strong>
+                  <span>{{ t("metricsUptime") }}</span>
+                  <small v-if="metrics.kernel">{{ metrics.kernel }}</small>
+                </div>
+              </div>
+              <div v-if="metrics.disks?.length" class="metrics-disks">
+                <div v-for="disk in metrics.disks" :key="disk.mount" class="disk-row">
+                  <span class="mono">{{ disk.mount }}</span>
+                  <progress :value="Math.min(100, disk.percentUsed)" max="100" :class="{ 'disk-warn': disk.percentUsed >= 85 }" />
+                  <span class="numeric">{{ formatBytes(disk.usedBytes) }} / {{ formatBytes(disk.totalBytes) }} · {{ Math.round(disk.percentUsed) }}%</span>
+                </div>
+              </div>
+              <div v-if="metrics.network?.length">
+                <h3 class="settings-section-title">{{ t("metricsNetwork") }}</h3>
+                <div class="metrics-disks">
+                  <div
+                    v-for="net in metrics.network"
+                    :key="net.name"
+                    class="disk-row"
+                    :title="`rx ${formatBytes(net.rxTotal)} · tx ${formatBytes(net.txTotal)}`"
+                  >
+                    <span class="mono">{{ net.name }}</span>
+                    <progress :value="networkRateShare(net)" max="100" />
+                    <span class="numeric">↓ {{ formatRate(net.rxRate) }} · ↑ {{ formatRate(net.txRate) }}</span>
+                  </div>
+                </div>
+              </div>
+              <div v-if="metrics.processes?.length">
+                <h3 class="settings-section-title">{{ t("metricsProc") }}</h3>
+                <div class="file-header" :style="metricsProcGridStyle">
+                  <span>{{ t("metricsProcPid") }}</span>
+                  <span>{{ t("metricsProcUser") }}</span>
+                  <span class="numeric">{{ t("metricsProcCpu") }}</span>
+                  <span class="numeric">{{ t("metricsProcMem") }}</span>
+                  <span>{{ t("metricsProcCommand") }}</span>
+                </div>
+                <div v-for="proc in metrics.processes" :key="proc.pid" class="file-row" :style="metricsProcGridStyle">
+                  <span class="mono">{{ proc.pid }}</span>
+                  <span class="mono">{{ proc.user }}</span>
+                  <span class="numeric">{{ proc.cpuPercent }}%</span>
+                  <span class="numeric">{{ proc.memPercent }}%</span>
+                  <span class="mono" :title="proc.command">{{ proc.command }}</span>
+                </div>
+              </div>
+              <p class="metrics-hint muted">{{ t("metricsRefreshHint") }}</p>
+            </template>
+          </div>
+        </section>
       </section>
 
-      <div class="divider" @pointerdown="startDividerDrag" />
+      <div v-if="sftpPaneOpen" class="divider" @pointerdown="startDividerDrag" />
 
-      <section class="sftp-pane" :class="{ 'drag-active': dragActive }" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop">
+      <section v-if="sftpPaneOpen" class="sftp-pane" :class="{ 'drag-active': dragActive }" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop">
         <div class="path-toolbar">
           <button class="icon-button" :title="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
+          <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
+          <button class="icon-button icon-cyan" :title="t('refresh')" :disabled="!connected || loadingFiles" @click="loadDirectory()"><RefreshCw :class="{ spinning: loadingFiles }" /></button>
           <input v-model="currentPath" spellcheck="false" @keydown.enter="loadDirectory()" />
           <div class="menu-anchor">
             <button class="icon-button" :title="t('sftpPathHistory.title')" :disabled="!connected" @click.stop="fileMenu = undefined; terminalMenu = undefined; transferPanelOpen = false; columnsOpen = false; pathHistoryOpen = !pathHistoryOpen"><History /></button>
@@ -3485,7 +3638,10 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <button class="icon-button" :title="t('sftpPaste.action')" :disabled="!connected || !canWrite || !sftpClipboard || pasteBusy" @click="pasteClipboard"><ClipboardPaste /></button>
-          <label class="follow-directory-control" :title="!canWrite ? t('readOnly') : t('sudo.modeHint')">
+          <button class="icon-button icon-teal" :title="t('upload')" :disabled="!connected || !canWrite" @click.stop="chooseUpload"><FileUp /></button>
+          <button class="icon-button icon-amber" :title="t('newFolder')" :disabled="!connected || !canWrite" @click="operationDraft = ''; operationDialog = 'mkdir'"><FolderPlus /></button>
+          <button class="icon-button icon-amber" :title="t('sftpNewFile.action')" :disabled="!connected || !canWrite" @click="openNewFileDialog"><FilePlus /></button>
+          <label class="follow-directory-control sudo-label" :title="!canWrite ? t('readOnly') : t('sudo.modeHint')">
             <button class="switch-control" type="button" role="switch" :aria-checked="sudoMode" :disabled="!connected || !canWrite" @click="toggleSudoMode"><span /></button>
             <span>{{ t("sudo.mode") }}</span>
           </label>
@@ -3669,79 +3825,6 @@ onBeforeUnmount(() => {
       </article>
     </section>
 
-    <section v-if="metricsOpen" class="modal-backdrop" @mousedown.self="closeMetrics">
-      <article class="modal metrics-modal">
-        <header>
-          <h2>{{ t("metrics") }}<span v-if="metrics?.hostname" class="metrics-host"> · {{ metrics.hostname }}</span></h2>
-          <button class="icon-button" @click="closeMetrics"><X /></button>
-        </header>
-        <div v-if="metricsLoading && !metrics" class="empty"><Loader2 class="spinning" />{{ t("loading") }}</div>
-        <p v-else-if="metricsError" class="task-error">{{ metricsError }} <button class="link-button" @click="refreshMetrics">{{ t("refresh") }}</button></p>
-        <template v-else-if="metrics">
-          <div class="settings-body">
-            <div class="metrics-grid">
-              <div class="metric-card">
-                <strong>{{ metrics.cpu?.percent ?? "–" }}%</strong>
-                <span>{{ t("metricsCpu") }}</span>
-                <small v-if="metrics.cpu?.cores">{{ metrics.cpu.cores }} vCPU · {{ metrics.cpu?.load1 ?? "–" }} / {{ metrics.cpu?.load5 ?? "–" }} / {{ metrics.cpu?.load15 ?? "–" }}</small>
-              </div>
-              <div class="metric-card">
-                <strong>{{ metrics.memory?.totalBytes ? Math.round(((metrics.memory.usedBytes ?? 0) / metrics.memory.totalBytes) * 100) : "–" }}%</strong>
-                <span>{{ t("metricsMemory") }}</span>
-                <small v-if="metrics.memory?.totalBytes">{{ formatBytes(metrics.memory.usedBytes) }} / {{ formatBytes(metrics.memory.totalBytes) }}<template v-if="metrics.memory.swapTotalBytes"> · swap {{ formatBytes(metrics.memory.swapUsedBytes ?? 0) }}</template></small>
-              </div>
-              <div class="metric-card" v-if="metrics.uptimeSeconds != null">
-                <strong>{{ formatUptime(metrics.uptimeSeconds) }}</strong>
-                <span>{{ t("metricsUptime") }}</span>
-                <small v-if="metrics.kernel">{{ metrics.kernel }}</small>
-              </div>
-            </div>
-            <div v-if="metrics.disks?.length" class="metrics-disks">
-              <div v-for="disk in metrics.disks" :key="disk.mount" class="disk-row">
-                <span class="mono">{{ disk.mount }}</span>
-                <progress :value="Math.min(100, disk.percentUsed)" max="100" :class="{ 'disk-warn': disk.percentUsed >= 85 }" />
-                <span class="numeric">{{ formatBytes(disk.usedBytes) }} / {{ formatBytes(disk.totalBytes) }} · {{ Math.round(disk.percentUsed) }}%</span>
-              </div>
-            </div>
-            <div v-if="metrics.network?.length">
-              <h3 class="settings-section-title">{{ t("metricsNetwork") }}</h3>
-              <div class="metrics-disks">
-                <div
-                  v-for="net in metrics.network"
-                  :key="net.name"
-                  class="disk-row"
-                  :title="`rx ${formatBytes(net.rxTotal)} · tx ${formatBytes(net.txTotal)}`"
-                >
-                  <span class="mono">{{ net.name }}</span>
-                  <progress :value="networkRateShare(net)" max="100" />
-                  <span class="numeric">↓ {{ formatRate(net.rxRate) }} · ↑ {{ formatRate(net.txRate) }}</span>
-                </div>
-              </div>
-            </div>
-            <div v-if="metrics.processes?.length">
-              <h3 class="settings-section-title">{{ t("metricsProc") }}</h3>
-              <div class="file-header" :style="metricsProcGridStyle">
-                <span>{{ t("metricsProcPid") }}</span>
-                <span>{{ t("metricsProcUser") }}</span>
-                <span class="numeric">{{ t("metricsProcCpu") }}</span>
-                <span class="numeric">{{ t("metricsProcMem") }}</span>
-                <span>{{ t("metricsProcCommand") }}</span>
-              </div>
-              <div v-for="proc in metrics.processes" :key="proc.pid" class="file-row" :style="metricsProcGridStyle">
-                <span class="mono">{{ proc.pid }}</span>
-                <span class="mono">{{ proc.user }}</span>
-                <span class="numeric">{{ proc.cpuPercent }}%</span>
-                <span class="numeric">{{ proc.memPercent }}%</span>
-                <span class="mono" :title="proc.command">{{ proc.command }}</span>
-              </div>
-            </div>
-            <p class="metrics-hint muted">{{ t("metricsRefreshHint") }}</p>
-          </div>
-        </template>
-        <footer><button @click="closeMetrics">{{ t("close") }}</button></footer>
-      </article>
-    </section>
-
     <section v-if="chmodTarget" class="modal-backdrop" @mousedown.self="chmodTarget = undefined">
       <article class="modal small-modal">
         <header><h2>{{ t("permissionsEdit") }} · {{ chmodTarget.name }}</h2><button class="icon-button" @click="chmodTarget = undefined"><X /></button></header>
@@ -3864,6 +3947,13 @@ onBeforeUnmount(() => {
               </select>
             </label>
             <p class="muted settings-note">{{ agentTerminalModeHint }}</p>
+
+            <h3 class="settings-section-title">{{ t("terminalSelectCopy.section") }}</h3>
+            <label class="quick-sudo-control">
+              <button class="switch-control" type="button" role="switch" :aria-checked="termSelectCopy" @click="toggleSelectCopy"><span /></button>
+              <span>{{ t("terminalSelectCopy.label") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalSelectCopy.hint") }}</p>
           </template>
 
           <h3 class="settings-section-title">{{ t("knownHosts.title") }}</h3>

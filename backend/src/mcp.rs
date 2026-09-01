@@ -136,9 +136,15 @@ fn validated_limit(value: &Value, name: &str, ceiling: u64) -> Result<u64, Strin
 pub fn run_mcp_stdio(data_dir: PathBuf) -> io::Result<()> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| io::Error::other(format!("Failed to create async runtime: {error}")))?;
-    let state = McpState::new(data_dir);
+    let state = Arc::new(McpState::new(data_dir));
     let stdin = io::stdin();
-    let stdout = io::stdout();
+    // Spawned handlers may finish out of order; the mutex keeps each
+    // JSON-RPC line intact and id-based correlation makes ordering
+    // irrelevant to callers.
+    let stdout = Arc::new(std::sync::Mutex::new(io::stdout()));
+    // Handles of every spawned request, drained before exit so a task that
+    // is mid-connection (or mid-command) isn't cancelled when stdin closes.
+    let mut in_flight = Vec::new();
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -154,17 +160,43 @@ pub fn run_mcp_stdio(data_dir: PathBuf) -> io::Result<()> {
                 continue;
             }
         };
-        let response = runtime.block_on(state.dispatch(request));
-        if let Some(response) = response {
-            write_response(&stdout, response)?;
-        }
+        // Spawn every request instead of block_on: one long tool call (a
+        // slow ssh_exec, an sftp transfer) must not stall ping, tools/list,
+        // or calls for other connections behind it. The host may already
+        // have abandoned THIS call; its handler still runs to completion
+        // and replies into the pipe.
+        let state = Arc::clone(&state);
+        let stdout = Arc::clone(&stdout);
+        in_flight.push(runtime.spawn(async move {
+            if let Some(response) = state.dispatch(request).await {
+                let _ = write_response(&stdout, response);
+            }
+        }));
     }
+    // stdin is closed: drain in-flight handlers (bounded, as a runaway
+    // handler must not pin the process forever) before the runtime drops.
+    // The timeout future is built INSIDE block_on: tokio timers capture
+    // Handle::current() at construction, which needs the runtime context.
+    let drain = async {
+        for handle in in_flight {
+            let _ = handle.await;
+        }
+    };
+    let _ = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(300), drain).await
+    });
     Ok(())
 }
 
-fn write_response(mut stdout: &io::Stdout, response: Value) -> io::Result<()> {
-    writeln!(stdout, "{response}")?;
-    stdout.flush()
+fn write_response(
+    stdout: &std::sync::Mutex<io::Stdout>,
+    response: Value,
+) -> io::Result<()> {
+    let mut guard = stdout
+        .lock()
+        .map_err(|poisoned| io::Error::other(poisoned.to_string()))?;
+    writeln!(guard, "{response}")?;
+    guard.flush()
 }
 
 struct McpConnection {
@@ -364,7 +396,7 @@ impl McpState {
                 "Tool {name} is a write operation and the connection is read-only"
             ));
         }
-        if matches!(name, "ssh_exec" | "ssh_exec_sudo") {
+        if matches!(name, "ssh_exec" | "ssh_exec_sudo" | "ssh_run_bg") {
             let command = required_str(arguments, "command")?;
             match mcp_safety::assess_command(command) {
                 CommandRisk::Destructive(reason) if read_only => {
@@ -515,10 +547,12 @@ impl McpState {
                 Ok(json!({ "host": host, "port": port, "removed": removed }))
             }
             _ => {
-                let result = match name {
+                let mut result = match name {
                     "ssh_exec" | "ssh_exec_sudo" => {
                         self.ssh_exec_tool(name, arguments, emitter).await
                     }
+                    "ssh_run_bg" => self.ssh_run_bg_tool(arguments).await,
+                    "ssh_task_status" => self.ssh_task_status_tool(arguments).await,
                     "ssh_metrics" => {
                         let connection = self.connection(arguments).await?;
                         exec::collect_metrics(&connection).await
@@ -536,11 +570,32 @@ impl McpState {
                     }
                     other => self.sftp_tool(other, arguments).await,
                 };
-                // Drop the cached connection on failure so the next call
-                // reconnects with fresh credentials instead of reusing a
-                // broken transport.
                 if result.is_err() {
+                    // Drop the cached connection on failure so the next call
+                    // reconnects with fresh credentials instead of reusing a
+                    // broken transport.
                     self.drop_connection(arguments).await;
+                    // Flapping-network recovery: when the pooled transport
+                    // died BEFORE the remote command could start (channel
+                    // open/exec refused on a dead connection), retry once on
+                    // the fresh connection. Pre-exec failures cannot
+                    // double-execute the command; post-exec transport deaths
+                    // stay terminal because the command may already have run.
+                    if matches!(name, "ssh_exec" | "ssh_exec_sudo" | "ssh_run_bg") {
+                        let retryable = result
+                            .as_ref()
+                            .err()
+                            .map(|error| exec::is_pre_exec_transport_error(error))
+                            .unwrap_or(false);
+                        if retryable {
+                            result = match name {
+                                "ssh_exec" | "ssh_exec_sudo" => {
+                                    self.ssh_exec_tool(name, arguments, emitter).await
+                                }
+                                _ => self.ssh_run_bg_tool(arguments).await,
+                            };
+                        }
+                    }
                 }
                 result
             }
@@ -617,12 +672,18 @@ impl McpState {
             }
             _ => {}
         }
-        let connection = self.connection(arguments).await?;
+        // Saved DBX connections declare their Quick Sudo source (form field
+        // sudo_source); the hidden exec channel honors it exactly like the
+        // workbench instead of requiring inline credentials on every call.
+        let stored = match connection_id {
+            Some(id) => self.dbx_connections.read().await.get(id).cloned(),
+            None => None,
+        };
         if name == "ssh_exec_sudo" {
-            let mut auth = sudo_auth(arguments);
-            if let Some(profile) = &sudo_profile {
-                apply_profile_fallbacks(&mut auth, profile);
-            }
+            let auth = self
+                .resolve_sudo_auth(arguments, sudo_profile, stored)
+                .await?;
+            let connection = self.connection(arguments).await?;
             exec::exec_with_sudo(
                 &connection,
                 &auth,
@@ -633,6 +694,7 @@ impl McpState {
             .await
             .map(|outcome| json!({ "output": outcome.output, "exitCode": outcome.exit_code }))
         } else {
+            let connection = self.connection(arguments).await?;
             exec::exec_plain(
                 &connection,
                 command,
@@ -641,6 +703,131 @@ impl McpState {
             .await
             .map(|outcome| json!({ "output": outcome.output, "exitCode": outcome.exit_code }))
         }
+    }
+
+    /// `ssh_run_bg`: stages a long-running command detached on the remote
+    /// host (nohup, output appended to `/tmp/.dbx-ssh-tasks/<taskId>.log`)
+    /// and returns immediately. The server-side log file is the task's
+    /// durable record: status polling reattaches over a fresh connection, so
+    /// flapping networks, disconnects, and MCP-host wait caps never lose
+    /// output or kill the job.
+    async fn ssh_run_bg_tool(&self, arguments: &Value) -> Result<Value, String> {
+        let command = required_str(arguments, "command")?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let task_id = format!("bg-{stamp}-{}", std::process::id() % 100_000);
+        // Single-quote escape for embedding inside the remote `sh -c '...'`.
+        let escaped = command.replace('\'', "'\\''");
+        let remote = format!(
+            "d=/tmp/.dbx-ssh-tasks; mkdir -p \"$d\" || exit 3; f=\"$d/{task_id}.log\"; : > \"$f\"; \
+             nohup sh -c '{escaped}; s=$?; echo EXIT_$s' >> \"$f\" 2>&1 & p=$!; \
+             echo \"$p\" > \"$f.pid\"; echo \"PID=$p\"; echo \"LOG=$f\""
+        );
+        let connection = self.connection(arguments).await?;
+        let outcome = exec::exec_plain(&connection, &remote, Duration::from_secs(15)).await?;
+        if outcome.exit_code != 0 {
+            return Err(format!(
+                "Failed to stage background task (exit {}): {}",
+                outcome.exit_code, outcome.output
+            ));
+        }
+        let default_log = format!("/tmp/.dbx-ssh-tasks/{task_id}.log");
+        let (pid, log_path) = parse_bg_start_output(&outcome.output, default_log);
+        Ok(json!({
+            "taskId": task_id,
+            "pid": pid,
+            "logPath": log_path,
+            "pollWith": "ssh_task_status",
+            "note": "Running detached (nohup). Poll ssh_task_status(logPath); output survives disconnects and session restarts.",
+        }))
+    }
+
+    /// `ssh_task_status`: polls a task started by `ssh_run_bg` through its
+    /// server-side log file. Works across disconnects and from later
+    /// sessions because the log lives on the remote host, not in this MCP
+    /// session.
+    async fn ssh_task_status_tool(&self, arguments: &Value) -> Result<Value, String> {
+        let log_path = required_str(arguments, "logPath")?;
+        let tail_bytes = arguments
+            .get("tailBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(4_000)
+            .clamp(200, 16_000);
+        let quoted = exec::shell_quote(log_path);
+        let remote = format!(
+            "f={quoted}; if [ ! -f \"$f\" ]; then echo STATE=MISSING; exit 0; fi; \
+             if grep -q '^EXIT_[0-9][0-9]*$' \"$f\" 2>/dev/null; then \
+               echo STATE=DONE; echo CODE=$(grep -o '^EXIT_[0-9][0-9]*$' \"$f\" | tail -1); \
+             else echo STATE=RUNNING; fi; \
+             pf=\"$f.pid\"; if [ -f \"$pf\" ]; then p=$(cat \"$pf\"); \
+               kill -0 \"$p\" 2>/dev/null && echo PID_ALIVE=yes || echo PID_ALIVE=no; fi; \
+             echo ===TAIL===; tail -c {tail_bytes} \"$f\""
+        );
+        let connection = self.connection(arguments).await?;
+        let outcome = exec::exec_plain(&connection, &remote, Duration::from_secs(15)).await?;
+        if outcome.exit_code != 0 {
+            return Err(format!(
+                "Failed to read task status (exit {}): {}",
+                outcome.exit_code, outcome.output
+            ));
+        }
+        let (state, exit_code, pid_alive, tail) = parse_task_status_output(&outcome.output);
+        Ok(json!({
+            "state": state,
+            "exitCode": exit_code,
+            "pidAlive": pid_alive,
+            "output": tail.trim_end(),
+            "logPath": log_path,
+            "done": state == "done",
+        }))
+    }
+
+    /// `ssh_exec_sudo` credential resolution for the hidden exec channel:
+    /// explicit per-call arguments always win; otherwise a saved DBX
+    /// connection's declared sudo source applies (Global: its form profile
+    /// reference / workbench binding, Custom: the connection's secret-bound
+    /// sudo configuration, Off: refuse unless the caller passed explicit
+    /// credentials), mirroring the workbench exec gate; the per-call
+    /// `quickSudoProfile` reference replaces the connection's declared
+    /// global profile.
+    async fn resolve_sudo_auth(
+        &self,
+        arguments: &Value,
+        explicit_profile: Option<sudo_profiles::SudoProfile>,
+        stored: Option<StoredConnection>,
+    ) -> Result<SudoAuth, String> {
+        let has_explicit_credentials = ["sudoPassword", "totpSecret"].iter().any(|key| {
+            arguments
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+        });
+        if let Some(stored) = &stored {
+            if stored.sudo_source == SudoSource::Off && !has_explicit_credentials {
+                return Err("Quick Sudo is disabled for this connection".to_string());
+            }
+        }
+        let store = sudo_profiles::load_store(&self.runtime.data_dir());
+        let profile = match explicit_profile {
+            Some(profile) => Some(profile),
+            None => stored
+                .as_ref()
+                .and_then(|stored| crate::ssh::effective_sudo_profile(stored, &store)),
+        };
+        let mut auth = match (&stored, &profile) {
+            (Some(stored), profile) => crate::ssh::resolved_sudo_auth(stored, profile.as_ref()),
+            (None, Some(profile)) => {
+                let mut auth = sudo_auth(arguments);
+                apply_profile_fallbacks(&mut auth, profile);
+                auth
+            }
+            (None, None) => sudo_auth(arguments),
+        };
+        apply_explicit_argument_overrides(&mut auth, arguments);
+        Ok(auth)
     }
 
     /// Terminal-routed `ssh_exec` / `ssh_exec_sudo`: resolves the
@@ -1347,6 +1534,7 @@ fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
         "ssh_exec_sudo"
+            | "ssh_run_bg"
             | "sftp_write_file"
             | "sftp_upload"
             | "sftp_mkdir"
@@ -1396,6 +1584,34 @@ fn apply_profile_fallbacks(auth: &mut SudoAuth, profile: &sudo_profiles::SudoPro
     }
     if auth.flow_mode.is_none() {
         auth.flow_mode = Some(AuthFlowMode::parse(&profile.auth_flow_mode));
+    }
+}
+
+/// Re-applies the caller's explicit per-call arguments on top of the
+/// source-resolved base auth: values the caller actually sent always win,
+/// whatever the connection's declared sudo source contributed.
+fn apply_explicit_argument_overrides(auth: &mut SudoAuth, arguments: &Value) {
+    let explicit = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(password) = explicit("sudoPassword") {
+        auth.password = password.to_string();
+    }
+    if let Some(secret) = explicit("totpSecret") {
+        auth.totp_secrets = exec::parse_totp_secrets(secret);
+    }
+    if let Some(hint) = explicit("passwordPromptHint") {
+        auth.password_prompt_hint = exec::sanitize_prompt_hint(hint);
+    }
+    if let Some(hint) = explicit("totpPromptHint") {
+        auth.totp_prompt_hint = exec::sanitize_prompt_hint(hint);
+    }
+    if let Some(mode) = explicit("authFlowMode") {
+        auth.flow_mode = Some(AuthFlowMode::parse(mode));
     }
 }
 
@@ -1549,6 +1765,47 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
     })
 }
 
+/// Parses the `PID=` / `LOG=` lines emitted by the `ssh_run_bg` staging
+/// command. Falls back to the derived default log path when the remote
+/// never echoed `LOG=`.
+fn parse_bg_start_output(output: &str, default_log: String) -> (String, String) {
+    let mut pid = String::new();
+    let mut log_path = default_log;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("PID=") {
+            pid = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("LOG=") {
+            log_path = value.trim().to_string();
+        }
+    }
+    (pid, log_path)
+}
+
+/// Parses the STATE= / CODE= / PID_ALIVE= markers and the post-`===TAIL===`
+/// section emitted by the `ssh_task_status` probe command.
+type TaskStatusParse = (String, Option<i64>, Option<bool>, String);
+fn parse_task_status_output(output: &str) -> TaskStatusParse {
+    let mut state = "unknown".to_string();
+    let mut exit_code: Option<i64> = None;
+    let mut pid_alive: Option<bool> = None;
+    let mut tail = String::new();
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("STATE=") {
+            state = value.trim().to_lowercase();
+        } else if let Some(value) = line.strip_prefix("CODE=EXIT_") {
+            exit_code = value.trim().parse().ok();
+        } else if let Some(value) = line.strip_prefix("PID_ALIVE=") {
+            pid_alive = Some(value.trim() == "yes");
+        } else if line == "===TAIL===" {
+            tail.clear();
+        } else if !line.is_empty() {
+            tail.push_str(line);
+            tail.push('\n');
+        }
+    }
+    (state, exit_code, pid_alive, tail)
+}
+
 /// Parses the optional `jumpHosts` array (snake_case fields, same shape as
 /// `external_config.jump_hosts`) into the ProxyJump chain.
 fn parse_jump_hosts(arguments: &Value) -> Result<Vec<JumpHost>, String> {
@@ -1613,12 +1870,12 @@ pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "ssh_exec",
-            "description": "Run a non-interactive remote shell command over SSH. Quick Sudo orchestration is NOT applied; use ssh_exec_sudo for privileged commands. Commands matching catastrophic patterns (disk formatting, recursive system deletes, shutdown, raw device writes, SQL DROP) require confirmDestructive: true; on read-only connections only whitelisted inspection commands (ls, cat, df, ps, systemctl status, journalctl, docker ps, ...) are allowed.",
+            "description": "Run a non-interactive remote shell command over SSH. Quick Sudo orchestration is NOT applied; use ssh_exec_sudo for privileged commands. Commands matching catastrophic patterns (disk formatting, recursive system deletes, shutdown, raw device writes, SQL DROP) require confirmDestructive: true; on read-only connections only whitelisted inspection commands (ls, cat, df, ps, systemctl status, journalctl, docker ps, ...) are allowed. Hosts commonly give up waiting after ~15s regardless of timeoutSecs while the command keeps running remotely (and further calls to this server stall until it finishes) - for anything that may exceed ~10s use ssh_run_bg + ssh_task_status instead. After a timeout the command may STILL be running: verify before rerunning.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[
                     ("command", "string", "Shell command to execute"),
-                    ("timeoutSecs", "integer", "Execution timeout in seconds (5-300)"),
+                    ("timeoutSecs", "integer", "Plugin-side wait cap in seconds (5-300, default 60). The MCP host may abandon the wait earlier (~15s); the command keeps running remotely either way"),
                     ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
                     ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app)"),
                 ]),
@@ -1627,17 +1884,41 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_exec_sudo",
-            "description": "Run a remote shell command with sudo. The sudo password is piped over stdin and 2FA/TOTP prompts are answered automatically when a TOTP secret is available (inline arguments, or a shared global Quick Sudo profile referenced by quickSudoProfile; explicit arguments win). Commands matching catastrophic patterns require confirmDestructive: true; refused outright on read-only connections.",
+            "description": "Run a remote shell command with sudo. The sudo password is piped over stdin and 2FA/TOTP prompts are answered automatically when a TOTP secret is available (inline arguments, or a shared global Quick Sudo profile referenced by quickSudoProfile; explicit arguments win). Commands matching catastrophic patterns require confirmDestructive: true; refused outright on read-only connections. Same wait-cap caveat as ssh_exec: hosts may stop waiting after ~15s; prefer short commands and keep long privileged jobs under ssh_run_bg.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[
                     ("command", "string", "Shell command to execute with sudo"),
-                    ("timeoutSecs", "integer", "Execution timeout in seconds (5-300)"),
+                    ("timeoutSecs", "integer", "Plugin-side wait cap in seconds (5-300, default 90). The MCP host may abandon the wait earlier (~15s); the command keeps running remotely either way"),
                     ("quickSudoProfile", "string", "Global Quick Sudo profile id or exact name supplying sudo password/TOTP/prompt defaults"),
                     ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
                     ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app)"),
                 ]),
                 "required": ["command"],
+            },
+        },
+        {
+            "name": "ssh_run_bg",
+            "description": "Start a long-running command detached on the remote host (nohup; output appended to /tmp/.dbx-ssh-tasks/<taskId>.log) and return immediately with taskId/pid/logPath. Survives disconnects, MCP-host wait caps, and session restarts because the output lives on the server. Poll progress with ssh_task_status(logPath). Same safety gates as ssh_exec: destructive patterns need confirmDestructive: true, read-only connections refuse it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": connection_properties(&[
+                    ("command", "string", "Shell command to run detached"),
+                    ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
+                ]),
+                "required": ["command"],
+            },
+        },
+        {
+            "name": "ssh_task_status",
+            "description": "Poll a background task started with ssh_run_bg: returns state (running/done/missing), exit code once finished, pid liveness, and the trailing bytes of output from the server-side log file. Reconnects transparently, so it works after disconnects or from a later session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": connection_properties(&[
+                    ("logPath", "string", "logPath returned by ssh_run_bg"),
+                    ("tailBytes", "integer", "Trailing bytes of output to return (200-16000, default 4000)"),
+                ]),
+                "required": ["logPath"],
             },
         },
         {
@@ -1836,6 +2117,108 @@ mod tests {
         McpState::new(std::env::temp_dir().join("dbx-mcp-test"))
     }
 
+    #[test]
+    fn parses_bg_start_markers_with_default_log_fallback() {
+        let (pid, log) = parse_bg_start_output(
+            "PID=4242\nLOG=/tmp/.dbx-ssh-tasks/bg-1-2.log\n",
+            "/tmp/.dbx-ssh-tasks/default.log".to_string(),
+        );
+        assert_eq!(pid, "4242");
+        assert_eq!(log, "/tmp/.dbx-ssh-tasks/bg-1-2.log");
+
+        // A remote without echo output (busybox edge) still yields the
+        // derived default path.
+        let (pid, log) = parse_bg_start_output("", "/tmp/.dbx-ssh-tasks/x.log".to_string());
+        assert_eq!(pid, "");
+        assert_eq!(log, "/tmp/.dbx-ssh-tasks/x.log");
+    }
+
+    #[test]
+    fn parses_task_status_running_done_and_missing() {
+        let (state, code, alive, tail) = parse_task_status_output(
+            "STATE=RUNNING\nPID_ALIVE=yes\n===TAIL===\nstep 1 done\nstep 2 running\n",
+        );
+        assert_eq!(state, "running");
+        assert_eq!(code, None);
+        assert_eq!(alive, Some(true));
+        assert_eq!(tail, "step 1 done\nstep 2 running\n");
+
+        let (state, code, alive, _tail) = parse_task_status_output(
+            "STATE=DONE\nCODE=EXIT_3\nPID_ALIVE=no\n===TAIL===\nEXIT_3\n",
+        );
+        assert_eq!(state, "done");
+        assert_eq!(code, Some(3));
+        assert_eq!(alive, Some(false));
+
+        let (state, code, alive, tail) =
+            parse_task_status_output("STATE=MISSING\n===TAIL===\n");
+        assert_eq!(state, "missing");
+        assert_eq!(code, None);
+        assert_eq!(alive, None);
+        assert_eq!(tail, "");
+    }
+
+    #[tokio::test]
+    async fn run_bg_respects_read_only_gate() {
+        let mut state = state();
+        state.global_read_only = true;
+        let error = state
+            .call_tool(
+                "ssh_run_bg",
+                &json!({
+                    "host": "example.test",
+                    "username": "op",
+                    "command": "sleep 30"
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("read-only"),
+            "expected read-only refusal, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bg_requires_destructive_confirmation() {
+        let state = state();
+        let error = state
+            .call_tool(
+                "ssh_run_bg",
+                &json!({
+                    "host": "example.test",
+                    "username": "op",
+                    "command": "rm -rf /"
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("destructive"),
+            "expected destructive refusal, got: {error}"
+        );
+    }
+
+    #[test]
+    fn pre_exec_transport_errors_are_retryable_post_exec_are_not() {
+        assert!(exec::is_pre_exec_transport_error(
+            "Failed to open exec channel: Disconnected"
+        ));
+        assert!(exec::is_pre_exec_transport_error(
+            "Failed to start command: broken pipe"
+        ));
+        // Post-exec failures must NOT look retryable: the command may have
+        // already run server-side.
+        assert!(!exec::is_pre_exec_transport_error(
+            "Timed out waiting for the remote command to finish."
+        ));
+        assert!(!exec::is_pre_exec_transport_error(
+            "sudo exited 1: wrong password"
+        ));
+    }
+
     #[tokio::test]
     async fn initialize_and_list_tools_follow_mcp_shape() {
         let state = state();
@@ -1859,6 +2242,8 @@ mod tests {
         for expected in [
             "ssh_exec",
             "ssh_exec_sudo",
+            "ssh_run_bg",
+            "ssh_task_status",
             "ssh_metrics",
             "ssh_close",
             "ssh_test_connection",
@@ -2098,6 +2483,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed["profiles"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Builds a saved-connection payload with the given declared sudo source;
+    /// returns the connection plus its (runtime-composed) login password.
+    /// All credential values in tests are assembled at runtime — never real
+    /// credentials, never literals in source.
+    fn source_connection(source: &str, profile_ref: &str) -> (StoredConnection, String) {
+        let login = format!("login-{}", uuid::Uuid::new_v4());
+        let stored = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-src",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": login,
+                "external_config": {
+                    "sudo_source": source,
+                    "sudo_profile": profile_ref,
+                },
+            }
+        }))
+        .unwrap();
+        (stored, login)
+    }
+
+    #[tokio::test]
+    async fn sudo_auth_resolution_follows_declared_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbx-mcp-sudo-src-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = McpState::new(dir.clone());
+        let profile_secret = format!("profile-{}", uuid::Uuid::new_v4());
+        let call_secret = format!("call-{}", uuid::Uuid::new_v4());
+
+        let saved = state
+            .run_tool(
+                "ssh_quick_sudo_profiles_save",
+                &json!({
+                    "name": "src-ops",
+                    "sudoPassword": profile_secret,
+                    "totpSecret": "JBSWY3DPEHPK3PXP",
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved["created"], true);
+
+        // Global source: the referenced global profile owns the credential
+        // source (with TOTP), exactly like the workbench.
+        let (stored, _) = source_connection("global", "src-ops");
+        let auth = state
+            .resolve_sudo_auth(&json!({}), None, Some(stored))
+            .await
+            .unwrap();
+        assert_eq!(auth.password, profile_secret);
+        assert!(!auth.totp_secrets.is_empty());
+
+        // Explicit per-call arguments win over the declared source.
+        let (stored, _) = source_connection("global", "src-ops");
+        let auth = state
+            .resolve_sudo_auth(
+                &json!({ "sudoPassword": call_secret }),
+                None,
+                Some(stored),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.password, call_secret);
+
+        // The per-call quickSudoProfile reference replaces the declared one
+        // and is applied even without a saved connection (inline MCP calls).
+        let explicit_profile = sudo_profiles::SudoProfile {
+            id: "inline".to_string(),
+            name: "inline".to_string(),
+            sudo_password: call_secret.clone(),
+            totp_secret: String::new(),
+            auth_flow_mode: "password_only".to_string(),
+            password_prompt_hint: String::new(),
+            totp_prompt_hint: String::new(),
+            sudo_use_pty: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (stored, _) = source_connection("global", "src-ops");
+        let auth = state
+            .resolve_sudo_auth(&json!({}), Some(explicit_profile.clone()), Some(stored))
+            .await
+            .unwrap();
+        assert_eq!(auth.password, call_secret);
+        assert!(auth.totp_secrets.is_empty());
+        let auth = state
+            .resolve_sudo_auth(&json!({}), Some(explicit_profile.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(auth.password, call_secret);
+
+        // Custom source without a binding: the connection's own sudo config
+        // (empty here) degrades to the login password fallback.
+        let (stored, login) = source_connection("custom", "");
+        let auth = state
+            .resolve_sudo_auth(&json!({}), None, Some(stored))
+            .await
+            .unwrap();
+        assert_eq!(auth.password, login);
+
+        // Off refuses like the workbench gate, unless the caller passes
+        // explicit credentials.
+        let (stored, _) = source_connection("off", "");
+        let refused = state
+            .resolve_sudo_auth(&json!({}), None, Some(stored))
+            .await;
+        assert!(refused.unwrap_err().contains("Quick Sudo is disabled"));
+        let (stored, _) = source_connection("off", "");
+        let auth = state
+            .resolve_sudo_auth(
+                &json!({ "sudoPassword": call_secret }),
+                None,
+                Some(stored),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.password, call_secret);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

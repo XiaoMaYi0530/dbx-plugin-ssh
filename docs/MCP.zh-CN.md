@@ -79,11 +79,13 @@ dbx-plugin-ssh --mcp
 - 真机回环验证：`DBX_SSH_SMOKE_PASSWORD=… python3 scripts/smoke_mcp.py
   --host <host> --port <port> --username <user>`（凭据走环境变量，不落盘）。
 
-## 工具一览（25 个，两种方式通用）
+## 工具一览（27 个，两种方式通用）
 
 | 工具 | 说明 |
 | --- | --- |
-| `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」）；stdio 模式传 `true` 且带 `connectionId` 时自动转发到运行中的 DBX app（未运行则唤起），在 app 的可见终端里执行 |
+| `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」）；stdio 模式传 `true` 且带 `connectionId` 时自动转发到运行中的 DBX app（未运行则唤起），在 app 的可见终端里执行。**超过 ~10 秒的命令请改用 `ssh_run_bg`**（宿主等待上限与防重复执行见「长任务与断线恢复」） |
+| `ssh_run_bg` | 把长命令以 nohup 方式脱离会话启动，立即返回 `taskId`/`pid`/`logPath`；输出落在服务器 `/tmp/.dbx-ssh-tasks/<taskId>.log`，断线、超时、换会话均不丢。与 `ssh_exec` 同受危险命令确认门与只读写门约束 |
+| `ssh_task_status` | 轮询 `ssh_run_bg` 任务：`state`（running/done/missing）、完成后的 `exitCode`、pid 存活状态与输出尾部（`tailBytes`，200–16000）。通过服务器侧日志文件查询，天然跨连接/跨会话 |
 | `ssh_metrics` | CPU/内存/负载/磁盘/运行时长（只读命令） |
 | `ssh_test_connection` | 验证连通性与认证（含跳板链），返回延迟 |
 | `ssh_list_known_hosts` / `ssh_remove_known_host` | 管理插件 known_hosts（不改系统 `~/.ssh/known_hosts`） |
@@ -100,8 +102,8 @@ dbx-plugin-ssh --mcp
 MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此 exec 工具在执行前过
 三层安全门（全部在任何网络 I/O 之前，实现见 `backend/src/mcp_safety.rs`）：
 
-1. **只读连接写门**：DBX 连接勾选了"只读"后，写类工具（`ssh_exec_sudo` 与全部
-   sftp 写操作）直接拒绝，与工作台 `ensure_writable` 同源。
+1. **只读连接写门**：DBX 连接勾选了"只读"后，写类工具（`ssh_exec_sudo`、
+   `ssh_run_bg` 与全部 sftp 写操作）直接拒绝，与工作台 `ensure_writable` 同源。
 2. **只读命令白名单**：只读连接上的 `ssh_exec` 只放行**可证明只读**的巡检命令
    （`ls` / `cat` / `df` / `ps` / `systemctl status` / `journalctl` / `docker ps`
    / `git log` 等，含管道组合；重定向、命令替换、`sudo`、白名单外的动词一律
@@ -122,6 +124,25 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
 分类器不做 shell 完整解析（引号内 `;` 仍会切分、`$(...)` 与重定向按 Unknown
 处理），所有偏差方向都是"更严"：最坏情况是把可放行的命令降级拒绝，不会放行
 更危险的命令。新增只读动词/危险模式请同步 `mcp_safety.rs` 的表与单测。
+
+## 长任务与断线恢复
+
+三层机制协同，针对"长命令 + 不稳定网络 + MCP 宿主等待上限"的组合场景：
+
+1. **stdio 请求并发**：sidecar 的 JSON-RPC 主循环逐请求 `tokio::spawn`，一个
+   慢 `ssh_exec` 不再阻塞 `ping` / `tools/list` / 其他连接的调用（此前逐请求
+   `block_on`，一个 300 秒命令会拖死整个插件直至超时）。stdin 关闭后在途请求
+   drain 至多 300 秒再退出。响应可能乱序返回，JSON-RPC 以 id 关联，语义不变。
+2. **后台任务工具**：`ssh_run_bg` + `ssh_task_status` 把"nohup + 日志文件 +
+   轮询"产品化。日志与 pid 文件存放在服务器 `/tmp/.dbx-ssh-tasks/`，是任务的
+   持久记录——宿主放弃等待、连接反复断开、sidecar 重启、换一个会话，都能重新
+   连上查询进度与最终退出码。`run_to_completion` 超时错误文本会提示"命令可能
+   仍在远程运行"，引导调用方先查证再重试，避免双实例互等包管理器锁。
+3. **pre-exec 断线自动重试**：连接池条目在调用失败时照旧丢弃（下次调用重连）；
+   若失败发生在**命令启动之前**（死连接上打开 exec 通道被拒等，`is_pre_exec_
+   transport_error` 判定），同一次调用内换新连接自动重试一次——命令确定没跑过，
+   重试不可能双执行；命令已启动后的传输错误保持终态，由调用方决定是否重跑。
+   keepalive（30 秒间隔，3 次容忍）用于让 NAT/防火墙不掐空闲连接、断线尽早暴露。
 
 ## AI 终端同步执行（runInTerminal）
 
