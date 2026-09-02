@@ -35,6 +35,11 @@
 | dbx-plugin package | 0.2.2 darwin-arm64 出包完整（5 文件 + checksums；**4,290,327 B，sha256 `a67bb683a2db1ee67e37ae8b6d96447a44fe160fb07e55b459289a450edf347e`**；出包后对重编二进制复跑 smoke_test PASS 1.2s） |
 | 性能基线（PROGRESS-P-SSH §3，真机） | 终端 PTY 流灌入 **71.9 MiB/s**（5 MiB 环形缓存）；SFTP 上传（网络）**220–237 MB/s**、上传（本地 spool）633.9–1078 MB/s；SFTP 下载 **113–118 MB/s**；replay 载荷 2.00 MiB / 601 帧 ≤ 2 MiB 上限（SHA-256 校验一致） |
 
+2026-09-02 增量（PROGRESS-P-SSH §8.7，纯前端轮）：frontend typecheck / build 过；
+vitest **86/86**（基线 79 → 86：terminalWriteThrottle 6 + terminalDrop 准入 1）；
+浏览器（visual.html Playwright）：终端拖放上传 overlay / drop 全链路（分屏 + solo）/
+只读拒绝 / 节流写入回归，截图 screenshots-ui-mock/terminal-drop-{overlay,solo}-round87.png。
+
 仍保持未验收（环境/CI 依赖）：DBX Web/Docker、长稳与突发、大文件 100 MiB/1 GiB、五平台包、
 宿主 plugin_tools_bridge 集成段（WIP-SKIP，宿主合流后必跑）。
 

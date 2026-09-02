@@ -600,3 +600,221 @@ context 内构造。
 验证：typecheck 过、vitest 73 绿、build 过、visual.html 浏览器验证
 （开关默认 on、切换持久化 localStorage、notice 文案、开启时右键不弹菜单、
 Shift+右键弹菜单、关闭后右键恢复菜单）。
+
+### §8.6 终端快捷键 + 搜索面板选区种子/选项持久化（纯前端轮，2026-09-01）
+
+后台 agent 执行轮，最终汇报偏题，改动本体完整有效，由主 agent 补齐验证与
+本文档。改动均为纯前端（App.vue / TerminalSearchPanel.vue /
+lib/terminalInteraction.{ts,spec.ts}），协议契约与后端零改动：
+
+1. **终端内快捷键路由（iTerm2/XShell 风格）**：新增纯函数
+   `resolveTerminalKeyAction`——Ctrl/Cmd+V 与 Ctrl/Cmd+Shift+V 粘贴（沿用
+   既有风险确认流程），Ctrl/Cmd+Shift+C 复制当前选区；**普通 Ctrl/Cmd+C 不
+   拦截**，保持发给远端 shell（SIGINT 语义）。App.vue `handleTerminalKey`
+   接线，复制复用 `copyTerminalSelection`。
+2. **搜索面板选区种子**：`terminalSearchSeedFromSelection` 取终端当前选区
+   首行（截断 200 字符），打开搜索面板时预填并立即执行一次查找（面板打开
+   即出结果）；多行/超长选区不会产生不可用查询。
+3. **搜索选项持久化**：`sanitizeSearchOptions` / `persistSearchOptions`——
+   localStorage `ssh-terminal-search-options` 保存 caseSensitive/regex/
+   wholeWord 三开关（JSON 对象；解析失败或缺失回退全关，localStorage 不可用
+   时降级会话级）。面板重开/页面刷新后恢复，切换即时写入。
+4. **附带修复**：xterm `allowProposedApi: true`——SearchAddon 的 highlight
+   decorations 走 proposed API，缺该项会在 findNext/registerDecoration 时抛
+   "allowProposedApi option"。
+
+验证（主 agent 复核）：
+- typecheck 过；vitest **79 绿**（基线 73 → 79，terminalInteraction.spec
+  8 例：快捷键分流含 Ctrl+C 放行反例、搜索选项 sanitize/persist、选区种子
+  首行截断）；build 过（产物写 ui/index.html）。
+- 浏览器验证（visual.html @ vite 5180，截图
+  `docs/screenshots-ui-mock/search-options-persist-round86.png`）：
+  Ctrl+F 打开面板、切换 Aa/.*/|w| 即时写入 localStorage
+  （`{"caseSensitive":true,"regex":true,"wholeWord":true}`）、输入 nginx
+  命中 2 处（状态 1/2）、页面刷新后重开面板三开关全部恢复。
+
+剩余风险：快捷键真键程未在真机验证（纯函数单测覆盖分流逻辑）；搜索种子
+仅首行策略为刻意取舍（多行选区不整段带入）。
+
+### §8.7 终端拖放上传入口 + 大输出渲染节流（纯前端轮，2026-09-02）
+
+后台 agent 持续完善轮，两项聚焦改进，均为纯前端（App.vue / style.css /
+lib/terminalWriteThrottle.{ts,spec.ts} / lib/terminalInteraction.{ts,spec.ts} /
+mockDbxHost.ts），协议契约与后端零改动：
+
+1. **终端窗格拖放上传**（补齐 batch3 deferred「路径拖拽上传增强」的终端侧）：
+   - 此前拖放上传只有 SFTP 面板一个 drop 目标，面板收起（solo 模式）后无入口；
+     现在 `.terminal-pane` 自带 dragenter/dragover/dragleave/drop 处理，
+     拖入文件显示 `drop-overlay`（虚线框 + 上传图标 + 七语提示
+     `terminalDrop.hint`「松开上传到 {path}」，path 为当前 SFTP 目录）；
+   - 准入纯函数 `canAcceptTerminalDrop`（terminalInteraction.ts）：已连接 +
+     可写 + 非 ZMODEM 占用三者齐才收文件，只读连接/ZMODEM 传输中静默拒绝
+     （与 SFTP 面板 drop 同语义）；drop 后复用 `uploadLocalFiles` 全链路
+     （传输面板、分块上传、目录刷新、完成 notice），目录跟随开启时即上传到
+     shell 当前 cwd；宿主 fileTransfer 拖拽态（dragActive）在面板收起时也
+     复用同一 overlay 提示；
+   - mockDbxHost 补最小可写 fixture：URL `?rw=1` 切换可写连接（默认只读）+
+     `sftp/upload/start|finish`、`sftp/transfer/cancel`、上传 ack 事件，
+     拖放上传可在 visual.html 全流程走通。
+2. **大输出渲染节流**：新增 `lib/terminalWriteThrottle.ts`——PTY 二进制帧
+   不再逐帧直写 xterm，而是排队合并为一帧一次合并 write（rAF 调度，
+   setTimeout 兜底），顺序严格保持；排队字节超 1 MiB 上限同步 flush，
+   持续突发下内存有界；`dispose()` 于工作台卸载时冲刷残余。sink 惰性引用
+   `terminal`，跨终端重建安全。App.vue `writeTerminalOutput` 改走节流通道，
+   卸载钩子补 `terminalWriteThrottle.dispose()`。
+
+验证：
+- typecheck 过；vitest **86 绿**（基线 79 → 86：terminalWriteThrottle 6 例
+  （合帧合并、跨帧顺序、上限同步 flush、flush 取消不双投、dispose 冲刷、
+  空队不投递、超限单块整投）+ terminalInteraction 拖放准入 1 例含三反例）；
+  build 过（ui/index.html 产出）。
+- 浏览器验证（visual.html @ vite 5180，Playwright，截图
+  `docs/screenshots-ui-mock/terminal-drop-overlay-round87.png`（分屏）与
+  `terminal-drop-solo-round87.png`（solo 全宽））：
+  - `?rw=1` 拖入文件 → overlay 出现且提示含 `/home/demo`；dragleave 即消失；
+  - drop → 传输面板打开、notice「1 file(s) uploaded」、无错误横幅，分屏与
+    solo 两模式均过；
+  - 只读模式（默认 fixture）→ overlay 拒绝出现；
+  - 节流写入路径回归：欢迎输出/命令标记等 PTY 帧渲染正常。
+
+剩余风险：真实大文件拖放上传未连真机（fixture 全流程 + 单测覆盖逻辑，
+真实 SFTP 通道由既有 uploadLocalFiles 链路承担，无新协议面）；xterm 键入
+回显 fixture 不模拟（mock 只回 ack），大输出节流在真机突发下的体感收益
+未量化（单测保证合并/顺序/上限语义）；`dragleave.self` 沿用 SFTP 面板
+同一简易模式，极端嵌套拖拽路径未穷举。
+
+### §8.8 断线重连体验轮 + 重连死锁修复（2026-09-02）
+
+第三轮 agent 因配额超限中断，改动主体完整（重连横幅 / 立即重连按钮 /
+恢复提示 / fixture `?err=disconnect`），主 agent 验证时**发现并修复一个被
+fixture 首次暴露的既有死锁**。
+
+**新增能力**（纯前端）：
+1. **重连横幅**：`reconnectPending` 期间终端内嵌横幅（Loader + 「连接丢失，
+   自动重连中」+ 第 N 次重试 + 进度条 + 立即重连按钮），250ms tick 驱动纯函数
+   `describeReconnectCountdown`；
+2. **恢复提示**：重连成功后按 `describeReconnectRestoredNotice` 显示
+   「已重新连接，当前目录 {path}」（有 cwd 时）或「连接已恢复」，首连不弹；
+3. **fixture `?err=disconnect`**：会话建立 4s 后注入一次
+   `ssh/session/state disconnected`，全流程 UI 验证载体。
+
+**死锁分析**（`?err=disconnect` 首次真实触发，页面 100% CPU 冻结、连
+Playwright evaluate 都被饿死、headless virtual-time-budget 永不完成）：
+1. 首连消费终端帧 seq=1 后 `lastSequence=1`；
+2. 断线自动重连走 `openSession()` 重置 `lastSequence=0`，但 mock 的序号
+   计数器是全局的——重连后欢迎帧 seq=2，帧 1 已被消费、**永久缺失**；
+3. `drainTerminalFrames` 检测到缺口即调 `ssh/terminal/replay`，mock 返回
+   `complete:true` 但不补帧 → `.finally` 再 drain → 缺口依旧 → 再 replay；
+4. **promise 微任务级无限自旋**（每轮极快、永不给事件循环让路）。
+
+**修复**（两侧）：
+- `mockDbxHost.ts`：`ssh/session/open` 时 `sequence=0`——对齐真实 sidecar
+  「每会话重置序号」语义，重连后 `lastSequence=0` 与新帧序号天然对齐；
+- `App.vue openSession`：重置游标同时清空 `pendingTerminalFrames` 并复位
+  `replayNoProgress`（旧会话残帧不污染新流）；
+- `App.vue drainTerminalFrames`：**无进展熔断**——连续 3 次 replay 返回
+  complete 但同一缺口未补齐时，`lastSequence = firstPending-1` 越过缺口
+  （丢弃缺失前缀的降级路径，优于永久自旋冻结整个工作台）。
+
+**验证**：typecheck 0 错；vitest **87 绿**；build 过。修复前 headless
+`--virtual-time-budget` 确定性挂死（exit 124），修复后 10s 虚拟时间完整
+跑完（exit 0）终态 Connected；真浏览器 MutationObserver 捕获横幅
+「Connection lost, reconnecting automatically · Reconnect now」与恢复提示
+「Reconnected, current directory /home/demo」；终端欢迎行 ×2、提示符 ×4
+证明第二轮 OSC 633 周期完整重放；截图
+`docs/screenshots-ui-mock/reconnect-restored-round88.png`（横幅窗口仅
+~500ms，像素截图以 DOM 观察器文本证据为准）。
+
+**剩余风险**：熔断的「丢前缀」是降级路径；真实 sidecar 的序号重启语义与
+mock 假设需真机断线注入回归确认；后端未动（协议零变更）。
+
+### §8.9 stdio MCP 声明 connectionId——已打开终端可被 MCP 驱动（2026-09-02）
+
+**问题**：stdio 模式（ZCode 直连 sidecar `--mcp`）下，`ssh_exec{runInTerminal:true,
+connectionId}` 三连败——分发器读 `connectionId`（mcp.rs `ssh_exec_tool`）但
+`connection_properties()` 从未在 inputSchema 声明该字段，严格校验的 MCP 客户端
+先以「未声明参数」拒绝，字段根本到不了 sidecar，表现为「MCP 工具不接受
+connectionId」「已打开的终端会话 MCP 调用不了」。
+
+**修复**（纯 schema 声明，零逻辑变更）：
+- `mcp.rs connection_properties()`：头部声明 `connectionId`（string，说明终端
+  路由与 embedded 存储连接解析两用途）——`ssh_*` + `sftp_*` 共 22 个连接类工具
+  一次性覆盖；
+- 单测 `connection_tools_declare_connection_id` 防回归（8 个代表工具断言）；
+- `smoke_mcp.py` schema 段补 `connectionId` 断言；
+- `docs/MCP.zh-CN.md`「AI 终端同步执行」节补声明说明与连接 id 查询口径。
+
+**验证**：cargo test 183 绿；release 重编后对安装同款二进制 spawn stdio 会话：
+initialize → tools/list 27 工具、22 个声明 `connectionId` →
+`ssh_exec{connectionId:"e60c6b55-…"(hktkosl1103), runInTerminal:true,
+command:"echo DBX_BRIDGE_OK_…"}` 经 app bridge（mcp-bridge-port 49568）落到 DBX
+可见工作台终端，返回 `{mode:"terminal", output:"\rDBX_BRIDGE_OK_…"}`，marker 命中。
+
+**流程结论**（stdio 客户端视角）：驱动已打开终端 =
+`connectionId + runInTerminal:true`；连接 id 查 `~/Library/Application
+Support/com.dbx.app/dbx.db` 的 `connections` 表（本机 SSH 连接用户名统一
+jinpy.he）。存量 MCP 会话需重连/重启才拿到新 schema。
+
+**剩余风险**：`connectionId` 不带 `runInTerminal` 时在 stdio 模式不解析存储凭据
+（仍需内联参数，行为与之前一致）；`ssh_list_connections` 发现工具未做（可选后续，
+需定数据源：rusqlite 或宿主桥端点）。
+
+### §8.10 切 tab 重连/闪屏修复：重挂载 reattach 存活会话（2026-09-02）
+
+**症状**：SSH 工作台切换 tab 触发重连且终端闪屏；已打开的 SSH 从左侧菜单重新
+唤起后连接被重置（全新登录、屏幕清空）。
+
+**根因**（宿主侧限制 × 插件侧兜底未命中，三层叠加）：
+1. 宿主 `ContentArea.vue` 只渲染 activeTab 且无 KeepAlive——切 tab 即销毁插件
+   webview（iframe srcdoc），重开时整体重建（闪屏的物理来源）；
+2. 宿主桥**未实现 workbenchState**（pluginHostBridge.ts 全仓 0 处）：插件
+   `writeWorkbenchState()` 的 `sessionId/terminalSequence` 持久化被 `?.` + 静默
+   catch 吞掉，重挂载后 `initialState().sessionId` 永远为空，§8.8 的 attach
+   路径从不命中；
+3. 宿主 `openPluginConnection` 每次点击都 `workbenchId: crypto.randomUUID()`，
+   且复用 tab 时整体替换 context——即使有 sessionId，sidecar
+   `attach_session` 的 `connectionId+workbenchId` 双匹配也必扑空。
+
+三层叠加的净效果：任何 remount 都走 `openSession()` 全新拨号（连接重置），
+旧会话在 sidecar 里变僵尸。
+
+**修复**（纯插件侧，自洽不依赖宿主改动）：
+- `ssh.rs`：`SessionEntry.workbench_id` 改 `RwLock<String>`（内部可变）；
+  `attach_session` 匹配放宽——先精确 `(connectionId, workbenchId)`，否则复用
+  该连接的活会话并**重绑**到新 workbench（re-home，后续 close_workbench/list
+  归属正确）；匹配逻辑抽纯函数 `pick_attach_target` + 单测；
+- 前端 `initialize()`：持久化 sessionId 缺失时先 `ssh/sessions/list` 查该连接
+  活会话（`lib/sessionRestore.ts` 纯函数 + spec：同 workbench 优先、createdAt
+  最新、死会话忽略），命中则 `attachSession`（replay 恢复终端内容），否则照旧
+  `openSession()`；attach 失败仍走既有退避梯子，梯尽 `openSession(true)` 兜底。
+
+**验证**：cargo test **184 绿**（+attach 选择器）；vitest **96 绿**（+5 个
+reattach 选择器用例）；typecheck 0 错、build 过；测试容器行为级验证 ALL
+GREEN——wb-A 打开的活会话换 wb-B attach 返回同一 sessionId、sessions/list
+确认 re-home、二次 attach 稳定、未知连接仍拒绝。
+
+**说明**：七语不涉及（无新 UI 文案，错误全走既有降级路径）；改动生效需重新
+打包安装插件（会重启 DBX，等用户窗口期执行）。**宿主侧遗留**（可选后续）：
+① 桥补 workbenchState 实现（root fix，插件已兼容两种形态）；② 插件 tab 改
+v-show/常驻可消除 iframe 重建闪屏（内存换体验，宿主设计决策）。
+
+### §8.10 增补：SFTP 全局默认关 + 切 tab 闪屏宿主补丁（同日）
+
+**SFTP 全局默认关**：`sanitizeSftpPaneDefaultOpen` 回退翻转（缺失/非法值不再
+默认开，仅显式 "true" 开）——新工作台默认纯终端布局；`loadSftpPaneDefaultOpen`
+的 catch 回退同步改 false；spec 断言更新。用户历史偏好仍生效（存过 "true" 就
+开）。注意 workbenchState 在宿主桥未实现（§8.10 根因 2），工作台内的即时开关
+只在本次 webview 存活期内有效。
+
+**闪屏宿主补丁**（连接已由 reattach 保住，闪屏是 iframe 销毁重建的物理现象，
+插件侧无解）：宿主 `ContentArea` 被 `:key` 的 KeepAlive 承载，切 tab 整树销毁
+重建，iframe 移出 DOM 必然整页重载。按 DriverStorePage/PluginCenterPage 既有
+`v-if+v-show` 常驻模式在宿主 App.vue 加常驻插件工作台图层，ContentArea 移除
+plugin-workbench 分支（防双挂载）；`openPluginWorkbench` 复用 tab 不再替换
+context（左侧菜单每次点击 mint 新 workbenchId，替换会重载 webview 并使会话
+绑定失效）。详见 shared/PROGRESS-HOST-SUBREPO §11。验证：宿主 typecheck
+0 错 + 相关 vitest 27 例全过（含新增 2 例）。
+
+**生效路径**：插件重新打包安装（`frontend` 三件套已过，`scripts/build.sh` +
+`scripts/install.sh --reinstall`）；宿主 `pnpm tauri build --debug` 重建
+DBX.app。两者都会重启 DBX，待用户窗口期执行。

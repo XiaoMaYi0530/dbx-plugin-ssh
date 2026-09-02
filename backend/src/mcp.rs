@@ -1840,6 +1840,11 @@ fn parse_jump_hosts(arguments: &Value) -> Result<Vec<JumpHost>, String> {
 /// fields (`maxBytes`, `overwrite`, …).
 fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
     let mut properties = json!({
+        // Declared here so strict MCP hosts forward it: the dispatcher reads
+        // it for terminal routing (runInTerminal) and stored-connection
+        // resolution, and an undeclared argument is dropped by schema
+        // validation before the sidecar ever sees the call.
+        "connectionId": { "type": "string", "description": "Saved DBX connection id. With runInTerminal: true, a stdio-mode call is forwarded through the DBX app bridge to the connection's visible workbench terminal; on the embedded bridge it also resolves the stored connection's Quick Sudo source and read-only flag" },
         "host": { "type": "string", "description": "Remote SSH host" },
         "port": { "type": "integer", "description": "SSH port (default 22)" },
         "username": { "type": "string", "description": "Login user" },
@@ -2183,6 +2188,34 @@ mod tests {
             error.contains("read-only"),
             "expected read-only refusal, got: {error}"
         );
+    }
+
+    #[test]
+    fn connection_tools_declare_connection_id() {
+        // Strict MCP hosts drop arguments the input schema does not declare,
+        // so a missing connectionId makes runInTerminal unreachable from
+        // stdio mode before the dispatcher ever reads it.
+        let tools = tool_definitions();
+        let array = tools.as_array().unwrap();
+        for name in [
+            "ssh_exec",
+            "ssh_exec_sudo",
+            "ssh_run_bg",
+            "ssh_task_status",
+            "ssh_metrics",
+            "ssh_test_connection",
+            "sftp_list_dir",
+            "sftp_upload",
+        ] {
+            let schema = array
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} missing from definitions"))
+                ["inputSchema"]["properties"]
+                .get("connectionId")
+                .unwrap_or_else(|| panic!("tool {name} schema does not declare connectionId"));
+            assert_eq!(schema["type"], "string", "tool {name} connectionId type");
+        }
     }
 
     #[tokio::test]

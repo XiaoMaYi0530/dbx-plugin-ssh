@@ -22,6 +22,25 @@ export function isConnectionInactiveError(cause: unknown): boolean {
   return /Connection is not active/i.test(message);
 }
 
+export interface ReconnectRestoredNotice {
+  /** i18n key: cwd variant when a path is known, plain variant otherwise. */
+  key: "reconnectRestored.cwd" | "reconnectRestored.plain";
+  values: Record<string, string>;
+}
+
+/**
+ * Chooses the "connection restored" notice shown after an auto-reconnect
+ * succeeds: surfaces the restored working-directory context when one is
+ * available, or a plain restored message otherwise. Returns null when the
+ * session connected normally (no reconnect happened), so no notice is shown.
+ */
+export function describeReconnectRestoredNotice(options: { wasReconnecting: boolean; path: string }): ReconnectRestoredNotice | null {
+  if (!options.wasReconnecting) return null;
+  const path = String(options.path || "").trim();
+  if (path) return { key: "reconnectRestored.cwd", values: { path } };
+  return { key: "reconnectRestored.plain", values: {} };
+}
+
 export interface ReconnectCountdown {
   /** Seconds until the retry fires, clamped at 0. */
   seconds: number;

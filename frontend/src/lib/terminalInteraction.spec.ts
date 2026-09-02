@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveTerminalRightClickAction, sanitizeSelectCopyEnabled } from "./terminalInteraction";
+import { canAcceptTerminalDrop, resolveTerminalKeyAction, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
 
 describe("terminal interaction preferences (select-to-copy / right-click-paste)", () => {
   it("defaults select-to-copy to enabled and only honors an explicit 'false'", () => {
@@ -17,5 +17,59 @@ describe("terminal interaction preferences (select-to-copy / right-click-paste)"
     // Mode off: right-click always opens the menu (historical behavior).
     expect(resolveTerminalRightClickAction({ selectCopy: false, shiftKey: false })).toBe("menu");
     expect(resolveTerminalRightClickAction({ selectCopy: false, shiftKey: true })).toBe("menu");
+  });
+});
+
+describe("terminal keyboard shortcuts (copy/paste routing)", () => {
+  it("routes Ctrl/Cmd+Shift+C with a selection to copy and without one to none", () => {
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "c", hasSelection: true })).toBe("copy");
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "C", hasSelection: true })).toBe("copy");
+    // No selection: nothing to copy; the chord must not reach the remote shell either.
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "c", hasSelection: false })).toBe("none");
+    // Plain Ctrl+Shift+C without the modifier is untouched.
+    expect(resolveTerminalKeyAction({ mod: false, shiftKey: true, key: "c", hasSelection: true })).toBe("none");
+  });
+
+  it("keeps plain Ctrl/Cmd+C as shell input (SIGINT) and never routes it to copy", () => {
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "c", hasSelection: true })).toBe("none");
+  });
+
+  it("routes both Ctrl+V and Ctrl/Cmd+Shift+V to paste", () => {
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "v", hasSelection: false })).toBe("paste");
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "V", hasSelection: false })).toBe("paste");
+    expect(resolveTerminalKeyAction({ mod: false, shiftKey: true, key: "v", hasSelection: false })).toBe("none");
+  });
+});
+
+describe("terminal search option persistence", () => {
+  it("falls back to all-off defaults for missing or malformed storage", () => {
+    expect(sanitizeSearchOptions(null)).toEqual({ caseSensitive: false, regex: false, wholeWord: false });
+    expect(sanitizeSearchOptions("")).toEqual({ caseSensitive: false, regex: false, wholeWord: false });
+    expect(sanitizeSearchOptions("not json {")).toEqual({ caseSensitive: false, regex: false, wholeWord: false });
+    expect(sanitizeSearchOptions('{"caseSensitive":"yes"}')).toEqual({ caseSensitive: false, regex: false, wholeWord: false });
+  });
+
+  it("honors only strict true flags and drops unknown fields", () => {
+    expect(sanitizeSearchOptions('{"caseSensitive":true,"wholeWord":true,"hacker":1}')).toEqual({ caseSensitive: true, regex: false, wholeWord: true });
+    expect(sanitizeSearchOptions('{"regex":true}')).toEqual({ caseSensitive: false, regex: true, wholeWord: false });
+  });
+});
+
+describe("terminal search seed from selection", () => {
+  it("keeps the first line and clamps it to a bounded length", () => {
+    expect(terminalSearchSeedFromSelection("")).toBe("");
+    expect(terminalSearchSeedFromSelection("hello world")).toBe("hello world");
+    expect(terminalSearchSeedFromSelection("first\r\nsecond")).toBe("first");
+    expect(terminalSearchSeedFromSelection("first\nsecond\nthird")).toBe("first");
+    expect(terminalSearchSeedFromSelection("a".repeat(500)).length).toBe(200);
+  });
+});
+
+describe("terminal drop acceptance", () => {
+  it("requires a connected, writable, non-zmodem session", () => {
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, zmodemBusy: false })).toBe(true);
+    expect(canAcceptTerminalDrop({ connected: false, canWrite: true, zmodemBusy: false })).toBe(false);
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: false, zmodemBusy: false })).toBe(false);
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, zmodemBusy: true })).toBe(false);
   });
 });

@@ -3,16 +3,24 @@ const binaryListeners = new Set<(event: DbxPluginBinaryEvent) => void>();
 const appearanceListeners = new Set<(appearance: DbxPluginAppearance) => void>();
 const contextListeners = new Set<(context: Record<string, unknown>) => void>();
 
+const fixtureParams = new URLSearchParams(location.search);
+// ?rw=1 模拟可写连接（默认只读），供拖放上传等写路径 UI 验证。
+const writable = fixtureParams.get("rw") === "1";
+// ?err=disconnect 在会话建立 4s 后模拟一次传输断开（ssh/session/state
+// disconnected，单次不复发），供重连横幅/倒计时/立即重连/恢复提示的全流程 UI 验证。
+const disconnectAfterMs = fixtureParams.get("err") === "disconnect" ? 4000 : 0;
+let disconnectEmitted = false;
+// 与 DBX globals.css 的 :root（pearl 浅色）和 .dark 规范块保持一致。
+const light = fixtureParams.get("theme") === "light";
+
 const context = {
   connectionId: "visual-connection",
   workbenchId: "visual-workbench",
   restored: false,
   workbenchState: { sftpPath: "/home/demo", splitRatio: 58, paneOrder: "terminal-left", visibleColumns: ["size", "modified", "permissions"] },
-  connection: { name: "Production SSH", host: "192.168.1.64", port: 22, username: "user", color: "#3b82f6", readOnly: true },
+  connection: { name: "Production SSH", host: "192.168.1.64", port: 22, username: "user", color: "#3b82f6", readOnly: !writable },
 };
 
-const light = new URLSearchParams(location.search).get("theme") === "light";
-// 与 DBX globals.css 的 :root（pearl 浅色）和 .dark 规范块保持一致。
 const appearance: DbxPluginAppearance = {
   colorScheme: light ? "light" : "dark",
   colors: light
@@ -43,15 +51,101 @@ function emitTerminal(text: string) {
   for (const listener of binaryListeners) listener(event);
 }
 
-const entries = [
-  { name: ".config", uri: "sftp:/home/demo/.config", kind: "directory", modifiedAt: 1786262400, permissions: "0755" },
-  { name: "projects", uri: "sftp:/home/demo/projects", kind: "directory", modifiedAt: 1786266000, permissions: "0755" },
-  { name: "deploy.sh", uri: "sftp:/home/demo/deploy.sh", kind: "file", size: 2481, modifiedAt: 1786270500, permissions: "0755" },
-  { name: "docker-compose.yml", uri: "sftp:/home/demo/docker-compose.yml", kind: "file", size: 8192, modifiedAt: 1786271400, permissions: "0644" },
-  { name: "server.log", uri: "sftp:/home/demo/server.log", kind: "file", size: 741248, modifiedAt: 1786272000, permissions: "0644" },
-  { name: "latest", uri: "sftp:/home/demo/latest", kind: "symlink", size: 12, modifiedAt: 1786272000, permissions: "0777" },
-];
+// ---- 内存 fixture 树：路径感知的 sftp/list 与写操作（?mock=1 走通侧栏树/新建/压缩）----
+interface MockNode {
+  name: string;
+  kind: "directory" | "file";
+  size: number;
+  modifiedAt: number;
+  permissions: string;
+  children?: MockNode[];
+}
+
+let mockStamp = 1786262400;
+function nextMockStamp() {
+  mockStamp += 3600;
+  return mockStamp;
+}
+function mockDir(name: string, children: MockNode[] = []): MockNode {
+  return { name, kind: "directory", size: 0, modifiedAt: nextMockStamp(), permissions: "0755", children };
+}
+function mockFile(name: string, size: number, permissions = "0644"): MockNode {
+  return { name, kind: "file", size, modifiedAt: nextMockStamp(), permissions };
+}
+
+const mockTree: MockNode = mockDir("/", [
+  mockDir("home", [
+    mockDir("demo", [
+      mockDir(".config"),
+      mockDir("projects"),
+      mockFile("deploy.sh", 2481, "0755"),
+      mockFile("docker-compose.yml", 8192),
+      mockFile("server.log", 741248),
+    ]),
+  ]),
+  mockDir("etc", [mockFile("hosts", 221), mockDir("nginx", [mockFile("nginx.conf", 1264)])]),
+  mockDir("tmp"),
+  mockDir("var", [mockDir("log", [mockFile("syslog", 15432)])]),
+  mockDir("root"),
+]);
+
+function normalizeMockPath(path: string): string {
+  let value = (path || "/").trim() || "/";
+  if (!value.startsWith("/")) value = `/${value}`;
+  value = value.replace(/\/{2,}/g, "/");
+  return value === "/" ? value : value.replace(/\/+$/, "");
+}
+
+function findMockNode(path: string): MockNode | null {
+  const normalized = normalizeMockPath(path);
+  if (normalized === "/") return mockTree;
+  let node: MockNode = mockTree;
+  for (const segment of normalized.slice(1).split("/")) {
+    const next = node.children?.find((child) => child.name === segment);
+    if (!next) return null;
+    node = next;
+  }
+  return node;
+}
+
+function mockParentAndName(path: string): { parent: MockNode | null; name: string } {
+  const normalized = normalizeMockPath(path);
+  const index = normalized.lastIndexOf("/");
+  const parentPath = index <= 0 ? "/" : normalized.slice(0, index);
+  return { parent: findMockNode(parentPath), name: normalized.slice(index + 1) };
+}
+
+function mockEntryOf(node: MockNode, parentPath: string) {
+  return {
+    name: node.name,
+    uri: `sftp:${parentPath === "/" ? "" : parentPath}/${node.name}`,
+    kind: node.kind,
+    ...(node.kind === "file" ? { size: node.size } : {}),
+    modifiedAt: node.modifiedAt,
+    permissions: node.permissions,
+  };
+}
+
+function mockList(path: string) {
+  const parentPath = normalizeMockPath(path);
+  const node = findMockNode(parentPath);
+  if (!node || node.kind !== "directory") throw new Error(`sftp: no such directory: ${parentPath}`);
+  return (node.children ?? [])
+    .map((child) => mockEntryOf(child, parentPath))
+    .sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "directory" ? -1 : 1));
+}
+
+function mockWriteEntry(path: string, node: MockNode): { success: true } {
+  const { parent, name } = mockParentAndName(path);
+  if (!parent || parent.kind !== "directory" || !name || parent.children?.some((child) => child.name === name)) {
+    throw new Error(`sftp: cannot write ${normalizeMockPath(path)}`);
+  }
+  parent.children!.push(node);
+  return { success: true };
+}
+
 const fixtureDownloads = new Map<string, { fileName: string; size: number; offset: number }>();
+const fixtureUploadCount = { value: 0 };
 const settingsState = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "" };
 
 const request: DbxPluginApi["request"] = async <T = unknown>(method: string) =>
@@ -60,6 +154,11 @@ const request: DbxPluginApi["request"] = async <T = unknown>(method: string) =>
 const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, params?: unknown) => {
   let result: unknown;
   if (method === "ssh/session/open") {
+    // A fresh session restarts sequence numbering at 1 (real sidecar
+    // semantics): after an auto-reconnect the client resets its cursor to 0,
+    // so continuing the global counter here would leave a permanent hole at
+    // the old tail and spin the client's replay loop.
+    sequence = 0;
     // Simulate a VS Code-style shell integration cycle (OSC 633) so the
     // command marker strip has something to render in the visual fixture.
     const osc = "\u001b]633;";
@@ -76,19 +175,64 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
       "user@server:~$ ",
     ].join("");
     setTimeout(() => emitTerminal(`Welcome to DBX SSH/SFTP visual fixture\r\n${cycle}`), 30);
+    if (disconnectAfterMs && !disconnectEmitted) {
+      disconnectEmitted = true;
+      setTimeout(() => {
+        for (const listener of eventListeners) listener({ method: "ssh/session/state", params: { sessionId: "visual-session", state: "disconnected" } });
+      }, disconnectAfterMs);
+    }
     result = { sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, connected: true, sequence: 0, chunkSize: 262144, directoryTrackingSupported: true };
   } else if (method === "ssh/terminal/replay") result = { frameCount: 0, firstAvailableSequence: 1, tailSequence: sequence, complete: true };
-  else if (method === "ssh/sessions/list") result = { sessions: [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: true, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: "private-key" }] };
-  else if (method === "sftp/list") result = { entries };
+  else if (method === "ssh/sessions/list") result = { sessions: [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: !writable, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: "private-key" }] };
+  else if (method === "sftp/list" || method === "sudo/listDir") result = { entries: mockList(String((params as Record<string, unknown>)?.path || "/")) };
   else if (method === "sftp/home") result = { path: "/home/demo" };
+  else if (method === "sftp/createDirectory") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockDir(String((params as Record<string, unknown>)?.path || "/").split("/").pop() || "folder"));
+  else if (method === "sftp/touch") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockFile(String((params as Record<string, unknown>)?.path || "").split("/").pop() || "file.txt", 0));
+  else if (method === "sftp/archive") {
+    const input = params as Record<string, unknown>;
+    const sources = Array.isArray(input.sourcePaths) ? (input.sourcePaths as string[]) : [];
+    const total = sources.reduce((sum, source) => sum + (findMockNode(source)?.size || 1024), 0);
+    result = mockWriteEntry(String(input.archivePath || ""), mockFile(String(input.archivePath || "").split("/").pop() || "archive.tar.gz", Math.max(total, 512)));
+  }
+  else if (method === "sftp/extract") {
+    const input = params as Record<string, unknown>;
+    const destination = String(input.destinationPath || "");
+    result = mockWriteEntry(destination, mockDir(destination.split("/").pop() || "extracted", [mockFile("README", 64)]));
+  }
+  else if (method === "sftp/delete") {
+    const { parent, name } = mockParentAndName(String((params as Record<string, unknown>)?.path || ""));
+    const index = parent?.children?.findIndex((child) => child.name === name) ?? -1;
+    if (!parent || index < 0) throw new Error(`sftp: no such file: ${name}`);
+    parent.children!.splice(index, 1);
+    result = { success: true };
+  }
+  else if (method === "sftp/rename") {
+    const input = params as Record<string, unknown>;
+    const node = findMockNode(String(input.sourcePath || ""));
+    if (!node) throw new Error(`sftp: no such file: ${input.sourcePath}`);
+    const { parent: sourceParent, name: sourceName } = mockParentAndName(String(input.sourcePath || ""));
+    const sourceIndex = sourceParent?.children?.findIndex((child) => child.name === sourceName) ?? -1;
+    sourceParent?.children?.splice(sourceIndex, 1);
+    node.name = String(input.targetPath || "").split("/").pop() || node.name;
+    result = mockWriteEntry(String(input.targetPath || ""), node);
+  }
+  else if (method === "sftp/exists") result = { exists: !!findMockNode(String((params as Record<string, unknown>)?.path || "")) };
+  else if (method === "sftp/stat") {
+    const node = findMockNode(String((params as Record<string, unknown>)?.path || ""));
+    if (!node) throw new Error("sftp: no such file");
+    result = { path: normalizeMockPath(String((params as Record<string, unknown>)?.path || "")), kind: node.kind, ...(node.kind === "file" ? { size: node.size } : {}), modifiedAt: node.modifiedAt, mode: node.permissions };
+  }
   else if (method === "sftp/transfer/list") result = { tasks: [] };
+  else if (method === "sftp/upload/start") result = { taskId: `visual-upload-${++fixtureUploadCount.value}`, chunkSize: 262144 };
+  else if (method === "sftp/upload/finish") result = { success: true };
+  else if (method === "sftp/transfer/cancel") result = { success: true };
   else if (method === "sftp/read") result = { dataBase64: base64(new TextEncoder().encode("#!/usr/bin/env bash\nset -euo pipefail\n\necho deploy\n")), truncated: false };
   else if (method === "sftp/download/start") {
-    const remotePath = String((params as Record<string, unknown>)?.remotePath || "download.bin");
-    const entry = entries.find((candidate) => remotePath.endsWith(`/${candidate.name}`));
+    const remotePath = normalizeMockPath(String((params as Record<string, unknown>)?.remotePath || "download.bin"));
+    const node = findMockNode(remotePath);
     const taskId = `visual-download-${fixtureDownloads.size + 1}`;
-    const fileName = entry?.name || remotePath.split("/").pop() || "download.bin";
-    const size = entry?.size || 32;
+    const fileName = node?.kind === "file" ? node.name : remotePath.split("/").pop() || "download.bin";
+    const size = node?.kind === "file" ? node.size : 32;
     fixtureDownloads.set(taskId, { fileName, size, offset: 0 });
     for (const listener of eventListeners) listener({ method: "sftp/transfer/progress", params: { taskId, sessionId: "visual-session", direction: "download", fileName, transferred: 0, size, status: "queued" } });
     result = { taskId, fileName, size, chunkSize: 262144 };
@@ -143,7 +287,9 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { filesystem: "/dev/sda1", mount: "/", totalBytes: 52_723_200_512, usedBytes: 24_023_981_056, availableBytes: 26_005_927_936, percentUsed: 48 };
   }
   else if (method === "sftp/chmod") {
-    entries[0].permissions = "0700";
+    const input = params as Record<string, unknown>;
+    const node = findMockNode(String(input.path || ""));
+    if (node) node.permissions = String(input.mode || node.permissions);
     result = { success: true };
   }
   else if (method === "ssh/settings/get") {
@@ -178,6 +324,13 @@ window.dbxPlugin = {
   invoke,
   notify: async () => undefined,
   sendBinary: async (channel, data) => {
+    if (channel.startsWith("sftp/upload/")) {
+      const bytes = typeof data === "string" ? Uint8Array.from(atob(data), (value) => value.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
+      const offset = Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, false));
+      const taskId = channel.slice("sftp/upload/".length);
+      for (const listener of eventListeners) listener({ method: "sftp/upload/ack", params: { taskId, nextOffset: offset + Math.max(0, bytes.byteLength - 8) } });
+      return;
+    }
     if (!channel.startsWith("ssh/terminal/in/")) return;
     const bytes = typeof data === "string" ? Uint8Array.from(atob(data), (value) => value.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
     const inputSequence = Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, false));

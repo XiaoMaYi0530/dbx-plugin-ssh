@@ -49,8 +49,18 @@ import {
 } from "@lucide/vue";
 import type { Detection as ZmodemDetection, Session as ZmodemSession, Sentry as ZmodemSentry } from "zmodem.js";
 import { Osc7DirectoryParser } from "./lib/terminalDirectoryTracking";
-import { resolveTerminalRightClickAction, sanitizeSelectCopyEnabled } from "./lib/terminalInteraction";
-import { describeReconnectCountdown, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
+import {
+  resolveTerminalKeyAction,
+  resolveTerminalRightClickAction,
+  sanitizeSearchOptions,
+  sanitizeSelectCopyEnabled,
+  TERMINAL_SEARCH_OPTIONS_KEY,
+  terminalSearchSeedFromSelection,
+  canAcceptTerminalDrop,
+  type TerminalSearchOptions,
+} from "./lib/terminalInteraction";
+import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
+import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
@@ -69,9 +79,12 @@ import { formatBytes, formatRate } from "./lib/format";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI } from "./lib/appearance";
 import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload } from "./lib/agentTerminal";
 import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
+import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRestore";
+import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
 import { workbenchMessage } from "./lib/i18n";
 import TextPreview from "./components/TextPreview.vue";
 import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
+import SideNavPanel, { type SftpSideQuickPath } from "./components/SideNavPanel.vue";
 
 interface SessionInfo {
   sessionId: string;
@@ -275,6 +288,9 @@ const QUICK_COMMANDS_KEY = "ssh-quick-commands";
 const TERMINAL_FONT_SIZE_KEY = "ssh-terminal-font-size";
 // SFTP 面板默认打开偏好：localStorage 全局持久化（"false" = 新工作台仅终端）。
 const SFTP_PANE_OPEN_KEY = "ssh-sftp-pane-open";
+// 侧栏形态偏好：tree/quick tab（默认 tree）与收起状态，localStorage 全局持久化。
+const SFTP_SIDE_TAB_KEY = "ssh-sftp-side-tab";
+const SFTP_SIDE_COLLAPSED_KEY = "ssh-sftp-side-collapsed";
 // 终端交互：选中复制 + 右键粘贴（localStorage 全局偏好，默认开，"false" 关闭）。
 const SELECT_COPY_KEY = "ssh-terminal-select-copy";
 
@@ -311,6 +327,13 @@ const paneOrder = ref<SshWorkbenchPaneOrder>("terminal-left");
 // 新工作台的初始值取全局"默认打开"偏好（localStorage）。
 const sftpPaneOpen = ref(loadSftpPaneDefaultOpen());
 const sftpPaneDefaultOpen = ref(loadSftpPaneDefaultOpen());
+// 侧栏导航形态偏好：tree（目录树，默认）/ quick（快捷路径）+ 收起状态。
+const sftpSideTab = ref<"tree" | "quick">(loadSftpSideTab());
+const sftpSideCollapsed = ref(loadSftpSideCollapsed());
+// 侧栏目录树：根 = 连接根 "/"，展开时经 sftp/list 懒加载子目录（仅目录）。
+const sftpTree = ref<DirTreeNode>(createTreeRoot("/", "/"));
+// sftp/home 探测结果：quick tab 置顶展示（获取失败时该项隐藏）。
+const sftpHomePath = ref("");
 // 选中复制 + 右键粘贴（终端交互偏好，全局生效，切换即持久化）。
 const termSelectCopy = ref(loadSelectCopyEnabled());
 const followDirectory = ref(false);
@@ -350,8 +373,16 @@ const renamingPath = ref("");
 const renameDraft = ref("");
 const renameSubmitting = ref(false);
 const dragActive = ref(false);
+// Terminal-local drag overlay: true only while files are dragged over the
+// terminal pane and the drop can actually be accepted (writable session).
+const terminalDragActive = ref(false);
 const terminalMenu = ref<{ x: number; y: number }>();
-const fileMenu = ref<{ x: number; y: number; entry: SftpEntry }>();
+// 行右键菜单：selection 为打开菜单瞬间的多选快照（>1 时切换为批量区）。
+const fileMenu = ref<{ x: number; y: number; entry: SftpEntry; selection: string[] }>();
+// 文件列表空白处右键：新建文件夹 / 新建文件 / 刷新（拦截浏览器默认菜单）。
+const blankMenu = ref<{ x: number; y: number }>();
+// 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩。
+const sideMenu = ref<{ x: number; y: number; path: string }>();
 const zmodemState = ref<"idle" | "waiting" | "uploading">("idle");
 const zmodemFileName = ref("");
 const zmodemTransferred = ref(0);
@@ -438,6 +469,9 @@ const mcpLoading = ref(false);
 const mcpError = ref("");
 const mcpSaving = ref(false);
 const searchOpen = ref(false);
+// 打开搜索面板时的种子状态：选区首行预填 + 持久化的选项开关（见 openTerminalSearch）。
+const searchSeedQuery = ref("");
+const searchSeedOptions = ref<TerminalSearchOptions>(sanitizeSearchOptions(null));
 const searchMatchState = ref<TerminalSearchMatchState>("idle");
 const searchResultIndex = ref(0);
 const searchResultCount = ref(0);
@@ -452,6 +486,10 @@ const reconnectCountdown = ref<ReconnectCountdown | null>(null);
 let reconnectNextAt = 0;
 let reconnectDelayMs = 0;
 let reconnectCountdownTimer = 0;
+// Set the moment a backoff loop starts; consumed by afterSessionConnected to
+// show the "connection restored" notice (with cwd context) only after a real
+// reconnect, not on the initial connect.
+let reconnectWasPending = false;
 const commandMarker = reactive({
   installed: false,
   active: false,
@@ -513,6 +551,11 @@ const OPEN_RETRY_MAX = 3;
 let openRetryAttempt = 0;
 let lastSequence = 0;
 let replayInFlight = false;
+// Consecutive replays that returned complete without filling the detected
+// sequence hole. A sidecar that keeps reporting complete on a gap that never
+// closes cannot self-heal by retrying — after a few attempts the drain must
+// resync past the hole instead of spinning the replay loop forever.
+let replayNoProgress = 0;
 let binaryInputChain = Promise.resolve();
 let terminalInputSequence = 0;
 let noticeTimer = 0;
@@ -538,6 +581,13 @@ const directoryParser = new Osc7DirectoryParser();
 // OSC 633 shell-integration markers (pure frontend parse; no-op streams pass through).
 const commandMarkerParser = new Osc633CommandParser();
 
+// Large-output rendering throttle: coalesce consecutive PTY frames into one
+// merged xterm write per animation frame (capped, order preserving). The sink
+// reads `terminal` lazily so it also works across terminal recreation.
+const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle({
+  sink: (data) => terminal?.write(data),
+});
+
 const locale = ref("zh-CN");
 const t = (key: string, values: Record<string, string | number> = {}) => workbenchMessage(locale.value, key, values);
 const connectionId = computed(() => String(hostContext.value.connectionId || ""));
@@ -557,6 +607,7 @@ const sessionStatus = computed<WorkbenchSessionStatus>(() => describeWorkbenchSe
 // Reconnect countdown lifecycle: while the backoff loop is pending a 250ms
 // tick recomputes the pure countdown; any exit from "reconnecting" stops it.
 watch(reconnectPending, (pending) => {
+  if (pending) reconnectWasPending = true;
   if (reconnectCountdownTimer) {
     window.clearInterval(reconnectCountdownTimer);
     reconnectCountdownTimer = 0;
@@ -767,6 +818,9 @@ function createTerminal() {
     fontSize: terminalFontSize.value,
     lineHeight: 1.15,
     scrollback: 25_000,
+    // SearchAddon 的 highlight decorations 走 proposed API，缺这一项会在
+    // findNext/registerDecoration 时直接抛 "allowProposedApi option"。
+    allowProposedApi: true,
     theme: terminalTheme(),
   });
   fitAddon = new FitAddon();
@@ -818,9 +872,16 @@ function handleTerminalKey(event: KeyboardEvent) {
     closeTerminalSearch();
     return false;
   }
-  if (mod && (event.key === "v" || event.key === "V")) {
+  // iTerm2/XShell 风格组合键：Ctrl/Cmd+V 与 Ctrl/Cmd+Shift+V 粘贴（走同一风险
+  // 确认流程），Ctrl/Cmd+Shift+C 复制选区；普通 Ctrl+C 保持发给远端（SIGINT）。
+  const keyAction = resolveTerminalKeyAction({ mod, shiftKey: event.shiftKey, key: event.key, hasSelection: terminal?.hasSelection() ?? false });
+  if (keyAction === "paste") {
     // 返回 false 会阻止默认行为与原生 paste 事件，避免与确认流程重复写入。
     void pasteFromClipboardToTerminal();
+    return false;
+  }
+  if (keyAction === "copy") {
+    void copyTerminalSelection();
     return false;
   }
   return true;
@@ -873,6 +934,9 @@ function applyTerminalFontSize(size: number) {
 function openTerminalSearch() {
   if (!terminal) return;
   terminalMenu.value = undefined;
+  // iTerm2 风格：打开搜索时用当前选区首行预填查询，并带入持久化的选项开关。
+  searchSeedQuery.value = terminalSearchSeedFromSelection(terminal.getSelection() || "");
+  searchSeedOptions.value = sanitizeSearchOptions(window.localStorage.getItem(TERMINAL_SEARCH_OPTIONS_KEY));
   searchOpen.value = true;
 }
 
@@ -1025,7 +1089,7 @@ function writeTerminalOutput(data: Uint8Array) {
     if (followDirectory.value) void loadDirectory(path, true);
   }
   applyCommandMarker(commandMarkerParser.push(data));
-  terminal?.write(data);
+  terminalWriteThrottle.write(data);
 }
 
 function resetZmodemSentry() {
@@ -1166,12 +1230,28 @@ function drainTerminalFrames() {
   }
   const firstPending = Math.min(...pendingTerminalFrames.keys());
   if (Number.isFinite(firstPending) && firstPending > lastSequence + 1 && !replayInFlight && session.value) {
+    const holeAt = lastSequence;
     replayInFlight = true;
     void window.dbxPlugin.invoke<ReplayResult>("ssh/terminal/replay", { sessionId: session.value.sessionId, afterSequence: lastSequence })
       .then((result) => {
         if (!result.complete) {
           terminalState.value = "error";
           terminalError.value = t("sessionUnrecoverable");
+          return;
+        }
+        // The replay returned healthy but the hole below firstPending is still
+        // there: those frames are gone for good (e.g. sequence numbering
+        // restarted across a reconnect). Retry once more, then resync the
+        // cursor past the hole — dropping the missing prefix beats spinning
+        // this replay loop forever and freezing the workbench.
+        if (lastSequence === holeAt) {
+          replayNoProgress += 1;
+          if (replayNoProgress >= 3) {
+            lastSequence = firstPending - 1;
+            replayNoProgress = 0;
+          }
+        } else {
+          replayNoProgress = 0;
         }
       })
       .catch((cause) => showError(cause, "terminal"))
@@ -1307,6 +1387,11 @@ async function openSession(forceNew = false) {
     activeTerminalSessionId = info.sessionId;
     session.value = info;
     lastSequence = 0;
+    // A fresh session restarts sequence numbering: buffered frames from the
+    // dead session belong to a different stream and must not poison the
+    // in-order drain (a stale higher sequence would fake a permanent hole).
+    pendingTerminalFrames.clear();
+    replayNoProgress = 0;
     directoryTrackingSupported.value = info.directoryTrackingSupported ?? true;
     terminalState.value = "connected";
     const replay = await window.dbxPlugin.invoke<ReplayResult>("ssh/terminal/replay", {
@@ -1336,7 +1421,7 @@ async function openSession(forceNew = false) {
   }
 }
 
-async function attachSession(sessionId: string) {
+async function attachSession(sessionId: string, retryReference: string = initialState().sessionId || "") {
   terminalState.value = "connecting";
   activeTerminalSessionId = sessionId;
   try {
@@ -1357,7 +1442,7 @@ async function attachSession(sessionId: string) {
     reconnectAttempt = 0;
     await afterSessionConnected();
   } catch (cause) {
-    if (!shouldReattachTerminal({ disposed, state: terminalState.value, expectedSessionId: sessionId, currentSessionId: initialState().sessionId })) {
+    if (!shouldReattachTerminal({ disposed, state: terminalState.value, expectedSessionId: sessionId, currentSessionId: retryReference })) {
       terminalState.value = "error";
       reconnectPending.value = false;
       activeTerminalSessionId = "";
@@ -1390,7 +1475,17 @@ async function afterSessionConnected() {
   await writeWorkbenchState();
   if (followDirectory.value) await setDirectoryTracking(true);
   void refreshQuickSudoSetting();
+  void refreshSftpHomePath();
   await Promise.all([loadDirectory(currentPath.value), restoreTransfers()]);
+  // 侧栏 tree tab 可见时补拉根节点（首连/重连后缓存仍为空的场景）。
+  ensureSideTreeRoot();
+  // After an auto-reconnect succeeds, tell the user the session is back and
+  // which working directory context it resumed with (pure-function chosen).
+  if (reconnectWasPending) {
+    reconnectWasPending = false;
+    const restored = describeReconnectRestoredNotice({ wasReconnecting: true, path: currentPath.value });
+    if (restored) showNotice(t(restored.key, restored.values));
+  }
 }
 
 async function closeSession(updateStatus = true) {
@@ -1419,6 +1514,22 @@ async function closeSession(updateStatus = true) {
 async function reconnect() {
   terminal?.clear();
   await closeSession(false);
+  await openSession();
+}
+
+/**
+ * Manual "reconnect now" entry: while the auto-reconnect backoff ladder is
+ * pending, cancel the scheduled retry and reconnect immediately instead of
+ * waiting out the current delay; otherwise behave like the plain reconnect.
+ */
+async function reconnectNow() {
+  if (!reconnectPending.value) {
+    await reconnect();
+    return;
+  }
+  window.clearTimeout(reconnectTimer);
+  reconnectPending.value = false;
+  reconnectAttempt = 0;
   await openSession();
 }
 
@@ -1522,7 +1633,148 @@ function interruptAgentRun() {
 async function loadHome() {
   if (!session.value) return;
   const result = await window.dbxPlugin.invoke<{ path: string }>("sftp/home", { sessionId: session.value.sessionId });
+  sftpHomePath.value = normalizeRemotePath(result.path);
   await loadDirectory(result.path);
+}
+
+/** 会话接通后探测一次主目录：quick tab 置顶项（失败静默隐藏，不阻塞浏览）。 */
+async function refreshSftpHomePath() {
+  if (!session.value) return;
+  try {
+    const result = await window.dbxPlugin.invoke<{ path: string }>("sftp/home", { sessionId: session.value.sessionId });
+    sftpHomePath.value = normalizeRemotePath(result.path);
+  } catch {
+    // 旧 sidecar 缺 sftp/home 或探测失败：quick tab 只展示静态快捷路径。
+  }
+}
+
+// ---- SFTP 侧栏（tree/quick 双 tab）--------------------------------------------
+
+/** quick tab 条目：home 探测结果置顶 + SFTP_QUICK_PATHS 静态列表（去重）。 */
+const sideQuickPaths = computed<SftpSideQuickPath[]>(() => {
+  const list: SftpSideQuickPath[] = [];
+  if (sftpHomePath.value) list.push({ path: sftpHomePath.value, label: t("home"), home: true });
+  for (const path of SFTP_QUICK_PATHS) {
+    if (!list.some((item) => item.path === path)) list.push({ path, label: path });
+  }
+  return list;
+});
+
+/** 侧栏树懒加载：collapse 只翻标记保留缓存；未加载时拉 sftp/list 挂子节点。 */
+async function expandSideTreeNode(node: DirTreeNode) {
+  if (node.expanded) {
+    node.expanded = false;
+    return;
+  }
+  if (!node.loaded) {
+    if (!session.value) return;
+    node.loading = true;
+    try {
+      const result = await window.dbxPlugin.invoke<{ entries: SftpEntry[] }>(sudoMode.value ? "sudo/listDir" : "sftp/list", {
+        sessionId: session.value.sessionId,
+        path: node.path,
+      });
+      applyTreeChildren(sftpTree.value, node.path, result.entries.map((entry) => ({ path: pathFromUri(entry.uri), name: entry.name, kind: entry.kind })));
+    } catch (cause) {
+      showError(cause); // 树展开失败要有反馈，不能静默（对标 files 插件 P-FILES 反馈）
+    } finally {
+      node.loading = false;
+    }
+    return;
+  }
+  node.expanded = true;
+}
+
+/** tree tab 可见时确保根已展开（未连接时跳过，接通后由 afterSessionConnected 触发）。 */
+function ensureSideTreeRoot() {
+  if (sftpSideTab.value !== "tree" || !session.value) return;
+  const root = sftpTree.value;
+  if (!root.loaded && !root.loading) void expandSideTreeNode(root);
+}
+
+/** 侧栏刷新按钮：整树标记重拉后重展开根。 */
+function refreshSideTree() {
+  const root = sftpTree.value;
+  markTreeStale(root);
+  root.expanded = false;
+  void expandSideTreeNode(root);
+}
+
+/** 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩。 */
+function openSideMenu(payload: { path: string; x: number; y: number }) {
+  terminalMenu.value = undefined;
+  fileMenu.value = undefined;
+  blankMenu.value = undefined;
+  sideMenu.value = { x: Math.min(payload.x, window.innerWidth - 190), y: Math.min(payload.y, window.innerHeight - 220), path: payload.path };
+}
+
+function sideMenuAction(action: "open" | "copyPath" | "copyName" | "archive") {
+  const menu = sideMenu.value;
+  sideMenu.value = undefined;
+  if (!menu) return;
+  if (action === "open") {
+    goToPath(menu.path);
+    return;
+  }
+  if (action === "archive") {
+    void archiveSidePath(menu.path);
+    return;
+  }
+  const value = action === "copyPath" ? menu.path : remoteBasename(menu.path) || "/";
+  copyTextToClipboard(value, action === "copyPath" ? "sftpCopy.copiedPath" : "sftpCopy.copiedName");
+}
+
+/** 侧栏目录压缩：归档落在该目录自身所在父目录（与行内 archiveEntry 语义一致）。 */
+async function archiveSidePath(path: string) {
+  const sessionId = session.value?.sessionId;
+  if (!sessionId || archiveBusy.value) return;
+  archiveBusy.value = true;
+  const archiveName = `${remoteBasename(path) || "root"}.tar.gz`;
+  try {
+    await window.dbxPlugin.invoke("sftp/archive", {
+      sessionId,
+      sourcePaths: [path],
+      archivePath: joinRemote(parentPath(path), archiveName),
+    }, { timeoutMs: 30 * 60 * 1000 });
+    showNotice(t("archive.done", { name: archiveName }));
+    // 父目录内容已变化：树缓存标记重拉；当前目录正是父目录时同步刷新列表。
+    const parentNode = findTreeNode(sftpTree.value, parentPath(path));
+    if (parentNode) parentNode.loaded = false;
+    if (currentPath.value === parentPath(path)) await loadDirectory();
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    archiveBusy.value = false;
+  }
+}
+
+/** 空白处右键：新建文件夹 / 新建文件 / 刷新（三菜单互斥，弹前先关其它）。 */
+function openBlankMenu(payload: { x: number; y: number }) {
+  terminalMenu.value = undefined;
+  fileMenu.value = undefined;
+  sideMenu.value = undefined;
+  blankMenu.value = { x: Math.min(payload.x, window.innerWidth - 190), y: Math.min(payload.y, window.innerHeight - 160) };
+}
+
+function blankMenuAction(action: "mkdir" | "newFile" | "refresh") {
+  const menu = blankMenu.value;
+  blankMenu.value = undefined;
+  if (!menu) return;
+  if (action === "refresh") {
+    void loadDirectory();
+    return;
+  }
+  if (action === "mkdir") {
+    operationDraft.value = "";
+    operationDialog.value = "mkdir";
+  } else {
+    openNewFileDialog();
+  }
+}
+
+/** 通用剪贴板写入 + 已复制提示（行菜单/侧栏菜单共用；失败走 sftp 错误条）。 */
+function copyTextToClipboard(value: string, noticeKey: string, values?: Record<string, string | number>) {
+  void window.dbxPlugin.clipboard?.writeText(value).then(() => showNotice(t(noticeKey, values)));
 }
 
 async function loadDirectory(path = currentPath.value, fromTerminal = false) {
@@ -1642,7 +1894,7 @@ function loadSftpPaneDefaultOpen(): boolean {
   try {
     return sanitizeSftpPaneDefaultOpen(window.localStorage.getItem(SFTP_PANE_OPEN_KEY));
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -1652,6 +1904,43 @@ function loadSelectCopyEnabled(): boolean {
   } catch {
     return true;
   }
+}
+
+// 侧栏形态偏好：localStorage 全局持久化（不可用时仅当前会话生效，默认 tree/展开）。
+function loadSftpSideTab(): "tree" | "quick" {
+  try {
+    return window.localStorage.getItem(SFTP_SIDE_TAB_KEY) === "quick" ? "quick" : "tree";
+  } catch {
+    return "tree";
+  }
+}
+
+function loadSftpSideCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(SFTP_SIDE_COLLAPSED_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function persistSftpSideShape() {
+  try {
+    window.localStorage.setItem(SFTP_SIDE_TAB_KEY, sftpSideTab.value);
+    window.localStorage.setItem(SFTP_SIDE_COLLAPSED_KEY, sftpSideCollapsed.value ? "true" : "false");
+  } catch {
+    // localStorage 不可用时偏好仅对当前会话生效。
+  }
+}
+
+function setSftpSideTab(tab: "tree" | "quick") {
+  sftpSideTab.value = tab;
+  persistSftpSideShape();
+  if (tab === "tree") ensureSideTreeRoot();
+}
+
+function setSftpSideCollapsed(collapsed: boolean) {
+  sftpSideCollapsed.value = collapsed;
+  persistSftpSideShape();
 }
 
 // 切换即生效并持久化（纯前端行为，不进连接级 ssh/settings）。
@@ -2525,6 +2814,24 @@ function onDrop(event: DragEvent) {
   if (files.length) void uploadLocalFiles(files).catch(showError);
 }
 
+function onTerminalDragEnter(event: DragEvent) {
+  if (!event.dataTransfer?.types.includes("Files")) return;
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, zmodemBusy: zmodemBusy.value })) return;
+  terminalDragActive.value = true;
+}
+
+function onTerminalDrop(event: DragEvent) {
+  terminalDragActive.value = false;
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, zmodemBusy: zmodemBusy.value })) return;
+  // Files dropped on the terminal upload into the SFTP current directory —
+  // with directory tracking on this is the shell's cwd, so the terminal alone
+  // (SFTP pane closed) is a complete upload entry point.
+  const files = Array.from(event.dataTransfer?.files || []);
+  if (!files.length) return;
+  void uploadLocalFiles(files).catch(showError);
+  terminal?.focus();
+}
+
 async function copyTerminalSelection() {
   const text = terminal?.getSelection() || "";
   if (!text) return;
@@ -3225,19 +3532,108 @@ function showTerminalMenu(event: MouseEvent) {
 
 function showFileMenu(event: MouseEvent, entry: SftpEntry) {
   event.preventDefault();
+  // .stop 防止冒泡到文件列表容器的空白右键菜单（空白菜单会覆盖行菜单的回归）。
+  event.stopPropagation();
   selectedPath.value = entry.uri;
-  fileMenu.value = { x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 290), entry };
+  fileMenu.value = {
+    x: Math.min(event.clientX, window.innerWidth - 190),
+    y: Math.min(event.clientY, window.innerHeight - 290),
+    entry,
+    selection: [...selectedUris.value],
+  };
   terminalMenu.value = undefined;
+  blankMenu.value = undefined;
+  sideMenu.value = undefined;
 }
 
 function closeMenus() {
   terminalMenu.value = undefined;
   fileMenu.value = undefined;
+  blankMenu.value = undefined;
+  sideMenu.value = undefined;
   transferPanelOpen.value = false;
   columnsOpen.value = false;
   pathHistoryOpen.value = false;
   quickMenuOpen.value = false;
   connectionInfoOpen.value = false;
+}
+
+/** 多选批量：复制所选路径（换行拼接写入剪贴板）。 */
+function copySelectedPaths() {
+  const menu = fileMenu.value;
+  fileMenu.value = undefined;
+  if (!menu) return;
+  const uris = menu.selection.length ? menu.selection : [menu.entry.uri];
+  copyTextToClipboard(uris.map((uri) => pathFromUri(uri)).join("\n"), "sftpCopy.copiedPaths", { count: uris.length });
+}
+
+/**
+ * Esc 关闭链（一次按键关一层）：预览 > 对话框 > 右键菜单 > 工具栏弹出层。
+ * 逐层 if-return：无内容打开时按键穿透，不影响终端内 vim 等自身 Esc 语义。
+ */
+function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.key !== "Escape") return;
+  if (previewOpen.value) {
+    closePreview();
+    return;
+  }
+  // ---- 对话框（安全取消语义；hostKey/agent 审批等安全弹窗不在此列）----
+  if (pasteConfirm.value) {
+    resolvePasteConfirm(false);
+    return;
+  }
+  if (attrsTarget.value) {
+    closeAttributes();
+    return;
+  }
+  if (deleteTarget.value) {
+    deleteTarget.value = undefined;
+    return;
+  }
+  if (batchDeleteOpen.value) {
+    if (!batchDeleteSubmitting.value) batchDeleteOpen.value = false;
+    return;
+  }
+  if (chmodTarget.value) {
+    chmodTarget.value = undefined;
+    return;
+  }
+  if (newFileDialog.value) {
+    newFileDialog.value = false;
+    return;
+  }
+  if (operationDialog.value) {
+    operationDialog.value = null;
+    return;
+  }
+  if (commandOpen.value) {
+    commandOpen.value = false;
+    return;
+  }
+  if (profilesOpen.value) {
+    profilesOpen.value = false;
+    return;
+  }
+  if (settingsOpen.value) {
+    settingsOpen.value = false;
+    return;
+  }
+  // ---- 右键菜单（fileMenu/terminalMenu/侧栏菜单/空白菜单互斥，一次全清）----
+  if (fileMenu.value || terminalMenu.value || sideMenu.value || blankMenu.value) {
+    fileMenu.value = undefined;
+    terminalMenu.value = undefined;
+    sideMenu.value = undefined;
+    blankMenu.value = undefined;
+    return;
+  }
+  // ---- 工具栏弹出层 ----
+  if (quickMenuOpen.value || pathHistoryOpen.value || columnsOpen.value || transferPanelOpen.value || connectionInfoOpen.value) {
+    quickMenuOpen.value = false;
+    pathHistoryOpen.value = false;
+    columnsOpen.value = false;
+    transferPanelOpen.value = false;
+    connectionInfoOpen.value = false;
+  }
 }
 
 function openTransferPanel() {
@@ -3348,13 +3744,36 @@ async function initialize() {
     return;
   }
   if (typeof state.sessionId === "string" && state.sessionId) await attachSession(state.sessionId);
-  else await openSession();
+  else {
+    // 宿主切 tab / 左侧菜单重开会整体重建工作台 webview，且不回传
+    // workbenchState（桥未实现）、每次重开还换新 workbenchId——持久化
+    // sessionId 的 attach 路径永远不命中。改为向 sidecar 查询该连接的
+    // 存活会话并 attach（replay 恢复终端内容），避免全新拨号重置连接。
+    const reattach = await findReattachSession();
+    if (reattach) await attachSession(reattach, reattach);
+    else await openSession();
+  }
+}
+
+/**
+ * Asks the sidecar for a live session bound to this connection (sidecar
+ * `ssh/sessions/list`); "" when none — caller dials fresh. Failures degrade
+ * to a fresh open instead of blocking the workbench.
+ */
+async function findReattachSession(): Promise<string> {
+  try {
+    const result = await window.dbxPlugin.invoke<{ sessions?: SessionSummary[] }>("ssh/sessions/list", {}, { timeoutMs: 10_000 });
+    return pickLiveSessionForReattach(result?.sessions, { connectionId: connectionId.value, workbenchId: workbenchId.value });
+  } catch {
+    return "";
+  }
 }
 
 watch([splitRatio, paneOrder, sftpPaneOpen, followDirectory, sudoMode, visibleColumns], persistState, { deep: true });
 
 onMounted(() => {
   document.addEventListener("click", closeMenus);
+  document.addEventListener("keydown", onDocumentKeydown);
   void initialize().catch((cause) => {
     terminalState.value = "error";
     showError(cause, "terminal");
@@ -3380,6 +3799,7 @@ onBeforeUnmount(() => {
     if (terminalWheelHandler) terminalHost.value.removeEventListener("wheel", terminalWheelHandler, true);
   }
   document.removeEventListener("click", closeMenus);
+  document.removeEventListener("keydown", onDocumentKeydown);
   unsubscribeEvent?.();
   unsubscribeBinary?.();
   unsubscribeAppearance?.();
@@ -3390,6 +3810,7 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   disposeInput?.dispose();
   disposeSelectionCopy?.dispose();
+  terminalWriteThrottle.dispose();
   terminal?.dispose();
   for (const waiter of uploadAckWaiters.values()) {
     window.clearTimeout(waiter.timer);
@@ -3420,7 +3841,7 @@ onBeforeUnmount(() => {
         <button class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
-        <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting'" @click="reconnect"><PlugZap /></button>
+        <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting' && !reconnectPending" @click="reconnectNow"><PlugZap /></button>
         <button class="icon-button icon-emerald" :class="{ 'is-active': quickSudo }" :title="quickSudoTitle" :aria-pressed="quickSudo" :disabled="!connected" @click="toggleQuickSudo"><ShieldCheck /></button>
         <button class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
         <label class="follow-directory-control" :title="t('followTerminal')">
@@ -3503,11 +3924,14 @@ onBeforeUnmount(() => {
     <div v-if="sftpError" class="error-banner"><span>{{ sftpError }}</span><button @click="sftpError = ''"><X /></button></div>
 
     <section ref="paneContainer" :class="orderedPaneClass">
-      <section class="terminal-pane" :style="terminalBasis" @contextmenu="showTerminalMenu">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
         <div ref="terminalHost" class="terminal-host" />
+        <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint", { path: currentPath }) }}</strong></div>
         <TerminalSearchPanel
           v-if="searchOpen"
           :locale="locale"
+          :initial-query="searchSeedQuery"
+          :initial-options="searchSeedOptions"
           :match-state="searchMatchState"
           :result-index="searchResultIndex"
           :result-count="searchResultCount"
@@ -3516,7 +3940,15 @@ onBeforeUnmount(() => {
           @clear="clearTerminalSearch"
           @close="closeTerminalSearch"
         />
-        <div v-if="terminalState !== 'connected'" class="terminal-overlay">
+        <div v-if="reconnectPending" class="reconnect-banner" role="status">
+          <Loader2 class="spinning" />
+          <span class="reconnect-text">{{ t("reconnectBanner.label") }}</span>
+          <span v-if="reconnectCountdown" class="reconnect-countdown mono">{{ t("sessionStatus.reconnectCountdown", { seconds: reconnectCountdown.seconds, attempt: reconnectCountdown.attempt }) }}</span>
+          <span v-if="reconnectCountdown" class="reconnect-attempt">{{ t("reconnectBanner.attempt", { attempt: reconnectCountdown.attempt }) }}</span>
+          <progress v-if="reconnectCountdown" :value="reconnectCountdown.percent" max="100" />
+          <button class="reconnect-now" @click="reconnectNow">{{ t("reconnectNow") }}</button>
+        </div>
+        <div v-if="terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
           <Loader2 v-if="terminalState === 'connecting'" class="spinning large-icon" />
           <svg v-else class="terminal-state-icon" viewBox="0 0 64 64" role="img" aria-label="SSH">
             <rect x="5" y="8" width="54" height="48" rx="9" fill="#111827" />
@@ -3646,72 +4078,92 @@ onBeforeUnmount(() => {
             <span>{{ t("sudo.mode") }}</span>
           </label>
         </div>
-        <div class="sftp-filter-bar">
-          <label class="sftp-search-input">
-            <Search />
-            <input v-model="sftpSearch" type="search" :placeholder="t('sftpSearch.placeholder')" spellcheck="false" />
-            <button v-if="sftpSearch" class="sftp-search-clear" :title="t('cancel')" @click.prevent="sftpSearch = ''"><X /></button>
-          </label>
-          <select v-model="sftpTypeFilter" class="sftp-type-filter" :title="t('sftpFilter.all')">
-            <option value="all">{{ t("sftpFilter.all") }}</option>
-            <option value="directory">{{ t("sftpFilter.folders") }}</option>
-            <option value="file">{{ t("sftpFilter.files") }}</option>
-          </select>
-        </div>
-        <div v-if="selectedUris.length > 1" class="sftp-batch-bar">
-          <span>{{ t("sftpBatch.selected", { count: selectedUris.length }) }}</span>
-          <template v-if="batchProgress">
-            <progress class="batch-progress-bar" :value="batchProgressPercent(batchProgress)" max="100" />
-            <span class="batch-progress mono">{{ t("sftpBatch.progress", { done: batchProgress.done, total: batchProgress.total }) }}</span>
-          </template>
-          <button :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="batchArchive"><Archive />{{ t("sftpBatch.archive") }}</button>
-          <button class="danger" :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="batchDeleteOpen = true"><Trash2 />{{ t("sftpBatch.delete") }}</button>
-          <button @click="clearRowSelection"><X />{{ t("sftpBatch.clear") }}</button>
-        </div>
-        <div class="file-table">
-          <div class="file-rows">
-            <div class="file-header" :style="sftpGridStyle">
-              <button @click="toggleSort('name')">{{ t("name") }}<component :is="sortIcon('name')" /></button>
-              <button v-if="visibleColumns.includes('size')" @click="toggleSort('size')">{{ t("size") }}<component :is="sortIcon('size')" /></button>
-              <button v-if="visibleColumns.includes('modified')" @click="toggleSort('modified')">{{ t("modified") }}<component :is="sortIcon('modified')" /></button>
-              <span v-if="visibleColumns.includes('permissions')">{{ t("permissions") }}</span>
-            </div>
-            <div v-if="loadingFiles" class="empty"><Loader2 class="spinning" />{{ t("loading") }}</div>
-            <button
-              v-for="entry in visibleEntries"
-              v-else
-              :key="entry.uri"
-              class="file-row"
-              :class="{ selected: selectedPath === entry.uri || selectedUris.includes(entry.uri) }"
-              :style="sftpGridStyle"
-              @click="selectFile(entry, $event)"
-              @dblclick="openEntry(entry)"
-              @contextmenu="showFileMenu($event, entry)"
-            >
-              <span class="file-name">
-                <Folder v-if="entry.kind === 'directory'" class="folder-icon" />
-                <FileIcon v-else-if="entry.kind === 'file'" />
-                <FileText v-else />
-                <input
-                  v-if="renamingPath === entry.uri"
-                  v-model="renameDraft"
-                  class="rename-input"
-                  :disabled="renameSubmitting"
-                  @click.stop
-                  @dblclick.stop
-                  @keydown.enter.stop="commitRename(entry)"
-                  @keydown.escape.stop="renamingPath = ''"
-                  @blur="commitRename(entry)"
-                />
-                <span v-else>{{ entry.name }}</span>
-              </span>
-              <span v-if="visibleColumns.includes('size')" class="numeric">{{ entry.kind === "file" ? formatBytes(entry.size) : "" }}</span>
-              <span v-if="visibleColumns.includes('modified')">{{ formatModified(entry.modifiedAt) }}</span>
-              <span v-if="visibleColumns.includes('permissions')" class="mono">{{ entry.permissions }}</span>
-            </button>
-            <div v-if="!loadingFiles && !visibleEntries.length" class="empty">{{ entries.length ? t("sftpSearch.noMatch") : t("emptyFolder") }}</div>
+        <!-- SFTP 面板主体：左侧 tree/quick 双 tab 侧栏（可收起）+ 右侧文件区 -->
+        <div class="sftp-body">
+          <SideNavPanel
+            :tab="sftpSideTab"
+            :collapsed="sftpSideCollapsed"
+            :tree-root="sftpTree"
+            :quick-paths="sideQuickPaths"
+            :current-path="currentPath"
+            :t="t"
+            @update:tab="setSftpSideTab"
+            @update:collapsed="setSftpSideCollapsed"
+            @navigate="goToPath"
+            @toggle-node="expandSideTreeNode"
+            @refresh-tree="refreshSideTree"
+            @node-context="openSideMenu"
+          />
+          <div class="sftp-main">
+          <div class="sftp-filter-bar">
+            <label class="sftp-search-input">
+              <Search />
+              <input v-model="sftpSearch" type="search" :placeholder="t('sftpSearch.placeholder')" spellcheck="false" />
+              <button v-if="sftpSearch" class="sftp-search-clear" :title="t('cancel')" @click.prevent="sftpSearch = ''"><X /></button>
+            </label>
+            <select v-model="sftpTypeFilter" class="sftp-type-filter" :title="t('sftpFilter.all')">
+              <option value="all">{{ t("sftpFilter.all") }}</option>
+              <option value="directory">{{ t("sftpFilter.folders") }}</option>
+              <option value="file">{{ t("sftpFilter.files") }}</option>
+            </select>
           </div>
-          <footer class="file-footer"><span>{{ sftpFiltersActive ? t("sftpSearch.footerMatch", { matched: visibleEntries.length, total: entries.length }) : t("items", { count: entries.length }) }}</span><span v-if="diskUsage" :title="`${diskUsage.filesystem} → ${diskUsage.mount}`">{{ formatBytes(diskUsage.availableBytes) }} {{ t("diskFreeOf", { total: formatBytes(diskUsage.totalBytes) }) }}</span><span>{{ currentPath }}</span></footer>
+          <div v-if="selectedUris.length > 1" class="sftp-batch-bar">
+            <span>{{ t("sftpBatch.selected", { count: selectedUris.length }) }}</span>
+            <template v-if="batchProgress">
+              <progress class="batch-progress-bar" :value="batchProgressPercent(batchProgress)" max="100" />
+              <span class="batch-progress mono">{{ t("sftpBatch.progress", { done: batchProgress.done, total: batchProgress.total }) }}</span>
+            </template>
+            <button :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="batchArchive"><Archive />{{ t("sftpBatch.archive") }}</button>
+            <button class="danger" :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="batchDeleteOpen = true"><Trash2 />{{ t("sftpBatch.delete") }}</button>
+            <button @click="clearRowSelection"><X />{{ t("sftpBatch.clear") }}</button>
+          </div>
+          <div class="file-table">
+            <!-- 空白处右键：新建文件夹/新建文件/刷新（行右键已在 showFileMenu 内 .stop）-->
+            <div class="file-rows" @contextmenu.prevent.stop="openBlankMenu({ x: $event.clientX, y: $event.clientY })">
+              <div class="file-header" :style="sftpGridStyle">
+                <button @click="toggleSort('name')">{{ t("name") }}<component :is="sortIcon('name')" /></button>
+                <button v-if="visibleColumns.includes('size')" @click="toggleSort('size')">{{ t("size") }}<component :is="sortIcon('size')" /></button>
+                <button v-if="visibleColumns.includes('modified')" @click="toggleSort('modified')">{{ t("modified") }}<component :is="sortIcon('modified')" /></button>
+                <span v-if="visibleColumns.includes('permissions')">{{ t("permissions") }}</span>
+              </div>
+              <div v-if="loadingFiles" class="empty"><Loader2 class="spinning" />{{ t("loading") }}</div>
+              <button
+                v-for="entry in visibleEntries"
+                v-else
+                :key="entry.uri"
+                class="file-row"
+                :class="{ selected: selectedPath === entry.uri || selectedUris.includes(entry.uri) }"
+                :style="sftpGridStyle"
+                @click="selectFile(entry, $event)"
+                @dblclick="openEntry(entry)"
+                @contextmenu="showFileMenu($event, entry)"
+              >
+                <span class="file-name">
+                  <Folder v-if="entry.kind === 'directory'" class="folder-icon" />
+                  <FileIcon v-else-if="entry.kind === 'file'" />
+                  <FileText v-else />
+                  <input
+                    v-if="renamingPath === entry.uri"
+                    v-model="renameDraft"
+                    class="rename-input"
+                    :disabled="renameSubmitting"
+                    @click.stop
+                    @dblclick.stop
+                    @keydown.enter.stop="commitRename(entry)"
+                    @keydown.escape.stop="renamingPath = ''"
+                    @blur="commitRename(entry)"
+                  />
+                  <span v-else>{{ entry.name }}</span>
+                </span>
+                <span v-if="visibleColumns.includes('size')" class="numeric">{{ entry.kind === "file" ? formatBytes(entry.size) : "" }}</span>
+                <span v-if="visibleColumns.includes('modified')">{{ formatModified(entry.modifiedAt) }}</span>
+                <span v-if="visibleColumns.includes('permissions')" class="mono">{{ entry.permissions }}</span>
+              </button>
+              <div v-if="!loadingFiles && !visibleEntries.length" class="empty">{{ entries.length ? t("sftpSearch.noMatch") : t("emptyFolder") }}</div>
+            </div>
+            <footer class="file-footer"><span>{{ sftpFiltersActive ? t("sftpSearch.footerMatch", { matched: visibleEntries.length, total: entries.length }) : t("items", { count: entries.length }) }}</span><span v-if="diskUsage" :title="`${diskUsage.filesystem} → ${diskUsage.mount}`">{{ formatBytes(diskUsage.availableBytes) }} {{ t("diskFreeOf", { total: formatBytes(diskUsage.totalBytes) }) }}</span><span>{{ currentPath }}</span></footer>
+          </div>
+          </div>
         </div>
         <div v-if="dragActive" class="drop-overlay"><FileUp /><strong>{{ t("upload") }}</strong></div>
       </section>
@@ -3729,17 +4181,45 @@ onBeforeUnmount(() => {
     </nav>
 
     <nav v-if="fileMenu" class="context-menu" :style="{ left: fileMenu.x + 'px', top: fileMenu.y + 'px' }" @click.stop>
-      <button v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @click="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</button>
-      <button v-if="fileMenu.entry.kind === 'file'" @click="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</button>
-      <button :disabled="!canWrite" @click="beginRename(fileMenu.entry); fileMenu = undefined"><Pencil />{{ t("rename") }}</button>
-      <button @click="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</button>
-      <button :disabled="!canWrite" @click="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</button>
-      <button :disabled="!canWrite" @click="beginChmod(fileMenu.entry)"><Lock />{{ t("permissionsEdit") }}</button>
-      <button @click="openAttributes(fileMenu.entry)"><Info />{{ t("sftpAttrs.action") }}</button>
-      <button v-if="fileMenu.entry.kind === 'directory' || (fileMenu.entry.kind === 'file' && !isArchiveName(fileMenu.entry.name))" :disabled="!canWrite || archiveBusy" @click="archiveEntry(fileMenu.entry)"><Archive />{{ t("archive.action") }}</button>
-      <button v-if="fileMenu.entry.kind === 'file' && isArchiveName(fileMenu.entry.name)" :disabled="!canWrite || archiveBusy" @click="extractEntry(fileMenu.entry)"><PackageOpen />{{ t("extract.action") }}</button>
-      <hr />
-      <button class="danger" :disabled="!canWrite" @click="deleteTarget = fileMenu.entry; fileMenu = undefined"><Trash2 />{{ t("delete") }}</button>
+      <!-- 多选感知：右键时已多选（selection > 1）→ 菜单整体切换为批量区，单项动作隐藏 -->
+      <template v-if="fileMenu.selection.length > 1">
+        <button :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="fileMenu = undefined; batchArchive()"><Archive />{{ t("sftpBatch.archive") }}</button>
+        <button class="danger" :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="fileMenu = undefined; batchDeleteOpen = true"><Trash2 />{{ t("sftpBatch.delete") }}</button>
+        <hr />
+        <button @click="copySelectedPaths"><Copy />{{ t("sftpCopy.copySelected") }}</button>
+      </template>
+      <template v-else>
+        <button v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @click="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</button>
+        <button v-if="fileMenu.entry.kind === 'file'" @click="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</button>
+        <button :disabled="!canWrite" @click="beginRename(fileMenu.entry); fileMenu = undefined"><Pencil />{{ t("rename") }}</button>
+        <button @click="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</button>
+        <button :disabled="!canWrite" @click="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</button>
+        <hr />
+        <button @click="copyTextToClipboard(pathFromUri(fileMenu.entry.uri), 'sftpCopy.copiedPath'); fileMenu = undefined"><Copy />{{ t("sftpCopy.copyPath") }}</button>
+        <button @click="copyTextToClipboard(fileMenu.entry.name, 'sftpCopy.copiedName'); fileMenu = undefined"><FileText />{{ t("sftpCopy.copyName") }}</button>
+        <hr />
+        <button :disabled="!canWrite" @click="beginChmod(fileMenu.entry)"><Lock />{{ t("permissionsEdit") }}</button>
+        <button @click="openAttributes(fileMenu.entry)"><Info />{{ t("sftpAttrs.action") }}</button>
+        <button v-if="fileMenu.entry.kind === 'directory' || (fileMenu.entry.kind === 'file' && !isArchiveName(fileMenu.entry.name))" :disabled="!canWrite || archiveBusy" @click="archiveEntry(fileMenu.entry)"><Archive />{{ t("archive.action") }}</button>
+        <button v-if="fileMenu.entry.kind === 'file' && isArchiveName(fileMenu.entry.name)" :disabled="!canWrite || archiveBusy" @click="extractEntry(fileMenu.entry)"><PackageOpen />{{ t("extract.action") }}</button>
+        <hr />
+        <button class="danger" :disabled="!canWrite" @click="deleteTarget = fileMenu.entry; fileMenu = undefined"><Trash2 />{{ t("delete") }}</button>
+      </template>
+    </nav>
+
+    <!-- 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩 -->
+    <nav v-if="sideMenu" class="context-menu" :style="{ left: sideMenu.x + 'px', top: sideMenu.y + 'px' }" @click.stop>
+      <button @click="sideMenuAction('open')"><Folder />{{ t("openFolder") }}</button>
+      <button @click="sideMenuAction('copyPath')"><Copy />{{ t("sftpCopy.copyPath") }}</button>
+      <button @click="sideMenuAction('copyName')"><FileText />{{ t("sftpCopy.copyName") }}</button>
+      <button :disabled="!canWrite || archiveBusy" @click="sideMenuAction('archive')"><Archive />{{ t("archive.action") }}</button>
+    </nav>
+
+    <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 刷新 -->
+    <nav v-if="blankMenu" class="context-menu" :style="{ left: blankMenu.x + 'px', top: blankMenu.y + 'px' }" @click.stop>
+      <button :disabled="!canWrite" @click="blankMenuAction('mkdir')"><FolderPlus />{{ t("newFolder") }}</button>
+      <button :disabled="!canWrite" @click="blankMenuAction('newFile')"><FilePlus />{{ t("sftpNewFile.action") }}</button>
+      <button :disabled="!connected || loadingFiles" @click="blankMenuAction('refresh')"><RefreshCw />{{ t("refresh") }}</button>
     </nav>
 
     <section v-if="previewOpen" class="modal-backdrop" @mousedown.self="closePreview">

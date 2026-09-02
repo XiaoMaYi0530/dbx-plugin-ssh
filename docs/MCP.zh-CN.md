@@ -156,6 +156,9 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
   app 未运行会尝试 `open -a DBX.app` 唤起，可用 `DBX_APP_LAUNCH_CMD` 自定义）把调用
   转发到 **app 自己的插件 sidecar**——与工作台同一进程，命令出现在 app 终端里。
   转发要求 `connectionId` 指向 DBX 已保存的连接（凭据由 app 侧解析，不经 stdio 调用方）。
+  `connectionId` 已随全部连接类工具的 inputSchema 声明（0.4.12：`ssh_*` / `sftp_*` 共
+  22 个），严格校验的 stdio 客户端（如 ZCode）不会再以「未声明参数」拒绝该字段；
+  连接 id 可从 DBX 连接存储查得（`connections` 表 `id` 列，连接名在 `config_json.name`）。
 - 该连接没有打开的终端会话时报错引导（"open the SSH workbench terminal first"），
   不回退到隐藏执行——可见才执行是该模式的承诺。
 - 连接级默认行为由工作台设置 `agentTerminalMode` 决定（`off` 默认不路由 /

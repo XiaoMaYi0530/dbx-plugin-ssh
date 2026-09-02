@@ -554,9 +554,11 @@ impl ReplayBuffer {
     }
 }
 
+/// `workbench_id` is interior-mutable: attach re-homes a live session to the
+/// reopened workbench (the host mints a fresh workbenchId per sidebar open).
 struct SessionEntry {
     connection_id: String,
-    workbench_id: String,
+    workbench_id: RwLock<String>,
     read_only: bool,
     keepalive_interval_secs: u64,
     connected: AtomicBool,
@@ -819,7 +821,7 @@ impl SshRuntime {
         // update, so configuring Quick Sudo after connecting still arms it.
         let entry = Arc::new(SessionEntry {
             connection_id: connection.id.clone(),
-            workbench_id: workbench_id.to_string(),
+            workbench_id: RwLock::new(workbench_id.to_string()),
             read_only: connection.read_only,
             keepalive_interval_secs: connection.keepalive_interval_secs,
             connected: AtomicBool::new(true),
@@ -1338,10 +1340,15 @@ impl SshRuntime {
                     .and_then(|store| store.get(&entry.connection_id))
                     .map(|connection| connection.authentication.method_name())
                     .unwrap_or("password");
+                let workbench_id = entry
+                    .workbench_id
+                    .read()
+                    .map(|workbench| workbench.clone())
+                    .unwrap_or_default();
                 session_info_payload(
                     session_id,
                     &entry.connection_id,
-                    &entry.workbench_id,
+                    &workbench_id,
                     entry.read_only,
                     entry.connected.load(Ordering::Acquire),
                     keepalives.contains(&entry.connection_id),
@@ -1425,6 +1432,33 @@ impl SshRuntime {
         }))
     }
 
+    /// Picks the session to attach for a (re)opened workbench. The exact
+    /// `(connection_id, workbench_id)` match wins; otherwise the connection's
+    /// live session is re-homed — the host mints a fresh `workbenchId` on
+    /// every sidebar reopen, and a strict double match would force a
+    /// redundant SSH re-dial for a session that is still perfectly alive.
+    fn pick_attach_target(
+        sessions: &[(String, String, String, bool)],
+        connection_id: &str,
+        workbench_id: &str,
+    ) -> Option<String> {
+        sessions
+            .iter()
+            .find(|(_, session_connection, session_workbench, connected)| {
+                *connected
+                    && session_connection.as_str() == connection_id
+                    && session_workbench.as_str() == workbench_id
+            })
+            .or_else(|| {
+                sessions
+                    .iter()
+                    .find(|(_, session_connection, _, connected)| {
+                        *connected && session_connection.as_str() == connection_id
+                    })
+            })
+            .map(|(session_id, _, _, _)| session_id.clone())
+    }
+
     pub async fn attach_session(
         &self,
         connection_id: &str,
@@ -1432,23 +1466,40 @@ impl SshRuntime {
         after_sequence: u64,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
-        let session = self
-            .sessions
-            .read()
-            .await
-            .iter()
-            .find(|(_, session)| {
-                session.connection_id == connection_id
-                    && session.workbench_id == workbench_id
-                    && session.connected.load(Ordering::Acquire)
-            })
-            .map(|(session_id, session)| (session_id.clone(), session.clone()))
-            .ok_or("No live SSH session is attached to this workbench")?;
+        let session_id = {
+            let sessions = self.sessions.write().await;
+            let snapshot: Vec<(String, String, String, bool)> = sessions
+                .iter()
+                .map(|(id, entry)| {
+                    (
+                        id.clone(),
+                        entry.connection_id.clone(),
+                        entry
+                            .workbench_id
+                            .read()
+                            .map(|workbench| workbench.clone())
+                            .unwrap_or_default(),
+                        entry.connected.load(Ordering::Acquire),
+                    )
+                })
+                .collect();
+            let target = Self::pick_attach_target(&snapshot, connection_id, workbench_id)
+                .ok_or("No live SSH session is attached to this workbench")?;
+            // Re-home when the workbench ids diverge: the reopened tab owns
+            // the session from now on (close_workbench, list payloads), while
+            // the SSH connection and replay buffer continue undisturbed.
+            if let Some(entry) = sessions.get(&target) {
+                if let Ok(mut workbench) = entry.workbench_id.write() {
+                    *workbench = workbench_id.to_string();
+                }
+            }
+            target
+        };
         let replay = self
-            .replay_terminal(&session.0, after_sequence, emitter)
+            .replay_terminal(&session_id, after_sequence, emitter)
             .await?;
         Ok(json!({
-            "sessionId": session.0,
+            "sessionId": session_id,
             "connectionId": connection_id,
             "workbenchId": workbench_id,
             "connected": true,
@@ -1464,7 +1515,13 @@ impl SshRuntime {
             .read()
             .await
             .iter()
-            .filter(|(_, session)| session.workbench_id == workbench_id)
+            .filter(|(_, session)| {
+                session
+                    .workbench_id
+                    .read()
+                    .map(|workbench| workbench.as_str() == workbench_id)
+                    .unwrap_or(false)
+            })
             .map(|(session_id, _)| session_id.clone())
             .collect::<Vec<_>>();
         for session_id in session_ids {
@@ -4068,6 +4125,33 @@ mod tests {
         assert!(
             lock.try_lock().is_ok(),
             "release must admit the next agent command"
+        );
+    }
+
+    #[test]
+    fn attach_target_prefers_exact_workbench_then_rehomes_connection_session() {
+        let sessions: Vec<(String, String, String, bool)> = vec![
+            ("s-old".into(), "conn-1".into(), "wb-old".into(), true),
+            ("s-other".into(), "conn-2".into(), "wb-other".into(), true),
+        ];
+        // Exact double match wins when the workbench id is stable.
+        assert_eq!(
+            SshRuntime::pick_attach_target(&sessions, "conn-1", "wb-old").as_deref(),
+            Some("s-old")
+        );
+        // Sidebar reopen mints a fresh workbenchId: the connection's live
+        // session must still be found instead of forcing a re-dial.
+        assert_eq!(
+            SshRuntime::pick_attach_target(&sessions, "conn-1", "wb-new").as_deref(),
+            Some("s-old")
+        );
+        // Dead sessions never attach; other connections' sessions stay put.
+        let dead: Vec<(String, String, String, bool)> =
+            vec![("s-dead".into(), "conn-1".into(), "wb-old".into(), false)];
+        assert_eq!(SshRuntime::pick_attach_target(&dead, "conn-1", "wb-new"), None);
+        assert_eq!(
+            SshRuntime::pick_attach_target(&sessions, "conn-3", "wb-new"),
+            None
         );
     }
 

@@ -2,11 +2,16 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { ChevronDown, ChevronUp, Search, X } from "@lucide/vue";
 import { workbenchMessage } from "../lib/i18n";
+import { persistSearchOptions, type TerminalSearchOptions } from "../lib/terminalInteraction";
 
 type TerminalSearchMatchState = "idle" | "match" | "no-match";
 
 interface Props {
   locale: string;
+  /** Seed query from the current terminal selection (may be empty). */
+  initialQuery?: string;
+  /** Persisted toggle state restored by the parent on open. */
+  initialOptions?: TerminalSearchOptions;
   matchState: TerminalSearchMatchState;
   resultIndex: number;
   resultCount: number;
@@ -21,10 +26,10 @@ const emit = defineEmits<{
   close: [];
 }>();
 
-const query = ref("");
-const caseSensitive = ref(false);
-const useRegex = ref(false);
-const wholeWord = ref(false);
+const query = ref(props.initialQuery ?? "");
+const caseSensitive = ref(props.initialOptions?.caseSensitive ?? false);
+const useRegex = ref(props.initialOptions?.regex ?? false);
+const wholeWord = ref(props.initialOptions?.wholeWord ?? false);
 const input = ref<HTMLInputElement>();
 
 const t = (key: string, values: Record<string, string | number> = {}) => workbenchMessage(props.locale, key, values);
@@ -60,12 +65,15 @@ function onKeydown(event: KeyboardEvent) {
 }
 
 watch([caseSensitive, useRegex, wholeWord], () => {
+  persistSearchOptions(searchOptions());
   if (query.value) emitSearch("next");
 });
 
 onMounted(() => {
   input.value?.focus();
   input.value?.select();
+  // 带入选区种子时立即执行一次查找，面板打开即出结果。
+  if (query.value) emitSearch("next");
 });
 </script>
 

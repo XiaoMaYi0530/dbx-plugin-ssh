@@ -328,6 +328,9 @@ def main() -> None:
             tool["inputSchema"]["properties"] for tool in tools if tool["name"] == "ssh_exec"
         )
         assert "runInTerminal" in exec_schema, "ssh_exec lacks runInTerminal"
+        # Strict MCP hosts drop undeclared arguments, so connectionId must be
+        # part of the advertised schema or runInTerminal is unreachable there.
+        assert "connectionId" in exec_schema, "ssh_exec lacks connectionId"
         send(proc, {
             "jsonrpc": "2.0", "id": 20, "method": "tools/call",
             "params": {"name": "ssh_exec", "arguments": {

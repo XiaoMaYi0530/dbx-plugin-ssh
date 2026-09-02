@@ -18,10 +18,10 @@ export function resolveSftpPaneOpen(state: { sftpPaneOpen?: unknown }, defaultOp
 }
 
 /**
- * Parses the persisted global preference ("false" = keep new workbenches on the
- * terminal-only layout; anything else, including missing values, keeps the
- * historical always-open default).
+ * Parses the persisted global preference ("true" = open the SFTP pane on new
+ * workbenches; anything else, including missing values, keeps the global
+ * default of a terminal-only workbench).
  */
 export function sanitizeSftpPaneDefaultOpen(raw: string | null): boolean {
-  return raw !== "false";
+  return raw === "true";
 }

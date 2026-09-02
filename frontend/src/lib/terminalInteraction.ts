@@ -19,3 +19,74 @@ export function sanitizeSelectCopyEnabled(raw: string | null): boolean {
 export function resolveTerminalRightClickAction(options: { selectCopy: boolean; shiftKey: boolean }): TerminalRightClickAction {
   return options.selectCopy && !options.shiftKey ? "paste" : "menu";
 }
+
+export type TerminalKeyAction = "copy" | "paste" | "none";
+
+/**
+ * Keyboard shortcut routing inside the terminal (iTerm2/XShell style):
+ * Ctrl/Cmd+V and Ctrl/Cmd+Shift+V paste, Ctrl/Cmd+Shift+C copies the current
+ * selection. Plain Ctrl/Cmd+C must stay untouched so it keeps reaching the
+ * remote shell as SIGINT.
+ */
+export function resolveTerminalKeyAction(options: { mod: boolean; shiftKey: boolean; key: string; hasSelection: boolean }): TerminalKeyAction {
+  const key = options.key.toLowerCase();
+  if (options.mod && key === "v") return "paste";
+  if (options.mod && options.shiftKey && key === "c" && options.hasSelection) return "copy";
+  return "none";
+}
+
+export interface TerminalSearchOptions {
+  caseSensitive: boolean;
+  regex: boolean;
+  wholeWord: boolean;
+}
+
+export const TERMINAL_SEARCH_OPTIONS_KEY = "ssh-terminal-search-options";
+const TERMINAL_SEARCH_SEED_MAX_LENGTH = 200;
+
+/**
+ * Search toggle persistence: the stored shape is a JSON object; anything
+ * malformed (or a missing entry) falls back to the all-off defaults instead
+ * of throwing or leaking stale partial state.
+ */
+export function sanitizeSearchOptions(raw: string | null): TerminalSearchOptions {
+  let parsed: unknown;
+  try {
+    parsed = raw == null ? undefined : JSON.parse(raw);
+  } catch {
+    parsed = undefined;
+  }
+  const source = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+  return {
+    caseSensitive: source.caseSensitive === true,
+    regex: source.regex === true,
+    wholeWord: source.wholeWord === true,
+  };
+}
+
+export function persistSearchOptions(options: TerminalSearchOptions): void {
+  try {
+    window.localStorage.setItem(TERMINAL_SEARCH_OPTIONS_KEY, JSON.stringify(options));
+  } catch {
+    // localStorage unavailable: the toggles stay session-scoped.
+  }
+}
+
+/**
+ * Search seed from the current terminal selection (iTerm2 "find selected
+ * text"): only the first line is kept and clamped to a bounded length, so a
+ * huge or multiline selection cannot turn into an unusable query.
+ */
+export function terminalSearchSeedFromSelection(selection: string): string {
+  const firstLine = selection.split(/\r?\n/, 1)[0] ?? "";
+  return firstLine.slice(0, TERMINAL_SEARCH_SEED_MAX_LENGTH);
+}
+
+/**
+ * Whether a file dropped onto the terminal pane can be uploaded right now.
+ * Mirrors the SFTP pane's drop gate: needs an active writable session, and a
+ * running ZMODEM session owns the terminal data path so drops are refused.
+ */
+export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: boolean; zmodemBusy: boolean }): boolean {
+  return options.connected && options.canWrite && !options.zmodemBusy;
+}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Osc7DirectoryParser, parseOsc7Path } from "./terminalDirectoryTracking";
-import { describeReconnectCountdown, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay } from "./terminalReconnect";
+import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay } from "./terminalReconnect";
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress } from "./sftpBatchProgress";
 import { sampleTransferSpeed } from "./transferSpeed";
 import { DANGEROUS_COMMAND_PATTERNS, buildPasteConfirmation, inspect } from "./dangerousCommands";
@@ -42,6 +42,16 @@ describe("SSH workbench protocol helpers", () => {
     expect(describeReconnectCountdown({ pending: true, attempt: 2, nextAt: 10_000, now: 12_500, delayMs: 5000 })).toEqual({ seconds: 0, attempt: 2, percent: 100 });
     // A fraction of a second still rounds up to 1 visible second.
     expect(describeReconnectCountdown({ pending: true, attempt: 1, nextAt: 10_000, now: 9200, delayMs: 2000 })).toEqual({ seconds: 1, attempt: 1, percent: 60 });
+  });
+
+  it("shows the restored notice only after a reconnect, with cwd context when known", () => {
+    // Normal initial connect: no notice at all.
+    expect(describeReconnectRestoredNotice({ wasReconnecting: false, path: "/home/demo" })).toBeNull();
+    // Reconnect with a known working directory surfaces the cwd variant.
+    expect(describeReconnectRestoredNotice({ wasReconnecting: true, path: "/home/demo" })).toEqual({ key: "reconnectRestored.cwd", values: { path: "/home/demo" } });
+    // Whitespace-only path falls back to the plain variant.
+    expect(describeReconnectRestoredNotice({ wasReconnecting: true, path: "  " })).toEqual({ key: "reconnectRestored.plain", values: {} });
+    expect(describeReconnectRestoredNotice({ wasReconnecting: true, path: "" })).toEqual({ key: "reconnectRestored.plain", values: {} });
   });
 
   it("aggregates batch progress across succeeded and failed items", () => {
@@ -97,9 +107,11 @@ describe("SSH workbench protocol helpers", () => {
   });
 
   it("parses the persisted SFTP default-open preference defensively", () => {
-    expect(sanitizeSftpPaneDefaultOpen(null)).toBe(true);
+    // Global default is OFF: only the explicit opt-in opens new workbenches
+    // with the SFTP pane visible.
+    expect(sanitizeSftpPaneDefaultOpen(null)).toBe(false);
     expect(sanitizeSftpPaneDefaultOpen("true")).toBe(true);
-    expect(sanitizeSftpPaneDefaultOpen("garbage")).toBe(true);
+    expect(sanitizeSftpPaneDefaultOpen("garbage")).toBe(false);
     expect(sanitizeSftpPaneDefaultOpen("false")).toBe(false);
   });
 });
