@@ -12,6 +12,14 @@ const messages = {
     transportDisconnected: "The SSH connection was closed by the server or network. Reconnect to continue.",
     restartDisconnected: "SSH sessions are not restored after DBX restarts",
     connectionInactive: "This connection was not reopened after DBX restarted, so its credentials are no longer available. Reopen the connection from the DBX sidebar, then press Reconnect.",
+    connectError: {
+      auth: "Authentication failed. Check the username, password or private key configured for this connection, then press Reconnect.",
+      refused: "The server refused the connection. Verify the host and port, and make sure the SSH service is running.",
+      dns: "The host name could not be resolved. Check the spelling of the host address.",
+      timeout: "The connection timed out. Check network reachability, firewalls and VPN routes.",
+      hostKey: "The server's host key was rejected. If the server was rebuilt, update the known-hosts entry from the workbench tools.",
+      network: "The server is unreachable over the network. Check routing and firewalls, then press Reconnect.",
+    },
     terminalSelectCopy: {
       section: "Terminal interaction",
       label: "Copy on select · paste on right-click",
@@ -254,6 +262,14 @@ const messages = {
     transportDisconnected: "El servidor o la red cerraron la conexión SSH. Vuelva a conectarse para continuar.",
     restartDisconnected: "Las sesiones SSH no se restauran al reiniciar DBX",
     connectionInactive: "Esta conexión no se reabrió tras reiniciar DBX y sus credenciales ya no están disponibles. Vuelve a abrir la conexión en la barra lateral de DBX y pulsa Reconectar.",
+    connectError: {
+      auth: "Error de autenticación. Comprueba el usuario, la contraseña o la clave privada configurados en esta conexión y pulsa Reconectar.",
+      refused: "El servidor rechazó la conexión. Verifica el host y el puerto, y asegúrate de que el servicio SSH esté en ejecución.",
+      dns: "No se pudo resolver el nombre del host. Revisa la escritura de la dirección del host.",
+      timeout: "La conexión agotó el tiempo de espera. Comprueba la accesibilidad de la red, los cortafuegos y las rutas VPN.",
+      hostKey: "La clave de host del servidor fue rechazada. Si el servidor se reconstruyó, actualiza la entrada de known-hosts desde las herramientas del área de trabajo.",
+      network: "No se puede alcanzar el servidor por la red. Revisa el enrutamiento y los cortafuegos y pulsa Reconectar.",
+    },
     terminalSelectCopy: {
       section: "Interacción con la terminal",
       label: "Copiar al seleccionar · pegar con clic derecho",
@@ -490,6 +506,14 @@ const messages = {
     transportDisconnected: "La connessione SSH è stata chiusa dal server o dalla rete. Riconnettiti per continuare.",
     restartDisconnected: "Le sessioni SSH non vengono ripristinate dopo il riavvio di DBX",
     connectionInactive: "Questa connessione non è stata riaperta dopo il riavvio di DBX, quindi le sue credenziali non sono più disponibili. Riapri la connessione dalla barra laterale di DBX e premi Riconnetti.",
+    connectError: {
+      auth: "Autenticazione non riuscita. Controlla nome utente, password o chiave privata configurati per questa connessione, poi premi Riconnetti.",
+      refused: "Il server ha rifiutato la connessione. Verifica host e porta e assicurati che il servizio SSH sia in esecuzione.",
+      dns: "Impossibile risolvere il nome host. Controlla l'ortografia dell'indirizzo host.",
+      timeout: "Connessione scaduta. Verifica raggiungibilità di rete, firewall e route VPN.",
+      hostKey: "La host key del server è stata rifiutata. Se il server è stato ricostruito, aggiorna la voce known-hosts dagli strumenti del workbench.",
+      network: "Il server non è raggiungibile in rete. Controlla routing e firewall, poi premi Riconnetti.",
+    },
     terminalSelectCopy: {
       section: "Interazione con il terminale",
       label: "Copia alla selezione · incolla con clic destro",
@@ -726,6 +750,14 @@ const messages = {
     transportDisconnected: "SSH 接続がサーバーまたはネットワークによって切断されました。再接続してください。",
     restartDisconnected: "DBX の再起動後は SSH セッションを復元できません",
     connectionInactive: "DBX の再起動後にこの接続が再オープンされていないため、認証情報を利用できません。DBX のサイドバーで接続を開き直してから、再接続を押してください。",
+    connectError: {
+      auth: "認証に失敗しました。この接続に設定されたユーザー名・パスワード・秘密鍵を確認してから、再接続を押してください。",
+      refused: "サーバーが接続を拒否しました。ホストとポートを確認し、SSH サービスが起動しているか確認してください。",
+      dns: "ホスト名を解決できませんでした。ホストアドレスの綴りを確認してください。",
+      timeout: "接続がタイムアウトしました。ネットワークの到達性・ファイアウォール・VPN 経路を確認してください。",
+      hostKey: "サーバーのホスト鍵が拒否されました。サーバーを再構築した場合は、ワークベンチのツールから known-hosts のエントリを更新してください。",
+      network: "ネットワーク経由でサーバーに到達できません。ルーティングとファイアウォールを確認してから、再接続を押してください。",
+    },
     terminalSelectCopy: {
       section: "ターミナル操作",
       label: "選択でコピー · 右クリックで貼り付け",
@@ -962,6 +994,14 @@ const messages = {
     transportDisconnected: "A conexão SSH foi encerrada pelo servidor ou pela rede. Reconecte para continuar.",
     restartDisconnected: "As sessões SSH não são restauradas após reiniciar o DBX",
     connectionInactive: "Esta conexão não foi reaberta após o reinício do DBX, então suas credenciais não estão mais disponíveis. Abra novamente a conexão na barra lateral do DBX e pressione Reconectar.",
+    connectError: {
+      auth: "Falha de autenticação. Verifique o usuário, a senha ou a chave privada configurados nesta conexão e pressione Reconectar.",
+      refused: "O servidor recusou a conexão. Confirme o host e a porta e verifique se o serviço SSH está em execução.",
+      dns: "Não foi possível resolver o nome do host. Verifique a grafia do endereço do host.",
+      timeout: "A conexão expirou. Verifique a acessibilidade da rede, firewalls e rotas de VPN.",
+      hostKey: "A host key do servidor foi rejeitada. Se o servidor foi reconstruído, atualize a entrada de known-hosts nas ferramentas do workbench.",
+      network: "O servidor está inacessível pela rede. Verifique roteamento e firewalls e pressione Reconectar.",
+    },
     terminalSelectCopy: {
       section: "Interação com o terminal",
       label: "Copiar ao selecionar · colar com botão direito",
@@ -1198,6 +1238,14 @@ const messages = {
     transportDisconnected: "SSH 连接已被服务器或网络中断，请重新连接。",
     restartDisconnected: "DBX 重启后不会自动恢复 SSH 会话",
     connectionInactive: "DBX 重启后未重新打开该连接，凭据已不可用。请先在 DBX 左侧连接列表重新打开该连接，再点击“重新连接”。",
+    connectError: {
+      auth: "认证失败。请核对该连接配置的用户名、密码或私钥，然后点击“重新连接”。",
+      refused: "服务器拒绝了连接。请确认主机地址与端口正确，且 SSH 服务正在运行。",
+      dns: "无法解析主机名。请检查主机地址拼写是否正确。",
+      timeout: "连接超时。请检查网络可达性、防火墙与 VPN 路由。",
+      hostKey: "服务器主机密钥被拒绝。若服务器曾重装，请在工作台工具中更新 known-hosts 记录。",
+      network: "网络无法到达服务器。请检查路由与防火墙，然后点击“重新连接”。",
+    },
     terminalSelectCopy: {
       section: "终端交互",
       label: "选中复制 · 右键粘贴",
@@ -1440,6 +1488,14 @@ const messages = {
     transportDisconnected: "SSH 連線已被伺服器或網路中斷，請重新連線。",
     restartDisconnected: "DBX 重新啟動後不會自動恢復 SSH 工作階段",
     connectionInactive: "DBX 重新啟動後未重新開啟該連線，憑證已不可用。請先在 DBX 左側連線清單重新開啟該連線，再點擊「重新連線」。",
+    connectError: {
+      auth: "驗證失敗。請核對該連線設定的使用者名稱、密碼或私密金鑰，然後點擊「重新連線」。",
+      refused: "伺服器拒絕了連線。請確認主機位址與連接埠正確，且 SSH 服務正在執行。",
+      dns: "無法解析主機名稱。請檢查主機位址拼寫是否正確。",
+      timeout: "連線逾時。請檢查網路可達性、防火牆與 VPN 路由。",
+      hostKey: "伺服器主機金鑰被拒絕。若伺服器曾重裝，請在工作台工具中更新 known-hosts 記錄。",
+      network: "網路無法抵達伺服器。請檢查路由與防火牆，然後點擊「重新連線」。",
+    },
     terminalSelectCopy: {
       section: "終端互動",
       label: "選取複製 · 右鍵貼上",

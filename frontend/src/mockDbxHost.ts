@@ -10,6 +10,9 @@ const writable = fixtureParams.get("rw") === "1";
 // disconnected，单次不复发），供重连横幅/倒计时/立即重连/恢复提示的全流程 UI 验证。
 const disconnectAfterMs = fixtureParams.get("err") === "disconnect" ? 4000 : 0;
 let disconnectEmitted = false;
+// ?err=authfail 让 ssh/session/open 抛出真实 sidecar 风格的认证失败错误串，
+// 供连接失败错误提示友好化（connectError.*）的浏览器 UI 验证。
+const failSessionOpen = fixtureParams.get("err") === "authfail";
 // 与 DBX globals.css 的 :root（pearl 浅色）和 .dark 规范块保持一致。
 const light = fixtureParams.get("theme") === "light";
 
@@ -154,6 +157,7 @@ const request: DbxPluginApi["request"] = async <T = unknown>(method: string) =>
 const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, params?: unknown) => {
   let result: unknown;
   if (method === "ssh/session/open") {
+    if (failSessionOpen) throw new Error("SSH password authentication failed: password rejected by server");
     // A fresh session restarts sequence numbering at 1 (real sidecar
     // semantics): after an auto-reconnect the client resets its cursor to 0,
     // so continuing the global counter here would leave a permanent hole at
@@ -183,7 +187,8 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     }
     result = { sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, connected: true, sequence: 0, chunkSize: 262144, directoryTrackingSupported: true };
   } else if (method === "ssh/terminal/replay") result = { frameCount: 0, firstAvailableSequence: 1, tailSequence: sequence, complete: true };
-  else if (method === "ssh/sessions/list") result = { sessions: [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: !writable, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: "private-key" }] };
+  else if (method === "ssh/sessions/list") result = { sessions: failSessionOpen ? [] : [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: !writable, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: "private-key" }] };
+  else if (method === "ssh/session/attach" && failSessionOpen) throw new Error("Connection is not active");
   else if (method === "sftp/list" || method === "sudo/listDir") result = { entries: mockList(String((params as Record<string, unknown>)?.path || "/")) };
   else if (method === "sftp/home") result = { path: "/home/demo" };
   else if (method === "sftp/createDirectory") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockDir(String((params as Record<string, unknown>)?.path || "/").split("/").pop() || "folder"));

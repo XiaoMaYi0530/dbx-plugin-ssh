@@ -61,6 +61,7 @@ import {
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
+import { classifyConnectError, connectErrorKey } from "./lib/connectError";
 import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
@@ -604,6 +605,14 @@ const canWrite = computed(() => !connection.value.readOnly && !connectionReadOnl
 const selectedEntry = computed(() => entries.value.find((entry) => entry.uri === selectedPath.value));
 const connected = computed(() => terminalState.value === "connected" && !!session.value);
 const sessionStatus = computed<WorkbenchSessionStatus>(() => describeWorkbenchSessionStatus(terminalState.value, { reattaching: reconnectPending.value }));
+// Connect-error friendlification: raw sidecar/russh error strings stay as the
+// tooltip detail while the primary line renders a localized per-category hint
+// (auth / refused / DNS / timeout / host key). Non-connect errors pass through.
+const terminalErrorDetail = computed(() => terminalError.value);
+const terminalErrorFriendly = computed(() => {
+  const kind = classifyConnectError(terminalError.value);
+  return kind ? t(connectErrorKey(kind)) : "";
+});
 // Reconnect countdown lifecycle: while the backoff loop is pending a 250ms
 // tick recomputes the pure countdown; any exit from "reconnecting" stops it.
 watch(reconnectPending, (pending) => {
@@ -3956,7 +3965,7 @@ onBeforeUnmount(() => {
             <path d="m17 23 9 9-9 9" fill="none" stroke="#86efac" stroke-linecap="round" stroke-linejoin="round" stroke-width="4" />
             <path d="M31 41h15" fill="none" stroke="#e5e7eb" stroke-linecap="round" stroke-width="4" />
           </svg>
-          <p>{{ sessionStatus === "connecting" ? t("connecting") : sessionStatus === "reconnecting" ? terminalError || t("sessionStatus.reconnecting") : terminalError || t("disconnected") }}</p>
+          <p :title="terminalErrorDetail || undefined">{{ sessionStatus === "connecting" ? t("connecting") : sessionStatus === "reconnecting" ? (terminalErrorFriendly || terminalError || t("sessionStatus.reconnecting")) : (terminalErrorFriendly || terminalError || t("disconnected")) }}</p>
           <button v-if="terminalState !== 'connecting'" class="primary-button" @click="reconnect">{{ t("reconnect") }}</button>
         </div>
         <div v-if="commandMarker.installed" class="terminal-command-marker" :class="{ active: commandMarker.active, failed: !commandMarker.active && commandMarker.exitCode !== null && commandMarker.exitCode !== 0 }" :title="commandMarkerDetails" @click="terminal?.focus()">
