@@ -1805,7 +1805,7 @@ fn apply_explicit_argument_overrides(auth: &mut SudoAuth, arguments: &Value) {
 }
 
 fn sudo_auth(arguments: &Value) -> SudoAuth {
-    SudoAuth::new(
+    let mut auth = SudoAuth::new(
         arguments
             .get("sudoPassword")
             .and_then(Value::as_str)
@@ -1834,7 +1834,16 @@ fn sudo_auth(arguments: &Value) -> SudoAuth {
                 .and_then(Value::as_str)
                 .map(AuthFlowMode::parse),
         },
-    )
+    );
+    auth.otp_ledger_scope = exec::otp_ledger_scope_for(
+        arguments
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        arguments.get("host").and_then(Value::as_str).unwrap_or_default(),
+        arguments.get("port").and_then(Value::as_u64).unwrap_or(22) as u16,
+    );
+    auth
 }
 
 fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnection, String> {
@@ -2040,7 +2049,7 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
         "authentication": { "type": "string", "enum": ["password", "private-key", "private-key-password", "agent"] },
         "connectTimeoutSecs": { "type": "integer" },
         "sudoPassword": { "type": "string", "description": "Sudo password override (defaults to password)" },
-        "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32 key, or static code) for 2FA auto-answer" },
+        "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32 key, or static code) for 2FA auto-answer; multiple secrets (newline/semicolon separated) rotate automatically — unexpired, unused codes first, across calls" },
         "authFlowMode": { "type": "string", "enum": ["password_only", "password_plus_otp", "password_then_otp"] },
         "passwordPromptHint": { "type": "string" },
         "totpPromptHint": { "type": "string" },
@@ -2170,7 +2179,7 @@ pub fn tool_definitions() -> Value {
                     "id": { "type": "string", "description": "Profile id to update; omit to create" },
                     "name": { "type": "string", "description": "Unique display name (max 64 characters)" },
                     "sudoPassword": { "type": "string", "description": "Sudo password; empty keeps the stored one" },
-                    "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32 key, or static code); empty keeps the stored one" },
+                    "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32 key, or static code); multiple secrets (newline/semicolon separated) rotate automatically — unexpired, unused codes first. Empty keeps the stored one" },
                     "clearSudoPassword": { "type": "boolean", "description": "Set true to remove the stored sudo password" },
                     "clearTotpSecret": { "type": "boolean", "description": "Set true to remove the stored TOTP secret" },
                     "authFlowMode": { "type": "string", "enum": ["password_only", "password_plus_otp", "password_then_otp"] },

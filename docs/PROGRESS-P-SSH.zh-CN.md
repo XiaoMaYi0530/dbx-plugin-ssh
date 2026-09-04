@@ -1036,3 +1036,40 @@ package.json 保持零新依赖），系统 Chrome 走 `channel:"chrome"` headle
 如需放开再议）；② sudoers 的 run-as（`-u`）/NOEXEC 等高级语义未建模；
 ③ 工作台交互终端手敲 sudo 不受此门（与既定信任模型一致：白名单管 AI/MCP
 执行面）；④ `scripts/test.sh` 全套未跑（同前述预存在问题），按层验证。
+### §8.12 TOTP 多密钥跨调用轮换：进程级 OTP 台账 + 目标作用域（2026-09-04）
+
+**问题**：OTP 轮换/防重放两本台账（`otp_usage` / `committed_totp`）原挂在
+`SudoAuth` 实例字段上。终端与 `ssh/exec` 路径按会话共享实例所以正常；但 MCP
+`ssh_exec_sudo` 每次调用经 `resolve_sudo_auth` **全新解析实例**
+（`sudo_auth_for` + profile overlay / `sudo_auth(arguments)`），台账随实例
+丢弃——同窗第二次调用重复提交第一个密钥已用掉的码（服务端必拒），配了多密钥
+也不轮换。这正是 MCP 通道跑 sudo + 2FA 的日常路径。
+
+**修复**（exec.rs，分支 `feat/ssh-totp-rotation`）：
+- 两本台账改 sidecar **进程全局**（`OnceLock<Mutex<HashMap>>`），对齐
+  tiny-rdm 服务级 `markOTPUsage` 语义；
+- 键控升级：`目标作用域(user@host:port) | 密钥 SHA-256 指纹(16hex，只存指纹)
+  | 窗口 | 码`；作用域隔离保证共用同一密钥的多个连接互不吞码（A 机烧掉的码
+  B 机仍可提交），同机跨调用/跨会话记账连续；
+- 静态码 usage 键去掉时间戳分量（原 `now+30` 逐秒漂移，跨调用记账失效）；
+- 选择算法对齐 tiny-rdm `resolveRotatingOTP` 排序（未用优先 → 剩余有效时长
+  最长 → 配置顺序稳定兜底），替换原"首个剩余 ≥5s 未用项"简化循环；防重放
+  硬跳过语义不变；
+- 作用域由凭据解析点注入：`ssh.rs sudo_auth_for`（连接配置）与
+  `mcp.rs sudo_auth`（内联参数，port 缺省 22）。
+
+**测试**：`cargo test` 188 通过（基线 184 + 新增 4：
+`otp_rotation_spans_separate_instances`（红→绿，本修复主回归）、
+`committed_replay_guard_spans_separate_instances`、
+`static_code_usage_keys_do_not_drift_across_calls`、
+`otp_ledger_marks_do_not_leak_across_targets`）。台账全局化后并行单测需隔离：
+新增 `otp_ledger_test_guard()`（进入清空 + 持锁串行），触碰台账的用例全部
+套上；`keyboard_interactive_answers_follow_flow_mode` 的 password+otp 组合
+段改用独立静态码——全局防重放正确拦截了同进程内同窗二次注入，属预期新行为。
+
+**真机**：`smoke_sudo_otp_test.py` 对 dbx-ssh-test 容器复跑 10 passed /
+0 skipped / 0 failed（同窗轮换第二密钥、第三次硬跳过、错误密钥拒绝等全过）。
+
+**文档**：PROTOCOL.zh-CN.md Quick Sudo 段（台账进程全局 + 作用域/指纹键控 +
+排序语义）、MCP.zh-CN.md 工具表、`totpSecret` 工具 schema 描述补多密钥
+（换行/分号分隔）轮换语义。

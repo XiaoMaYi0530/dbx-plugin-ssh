@@ -37,7 +37,7 @@ use crate::sudo_profiles;
 
 /// Resolves the Quick Sudo / 2FA orchestration settings for a connection.
 fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
-    SudoAuth::new(
+    let mut auth = SudoAuth::new(
         &connection.sudo_password,
         &connection.password,
         &connection.totp_secret,
@@ -47,7 +47,10 @@ fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
             flow_mode: (!connection.auth_flow_mode.is_empty())
                 .then(|| AuthFlowMode::parse(&connection.auth_flow_mode)),
         },
-    )
+    );
+    auth.otp_ledger_scope =
+        exec::otp_ledger_scope_for(&connection.username, &connection.host, connection.port);
+    auth
 }
 
 /// Resolved Quick Sudo source for one connection: the connection's own
