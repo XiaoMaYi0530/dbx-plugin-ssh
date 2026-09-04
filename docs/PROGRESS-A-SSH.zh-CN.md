@@ -108,3 +108,29 @@ mock 夹具同步补 `ssh/sessions/list`（返回 `authMethod: "private-key"`）
 3. 字号缩放区间为绝对字号 [8,32] 而非 0.8x–2.0x 相对倍率（可用性优先，宿主基准字号可变，绝对钳制更可预测）；如需严格倍率语义可改为对基准字号乘算。
 4. 截图 `06` 捕捉到缩放生效但未含 toast 文案（500ms 防抖竞态）；toast 文案已由单测+七语断言覆盖。
 5. 全部改动未 git 提交（硬性约束），请主会话审阅 diff 后统一收口。
+
+## 9. 2026-09-04 追加：宿主 1.1 theme 通道主题同步
+
+宿主 `dev/plugin-framework-current`（cd3ee5a45，2026-09-03）向沙箱推送
+`PluginBridgeTheme { appearance, tokens }`：init 携带 + env 消息实时推送，tokens
+为宿主根节点解析后的 `--color-*` 设计令牌（明暗切换与自定义调色板均实时下发）；
+宿主侧 `pluginAppearance` 契约尚未接线，`api.appearance`/`onAppearanceChange`
+在真实宿主恒缺失。本任务让工作台跟随宿主主题实时切换：
+
+- `env.d.ts`：新增 `DbxPluginTheme` 与 `DbxPluginApi.theme?`。
+- `lib/hostTheme.ts`（新）：token→colors 映射（`--color-*` → appearance 契约
+  字段）、`dbx-plugin-env` CustomEvent 订阅、输入校验（畸形输入降级不崩）。
+- `lib/appearance.ts`：`resolveAppearance` 入参放宽为逐字段可选
+  `DbxPluginAppearanceInput`（theme 通道只带颜色令牌；终端字体回退本地规范值）。
+- `App.vue`：init 时 `api.appearance` 缺失改用 `api.theme` 初始化；appearance
+  订阅不可用时订阅 env 主题推送（两套契约不同时挂，宿主未来同发也不互相覆盖）；
+  退订随 `onBeforeUnmount` 清理。
+- `mockDbxHost.ts`：按宿主形状镜像 `theme`（colors 反查 `--color-*` 令牌），
+  浏览器 `mock.html?theme=light|dark` 可走查两条路径。
+
+**验证**：`pnpm typecheck` 绿；vitest 112 全绿（新增 hostTheme.spec 7 例：token
+映射、env detail 解析、缺字段回退、畸形输入）。sidecar 未改动。
+
+**遗留**：宿主接线 `pluginAppearance`（terminal fontFamily/fontSize 下发）前，
+缩放复位基准仍为本地 13px 规范值；届时插件侧无需再改（applyAppearance 已按
+可选降级兼容完整 appearance）。本次无新增用户可见文案，七语无增量。

@@ -448,6 +448,53 @@ def read_only_server_section(args: argparse.Namespace) -> None:
         assert "Refused on read-only" in destructive, destructive
         override = expect_error("rm -rf /etc", arguments={"confirmDestructive": True})
         assert "Refused on read-only" in override, override
+
+        # Whitelist-hardening: shape-readonly-but-mutating forms stay Unknown.
+        for hardened in (
+            "ip link set dev eth0 down",
+            "ip route flush all",
+            "git branch -D main",
+            "git tag -d v1",
+            "sort -o /etc/cron.d/x /tmp/in",
+            "find / -fprint /tmp/keys",
+            "dmesg -C",
+            "history -c",
+        ):
+            message = expect_error(hardened)
+            assert "not recognized" in message, f"{hardened}: {message}"
+        # Listing shapes of the same verbs still pass the gate.
+        for allowed in ("git branch -a", "git tag -l 'v*'", "git remote -v", "dmesg -T"):
+            message = expect_error(allowed)
+            assert "not recognized" not in message, f"{allowed}: {message}"
+
+        # Sensitive-path denylist: credential paths are refused on read-only
+        # connections, both through exec verbs and SFTP read tools.
+        message = expect_error("cat /root/.ssh/id_rsa")
+        assert "not recognized" in message, message
+        message = expect_error("", name="sftp_read_file", arguments={"path": "/root/.ssh/id_rsa"})
+        assert "sensitive" in message, message
+        message = expect_error("", name="sftp_list_dir", arguments={"path": "/root/.ssh"})
+        assert "sensitive" in message, message
+        message = expect_error("", name="ssh_task_status", arguments={"logPath": "/root/.bash_history"})
+        assert "sensitive" in message, message
+        # Ordinary paths still pass the gate (they proceed to credential checks).
+        message = expect_error("", name="sftp_read_file", arguments={"path": "/var/log/app.log"})
+        assert "sensitive" not in message, message
+
+        # Local-write hygiene: sftp_download refuses bootstrap/cron/systemd
+        # targets on the operator machine regardless of the gate.
+        message = expect_error(
+            "df -h",
+            name="sftp_download",
+            arguments={"remotePath": "/tmp/p.sh", "localPath": "/home/u/.bashrc"},
+        )
+        assert "Refusing to write the local sensitive path" in message, message
+        message = expect_error(
+            "df -h",
+            name="sftp_download",
+            arguments={"remotePath": "/tmp/p.sh", "localPath": "/etc/cron.d/payload"},
+        )
+        assert "Refusing to write the local sensitive path" in message, message
         print("read-only server gate ok (DBX_SSH_MCP_READ_ONLY=1)")
     finally:
         if proc.stdin:

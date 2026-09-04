@@ -68,7 +68,8 @@ import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousC
 import { expandSelection, filterSftpEntries, type SftpTypeFilter } from "./lib/sftpFileFilters";
 import { pushPathHistory, sanitizePathHistories } from "./lib/sftpPathHistory";
 import { browseCommandHistory, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
-import { normalizeQuickCommands, removeQuickCommand, upsertQuickCommand, type QuickCommand } from "./lib/quickCommands";
+import { normalizeQuickCommands, type QuickCommand } from "./lib/quickCommands";
+import { batchTargetLabel, normalizeBatchTargets, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, type KnownAuthMethod } from "./lib/connectionInfo";
 import { clampFontSize } from "./lib/terminalZoom";
 import { commandMarkerTooltip, formatCommandDuration, Osc633CommandParser, runningCommandElapsedMs, type Osc633StreamUpdates } from "./lib/terminalCommandMarkers";
@@ -77,10 +78,12 @@ import { describeWorkbenchSessionStatus, type WorkbenchSessionStatus } from "./l
 import { sanitizeCommandOutput } from "./lib/terminalOutputText";
 import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
-import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI } from "./lib/appearance";
+import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI, type DbxPluginAppearanceInput } from "./lib/appearance";
+import { isDbxPluginTheme, onHostThemeChange, themeToAppearance } from "./lib/hostTheme";
 import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload } from "./lib/agentTerminal";
 import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRestore";
+import { bridgeBinaryBytes } from "../../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
 import { workbenchMessage } from "./lib/i18n";
 import TextPreview from "./components/TextPreview.vue";
@@ -285,6 +288,7 @@ const TERMINAL_PENDING_FRAME_LIMIT = 1024;
 const SFTP_QUICK_PATHS = ["/", "/home", "/tmp", "/etc", "/var", "/root"];
 // 命令历史 / 快速命令 / 终端字号：localStorage 持久化（敏感命令不入持久层）。
 const COMMAND_HISTORY_KEY = "ssh-command-history";
+// 快速命令旧键：迁移到 sidecar 全局存储后仅作一次性迁移种子（见 hydrateQuickCommands）。
 const QUICK_COMMANDS_KEY = "ssh-quick-commands";
 const TERMINAL_FONT_SIZE_KEY = "ssh-terminal-font-size";
 // SFTP 面板默认打开偏好：localStorage 全局持久化（"false" = 新工作台仅终端）。
@@ -400,10 +404,22 @@ const commandError = ref("");
 const commandHistory = ref<string[]>(loadCommandHistory());
 const commandHistoryIndex = ref(-1);
 const commandHistoryBackup = ref("");
-// 快速命令：用户自定义片段（≤20 条），工具栏下拉一键发送到 PTY。
+// 快速命令：用户自定义片段（≤20 条），全局存储在插件数据目录（sidecar），
+// 所有连接/工作台共享；工具栏下拉一键发送到 PTY。
 const quickCommands = ref<QuickCommand[]>(loadQuickCommands());
 const quickMenuOpen = ref(false);
+const quickSaving = ref(false);
 const quickDraft = reactive<{ id?: string; name: string; command: string }>({ name: "", command: "" });
+// 批量发送：目标来自 ssh/sessions/list（跨连接全部活跃会话），命令写入各
+// 会话交互终端（PTY 键盘语义，输出回显在各自终端，对齐 tiny-rdm batch send）。
+const batchOpen = ref(false);
+const batchLoading = ref(false);
+const batchSending = ref(false);
+const batchTargets = ref<BatchSendTarget[]>([]);
+const batchSelected = ref<string[]>([]);
+const batchDraft = ref("");
+const batchError = ref("");
+const batchSummary = ref<BatchSendSummary>();
 // 连接信息面板（只读摘要 + echo 往返延迟）。
 const connectionInfoOpen = ref(false);
 const connectionLatency = ref<number | null>(null);
@@ -539,6 +555,7 @@ let disposeSelectionCopy: { dispose(): void } | undefined;
 let unsubscribeEvent: (() => void) | undefined;
 let unsubscribeBinary: (() => void) | undefined;
 let unsubscribeAppearance: (() => void) | undefined;
+let unsubscribeTheme: (() => void) | undefined;
 let unsubscribeLocale: (() => void) | undefined;
 let unsubscribeContext: (() => void) | undefined;
 let unsubscribeFileDrag: (() => void) | undefined;
@@ -785,8 +802,8 @@ function terminalTheme() {
   };
 }
 
-function applyAppearance(next: DbxPluginAppearance) {
-  // 宿主可能缺字段（1.0 或部分下发），按 DBX 规范色板补齐。
+function applyAppearance(next: DbxPluginAppearanceInput) {
+  // 宿主可能缺字段（1.0 或部分下发、1.1 theme 通道只带颜色令牌），按 DBX 规范色板补齐。
   const resolved = resolveAppearance(next);
   appearance.value = resolved;
   const root = document.documentElement;
@@ -1183,7 +1200,7 @@ function cancelZmodemUpload() {
 function handleBinary(event: DbxPluginBinaryEvent) {
   const sessionId = activeTerminalSessionId || session.value?.sessionId;
   if (sessionId && event.channel === `ssh/terminal/out/${sessionId}`) {
-    const payload = window.dbxPlugin.decodeBase64(event.dataBase64);
+    const payload = bridgeBinaryBytes(event, window.dbxPlugin.decodeBase64);
     if (payload.length < 9) return;
     const sequence = readU64(payload, 1);
     if (sequence <= lastSequence) return;
@@ -1194,7 +1211,7 @@ function handleBinary(event: DbxPluginBinaryEvent) {
   const taskId = event.channel.startsWith("sftp/download/") ? event.channel.slice("sftp/download/".length) : "";
   const waiter = downloadChunkWaiters.get(taskId);
   if (!waiter) return;
-  const payload = window.dbxPlugin.decodeBase64(event.dataBase64);
+  const payload = bridgeBinaryBytes(event, window.dbxPlugin.decodeBase64);
   if (payload.length < 8 || readU64(payload, 0) !== waiter.offset) return;
   window.clearTimeout(waiter.timer);
   downloadChunkWaiters.delete(taskId);
@@ -3016,9 +3033,11 @@ async function cancelCommand() {
 }
 
 // ---------------------------------------------------------------------------
-// 快速命令栏：localStorage CRUD + PTY 一键发送
+// 快速命令栏：全局存储（sidecar 数据目录）CRUD + PTY 一键发送
 // ---------------------------------------------------------------------------
 
+// localStorage 旧键仅作为一次性迁移种子：宿主 webview 存储按工作台分区，
+// 旧数据表现为"和连接绑定"，迁移到 sidecar 后才真正全局共享。
 function loadQuickCommands(): QuickCommand[] {
   try {
     return normalizeQuickCommands(JSON.parse(window.localStorage.getItem(QUICK_COMMANDS_KEY) || "null"));
@@ -3027,24 +3046,53 @@ function loadQuickCommands(): QuickCommand[] {
   }
 }
 
-function persistQuickCommands() {
+// 挂载时从后端拉取全局清单；后端为空且本工作台有旧 localStorage 数据时一次性
+// 迁移（逐条 save 后清除本地键）。后端不可用时保留本地/内存值兜底。
+async function hydrateQuickCommands() {
   try {
-    window.localStorage.setItem(QUICK_COMMANDS_KEY, JSON.stringify(quickCommands.value));
+    let response = await window.dbxPlugin.invoke<{ commands: unknown }>("ssh/quickCommands/list");
+    let commands = normalizeQuickCommands(response.commands);
+    if (!commands.length) {
+      const legacy = loadQuickCommands();
+      for (const item of legacy) {
+        await window.dbxPlugin.invoke("ssh/quickCommands/save", { id: "", name: item.name, command: item.command }).catch(() => undefined);
+      }
+      if (legacy.length) {
+        response = await window.dbxPlugin.invoke<{ commands: unknown }>("ssh/quickCommands/list");
+        commands = normalizeQuickCommands(response.commands);
+        try {
+          window.localStorage.removeItem(QUICK_COMMANDS_KEY);
+        } catch {
+          // 清理失败只影响下次空跑迁移，不影响功能。
+        }
+      }
+    }
+    quickCommands.value = commands;
   } catch {
-    // localStorage 不可用时快速命令仅保留在内存中。
+    // 后端不可用（如旧版 sidecar）：保留 localStorage/内存值，行为回到旧语义。
   }
 }
 
-function addQuickCommand() {
+async function addQuickCommand() {
   const command = quickDraft.command.trim();
-  if (!command) return;
+  if (!command || quickSaving.value) return;
   if (!quickDraft.id && quickCommands.value.length >= 20) return;
-  const id = quickDraft.id || (typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `qc-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-  quickCommands.value = upsertQuickCommand(quickCommands.value, { id, name: quickDraft.name, command });
-  persistQuickCommands();
-  quickDraft.id = undefined;
-  quickDraft.name = "";
-  quickDraft.command = "";
+  quickSaving.value = true;
+  try {
+    const response = await window.dbxPlugin.invoke<{ commands: unknown }>("ssh/quickCommands/save", {
+      id: quickDraft.id ?? "",
+      name: quickDraft.name.trim(),
+      command,
+    });
+    quickCommands.value = normalizeQuickCommands(response.commands);
+    quickDraft.id = undefined;
+    quickDraft.name = "";
+    quickDraft.command = "";
+  } catch (cause) {
+    showError(cause, "terminal");
+  } finally {
+    quickSaving.value = false;
+  }
 }
 
 // 点击条目的编辑按钮：载入编辑器（携带 id 即更新语义），再次添加即保存。
@@ -3054,9 +3102,13 @@ function editQuickCommand(item: QuickCommand) {
   quickDraft.command = item.command;
 }
 
-function deleteQuickCommand(id: string) {
-  quickCommands.value = removeQuickCommand(quickCommands.value, id);
-  persistQuickCommands();
+async function deleteQuickCommand(id: string) {
+  try {
+    const response = await window.dbxPlugin.invoke<{ commands: unknown }>("ssh/quickCommands/delete", { id });
+    quickCommands.value = normalizeQuickCommands(response.commands);
+  } catch (cause) {
+    showError(cause, "terminal");
+  }
 }
 
 // 发送语义：快速命令是"在当前交互 shell 中执行"的片段（对齐 tiny-rdm），
@@ -3071,6 +3123,72 @@ function sendQuickCommand(item: QuickCommand) {
   trackPendingInput(`${text}\r`);
   sendTerminalBytes(new TextEncoder().encode(`${text}\r`));
   terminal?.focus();
+}
+
+// ---------------------------------------------------------------------------
+// 批量发送：跨连接把命令写入多个已打开会话的交互终端（tiny-rdm batch send）
+// ---------------------------------------------------------------------------
+
+async function openBatchDialog() {
+  batchOpen.value = true;
+  batchError.value = "";
+  batchSummary.value = undefined;
+  quickMenuOpen.value = false;
+  commandOpen.value = false;
+  batchLoading.value = true;
+  batchDraft.value = "";
+  try {
+    const response = await window.dbxPlugin.invoke<{ sessions: unknown }>("ssh/sessions/list");
+    batchTargets.value = normalizeBatchTargets(response.sessions);
+    // 默认只预选当前会话：批量写入影响所有被选主机，宁缺毋滥。
+    batchSelected.value = session.value?.sessionId ? [session.value.sessionId] : [];
+  } catch (cause) {
+    batchTargets.value = [];
+    batchSelected.value = [];
+    batchError.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    batchLoading.value = false;
+  }
+}
+
+function toggleBatchTargetId(sessionId: string) {
+  batchSelected.value = toggleBatchTarget(batchSelected.value, sessionId);
+}
+
+function pickBatchTargets(mode: "all" | "connected") {
+  batchSelected.value = selectBatchTargets(batchTargets.value, mode);
+}
+
+function applyBatchQuickPick(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (value) batchDraft.value = value;
+}
+
+function batchSessionLabel(sessionId: string): string {
+  const target = batchTargets.value.find((item) => item.sessionId === sessionId);
+  return target ? batchTargetLabel(target) : sessionId.slice(0, 8);
+}
+
+async function sendBatchCommand() {
+  const command = batchDraft.value.trim();
+  if (!command || !batchSelected.value.length || batchSending.value) return;
+  // 危险/超长命令复用粘贴红色确认弹窗（同一套 dangerousCommands 规则）。
+  const confirmed = await confirmRiskyPaste(command);
+  if (!confirmed || !batchOpen.value) return;
+  batchSending.value = true;
+  batchError.value = "";
+  try {
+    const response = await window.dbxPlugin.invoke<{ results: unknown }>("ssh/terminal/batchInput", {
+      sessionIds: batchSelected.value,
+      command,
+    });
+    batchSummary.value = summarizeBatchResults(response.results);
+    if (batchSummary.value.sent) batchDraft.value = "";
+  } catch (cause) {
+    batchError.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    batchSending.value = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3619,6 +3737,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
     commandOpen.value = false;
     return;
   }
+  if (batchOpen.value) {
+    batchOpen.value = false;
+    return;
+  }
   if (profilesOpen.value) {
     profilesOpen.value = false;
     return;
@@ -3731,7 +3853,10 @@ async function initialize() {
   locale.value = api.locale || "zh-CN";
   restoreUiState();
   if (api.appearance) applyAppearance(api.appearance);
+  else if (isDbxPluginTheme(api.theme)) applyAppearance(themeToAppearance(api.theme));
   unsubscribeAppearance = api.onAppearanceChange?.(applyAppearance);
+  // appearance 契约缺失（当前 1.1 桥只推 theme）时订阅 env 主题推送，两套不同时挂。
+  if (!unsubscribeAppearance) unsubscribeTheme = onHostThemeChange((theme) => applyAppearance(themeToAppearance(theme)));
   unsubscribeLocale = api.onLocaleChange?.((nextLocale) => (locale.value = nextLocale || "zh-CN"));
   unsubscribeContext = api.onContextChange?.((context) => {
     hostContext.value = context;
@@ -3783,6 +3908,7 @@ watch([splitRatio, paneOrder, sftpPaneOpen, followDirectory, sudoMode, visibleCo
 onMounted(() => {
   document.addEventListener("click", closeMenus);
   document.addEventListener("keydown", onDocumentKeydown);
+  void hydrateQuickCommands();
   void initialize().catch((cause) => {
     terminalState.value = "error";
     showError(cause, "terminal");
@@ -3812,6 +3938,7 @@ onBeforeUnmount(() => {
   unsubscribeEvent?.();
   unsubscribeBinary?.();
   unsubscribeAppearance?.();
+  unsubscribeTheme?.();
   unsubscribeLocale?.();
   unsubscribeContext?.();
   unsubscribeFileDrag?.();
@@ -3859,10 +3986,12 @@ onBeforeUnmount(() => {
         </label>
         <span class="toolbar-separator" aria-hidden="true" />
         <button class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
+        <button class="icon-button icon-neutral" :title="t('batchSendTitle')" :disabled="!connected" @click="openBatchDialog"><ListChecks /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-amber" :title="t('quickCommands')" :disabled="!connected" @click.stop="toggleQuickMenu"><Zap /></button>
           <section v-if="quickMenuOpen" class="popover quick-commands-popover" @click.stop>
             <h3>{{ t("quickCommands") }}</h3>
+            <p class="quick-command-global-hint">{{ t("quickCommandsGlobalHint") }}</p>
             <div v-if="!quickCommands.length" class="empty compact">{{ t("quickCommandsEmpty") }}</div>
             <div v-for="item in quickCommands" :key="item.id" class="quick-command-row">
               <button class="quick-command-send" :title="item.command" @click="sendQuickCommand(item)">
@@ -3876,7 +4005,7 @@ onBeforeUnmount(() => {
               <input v-model="quickDraft.name" :placeholder="t('quickCommandsName')" :maxlength="60" />
               <input v-model="quickDraft.command" class="mono" :placeholder="t('quickCommandsCommand')" :maxlength="500" @keydown.enter="addQuickCommand" />
               <div class="quick-command-editor-actions">
-                <button class="primary-button" :disabled="!quickDraft.command.trim() || (!quickDraft.id && quickCommands.length >= 20)" @click="addQuickCommand">{{ quickDraft.id ? t("save") : t("quickCommandsAdd") }}</button>
+                <button class="primary-button" :disabled="quickSaving || !quickDraft.command.trim() || (!quickDraft.id && quickCommands.length >= 20)" @click="addQuickCommand">{{ quickDraft.id ? t("save") : t("quickCommandsAdd") }}</button>
                 <button v-if="quickDraft.id" @click="quickDraft.id = undefined; quickDraft.name = ''; quickDraft.command = ''">{{ t("cancel") }}</button>
                 <span class="quick-command-limit">{{ t("quickCommandsLimit", { count: quickCommands.length, limit: 20 }) }}</span>
               </div>
@@ -4309,6 +4438,67 @@ onBeforeUnmount(() => {
             <Loader2 v-if="commandRunning" class="spinning" />
             <SquareTerminal v-else />
             {{ t("commandRun") }}
+          </button>
+        </footer>
+      </article>
+    </section>
+
+    <section v-if="batchOpen" class="modal-backdrop" @mousedown.self="batchOpen = false">
+      <article class="modal batch-modal">
+        <header><h2>{{ t("batchSendTitle") }}</h2><button class="icon-button" @click="batchOpen = false"><X /></button></header>
+        <p class="muted batch-send-hint">{{ t("batchSendHint") }}</p>
+        <div class="batch-targets">
+          <div class="command-history-header">
+            <span>{{ t("batchSendTargets", { count: batchSelected.length, total: batchTargets.length }) }}</span>
+            <span class="batch-target-actions">
+              <button class="link-button" @click="pickBatchTargets('connected')">{{ t("batchSendConnected") }}</button>
+              <button class="link-button" @click="pickBatchTargets('all')">{{ t("batchSendAll") }}</button>
+            </span>
+          </div>
+          <div v-if="batchLoading" class="empty compact"><Loader2 class="spinning" /><span>{{ t("batchSendLoading") }}</span></div>
+          <div v-else-if="!batchTargets.length" class="empty compact">{{ t("batchSendNoSessions") }}</div>
+          <div v-else class="batch-target-list">
+            <label v-for="target in batchTargets" :key="target.sessionId" class="batch-target-row" :class="{ offline: target.connected === false }">
+              <input type="checkbox" :checked="batchSelected.includes(target.sessionId)" @change="toggleBatchTargetId(target.sessionId)" />
+              <span class="mono">{{ batchTargetLabel(target) }}</span>
+              <span v-if="target.sessionId === session?.sessionId" class="batch-badge">{{ t("batchSendCurrent") }}</span>
+              <span v-if="target.connected === false" class="batch-badge batch-badge-warn">{{ t("batchSendDisconnected") }}</span>
+              <span v-if="target.readOnly" class="read-only-badge">{{ t("readOnly") }}</span>
+            </label>
+          </div>
+        </div>
+        <div v-if="quickCommands.length" class="batch-quick-pick-row">
+          <select class="batch-quick-pick" @change="applyBatchQuickPick">
+            <option value="">{{ t("batchSendQuickPick") }}</option>
+            <option v-for="item in quickCommands" :key="item.id" :value="item.command">{{ item.name }}</option>
+          </select>
+        </div>
+        <input
+          v-model="batchDraft"
+          class="mono"
+          spellcheck="false"
+          autofocus
+          :placeholder="t('batchSendPlaceholder')"
+          :disabled="batchSending"
+          @keydown.enter="sendBatchCommand"
+        />
+        <div v-if="batchSummary" class="batch-summary">
+          <p :class="batchSummary.failed ? 'task-error' : 'muted'">
+            {{ batchSummary.failed ? t("batchSendPartial", { sent: batchSummary.sent, failed: batchSummary.failed }) : t("batchSendSent", { count: batchSummary.sent }) }}
+          </p>
+          <div v-if="batchSummary.failed" class="batch-result-list">
+            <span v-for="row in batchSummary.rows.filter((item) => !item.success)" :key="row.sessionId" class="batch-result-row mono">
+              {{ batchSessionLabel(row.sessionId) }} · {{ row.error || t("batchSendFailed") }}
+            </span>
+          </div>
+        </div>
+        <p v-if="batchError" class="task-error">{{ batchError }}</p>
+        <footer>
+          <button @click="batchOpen = false">{{ t("close") }}</button>
+          <button class="primary-button" :disabled="!batchDraft.trim() || !batchSelected.length || batchSending" @click="sendBatchCommand">
+            <Loader2 v-if="batchSending" class="spinning" />
+            <ListChecks v-else />
+            {{ t("batchSendSend") }}
           </button>
         </footer>
       </article>

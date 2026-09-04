@@ -91,8 +91,8 @@
 
 | 项 | 原因 |
 | --- | --- |
-| 多会话标签 / 分屏 / 最近关闭恢复 / 批量发送 | 架构级：插件是单 workbench 单连接上下文，连接级 tab 归 DBX 宿主；需先与宿主确认多会话语义 |
-| 端口转发 -L/-R | 归属决策未定（插件 or DBX 宿主传输层），先登记 |
+| 多会话标签 / 分屏 / 最近关闭恢复 | 架构级：插件是单 workbench 单连接上下文，连接级 tab 归 DBX 宿主；需先与宿主确认多会话语义。**批量发送已于 2026-09-04 以跨连接形态落地**（`ssh/terminal/batchInput` + 工作台批量弹窗，目标来自 `ssh/sessions/list` 全部活跃会话，见 IMPL_PLAN_BATCH_QUICK），多会话语义不再是前置 |
+| 端口转发 -L/-R | 归属已核实（2026-09-05，见 ssh/docs/REVIEW_FORM_VS_TABBY.zh-CN.md §三）：宿主已有传输层隧道（ssh/proxy/http_tunnel）与本地转发端点机制且插件连接可用，-L/-R 用户面功能自然归宿主；插件不重复（硬性规则 3） |
 | SecretRef/vault 化密钥、审计、MCP 写入白名单 | 凭证与审批体系归宿主 |
 | 远程 SQL 会话、终端锁定、终端主题配色切换 | 属 tiny-rdm 数据库域/全局外观域，宿主承担 |
 | 终端缓冲查看器模态、路径拖拽上传增强 | 低优先，下批评估；**终端侧拖放上传已于 2026-09-02 落地**（terminal 窗格 drop → uploadLocalFiles，只读/ZMODEM 拒绝，见 PROGRESS-P-SSH §8.7），SFTP 面板侧增强仍 deferred |

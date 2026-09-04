@@ -32,6 +32,14 @@ const appearance: DbxPluginAppearance = {
   terminal: { fontFamily: "Cascadia Mono, Consolas, monospace", fontSize: 13 },
 };
 
+// 镜像宿主 1.1 theme 通道形状（colors 反查 --color-* 令牌），与真实宿主一致。
+const theme: DbxPluginTheme = {
+  appearance: appearance.colorScheme,
+  tokens: Object.fromEntries(
+    Object.entries(appearance.colors).map(([key, value]) => [`--color-${key.replace(/([A-Z])/g, (c) => `-${c.toLowerCase()}`)}`, value]),
+  ),
+};
+
 function terminalFrame(sequence: number, text: string) {
   const data = new TextEncoder().encode(text);
   const frame = new Uint8Array(9 + data.length);
@@ -50,7 +58,8 @@ function base64(bytes: Uint8Array) {
 let sequence = 0;
 function emitTerminal(text: string) {
   sequence += 1;
-  const event = { channel: "ssh/terminal/out/visual-session", dataBase64: base64(terminalFrame(sequence, text)) };
+  // mock 镜像当前宿主桥的二进制事件形状（零拷贝 data 字段），与真实宿主一致。
+  const event = { channel: "ssh/terminal/out/visual-session", data: terminalFrame(sequence, text) };
   for (const listener of binaryListeners) listener(event);
 }
 
@@ -149,6 +158,10 @@ function mockWriteEntry(path: string, node: MockNode): { success: true } {
 
 const fixtureDownloads = new Map<string, { fileName: string; size: number; offset: number }>();
 const fixtureUploadCount = { value: 0 };
+// 全局快速命令（ssh/quickCommands/*）与批量发送（ssh/terminal/batchInput）的
+// mock 状态：镜像真实 sidecar 的响应形状与上限/错误语义，防可视化夹具脱节。
+const QUICK_COMMANDS_LIMIT = 20;
+const quickCommandsState: { id: string; name: string; command: string; createdAt: number; updatedAt: number }[] = [];
 const settingsState = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "" };
 
 const request: DbxPluginApi["request"] = async <T = unknown>(method: string) =>
@@ -187,8 +200,24 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     }
     result = { sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, connected: true, sequence: 0, chunkSize: 262144, directoryTrackingSupported: true };
   } else if (method === "ssh/terminal/replay") result = { frameCount: 0, firstAvailableSequence: 1, tailSequence: sequence, complete: true };
-  else if (method === "ssh/sessions/list") result = { sessions: failSessionOpen ? [] : [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: !writable, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: "private-key" }] };
-  else if (method === "ssh/session/attach" && failSessionOpen) throw new Error("Connection is not active");
+  else if (method === "ssh/sessions/list") result = { sessions: failSessionOpen ? [] : [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: !writable, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: "private-key", host: "server.demo.internal", port: 22, username: "demo" }] };
+  else if (method === "ssh/session/attach") {
+    const input = params as Record<string, unknown>;
+    if (failSessionOpen) throw new Error("Connection is not active");
+    // Mirror the real sidecar: the connection's live session is re-homed to
+    // the requesting workbench and reported with a complete replay.
+    result = {
+      sessionId: String(input.sessionId || "") || "visual-session",
+      connectionId: context.connectionId,
+      workbenchId: context.workbenchId,
+      connected: true,
+      sequence,
+      chunkSize: 262144,
+      directoryTrackingSupported: true,
+      replay: { complete: true, frameCount: 0, firstAvailableSequence: sequence + 1, tailSequence: sequence },
+    };
+    setTimeout(() => emitTerminal("user@server:~$ "), 30);
+  }
   else if (method === "sftp/list" || method === "sudo/listDir") result = { entries: mockList(String((params as Record<string, unknown>)?.path || "/")) };
   else if (method === "sftp/home") result = { path: "/home/demo" };
   else if (method === "sftp/createDirectory") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockDir(String((params as Record<string, unknown>)?.path || "/").split("/").pop() || "folder"));
@@ -249,7 +278,7 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     const length = Math.min(262144, task.size - offset);
     const payload = new Uint8Array(8 + length);
     new DataView(payload.buffer).setBigUint64(0, BigInt(offset), false);
-    for (const listener of binaryListeners) listener({ channel: `sftp/download/${taskId}`, dataBase64: base64(payload) });
+    for (const listener of binaryListeners) listener({ channel: `sftp/download/${taskId}`, data: payload });
     task.offset = offset + length;
     for (const listener of eventListeners) listener({ method: "sftp/transfer/progress", params: { taskId, sessionId: "visual-session", direction: "download", fileName: task.fileName, transferred: task.offset, size: task.size, status: "running" } });
     result = { length, eof: task.offset >= task.size };
@@ -310,6 +339,45 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     settingsState.totpConfigured = typeof input.totpSecret === "string" ? input.totpSecret.trim().length > 0 : settingsState.totpConfigured;
     result = { ...settingsState };
   }
+  else if (method === "ssh/quickCommands/list") result = { commands: quickCommandsState };
+  else if (method === "ssh/quickCommands/save") {
+    const input = params as Record<string, unknown>;
+    const command = String(input.command || "").trim();
+    if (!command) throw new Error("Missing command");
+    if (command.length > 500) throw new Error("Quick command is limited to 500 characters");
+    const name = (String(input.name || "").trim() || command.slice(0, 60)).slice(0, 60);
+    const id = String(input.id || "").trim();
+    const now = Math.floor(Date.now() / 1000);
+    const existing = quickCommandsState.findIndex((entry) => entry.id === id);
+    if (existing >= 0) {
+      quickCommandsState[existing] = { ...quickCommandsState[existing], name, command, updatedAt: now };
+      result = { quickCommand: quickCommandsState[existing], created: false, commands: [...quickCommandsState] };
+    } else {
+      if (quickCommandsState.length >= QUICK_COMMANDS_LIMIT) throw new Error(`At most ${QUICK_COMMANDS_LIMIT} quick commands are supported`);
+      const entry = { id: `mock-qc-${quickCommandsState.length + 1}-${now}`, name, command, createdAt: now, updatedAt: now };
+      quickCommandsState.push(entry);
+      result = { quickCommand: entry, created: true, commands: [...quickCommandsState] };
+    }
+  }
+  else if (method === "ssh/quickCommands/delete") {
+    const id = String((params as Record<string, unknown>)?.id || "");
+    const index = quickCommandsState.findIndex((entry) => entry.id === id);
+    if (index >= 0) quickCommandsState.splice(index, 1);
+    result = { removed: index >= 0, commands: [...quickCommandsState] };
+  }
+  else if (method === "ssh/terminal/batchInput") {
+    const input = params as Record<string, unknown>;
+    const sessionIds = Array.isArray(input.sessionIds) ? (input.sessionIds as string[]) : [];
+    const command = String(input.command || "");
+    const results = sessionIds.map((sessionId) =>
+      sessionId === "visual-session"
+        ? { sessionId, success: true }
+        : { sessionId, success: false, error: "SSH session was not found" });
+    if (results.some((row) => row.success)) {
+      setTimeout(() => emitTerminal(`$ ${command}\r\nuser@server:~$ `), 30);
+    }
+    result = { results, sent: results.filter((row) => row.success).length, failed: results.filter((row) => !row.success).length };
+  }
   else if (method === "ssh/exec/cancel") result = { success: true };
   else if (method === "sudo/profiles/list") result = { profiles: [] };
   else if (method === "sudo/profiles/save" || method === "sudo/profiles/delete") result = { success: true };
@@ -324,6 +392,7 @@ window.dbxPlugin = {
   ready: Promise.resolve(context),
   context,
   appearance,
+  theme,
   locale: "en",
   request,
   invoke,

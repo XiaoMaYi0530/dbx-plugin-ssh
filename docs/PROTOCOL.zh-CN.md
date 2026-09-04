@@ -42,6 +42,8 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `keys/discover` | 本地 SSH 私钥发现（不返回私钥内容） |
 | `ssh/knownHosts/list`、`ssh/knownHosts/remove` | known_hosts 条目管理（含 `@cert-authority` / `@revoked` 标记条目） |
 | `ssh/sessions/list` | 只读会话清单：sidecar 当前跟踪的活跃会话（对齐 tiny-rdm ListSessions） |
+| `ssh/quickCommands/list`、`ssh/quickCommands/save`、`ssh/quickCommands/delete` | 全局快速命令管理（用户自定义常用命令片段，插件数据目录持久化，所有连接/工作台共享） |
+| `ssh/terminal/batchInput` | 批量发送：把同一条命令写入多个已打开会话的交互终端（PTY 键盘语义，对齐 tiny-rdm batch send），返回逐会话发送结果 |
 
 ## 运行时设置
 
@@ -411,5 +413,37 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 | `sudoKeepalive` | bool | 该连接是否运行 Quick Sudo 时间戳保活循环 |
 | `createdAt` | number | 会话创建时刻（Unix 秒） |
 | `authMethod` | string | 该连接的认证方式名（`password` / `private-key` / `private-key-password` / `agent` / `none`；连接不在注册表时回退 `password`）。仅方法名，**不含任何凭据材料**；供工作台连接信息面板只读展示 |
+| `host` | string | 所属连接主机名/IP（连接不在注册表时为空串）；只读展示字段 |
+| `port` | number | 所属连接端口（连接不在注册表时回退 22） |
+| `username` | string | 所属连接登录用户（连接不在注册表时为空串） |
 
 内存态清单，sidecar 重启即清零；会话关闭（`ssh/session/close`、`workbench/close`、连接断开）后不再出现。
+
+### ssh/quickCommands/list、ssh/quickCommands/save、ssh/quickCommands/delete
+
+全局快速命令：用户自定义的常用命令片段（名称 + 命令原文），持久化在
+`DBX_PLUGIN_DATA_DIR/quick-commands.json`（原子写、Unix 0600、坏文件降级为空清单），
+**所有连接与工作台共享一份**（对齐 tiny-rdm 快速命令的全局语义；此前存工作台
+localStorage 会因宿主 webview 存储分区表现为"绑连接"，已废弃该存储）。
+上限 20 条、`name` ≤ 60 字符、`command` ≤ 500 字符（与前端 `lib/quickCommands.ts`
+常量一致）。命令不含凭据字段，无脱敏需求，但文件权限与 sudo 配置存储保持同款收紧。
+
+`ssh/quickCommands/list`：参数无。返回 `{ commands: [{ id, name, command, createdAt, updatedAt }] }`，按插入顺序（`createdAt` 升序）排列。
+
+`ssh/quickCommands/save`：参数 `id?`（空/缺省=新建，非空=更新须存在）、`name?`（空/缺省取 `command` 截断兜底）、`command`（必填，trim 后非空）。返回 `{ quickCommand: {…}, created: bool, commands: [...] }`（完整清单随响应下发，工作台可直接采纳权威顺序）。错误：超限（"At most 20 quick commands…"）、字段超长、`command` 缺失。
+
+`ssh/quickCommands/delete`：参数 `id`。返回 `{ removed: bool, commands: [...] }`；id 不存在时 `removed: false` 不算错误（对齐 `ssh/knownHosts/remove` 语义），此时不重写存储文件。
+
+### ssh/terminal/batchInput
+
+批量发送命令（对齐 tiny-rdm batch send）：把同一条命令写入多个**已打开**会话的
+交互终端（PTY 键盘语义）——输出回显在各自会话的终端里，`cd`/`env` 等状态留在
+各 shell；方法本身不收集远端输出与退出码，只返回逐会话**发送**结果。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `sessionIds` | string[] | 是 | 目标会话 id 非空数组；后端按序去重 |
+| `command` | string | 是 | 命令原文；`\r\n`/`\n`/`\r` 归一为 `\r`（每个即一次回车），归一后上限 256 KiB |
+| `appendNewline` | bool | 否 | 默认 `true`，末尾追加回车即执行 |
+
+返回 `{ results: [{ sessionId, success, error? }], sent, failed }`：会话不存在、输入队列满/关闭记为该目标 `failed`（带 `error` 文本），不影响其他目标。发送语义等同用户键盘输入，命令原文不做 shell 转义；只读连接不拦截（与终端手敲一致）。

@@ -27,6 +27,7 @@ use crate::mcp_safety::{self, CommandRisk};
 use crate::model::{AuthenticationMethod, JumpHost, StoredConnection, SudoSource};
 use crate::sftp_copy;
 use crate::ssh::{SshClient, SshRuntime, NO_TERMINAL_SESSION_MESSAGE};
+use crate::sudo_allowlist;
 use crate::sudo_profiles;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -387,7 +388,11 @@ impl McpState {
         // 2. Read-only command whitelist: `ssh_exec` stays available on
         //    read-only connections, but only for provably read-only
         //    commands (ls, df, systemctl status, ...).
-        // 3. Destructive-command confirmation: recognized catastrophic
+        // 3. Sensitive-path denylist: on read-only connections even
+        //    whitelisted inspection tools may not touch credential/key paths
+        //    (~/.ssh, /etc/shadow, .env, *.pem, ...) — the exfiltration
+        //    channel the command whitelist cannot see for SFTP tools.
+        // 4. Destructive-command confirmation: recognized catastrophic
         //    patterns require an explicit confirmDestructive: true on every
         //    connection (and are refused outright on read-only ones).
         let read_only = self.connection_is_read_only(arguments).await;
@@ -396,8 +401,30 @@ impl McpState {
                 "Tool {name} is a write operation and the connection is read-only"
             ));
         }
+        if read_only {
+            if let Some(path) = sensitive_read_path(name, arguments) {
+                return Err(format!(
+                    "Tool {name} reads the sensitive path {path}; refused on read-only \
+                     connections"
+                ));
+            }
+        }
         if matches!(name, "ssh_exec" | "ssh_exec_sudo" | "ssh_run_bg") {
             let command = required_str(arguments, "command")?;
+            // Per-connection sudoers-style allowlist: privileged commands
+            // must match a `sudo_whitelist` entry when the connection
+            // declares one. Covers `ssh_exec_sudo` plus inline `sudo …` in
+            // `ssh_exec`/`ssh_run_bg` (NOPASSWD / cached-stamp bypasses).
+            if name == "ssh_exec_sudo" || mcp_safety::runs_under_sudo(command) {
+                let allowlist = self.sudo_allowlist_for(arguments).await;
+                if !allowlist.is_empty() && !sudo_allowlist::is_allowed(&allowlist, command) {
+                    return Err(format!(
+                        "sudo command is not allowed by this connection's whitelist. \
+                         Allowed patterns: {}",
+                        sudo_allowlist::render_entries(&allowlist)
+                    ));
+                }
+            }
             match mcp_safety::assess_command(command) {
                 CommandRisk::Destructive(reason) if read_only => {
                     return Err(format!(
@@ -449,20 +476,98 @@ impl McpState {
 
     /// True when the arguments reference a DBX-registered connection that was
     /// registered as read-only through `mcp/call` lifecycle payloads.
+    ///
+    /// Without a resolvable `connectionId` the gate falls back to endpoint
+    /// identity (host + port + username): keying read-only by connectionId
+    /// alone would let a caller walk around a read-only registration by
+    /// re-dialing the same host with inline credentials.
     async fn registered_connection_is_read_only(&self, arguments: &Value) -> bool {
-        let Some(id) = arguments
+        if let Some(id) = arguments
             .get("connectionId")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-        else {
-            return false;
-        };
+        {
+            return self
+                .dbx_connections
+                .read()
+                .await
+                .get(id)
+                .map(|connection| connection.read_only)
+                .unwrap_or(false);
+        }
+        self.inline_dial_is_registered_read_only(arguments).await
+    }
+
+    /// True when the inline dial arguments (host/port/username) identify the
+    /// same endpoint as a DBX-registered read-only connection.
+    async fn inline_dial_is_registered_read_only(&self, arguments: &Value) -> bool {
+        self.registered_connection_matching_inline(arguments)
+            .await
+            .is_some_and(|connection| connection.read_only)
+    }
+
+    /// Finds a lifecycle-registered connection whose endpoint identity
+    /// (host + port + username) matches the inline dial arguments. The port
+    /// defaults to 22 on both sides; host comparison is ASCII-case-insensitive.
+    async fn registered_connection_matching_inline(
+        &self,
+        arguments: &Value,
+    ) -> Option<StoredConnection> {
+        let host = arguments
+            .get("host")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let port = arguments
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(22);
+        let username = arguments
+            .get("username")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
         self.dbx_connections
             .read()
             .await
-            .get(id)
-            .map(|connection| connection.read_only)
-            .unwrap_or(false)
+            .values()
+            .find(|connection| {
+                connection.host.trim().eq_ignore_ascii_case(host)
+                    && connection.port == port
+                    && connection.username == username
+            })
+            .cloned()
+    }
+
+    /// Resolves the connection's sudoers-style allowlist: by `connectionId`
+    /// through the lifecycle registry, else by inline endpoint identity (the
+    /// same fallback as the read-only gate, so re-dialing a whitelisted host
+    /// with inline credentials cannot skip the list). Empty = not configured.
+    async fn sudo_allowlist_for(&self, arguments: &Value) -> Vec<Vec<String>> {
+        if let Some(id) = arguments
+            .get("connectionId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            return self
+                .dbx_connections
+                .read()
+                .await
+                .get(id)
+                .and_then(|connection| {
+                    (!connection.sudo_whitelist.is_empty())
+                        .then(|| sudo_allowlist::entries_from_lines(&connection.sudo_whitelist))
+                })
+                .unwrap_or_default();
+        }
+        self.registered_connection_matching_inline(arguments)
+            .await
+            .and_then(|connection| {
+                (!connection.sudo_whitelist.is_empty())
+                    .then(|| sudo_allowlist::entries_from_lines(&connection.sudo_whitelist))
+            })
+            .unwrap_or_default()
     }
 
     async fn run_tool(
@@ -1255,6 +1360,13 @@ impl McpState {
     async fn sftp_download_tool(&self, arguments: &Value) -> Result<Value, String> {
         let local_path = required_str(arguments, "localPath")?;
         let remote_path = required_str(arguments, "remotePath")?;
+        // Local-write hygiene before anything else: remote content must not
+        // land on shell bootstrap / scheduled-execution paths.
+        if is_sensitive_local_path(local_path) {
+            return Err(format!(
+                "Refusing to write the local sensitive path {local_path} via sftp_download"
+            ));
+        }
         let overwrite = arguments
             .get("overwrite")
             .and_then(Value::as_bool)
@@ -1534,7 +1646,9 @@ fn connection_pool_key(arguments: &Value) -> String {
 /// the read-only command whitelist in `call_tool` instead, so inspection
 /// commands (`df`, `systemctl status`, ...) stay available. Like the
 /// workbench read-only terminal, `sudo` execution is always refused.
-/// `sftp_download` stays allowed too: it only reads the remote side.
+/// `sftp_download` stays allowed too: it only reads the remote side (its
+/// local write target is guarded by `is_sensitive_local_path`, and the
+/// remote path by the sensitive-path denylist on read-only connections).
 fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
@@ -1548,6 +1662,76 @@ fn is_write_tool(name: &str) -> bool {
             | "sftp_chmod"
             | "sftp_copy"
             | "sftp_move"
+    )
+}
+
+/// Remote-path arguments of read tools that must respect the sensitive-path
+/// denylist on read-only connections. These tools return file content or
+/// listings straight to the LLM, a channel the exec command whitelist cannot
+/// classify; the denylist itself lives in `mcp_safety::is_sensitive_path`.
+fn sensitive_read_path(name: &str, arguments: &Value) -> Option<String> {
+    if !matches!(
+        name,
+        "sftp_list_dir"
+            | "sftp_read_file"
+            | "sftp_stat"
+            | "sftp_exists"
+            | "sftp_download"
+            | "ssh_task_status"
+    ) {
+        return None;
+    }
+    ["path", "remotePath", "logPath"]
+        .iter()
+        .find_map(|key| {
+            arguments
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|value| mcp_safety::is_sensitive_path(value))
+                .map(str::to_string)
+        })
+}
+
+/// Local write targets that must never receive downloaded content through
+/// the MCP channel: shell/SSH bootstrap files plus cron / systemd / launchd
+/// drop locations turn a remote file into local code execution. Applied on
+/// every connection (read-only or not) — this guard protects the operator
+/// machine, not the remote side. Defense in depth, not a sandbox.
+fn is_sensitive_local_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    const COMPONENTS: &[&str] = &[".ssh", ".gnupg"];
+    if lower
+        .split('/')
+        .any(|component| COMPONENTS.contains(&component))
+    {
+        return true;
+    }
+    const PREFIXES: &[&str] = &[
+        "/etc/cron",
+        "/var/spool/cron",
+        "/etc/sudoers",
+        "/etc/ssh",
+        "/etc/ld.so",
+        "/etc/pam.d",
+        "/etc/profile",
+        "/etc/bash",
+        "/etc/rc",
+        "/etc/systemd/system",
+        "/library/launchdaemons",
+        "/library/launchagents",
+    ];
+    if PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
+        return true;
+    }
+    let file_name = Path::new(&lower)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    matches!(
+        file_name,
+        ".bashrc" | ".zshrc" | ".profile" | ".bash_profile" | ".zprofile" | ".zshenv"
+            | ".zlogin" | ".cshrc" | ".tcshrc" | "authorized_keys" | ".netrc"
+            | ".git-credentials" | ".npmrc" | ".htpasswd"
     )
 }
 
@@ -1702,6 +1886,7 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         return Err("Private-key authentication requires privateKeyPath".to_string());
     }
     Ok(StoredConnection {
+        sudo_whitelist: Vec::new(),
         id: connection_pool_id(arguments),
         host: host.to_string(),
         port,
@@ -2038,7 +2223,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sftp_download",
-            "description": "Download a remote file to a local path over SFTP (single file). Remote size is capped by the configured maxDownloadBytes; missing local parent directories are created.",
+            "description": "Download a remote file to a local path over SFTP (single file). Remote size is capped by the configured maxDownloadBytes; missing local parent directories are created. Shell/cron/systemd bootstrap paths are refused as local targets, and on read-only connections credential paths are refused as remote sources.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[
                 ("remotePath", "string", "Remote file path to download"),
                 ("localPath", "string", "Local target file path"),
@@ -2187,6 +2372,303 @@ mod tests {
         assert!(
             error.contains("read-only"),
             "expected read-only refusal, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_dial_inherits_registered_read_only_gate() {
+        let state = state();
+        // All credential values in tests are assembled at runtime — never
+        // real credentials, never literals in source.
+        let stored = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-ro",
+                "host": "prod.example.test",
+                "port": 2222,
+                "username": "deploy",
+                "password": format!("pw-{}", uuid::Uuid::new_v4()),
+                "read_only": true,
+            }
+        }))
+        .unwrap();
+        assert!(stored.read_only, "lifecycle payload must carry read_only");
+        state
+            .dbx_connections
+            .write()
+            .await
+            .insert("conn-ro".to_string(), stored);
+        // Same endpoint re-dialed inline (no connectionId, host case-insensitive):
+        // the read-only gate still applies to write tools — the error fires
+        // before run_tool, so no localPath is needed to distinguish it from
+        // a plain validation error.
+        let error = state
+            .call_tool(
+                "sftp_upload",
+                &json!({
+                    "host": "PROD.example.test",
+                    "port": 2222,
+                    "username": "deploy",
+                    "remotePath": "/tmp/x",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("read-only"),
+            "expected read-only refusal for inline dial of a registered host, got: {error}"
+        );
+        // A different username or host is not covered by that registration.
+        for identity in [
+            json!({"host": "prod.example.test", "port": 2222, "username": "other"}),
+            json!({"host": "other.example.test", "username": "deploy"}),
+        ] {
+            let error = state
+                .call_tool("sftp_upload", &identity, None)
+                .await
+                .unwrap_err();
+            assert!(
+                !error.contains("read-only"),
+                "expected non-matching identity to pass the gate, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sudo_allowlist_gates_privileged_tools() {
+        let state = state();
+        let stored = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-sudo-list",
+                "host": "web.example.test",
+                "port": 22,
+                "username": "deploy",
+                "password": format!("pw-{}", uuid::Uuid::new_v4()),
+                "external_config": {
+                    "sudo_whitelist": "systemctl restart nginx\ndocker restart *"
+                },
+            }
+        }))
+        .unwrap();
+        assert_eq!(stored.sudo_whitelist.len(), 2, "external_config must parse");
+        state
+            .dbx_connections
+            .write()
+            .await
+            .insert("conn-sudo-list".to_string(), stored);
+
+        // ssh_exec_sudo with an unlisted command: refused, patterns listed.
+        let error = state
+            .call_tool(
+                "ssh_exec_sudo",
+                &json!({
+                    "connectionId": "conn-sudo-list",
+                    "command": "systemctl restart mysql",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("not allowed by this connection's whitelist")
+                && error.contains("docker restart *"),
+            "expected allowlist refusal, got: {error}"
+        );
+
+        // A matching command passes the gate and fails later (no dial here).
+        let error = state
+            .call_tool(
+                "ssh_exec_sudo",
+                &json!({
+                    "connectionId": "conn-sudo-list",
+                    "command": "docker restart api",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !error.contains("whitelist"),
+            "expected matching command to pass the gate, got: {error}"
+        );
+
+        // Inline `sudo …` inside plain ssh_exec is gated too.
+        let error = state
+            .call_tool(
+                "ssh_exec",
+                &json!({
+                    "connectionId": "conn-sudo-list",
+                    "command": "sudo systemctl restart mysql",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("not allowed by this connection's whitelist"),
+            "expected inline-sudo refusal, got: {error}"
+        );
+
+        // Inline identity fallback: re-dialing the same host without a
+        // connectionId inherits the whitelist; a different host does not.
+        let error = state
+            .call_tool(
+                "ssh_exec_sudo",
+                &json!({
+                    "host": "web.example.test",
+                    "username": "deploy",
+                    "command": "reboot",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("not allowed by this connection's whitelist"),
+            "expected identity-fallback refusal, got: {error}"
+        );
+        let error = state
+            .call_tool(
+                "ssh_exec_sudo",
+                &json!({
+                    "host": "other.example.test",
+                    "username": "deploy",
+                    "command": "reboot",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !error.contains("whitelist"),
+            "expected other host to skip the allowlist, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_respect_sensitive_path_denylist() {
+        let mut read_only_state = state();
+        read_only_state.global_read_only = true;
+        for (name, arguments) in [
+            (
+                "sftp_read_file",
+                json!({"host": "h.test", "username": "op", "path": "/root/.ssh/id_rsa"}),
+            ),
+            (
+                "sftp_list_dir",
+                json!({"host": "h.test", "username": "op", "path": "/root/.ssh"}),
+            ),
+            (
+                "sftp_download",
+                json!({"host": "h.test", "username": "op", "remotePath": "/etc/shadow",
+                       "localPath": "/tmp/dbx-denylist-test"}),
+            ),
+            (
+                "ssh_task_status",
+                json!({"host": "h.test", "username": "op", "logPath": "/root/.bash_history"}),
+            ),
+        ] {
+            let error = read_only_state
+                .call_tool(name, &arguments, None)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("sensitive"),
+                "expected sensitive-path refusal for {name}, got: {error}"
+            );
+        }
+        // Ordinary inspection paths still pass the gate (they fail later, at
+        // the dial).
+        let error = read_only_state
+            .call_tool(
+                "sftp_read_file",
+                &json!({"host": "h.test", "username": "op", "path": "/var/log/app.log"}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.contains("sensitive"), "got: {error}");
+        // On normal connections the denylist does not apply — the operator
+        // already grants full access.
+        let normal_state = state();
+        let error = normal_state
+            .call_tool(
+                "sftp_read_file",
+                &json!({"host": "h.test", "username": "op", "path": "/root/.ssh/id_rsa"}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.contains("sensitive"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn exec_whitelist_refuses_sensitive_paths_on_read_only() {
+        let mut state = state();
+        state.global_read_only = true;
+        let error = state
+            .call_tool(
+                "ssh_exec",
+                &json!({
+                    "host": "h.test",
+                    "username": "op",
+                    "command": "cat /root/.ssh/id_rsa",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("not recognized"),
+            "expected whitelist refusal for a sensitive path, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_download_refuses_sensitive_local_targets() {
+        let state = state();
+        for local in [
+            "/home/u/.bashrc",
+            "/home/u/.ssh/authorized_keys",
+            "/etc/cron.d/payload",
+            "/Library/LaunchDaemons/com.example.payload.plist",
+        ] {
+            let error = state
+                .call_tool(
+                    "sftp_download",
+                    &json!({
+                        "host": "h.test",
+                        "username": "op",
+                        "remotePath": "/tmp/payload.sh",
+                        "localPath": local,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("Refusing to write the local sensitive path"),
+                "expected local denylist refusal for {local}, got: {error}"
+            );
+        }
+        // Ordinary destinations pass the denylist (they fail later, at the
+        // dial).
+        let error = state
+            .call_tool(
+                "sftp_download",
+                &json!({
+                    "host": "h.test",
+                    "username": "op",
+                    "remotePath": "/tmp/payload.sh",
+                    "localPath": "/tmp/dbx-download-ok/payload.sh",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !error.contains("Refusing to write"),
+            "expected plain target to pass the denylist, got: {error}"
         );
     }
 

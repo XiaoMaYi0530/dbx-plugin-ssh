@@ -32,6 +32,7 @@ use crate::model::{
     StoredConnection, SudoSource, TerminalFrame, TerminalStream, MAX_TRANSFER_SIZE,
     TERMINAL_REPLAY_LIMIT, TRANSFER_CHUNK_SIZE,
 };
+use crate::quick_commands;
 use crate::sudo_profiles;
 
 /// Resolves the Quick Sudo / 2FA orchestration settings for a connection.
@@ -654,6 +655,26 @@ fn cached_metrics_payload(snapshot: &Value, collected_at: u64) -> Value {
     payload
 }
 
+/// Read-only connection display info resolved from the connections registry
+/// for a session row. Empty host/user means the connection is no longer
+/// registered (sidecar restarted after the workbench attached).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+}
+
+impl ConnectionEndpoint {
+    pub fn fallback() -> Self {
+        Self {
+            host: String::new(),
+            port: 22,
+            username: String::new(),
+        }
+    }
+}
+
 /// One row of `ssh/sessions/list`. Pure so tests can exercise the payload
 /// shape without a live SSH connection.
 fn session_info_payload(
@@ -665,6 +686,7 @@ fn session_info_payload(
     sudo_keepalive: bool,
     created_at_secs: u64,
     auth_method: &str,
+    endpoint: &ConnectionEndpoint,
 ) -> Value {
     json!({
         "sessionId": session_id,
@@ -675,6 +697,9 @@ fn session_info_payload(
         "sudoKeepalive": sudo_keepalive,
         "createdAt": created_at_secs,
         "authMethod": auth_method,
+        "host": endpoint.host,
+        "port": endpoint.port,
+        "username": endpoint.username,
     })
 }
 
@@ -1335,11 +1360,19 @@ impl SshRuntime {
         let mut list: Vec<Value> = sessions
             .iter()
             .map(|(session_id, entry)| {
-                let auth_method = connections
+                let connection = connections
                     .as_deref()
-                    .and_then(|store| store.get(&entry.connection_id))
+                    .and_then(|store| store.get(&entry.connection_id));
+                let auth_method = connection
                     .map(|connection| connection.authentication.method_name())
                     .unwrap_or("password");
+                let endpoint = connection
+                    .map(|connection| ConnectionEndpoint {
+                        host: connection.host.clone(),
+                        port: connection.port,
+                        username: connection.username.clone(),
+                    })
+                    .unwrap_or_else(ConnectionEndpoint::fallback);
                 let workbench_id = entry
                     .workbench_id
                     .read()
@@ -1354,6 +1387,7 @@ impl SshRuntime {
                     keepalives.contains(&entry.connection_id),
                     entry.created_at_secs,
                     auth_method,
+                    &endpoint,
                 )
             })
             .collect();
@@ -1405,6 +1439,80 @@ impl SshRuntime {
             .terminal_tx
             .try_send(TerminalCommand::Input(data))
             .map_err(|error| format!("SSH input queue is full or closed: {error}"))
+    }
+
+    /// Normalizes one batch command into PTY key input: newlines become
+    /// carriage returns (each an Enter for the remote shell), with a trailing
+    /// Enter when `append_newline`. Bounded so a single batch write cannot
+    /// flood a session's input queue. Pure for tests.
+    fn batch_input_payload(command: &str, append_newline: bool) -> Vec<u8> {
+        const MAX_BATCH_INPUT_BYTES: usize = 256 * 1024;
+        let normalized = command.replace("\r\n", "\r").replace(['\n', '\r'], "\r");
+        let mut payload = normalized.into_bytes();
+        if payload.len() > MAX_BATCH_INPUT_BYTES {
+            payload.truncate(MAX_BATCH_INPUT_BYTES);
+        }
+        if append_newline {
+            payload.push(b'\r');
+        }
+        payload
+    }
+
+    /// Deduplicates target ids while preserving call order. Pure for tests.
+    fn dedupe_session_ids(session_ids: &[String]) -> Vec<String> {
+        let mut seen = std::collections::HashSet::with_capacity(session_ids.len());
+        session_ids
+            .iter()
+            .filter(|id| !id.is_empty() && seen.insert(id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// One per-target outcome row of `ssh/terminal/batchInput`. Pure for tests.
+    fn batch_input_row(session_id: &str, error: Option<&str>) -> Value {
+        match error {
+            Some(error) => json!({ "sessionId": session_id, "success": false, "error": error }),
+            None => json!({ "sessionId": session_id, "success": true }),
+        }
+    }
+
+    /// Writes the same command into several open sessions' interactive shells
+    /// (tiny-rdm batch send): per-target outcomes only, the command's output
+    /// echoes in each session's own terminal. Unknown ids and full/closed
+    /// input queues fail their target without failing the whole call.
+    pub async fn batch_terminal_input(
+        &self,
+        session_ids: &[String],
+        command: &str,
+        append_newline: bool,
+    ) -> Value {
+        let payload = Self::batch_input_payload(command, append_newline);
+        let targets = Self::dedupe_session_ids(session_ids);
+        let sessions = self.sessions.read().await;
+        let mut results = Vec::with_capacity(targets.len());
+        let mut sent = 0u64;
+        let mut failed = 0u64;
+        for session_id in &targets {
+            let outcome = match sessions.get(session_id.as_str()) {
+                Some(session) => session
+                    .terminal_tx
+                    .try_send(TerminalCommand::Input(payload.clone()))
+                    .map_err(|error| format!("SSH input queue is full or closed: {error}")),
+                None => Err("SSH session was not found".to_string()),
+            };
+            match outcome {
+                Ok(()) => {
+                    sent += 1;
+                    results.push(Self::batch_input_row(session_id, None));
+                }
+                Err(error) => {
+                    failed += 1;
+                    results.push(Self::batch_input_row(session_id, Some(&error)));
+                }
+            }
+        }
+        drop(sessions);
+        json!({ "results": results, "sent": sent, "failed": failed })
     }
 
     pub async fn replay_terminal(
@@ -1545,6 +1653,34 @@ impl SshRuntime {
         } else {
             Ok(())
         }
+    }
+
+    /// Connection-level sudoers-style allowlist for privileged commands
+    /// (`sudo_whitelist` in the connection's external config). Empty config
+    /// = gate off; otherwise the command (minus a leading `sudo` token) must
+    /// match one entry. Mirrors the MCP gate on the workbench exec path;
+    /// structured `sudo_fs` operations are user-driven and stay exempt.
+    pub async fn ensure_sudo_allowed(&self, session_id: &str, command: &str) -> Result<(), String> {
+        let session = self.session(session_id).await?;
+        let connection = self
+            .connections
+            .read()
+            .map_err(|_| "Connection registry is poisoned".to_string())?
+            .get(&session.connection_id)
+            .cloned()
+            .ok_or("Connection is not active; reopen it from DBX".to_string())?;
+        if connection.sudo_whitelist.is_empty() {
+            return Ok(());
+        }
+        let entries = crate::sudo_allowlist::entries_from_lines(&connection.sudo_whitelist);
+        if crate::sudo_allowlist::is_allowed(&entries, command) {
+            return Ok(());
+        }
+        Err(format!(
+            "sudo command is not allowed by this connection's whitelist. \
+             Allowed patterns: {}",
+            crate::sudo_allowlist::render_entries(&entries)
+        ))
     }
 
     pub(crate) async fn sftp(
@@ -2558,6 +2694,42 @@ impl SshRuntime {
     pub fn profiles_list(&self) -> Value {
         let store = sudo_profiles::load_store(&self.data_dir);
         json!({ "profiles": sudo_profiles::list_views(&store) })
+    }
+
+    /// `ssh/quickCommands/list`: global quick commands shared by every
+    /// connection and workbench.
+    pub fn quick_commands_list(&self) -> Value {
+        let store = quick_commands::load_store(&self.data_dir);
+        json!({ "commands": quick_commands::list_views(&store) })
+    }
+
+    /// `ssh/quickCommands/save`: creates or updates one global quick command.
+    /// Returns the saved entry, whether it was newly created, and the full
+    /// list so the workbench can adopt the authoritative order in one call.
+    pub fn quick_commands_save(&self, params: &Value) -> Result<Value, String> {
+        let mut store = quick_commands::load_store(&self.data_dir);
+        let (entry, created) = quick_commands::save_entry(&mut store, params)?;
+        quick_commands::save_store(&self.data_dir, &store)?;
+        Ok(json!({
+            "quickCommand": quick_commands::entry_view(&entry),
+            "created": created,
+            "commands": quick_commands::list_views(&store),
+        }))
+    }
+
+    /// `ssh/quickCommands/delete`: removes one global quick command; unknown
+    /// ids report `removed: false` instead of erroring. The store file is
+    /// only rewritten when something was actually removed.
+    pub fn quick_commands_delete(&self, id: &str) -> Result<Value, String> {
+        let mut store = quick_commands::load_store(&self.data_dir);
+        let removed = quick_commands::delete_entry(&mut store, id);
+        if removed {
+            quick_commands::save_store(&self.data_dir, &store)?;
+        }
+        Ok(json!({
+            "removed": removed,
+            "commands": quick_commands::list_views(&store),
+        }))
     }
 
     /// `sudo/profiles/options`: secret-free select options for the host
@@ -3938,7 +4110,12 @@ mod tests {
 
     #[test]
     fn session_info_payload_carries_identity_and_liveness() {
-        let row = session_info_payload("sess-1", "conn-1", "wb-1", true, true, true, 1_700_000_123, "private-key");
+        let endpoint = ConnectionEndpoint {
+            host: "prod-01".to_string(),
+            port: 2222,
+            username: "ops".to_string(),
+        };
+        let row = session_info_payload("sess-1", "conn-1", "wb-1", true, true, true, 1_700_000_123, "private-key", &endpoint);
         assert_eq!(row["sessionId"], json!("sess-1"));
         assert_eq!(row["connectionId"], json!("conn-1"));
         assert_eq!(row["workbenchId"], json!("wb-1"));
@@ -3947,11 +4124,71 @@ mod tests {
         assert_eq!(row["sudoKeepalive"], json!(true));
         assert_eq!(row["createdAt"], json!(1_700_000_123));
         assert_eq!(row["authMethod"], json!("private-key"));
+        assert_eq!(row["host"], json!("prod-01"));
+        assert_eq!(row["port"], json!(2222));
+        assert_eq!(row["username"], json!("ops"));
         // No secrets leak through the inventory payload.
         let serialized = row.to_string();
         assert!(!serialized.contains("password"));
         assert!(!serialized.contains("passphrase"));
         assert!(!serialized.contains("privateKeyMaterial"));
+    }
+
+    #[test]
+    fn batch_input_payload_normalizes_newlines_and_bounds_size() {
+        assert_eq!(SshRuntime::batch_input_payload("df -h", true), b"df -h\r".to_vec());
+        assert_eq!(SshRuntime::batch_input_payload("df -h", false), b"df -h".to_vec());
+        // Every newline flavour becomes one Enter.
+        assert_eq!(
+            SshRuntime::batch_input_payload("a\nb\r\nc\rd", true),
+            b"a\rb\rc\rd\r".to_vec()
+        );
+        // Oversized commands are truncated, never rejected: a batch send is
+        // keyboard-level input, the shell copes with long lines.
+        let huge = "x".repeat(300 * 1024);
+        let payload = SshRuntime::batch_input_payload(&huge, true);
+        assert_eq!(payload.len(), 256 * 1024 + 1);
+        assert_eq!(*payload.last().unwrap(), b'\r');
+    }
+
+    #[test]
+    fn batch_input_helpers_dedupe_and_shape_rows() {
+        let targets = SshRuntime::dedupe_session_ids(&[
+            "b".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            String::new(),
+            "a".to_string(),
+        ]);
+        assert_eq!(targets, vec!["b".to_string(), "a".to_string()]);
+
+        let ok = SshRuntime::batch_input_row("s1", None);
+        assert_eq!(ok["sessionId"], json!("s1"));
+        assert_eq!(ok["success"], json!(true));
+        assert!(ok.get("error").is_none());
+        let bad = SshRuntime::batch_input_row("s2", Some("SSH session was not found"));
+        assert_eq!(bad["success"], json!(false));
+        assert_eq!(bad["error"], json!("SSH session was not found"));
+    }
+
+    #[tokio::test]
+    async fn batch_terminal_input_reports_unknown_sessions_as_target_failures() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+        let response = runtime
+            .batch_terminal_input(
+                &["ghost-1".to_string(), "ghost-2".to_string()],
+                "echo hi",
+                true,
+            )
+            .await;
+        assert_eq!(response["sent"], json!(0));
+        assert_eq!(response["failed"], json!(2));
+        let results = response["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["sessionId"], json!("ghost-1"));
+        assert_eq!(results[0]["error"], json!("SSH session was not found"));
+        assert_eq!(results[1]["sessionId"], json!("ghost-2"));
     }
 
     #[test]

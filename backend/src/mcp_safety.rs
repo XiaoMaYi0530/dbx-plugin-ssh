@@ -103,13 +103,62 @@ const SUBCOMMAND_VERBS: &[(&str, &[&str])] = &[
         ],
     ),
     ("docker", &["ps", "images", "stats", "version", "info", "logs", "inspect", "top", "port", "events", "search"]),
-    (
-        "git",
-        &["status", "log", "diff", "show", "branch", "blame", "describe", "rev-parse", "remote", "tag", "reflog"],
-    ),
+    // `git` has its own shape-sensitive rules: see `git_segment_risk`.
     ("kubectl", &["get", "describe", "top", "logs", "version", "explain", "api-resources", "api-versions"]),
     ("ip", &["addr", "a", "address", "l", "link", "route", "r", "rule", "neigh", "n"]),
 ];
+
+/// git inspection subcommands; `branch`/`tag`/`remote`/`reflog` are further
+/// narrowed to their listing shapes by [`git_segment_risk`].
+const GIT_READ_SUBCOMMANDS: &[&str] = &[
+    "status", "log", "diff", "show", "branch", "blame", "describe", "rev-parse", "remote", "tag",
+    "reflog",
+];
+
+/// Second-level `ip` object commands that mutate network state even though
+/// the object itself (`route`, `link`, `addr`, …) inspects by default.
+const MUTATING_OBJECT_COMMANDS: &[&str] = &[
+    "add", "del", "delete", "flush", "set", "change", "replace", "append",
+];
+
+/// Narrowing rules for git subcommands that are read-only only in their
+/// listing shapes.
+fn git_segment_risk(args: &[String], sensitive: bool) -> CommandRisk {
+    let Some(position) = args.iter().position(|arg| !arg.starts_with('-')) else {
+        return CommandRisk::Unknown;
+    };
+    let sub = args[position].as_str();
+    if !GIT_READ_SUBCOMMANDS.contains(&sub) {
+        return CommandRisk::Unknown;
+    }
+    let rest = &args[position + 1..];
+    let read_only = match sub {
+        // `git branch [-a]` / `git tag [-l 'v*']` list; `git branch work`,
+        // `git branch -D x`, `git tag v1`, `git tag -d v1` mutate.
+        "branch" | "tag" => {
+            rest.iter().any(|arg| arg == "-l" || arg == "--list")
+                || rest.iter().all(|arg| arg.starts_with('-'))
+        }
+        // `git remote [-v]` lists; add/rename/remove/set-url/prune mutate.
+        "remote" => !rest
+            .first()
+            .map(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "add" | "rename" | "remove" | "rm" | "set-url" | "set-head" | "prune"
+                        | "update"
+                )
+            })
+            .unwrap_or(false),
+        // `git reflog [show]` reads; delete/expire rewrite history.
+        "reflog" => rest.first().map(|arg| arg == "show").unwrap_or(true),
+        _ => true,
+    };
+    if !read_only || sensitive {
+        return CommandRisk::Unknown;
+    }
+    CommandRisk::ReadOnly
+}
 
 /// Command prefixes that merely wrap an inner command; unwrapped before the
 /// real verb is assessed.
@@ -133,6 +182,25 @@ const SQL_VERBS: &[&str] = &["mysql", "mariadb", "psql", "sqlite3"];
 const CRITICAL_FILES: &[&str] = &[
     "/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/fstab", "/boot/",
 ];
+
+/// Directory components that hold credentials, key material, or cloud /
+/// cluster identity. Any path reaching into them downgrades a whitelisted
+/// inspection command to `Unknown`.
+const SENSITIVE_COMPONENTS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube"];
+
+/// File basenames that carry credentials or leak them via history.
+const SENSITIVE_BASENAMES: &[&str] = &[
+    ".netrc", ".git-credentials", ".npmrc", ".htpasswd", ".pgpass", ".my.cnf",
+    "my.cnf", ".bash_history", ".zsh_history", ".sh_history", ".mysql_history",
+    ".psql_history",
+];
+
+/// Extensions used by private keys / PKCS containers.
+const SENSITIVE_EXTENSIONS: &[&str] = &[".pem", ".key", ".p12", ".pfx"];
+
+/// System credential files (prefix match, so `shadow-` backups match too).
+const SENSITIVE_SYSTEM_PREFIXES: &[&str] =
+    &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
 /// Assesses one chain segment (no `;`/`&&`/`|` left inside).
 fn assess_segment(segment: &str) -> CommandRisk {
@@ -162,14 +230,74 @@ fn assess_segment(segment: &str) -> CommandRisk {
         // destructive shape matters (checked inside destructive_pattern).
         return CommandRisk::Unknown;
     }
+    let sensitive = touches_sensitive_path(args);
+    if verb == "dmesg" {
+        // `-c`/`-C` print-and-clear or clear the kernel ring buffer;
+        // `-n`/`--console-level` changes console logging.
+        let mutating = args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-C" | "-c" | "-n" | "--clear" | "--read-clear" | "--console-level"
+            ) || arg.starts_with("--console-level=")
+        });
+        return if mutating || sensitive {
+            CommandRisk::Unknown
+        } else {
+            CommandRisk::ReadOnly
+        };
+    }
+    if verb == "history" {
+        // Only display forms stay read-only; -c/-d/-w/... rewrite history.
+        let mutating = args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-c" | "-d" | "-a" | "-r" | "-w" | "-p" | "-s" | "--clear"
+            )
+        });
+        return if mutating || sensitive {
+            CommandRisk::Unknown
+        } else {
+            CommandRisk::ReadOnly
+        };
+    }
+    if verb == "sort" {
+        // `sort -o FILE` writes its output to an arbitrary path.
+        let writes = args.iter().any(|arg| {
+            arg == "-o"
+                || arg == "--output"
+                || arg.starts_with("--output=")
+                || (arg.starts_with("-o") && arg.len() > 2)
+        });
+        return if writes || sensitive {
+            CommandRisk::Unknown
+        } else {
+            CommandRisk::ReadOnly
+        };
+    }
     if READ_ONLY_VERBS.contains(&verb) {
-        return CommandRisk::ReadOnly;
+        return if sensitive {
+            CommandRisk::Unknown
+        } else {
+            CommandRisk::ReadOnly
+        };
     }
     if verb == "find" {
-        if args.iter().any(|arg| arg.starts_with("-exec") || arg == "-ok") {
+        // `-exec`/`-ok` run arbitrary programs; any `-f…` option (`-fprint`,
+        // `-fprintf`, `-fls`, …) writes the match list to a file.
+        if args
+            .iter()
+            .any(|arg| arg.starts_with("-exec") || arg.starts_with("-f") || arg == "-ok")
+        {
             return CommandRisk::Unknown;
         }
-        return CommandRisk::ReadOnly;
+        return if sensitive {
+            CommandRisk::Unknown
+        } else {
+            CommandRisk::ReadOnly
+        };
+    }
+    if verb == "git" {
+        return git_segment_risk(args, sensitive);
     }
     if verb == "journalctl" {
         if args.iter().any(|arg| arg.starts_with("--vacuum") || arg.starts_with("--rotate")) {
@@ -194,10 +322,24 @@ fn assess_segment(segment: &str) -> CommandRisk {
         };
     }
     if let Some((_, allowed)) = SUBCOMMAND_VERBS.iter().find(|(owner, _)| *owner == verb) {
-        let subcommand = args.iter().find(|arg| !arg.starts_with('-'));
-        return match subcommand {
-            Some(sub) if allowed.contains(&sub.as_str()) => CommandRisk::ReadOnly,
-            _ => CommandRisk::Unknown,
+        let Some(position) = args.iter().position(|arg| !arg.starts_with('-')) else {
+            return CommandRisk::Unknown;
+        };
+        let sub = args[position].as_str();
+        if !allowed.contains(&sub) {
+            return CommandRisk::Unknown;
+        }
+        // `ip` takes a second-level command (`ip route flush all`): mutating
+        // object commands stay out of the read-only class even though the
+        // object itself (`route`, `link`, …) inspects by default.
+        let mutating = verb == "ip"
+            && args[position + 1..]
+                .iter()
+                .any(|arg| MUTATING_OBJECT_COMMANDS.contains(&arg.as_str()));
+        return if mutating || sensitive {
+            CommandRisk::Unknown
+        } else {
+            CommandRisk::ReadOnly
         };
     }
     CommandRisk::Unknown
@@ -395,13 +537,66 @@ fn destructive_delete_target(target: &str) -> bool {
     match components.first() {
         None => true, // "/" itself
         Some(&"tmp") | Some(&"var") => {
-            // `/tmp`, `/var`, `/var/tmp` are routine cleanup targets.
+            // `/tmp`, `/var/tmp` are routine cleanup targets.
             components.len() <= 1 || components.len() == 2 && components[1] == "tmp"
         }
         // Wildcards only escalate at shallow depth: `/*` and `/etc/*` wipe a
         // root, but `/root/.cache/*` is routine cleanup.
         _ => components.len() <= 2,
     }
+}
+
+/// True when any argument token references a credential / private-key path.
+pub fn touches_sensitive_path(args: &[String]) -> bool {
+    args.iter().any(|arg| is_sensitive_path(arg))
+}
+
+/// True when one command token references a credential / private-key path.
+///
+/// Such a command is still "read-only" in the write sense, but the realistic
+/// read-only-connection threat is an LLM driven by injected instructions to
+/// exfiltrate SSH keys, sudo or database credentials. The token therefore
+/// downgrades the segment to [`CommandRisk::Unknown`]: refused on read-only
+/// connections by the whitelist gate, allowed on normal connections where
+/// the operator already grants full access. Defense in depth, not an
+/// exhaustive secret scan — unrecognized verbs are refused anyway.
+pub fn is_sensitive_path(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if lower.is_empty() || lower == "/" {
+        return false;
+    }
+    // The `.pub` half of a keypair is public by design.
+    if lower.ends_with(".pub") {
+        return false;
+    }
+    let file_name = std::path::Path::new(&lower)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .trim_end_matches('*');
+    // `id_*` also matches glob patterns like `find / -name 'id_*'`; host
+    // keys are `/etc/ssh/ssh_host_<type>_key`.
+    if file_name.starts_with("id_")
+        || (file_name.starts_with("ssh_host_") && file_name.ends_with("_key"))
+        || SENSITIVE_BASENAMES.contains(&file_name)
+        || file_name == ".env"
+        || file_name.starts_with(".env.")
+    {
+        return true;
+    }
+    // Extension check runs on the whole token so globs (`*.pem`) match too.
+    if SENSITIVE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
+        return true;
+    }
+    if lower
+        .split('/')
+        .any(|component| SENSITIVE_COMPONENTS.contains(&component))
+    {
+        return true;
+    }
+    SENSITIVE_SYSTEM_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -455,6 +650,85 @@ mod tests {
         assert!(!super::runs_under_sudo("echo sudo is a word here"));
         assert!(!super::runs_under_sudo("whoami"));
         assert!(!super::runs_under_sudo("ls && cat /etc/hostname"));
+    }
+
+    #[test]
+    fn whitelisted_output_flags_are_unknown() {
+        // `sort -o` / `find -fprint…` write files while keeping read-only verbs.
+        unknown("sort -o /etc/cron.d/x /tmp/in");
+        unknown("sort --output=/etc/cron.d/x /tmp/in");
+        unknown("sort -o/etc/cron.d/x /tmp/in");
+        read_only("sort /tmp/in | head -5");
+        unknown("find / -fprint /tmp/keys");
+        unknown("find / -fprintf /tmp/x '%p'");
+        unknown("find . -fls /tmp/out");
+        read_only("find /var/log -name '*.log'");
+        read_only("du -sh /var | sort -rh | head");
+    }
+
+    #[test]
+    fn deep_subcommand_mutations_are_unknown() {
+        unknown("ip link set dev eth0 down");
+        unknown("ip route flush all");
+        unknown("ip addr add 10.0.0.1/24 dev eth0");
+        unknown("ip neigh flush all");
+        unknown("ip rule add from 0.0.0.0 table 200");
+        read_only("ip link show eth0");
+        read_only("ip route get 8.8.8.8");
+        read_only("ip addr show dev eth0");
+
+        unknown("git branch -D main");
+        unknown("git branch feature");
+        unknown("git tag -d v1");
+        unknown("git tag v1.0");
+        unknown("git remote add evil https://example.test/x.git");
+        unknown("git remote set-url origin https://example.test/x.git");
+        unknown("git reflog delete --all");
+        read_only("git branch -a");
+        read_only("git branch --show-current");
+        read_only("git tag -l 'v*'");
+        read_only("git remote -v");
+        read_only("git remote show origin");
+        read_only("git reflog");
+        read_only("git reflog show");
+        read_only("git log --oneline -5");
+        read_only("git show HEAD~1");
+
+        unknown("dmesg -C");
+        unknown("dmesg -c");
+        unknown("dmesg -n 1");
+        unknown("dmesg --console-level emerg");
+        read_only("dmesg | tail -20");
+        read_only("dmesg -T");
+
+        unknown("history -c");
+        unknown("history -w");
+        unknown("history -d 5");
+        read_only("history");
+        read_only("history 10");
+    }
+
+    #[test]
+    fn sensitive_paths_downgrade_read_only() {
+        unknown("cat ~/.ssh/id_rsa");
+        unknown("cat /root/.ssh/id_ed25519");
+        unknown("ls -la /root/.ssh");
+        unknown("grep -r key /home/u/.ssh");
+        unknown("cat /etc/shadow");
+        unknown("grep root /etc/shadow-");
+        unknown("stat /etc/sudoers");
+        unknown("cat /srv/app/.env.production");
+        unknown("cat /root/.aws/credentials");
+        unknown("find / -name id_rsa*");
+        unknown("cat /etc/ssl/private/server.pem");
+        unknown("tail -5 /root/.bash_history");
+        unknown("du /home/u/.gnupg");
+        read_only("cat ~/.ssh/id_rsa.pub");
+        read_only("cat /etc/hostname");
+        read_only("cat /etc/ssh/sshd_config");
+        read_only("ls /etc");
+        read_only("grep error /var/log/app.log");
+        read_only("df -h");
     }
 
     #[test]

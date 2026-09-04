@@ -120,6 +120,9 @@ pub struct StoredConnection {
     pub sudo_source: SudoSource,
     pub sudo_profile_ref: String,
     pub sudo_use_pty: bool,
+    /// sudoers-style per-connection sudo command allowlist
+    /// (`external_config.sudo_whitelist`); empty = gate off.
+    pub sudo_whitelist: Vec<String>,
     pub password_prompt_hint: String,
     pub totp_prompt_hint: String,
     pub auth_flow_mode: String,
@@ -240,6 +243,7 @@ impl JumpHost {
             sudo_source: SudoSource::Custom,
             sudo_profile_ref: String::new(),
             sudo_use_pty: false,
+            sudo_whitelist: Vec::new(),
             password_prompt_hint: self.password_prompt_hint.clone(),
             totp_prompt_hint: self.totp_prompt_hint.clone(),
             auth_flow_mode: self.auth_flow_mode.clone(),
@@ -319,6 +323,12 @@ impl StoredConnection {
             .and_then(|config| config.get("sudo_use_pty"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let sudo_whitelist = optional_string(external_config, "sudo_whitelist")
+            .split('\n')
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect();
         let jump_hosts = parse_jump_hosts(external_config)?;
         let runtime_host = if runtime_host.is_empty() {
             host.clone()
@@ -375,6 +385,7 @@ impl StoredConnection {
             sudo_source,
             sudo_profile_ref,
             sudo_use_pty,
+            sudo_whitelist,
             password_prompt_hint,
             totp_prompt_hint,
             auth_flow_mode,
