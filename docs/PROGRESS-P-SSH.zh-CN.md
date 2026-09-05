@@ -1089,3 +1089,14 @@ package.json 保持零新依赖），系统 Chrome 走 `channel:"chrome"` headle
 - 无新增用户可见文案（七语无改动）。
 - 验证：`vue-tsc` 0 错；`vitest run` 12 文件 119 用例全绿。真机复验随
   host 第 18 节待办一并执行。
+
+## 主题令牌桥：首绘同步与全覆盖（2026-09-05）
+
+- 接入 `shared/frontend/themeSync.ts`（单点实现）：`main.ts` 挂载前
+  `installHostThemeBridge()`，把 `--background/--primary/--radius/--*-font-family`
+  等插件变量声明为宿主 `--color-*`/`--radius-*`/`--font-*` 令牌引用。首绘即命中
+  宿主主题（此前等 init 后 JS 回写，亮色宿主下首绘落在 CSS 暗色默认）；宿主
+  切主题时随 SDK 令牌更新自动跟随；primary/radius/字体首次纳入同步面。
+- JS `applyAppearance` 保留（终端 ANSI 调色板等非 CSS 场景仍需）。
+- 验证：`vue-tsc` 0 错；`vitest run` 13 文件 122 用例全绿（含新增
+  `themeSync.spec.ts` 薄 spec）；v0.4.24 发版真机亮色主题下工作台首绘同步。
