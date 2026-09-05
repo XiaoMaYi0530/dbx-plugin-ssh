@@ -697,6 +697,7 @@ mod tests {
             "password_prompt_hint",
             "totp_prompt_hint",
             "sudo_use_pty",
+            "sudo_whitelist",
             "read_only",
         ];
         assert_eq!(keys, expected, "manifest field list drifted from parsing");
@@ -1206,6 +1207,7 @@ mod manifest_contract_tests {
             "sudo_source",
             "sudo_profile",
             "sudo_use_pty",
+            "sudo_whitelist",
             "read_only",
             "auth_flow_mode",
             "password_prompt_hint",
