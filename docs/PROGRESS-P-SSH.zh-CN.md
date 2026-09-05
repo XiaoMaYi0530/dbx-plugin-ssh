@@ -856,3 +856,33 @@ DBX.app。两者都会重启 DBX，待用户窗口期执行。
 **文档**：PROTOCOL.zh-CN.md Quick Sudo 段（台账进程全局 + 作用域/指纹键控 +
 排序语义）、MCP.zh-CN.md 工具表、`totpSecret` 工具 schema 描述补多密钥
 （换行/分号分隔）轮换语义。
+
+### §8.13 设置弹窗/配置编辑器回显已存原值（2026-09-04）
+
+**问题**：Quick Sudo 设置弹窗与全局配置编辑器的 sudo 密码 / TOTP 密钥输入框
+打开时永远空白，仅靠占位符提示"已配置"——用户看不到自己存的原值
+（`settings/get` 与 `profile_view` 只回布尔位，设计上从不回显），多密钥
+原文（换行/分号串）更是完全无处可查。
+
+**修复**（回显仍是显式、有边界的）：
+- `ssh/settings/get` 新增可选 `revealSecrets: true` → 额外回显本连接配置的
+  `sudoPassword` / `totpSecret` 原始串；缺省响应与此前完全一致（布尔位），
+  MCP 通道不暴露该参数。设置弹窗 `openSettings` 传参预填两个 draft 字段；
+  `refreshSettingsMeta` 保持不回显。
+- 新增 `sudo/profiles/reveal { id }`（工作台专用，**不进 MCP 工具面**，密钥
+  不进 agent 上下文）：返回完整视图含原值；未知 id 报错。配置编辑器
+  `startProfileEdit` 在有已存密钥时异步 reveal 预填（带 id/编辑态守卫，
+  失败回落占位提示）。保存语义不变：空串/清空字段=保持原值，清除走既有
+  清除按钮 / clear 标志。
+- `mockDbxHost.ts` 镜像两个方法当前形状（reveal 回空串壳）。
+
+**测试**：`cargo test` 189 通过（新增 `reveal_returns_raw_secrets_for_the_
+editor`：原值回显 + 未知 id 报错；`views_never_echo_secrets` 证明 list 视图
+仍不回显）。前端 typecheck 0 错、vitest 102 过、build 成功。smoke：
+`smoke_sudo_otp_test.py` 新增 `revealSecrets` 用例（默认不回显断言保留 +
+reveal 回显多密钥原文）；`smoke_fs_test.py` 新增 `sudo/profiles/reveal`
+用例（原值返回 + 未知 id 报错 + list 仍 flag-only）。
+
+**文档**：PROTOCOL.zh-CN.md（`ssh/settings/get` revealSecrets 参数、
+`sudo/profiles/reveal` 方法条目及其"仅工作台、不进 MCP"边界）。宿主渲染的
+连接表单 `totp_secret` 字段属宿主表单体系，不受本插件控制，不在本轮范围。

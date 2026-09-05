@@ -368,7 +368,8 @@ impl Plugin {
             }
             "ssh/settings/get" => {
                 let session_id = required_string(&params, "sessionId")?;
-                self.runtime.block_on(self.ssh.settings_get(session_id))
+                self.runtime
+                    .block_on(self.ssh.settings_get(session_id, &params))
             }
             "ssh/settings/set" => {
                 let session_id = required_string(&params, "sessionId")?;
@@ -462,6 +463,10 @@ impl Plugin {
             }
             "sudo/profiles/list" => Ok(self.ssh.profiles_list()),
             "sudo/profiles/options" => Ok(self.ssh.profiles_options()),
+            "sudo/profiles/reveal" => {
+                let id = required_string(&params, "id")?;
+                self.ssh.profiles_reveal(id)
+            }
             "sudo/profiles/save" => self.runtime.block_on(self.ssh.profiles_save(&params)),
             "sudo/profiles/delete" => {
                 let id = required_string(&params, "id")?;

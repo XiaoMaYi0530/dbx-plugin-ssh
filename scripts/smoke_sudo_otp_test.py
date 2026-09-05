@@ -497,6 +497,20 @@ def main() -> None:
                 print(f"    totpConfigured={settings.get('totpConfigured')} "
                       f"flowMode={settings.get('authFlowMode')} (secrets not echoed)")
 
+            def case_settings_reveal_secrets():
+                # 默认 get 只报布尔位；revealSecrets: true 回显本连接原值
+                # （多密钥原文，设置弹窗预填用）。
+                configured = f"{secret_a};{secret_b}"
+                revealed = req("ssh/settings/get",
+                               {"sessionId": session_id, "revealSecrets": True},
+                               timeout=30)
+                if revealed.get("totpSecret") != configured:
+                    raise AssertionError(
+                        f"reveal mismatch: {json.dumps(revealed)[:160]}")
+                if "sudoPassword" not in revealed:
+                    raise AssertionError("reveal response missing sudoPassword key")
+                print("    revealSecrets echoed the configured multi-secret verbatim")
+
             def read_log_new_rows(before: int) -> list[tuple[str, str, str]]:
                 rows = setup.read_submission_log()
                 return rows[before:]
@@ -538,7 +552,8 @@ def main() -> None:
                 b_windows = {totp_window(secret_b, w)
                              for w in (now_window - 1, now_window, now_window + 1)}
                 if not submitted:
-                    raise AssertionError("no OTP submission observed for the second attempt")
+                    raise AssertionError("no OTP submission observed for the second attempt; "
+                                         f"sidecar stderr: {client.drain_stderr()[-600:]!r}")
                 if any(code in a_windows for code in submitted):
                     raise AssertionError("the first window's code was replayed")
                 if not any(code in b_windows for code in submitted):
@@ -598,6 +613,9 @@ def main() -> None:
 
             report.run("ssh/settings/set registers TOTP secrets without echoing them",
                        "ssh/settings/set", case_settings_mask_secrets)
+            report.run("ssh/settings/get revealSecrets echoes the stored value",
+                       "ssh/settings/get", case_settings_reveal_secrets,
+                       needs="ssh/settings/set registers TOTP secrets without echoing them")
             report.run("current-window OTP is auto-answered and accepted end to end",
                        "ssh/exec", case_current_window_otp_accepted,
                        needs="ssh/settings/set registers TOTP secrets without echoing them")

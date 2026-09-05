@@ -397,6 +397,32 @@ def main() -> None:
             if "smoke-ops" not in names:
                 raise AssertionError(f"smoke-ops missing from list: {names}")
 
+        def case_profiles_reveal():
+            # 工作台专用回显：原值返回；list 视图仍保持 flag-only。
+            profile_id = profile_state.get("id")
+            if not profile_id:
+                raise AssertionError("no profile id from create case")
+            result = req("sudo/profiles/reveal", {"id": profile_id})
+            profile = result.get("profile") or {}
+            if profile.get("sudoPassword") != profile_secret:
+                raise AssertionError(
+                    f"reveal did not return the stored secret: {json.dumps(profile)[:160]}")
+            if profile.get("totpSecret") != "JBSWY3DPEHPK3PXP":
+                raise AssertionError("reveal did not return the stored TOTP secret")
+            error = None
+            try:
+                req("sudo/profiles/reveal", {"id": "smoke-missing"})
+            except SidecarError as raised:
+                error = str(raised)
+                if missing_method(raised) is not None:
+                    raise
+            if error is None:
+                raise AssertionError("unknown profile id was accepted")
+            list_result = req("sudo/profiles/list", {})
+            if profile_secret in json.dumps(list_result):
+                raise AssertionError("list still echoes the secret after reveal landed")
+            print("    reveal returned the stored values; list stays flag-only")
+
         def case_profiles_options():
             result = req("sudo/profiles/options", {})
             options = result.get("options")
@@ -829,6 +855,8 @@ def main() -> None:
                    case_profiles_update_keeps_secret, needs="sudo/profiles/save create")
         report.run("sudo/profiles/list hides secrets", "sudo/profiles/list",
                    case_profiles_list_hides_secrets, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/reveal returns stored secrets", "sudo/profiles/reveal",
+                   case_profiles_reveal, needs="sudo/profiles/save create")
         report.run("sudo/profiles/options dropdown payload", "sudo/profiles/options",
                    case_profiles_options, needs="sudo/profiles/save create")
         report.run("ssh/settings binds profile", "ssh/settings/set",
