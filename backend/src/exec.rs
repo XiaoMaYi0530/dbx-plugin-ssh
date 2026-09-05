@@ -802,12 +802,14 @@ pub async fn exec_with_sudo(
     // password readers), so automated writes race an unknowable per-host
     // timing; a plain pipe queues reliably no matter when the reads happen.
     let mut payload = format!("{}\n", auth.password).into_bytes();
+    let mut otp_piped = false;
     if let Some(code) = auth.totp_answer_logged() {
         // Already-committed codes inside their replay window are skipped by
         // the watcher path below instead.
         let mut otp_line = code.into_bytes();
         otp_line.push(b'\n');
         payload.extend_from_slice(&otp_line);
+        otp_piped = true;
     }
     if let Err(error) = channel.data(payload.as_slice()).await {
         return Err(abort_exec_channel(&mut channel, format!("Failed to write sudo password: {error}")).await);
@@ -816,10 +818,11 @@ pub async fn exec_with_sudo(
     // Phase 2: watch for follow-up prompts and collect output. Both factors
     // were piped, so the watcher only answers hosts that re-prompt and
     // reports sudo's authentication failures.
-    let outcome = match run_to_completion(&mut channel, timeout, Some((auth, use_pty))).await {
-        Ok(outcome) => outcome,
-        Err(error) => return Err(abort_exec_channel(&mut channel, error).await),
-    };
+    let outcome =
+        match run_to_completion(&mut channel, timeout, Some((auth, use_pty, otp_piped))).await {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(abort_exec_channel(&mut channel, error).await),
+        };
     if outcome.exit_code != 0 {
         return Err(format!(
             "sudo exited {}: {}",
@@ -861,7 +864,11 @@ pub fn is_pre_exec_transport_error(error: &str) -> bool {
         .any(|marker| error.contains(marker))
 }
 
-type PromptContext<'a> = (&'a SudoAuth, bool);
+/// `(auth, use_pty, otp_piped)` — the third flag records that the OTP code
+/// was already piped to stdin in phase 1, so the watcher must treat the
+/// prompt that consumed it as answered instead of burning the next
+/// secret's code on the same prompt.
+type PromptContext<'a> = (&'a SudoAuth, bool, bool);
 
 const SUDO_WAIT_TIMEOUT_MESSAGE: &str = "Timed out waiting for the remote command to finish. The command may \
      STILL be running on the remote host - check for stray processes or \
@@ -880,7 +887,10 @@ async fn run_to_completion(
     let mut closed = false;
     let mut auth_rounds = 0_u32;
     let mut password_answered = prompt_context.is_some();
-    let mut otp_answered = false;
+    let mut otp_answered = prompt_context
+        .as_ref()
+        .map(|(_, _, otp_piped)| *otp_piped)
+        .unwrap_or(false);
 
     while !closed {
         let message = tokio::time::timeout_at(deadline, channel.wait())
@@ -893,7 +903,7 @@ async fn run_to_completion(
         match message {
             ChannelMsg::Data { ref data } => {
                 stdout.extend_from_slice(data);
-                if let Some((auth, use_pty)) = prompt_context.as_ref() {
+                if let Some((auth, use_pty, _)) = prompt_context.as_ref() {
                     if *use_pty {
                         if let Some(error) = maybe_answer_prompt(
                             channel,
@@ -912,7 +922,7 @@ async fn run_to_completion(
             }
             ChannelMsg::ExtendedData { ref data, .. } => {
                 stderr.extend_from_slice(data);
-                if let Some((auth, _)) = prompt_context.as_ref() {
+                if let Some((auth, _, _)) = prompt_context.as_ref() {
                     if let Some(error) = maybe_answer_prompt(
                         channel,
                         auth,

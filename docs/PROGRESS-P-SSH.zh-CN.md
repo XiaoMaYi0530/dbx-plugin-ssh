@@ -1103,3 +1103,32 @@ reveal 回显多密钥原文）；`smoke_fs_test.py` 新增 `sudo/profiles/revea
 **文档**：PROTOCOL.zh-CN.md（`ssh/settings/get` revealSecrets 参数、
 `sudo/profiles/reveal` 方法条目及其"仅工作台、不进 MCP"边界）。宿主渲染的
 连接表单 `totp_secret` 字段属宿主表单体系，不受本插件控制，不在本轮范围。
+
+### §8.14 修复：OTP 预注入后 watcher 重复应答同一提示，烧掉第二密钥的码（2026-09-05，合并最新 master 后）
+
+**合并 master（kafka、ssh 批量快捷命令 + sudo allowlist、shared/frontend
+适配层）后真机 smoke 暴露新问题**：`same-window replay rotates to the
+second secret` FAIL——同窗第二次 sudo 无任何 OTP 提交，防重放台账把两个
+密钥的码都记为已提交。
+
+**根因**（stderr trace + 提交日志双证）：`exec_with_sudo` Phase 1 把密码与
+OTP 码一起预注入 stdin（`totp_answer_logged` → take #1，烧 secret_a 的码），
+但 Phase 2 watcher 的 `otp_answered` 标志仍是 false——shim/PAM 打出的**同
+一个** "Verification code:" 提示被 watcher 当作新提示再次应答（take #2，
+轮换选中 secret_b 的码），写入的码无人消费、直接废弃，但 usage/committed
+双台账已标记。同窗第二次 sudo 时 a、b 两码均已 committed，selection fallback
+选中已提交码被防重放守卫拦截——轮换语义失效。
+
+**修复**：`PromptContext` 增加 `otp_piped` 标志，Phase 1 成功预注入 OTP 码
+时 watcher 的 `otp_answered` 初始为 true（同一提示不再二次应答；预注入被
+防重放跳过时保持 false，后续真实提示照常应答）。
+
+**验证**：cargo test 212 通过；前端 typecheck 0 错 / vitest 119 过 /
+build 成功（合并 master 后全量复验）；真机 smoke：otp 11 passed / 0 failed
+（同窗轮换、第三次硬跳过、错误密钥拒绝、revealSecrets 回显全过），
+fs 46 passed / 0 skipped / 0 failed（含 `sudo/profiles/reveal` 新用例）。
+
+**排障基建**：`smoke_sudo_otp_test.py` FAIL 时打印完整提交日志（定位
+"码谁烧的"）与 sidecar stderr 过滤尾（进程退出后 drain，避免管道阻塞）。
+另注：sidecar 启动依赖可执行文件名 `dbx-plugin-ssh`——非同名副本无法
+initialize（sidecar closed），smoke 直连二进制排障时需保持原名。

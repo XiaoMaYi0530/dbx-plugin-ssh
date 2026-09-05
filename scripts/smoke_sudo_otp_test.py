@@ -552,8 +552,9 @@ def main() -> None:
                 b_windows = {totp_window(secret_b, w)
                              for w in (now_window - 1, now_window, now_window + 1)}
                 if not submitted:
-                    raise AssertionError("no OTP submission observed for the second attempt; "
-                                         f"sidecar stderr: {client.drain_stderr()[-600:]!r}")
+                    raise AssertionError(
+                        "no OTP submission observed for the second attempt; "
+                        f"full submission log: {setup.read_submission_log()}")
                 if any(code in a_windows for code in submitted):
                     raise AssertionError("the first window's code was replayed")
                 if not any(code in b_windows for code in submitted):
@@ -657,10 +658,20 @@ def main() -> None:
         print(f"  SKIP: all cases — {skip_all}")
     for title, reason in report.skipped:
         print(f"  SKIP: {title} — {reason}")
-    for title, reason in report.failed:
-        print(f"  FAIL: {title} — {reason}")
-    if report.failed:
-        sys.exit(1)
+        for title, reason in report.failed:
+            print(f"  FAIL: {title} — {reason}")
+        if report.failed:
+            # Sidecar 已随 close() 退出：此刻 drain stderr 才不会阻塞，
+            # 排查编排侧 "otp auto-answer skipped" 之类的诊断行。
+            stderr_tail = client.drain_stderr() if client is not None else ""
+            diagnostics = [line for line in stderr_tail.splitlines()
+                           if "otp" in line.lower() or "sudo" in line.lower()
+                           or "trace" in line.lower()]
+            if diagnostics:
+                print("  sidecar stderr (filtered):")
+                for line in diagnostics[-12:]:
+                    print(f"    {line}")
+            sys.exit(1)
     print("sudo/otp smoke: all green")
 
 
