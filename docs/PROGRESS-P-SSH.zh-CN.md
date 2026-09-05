@@ -819,6 +819,223 @@ context（左侧菜单每次点击 mint 新 workbenchId，替换会重载 webvie
 `scripts/install.sh --reinstall`）；宿主 `pnpm tauri build --debug` 重建
 DBX.app。两者都会重启 DBX，待用户窗口期执行。
 
+### §8.11 终端无输出修复：宿主桥二进制事件契约变更适配（2026-09-04）
+
+**症状**：连接成功后终端零输出（无提示符、按键无回显），SFTP 面板正常。
+
+**根因**（对照 ad76537 的终端改动排查，最终定位在宿主桥契约）：上游宿主
+b15281024（随 DBX.app 0.6.2 于 09-04 08:37 生效）把沙箱 binary 事件从
+`{ channel, dataBase64 }` 改为零拷贝 `{ channel, data: Uint8Array }`，
+`dataBase64` 字段不复存在。插件 `handleBinary` 仍读 `event.dataBase64`（恒
+undefined）→ `atob(undefined)` 抛异常 → 每个终端输出帧解码即炸，终端静默；
+SFTP 浏览走 invoke（JSON 通道）不受影响，症状精确吻合。输入方向 sendBinary
+新桥仍兼容 base64 字符串，故按键能发出、无回显。bug 逃过单测的原因：插件
+自带 mockDbxHost 仍按旧形状投递，类型定义（env.d.ts）也是插件本地旧契约，
+typecheck/单测全绿但与真实宿主脱节。
+
+**修复**（纯插件侧，兼容新旧两种桥，符合 Host API 1.0 基线 optional 降级）：
+- `lib/binaryEvent.ts`（新）：`bridgeBinaryBytes` 归一化两种形状——优先
+  `data: Uint8Array`，回退 `decodeBase64(dataBase64)`；+3 spec 用例（新形状/
+  旧形状/双缺失）；
+- `App.vue`：两处 binary 消费（终端输出帧、SFTP 下载分块 waiter）改走归一化
+  函数；
+- `env.d.ts`：`dataBase64` 改 optional、新增 `data?`；
+- `mockDbxHost.ts`：镜像当前宿主桥形状（`data` 字段），消除 mock 与现实脱节
+  （本类 bug 的逃逸口）。
+
+**验证**：typecheck 0 错；vitest **105 绿**（含 3 个新用例）；官方 installer
+装 0.4.16（sha256 93719389…，previous 0.4.15）；对安装副本双冒烟 PASS——
+smoke_test 全链路（连接→PTY 回显→SFTP→关闭）+ smoke_fs_test **45 PASS /
+0 FAIL**。真实终端回显需在 DBX 里重开 SSH 连接人工确认。
+
+**说明**：七语不涉及（无新文案）；版本 0.4.15→0.4.16（Cargo.toml/lock/
+manifest）。**installer 重编**：host 子模块同步后上游依赖需 rustc≥1.94，用
+本机 1.97.1 工具链 `cargo +1.97.1 build -p dbx-core --example
+install_plugin --release` 重编（不动源码树/锁文件）。
+
+**波及面提示**：files 插件前端 `handleBinary`（files/download/ 分块流）同样
+消费 `event.dataBase64`，对 0.6.2 宿主有同样的失效风险，需同款适配（归
+ files/ 并行会话处理，本轮未动）。
+
+**§8.11 增补（同日收敛）**：`binaryEvent` 已上移 `shared/frontend/` 公共适配层
+（与 files 同源单点维护），App.vue 改相对引用、`lib/binaryEvent.spec.ts` 保留
+为引用 shared 的薄 spec（3 用例，验证本插件工具链解析/打包/行为）；插件内本地
+副本删除。约定见 shared/frontend/README.zh-CN.md 与 AGENTS.md 硬性规则 7。
+复验：typecheck 0 错、vitest 112 绿。纯等价重构，已装 0.4.16 行为不变，下次
+构建自动带上 shared 源码。
+
+## 2026-09-04 批量发送命令 + 全局快速命令（0.4.17 → 0.4.18）
+
+**需求**：① 参考 tiny-rdm 在多个打开的会话批量发送命令；② 快速命令原存工作台
+localStorage，宿主 webview 存储按工作台分区 → 表现为"和连接绑定"，改为插件级
+全局存储，沉淀公共脚本。
+
+**契约**（详见 `IMPL_PLAN_BATCH_QUICK.zh-CN.md` 与 PROTOCOL 新节）：
+- 新增 `ssh/quickCommands/list|save|delete`：全局快速命令 CRUD，存储
+  `<data_dir>/quick-commands.json`（原子写 + 0600 + 坏文件降级，照抄
+  quick-sudo-profiles 模式）；上限 20 条、name ≤60、command ≤500；save 返回
+  完整清单供工作台直接采纳权威顺序，delete 对未知 id 回 `removed:false`。
+- 新增 `ssh/terminal/batchInput`：`{sessionIds[], command, appendNewline?=true}`，
+  把命令写入各会话 PTY（对齐 tiny-rdm batch send：输出回显在各自终端、不收集
+  远端输出），返回逐会话 `{results[{sessionId,success,error?}], sent, failed}`；
+  会话不存在/队列满记目标级失败不整体报错；命令归一 `\n`→`\r`、上限 256 KiB。
+- `ssh/sessions/list` 行**追加**只读展示字段 `host`/`port`/`username`
+  （连接注册表解析，缺失回退空/22/空），供批量目标列表显示 `user@host`。
+
+**实现**：
+- 后端：新模块 `quick_commands.rs`（存储 + 校验 + 单测 7 个）；`ssh.rs` 增
+  `batch_terminal_input` 及纯函数 `batch_input_payload`/`dedupe_session_ids`/
+  `batch_input_row`，`session_info_payload` 加 `ConnectionEndpoint`；
+  `main.rs` 注册 4 个方法臂。
+- 前端：`lib/batchSend.ts` 纯函数（目标归一/标签/多选/快捷选择/结果汇总）+
+  spec 7 用例；App.vue 工具栏批量发送按钮 + 弹窗（目标多选、当前会话预选、
+  全选/仅存活、快速命令下拉回填、危险命令复用 `confirmRiskyPaste` 红色确认、
+  逐会话发送结果）；快速命令 CRUD 改走后端 RPC，挂载时 `hydrateQuickCommands`
+  一次性迁移 localStorage 旧数据后清除本地键，后端不可用回退旧语义。
+- i18n：`batchSend*` 15 key + `quickCommandsGlobalHint`，七语全补。
+
+**验证**：cargo test **194 绿**（含 batchInput 纯函数/未知目标聚合、
+quick_commands roundtrip/坏文件/上限）；前端 typecheck 0 错、vitest **119 绿**
+（含 workbench.spec 七语 key 对齐）、build 通过；smoke
+`scripts/smoke_batch_quick_test.py` **10/10**（quickCommands CRUD 全链路 +
+batchInput 真机 PTY 回显 marker 验证 + endpoint 字段），回归 smoke_test /
+smoke_fs_test（45 PASS）/ smoke_batch3_test（17 PASS）全绿。
+
+**说明**：多会话标签/分屏仍 deferred（宿主职责），但批量发送以跨连接会话为
+目标集合已不受"单 workbench"限制（FEATURE_PARITY_BATCH3 deferred 表已注记）。
+快速命令旧 localStorage 键仅作迁移种子，删除逻辑保留七语不涉及新键。
+
+**⚠️ 预存在问题（与本次改动无关，待专项排查）**：`scripts/test.sh` 全套验证在
+`smoke_sudo_otp_test.py` 的 "same-window replay rotates to the second secret"
+用例失败（同一 TOTP 窗口内第二次 sudo exec，shim 未观测到任何 OTP 提交，
+报 "no OTP submission observed"）。A/B 定位：2026-08-29 构建的旧二进制
+`dbx-plugin-ssh-sftp` 两跑全绿（10/10）；**HEAD 提交源码原样构建的基线二进制
+同样失败**——回归介于 8/29 旧二进制与当前 HEAD 之间（0.4.15→0.4.17 的
+sudo 时间戳/OTP 编排改动），先于本次批量/快速命令改动存在。本次任务不涉及
+exec/sudo/OTP 代码路径（diff hunk 已复核）。test.sh 后续两步按其自身 SKIP
+语义处理：mock UI walkthrough（本机无 playwright-core，自门禁 SKIP）、宿主
+plugin_tools_bridge（WIP 未集成不编译，文档化 SKIP）。perf baseline 实测通过
+（终端回显 57.8 MiB/s、上传 149 MB/s、下载 122 MB/s）。建议下轮专项：
+对照 0.4.14→HEAD 的 exec.rs/sudo 编排 diff 定位同一窗口二次提交被跳过的根因。
+
+## 2026-09-05 MCP 只读门禁安全加固（纯后端轮）
+
+**需求**：对只读模式做安全审查（面向 MCP/AI 调用场景），修复发现的缺口：
+① 白名单混入"形似只读、实可变更"的命令（`sort -o`、`find -fprint/-fprintf/-fls`
+可写文件；`ip route flush`/`ip link set` 等深层变更；`git branch -D`/`tag -d`/
+`remote add`/`reflog delete` 变更形态；`dmesg -c/-C/-n`、`history -c` 清理态）；
+② 只读门禁按 connectionId 键控，独立 stdio 内联凭据重拨同一主机可绕过；
+③ 只读连接上读路径无界，`cat ~/.ssh/id_rsa`、`.env`、`/etc/shadow` 等凭据
+位置可直达（LLM 注入后凭只读连接偷凭据的现实威胁）；④ `sftp_download` 在
+只读连接放行且本地落点任意 + `overwrite` 可覆盖本机引导文件（落地即代码执行）。
+
+**实现**（`backend/src/mcp_safety.rs`、`backend/src/mcp.rs`）：
+- 分类器收紧：`sort -o/--output`（含粘连形式）、`find -f…`（`-fprint/-fprintf/
+  -fls` 等）、`dmesg -c/-C/-n/--console-level`、`history -c/-d/-a/-r/-w/-p/-s`
+  一律 Unknown；`git` 移出通用子命令表，改为形态敏感的 `git_segment_risk`
+  （`branch`/`tag` 仅列表形态放行，`remote` 拒变更子命令，`reflog` 仅
+  无参/`show`）；`ip` 增第二层变更子命令检查（`add/del/delete/flush/set/
+  change/replace/append`）。
+- 新增敏感路径拒绝清单：`is_sensitive_path`（`.ssh/.gnupg/.aws/.kube` 目录、
+  `id_*`/`ssh_host_*_key` 私钥、`*.pem/.key/.p12/.pfx`、`/etc/shadow`、
+  `/etc/gshadow`、`/etc/sudoers`、`.env*`、`.netrc`、`.git-credentials`、
+  `.npmrc`、`.htpasswd`、`.pgpass`、`my.cnf`、shell/mysql/psql history；
+  `.pub` 公钥半边放行，尾部 `*` 通配参与 basename 匹配）。命中即把白名单
+  命令降级 Unknown——只读连接拒绝、普通连接不受限，复用既有门禁语义。
+- `call_tool` 门禁序变为四层（写门 → 白名单 → 敏感路径 → 灾难确认）；只读
+  连接上 SFTP 读工具（`sftp_list_dir/read_file/stat/exists/download`）与
+  `ssh_task_status` 的 `path/remotePath/logPath` 参数过同一拒绝清单
+  （`sensitive_read_path`）。
+- 只读判定按连接身份兜底：无 `connectionId` 的内联拨打按
+  `host(ASCII case-insensitive) + port(缺省 22) + username` 与已注册只读
+  连接比对（`inline_dial_is_registered_read_only`），重拨同一主机不绕过。
+- `sftp_download` 本地落点拒绝清单 `is_sensitive_local_path`（任何连接生效，
+  保护操作员本机）：`~/.ssh`、`~/.gnupg`、shell 启动文件、`authorized_keys`、
+  `/etc/cron*`、`/var/spool/cron`、`/etc/systemd/system`、`/Library/Launch*`
+  等；`sftp_download` 工具描述同步。
+- 文档：`MCP.zh-CN.md` 门禁章节改为四层并补本地落点防护段；runInTerminal
+  小节注记敏感路径清单先于路由生效。
+
+**验证**：cargo test **201 绿**（新增 7 用例：`whitelisted_output_flags_are_
+unknown`、`deep_subcommand_mutations_are_unknown`、`sensitive_paths_downgrade_
+read_only`、`inline_dial_inherits_registered_read_only_gate`、
+`read_only_tools_respect_sensitive_path_denylist`、
+`exec_whitelist_refuses_sensitive_paths_on_read_only`、
+`sftp_download_refuses_sensitive_local_targets`）；smoke_mcp **全绿**（只读段
+扩展：8 个加固形态 + 4 个白名单放行形态 + 敏感路径 exec/SFTP 双路 + 本地
+落点拒绝，均离线跑通，无真机段 SKIP 不变）。无 UI 改动，七语不涉及；无新
+协议方法，`PROTOCOL.zh-CN.md` 不涉及。
+
+**边界与遗留**：① 按连接的目录白名单（`readPaths` 允许前缀，收窄只读连接
+的读范围）需表单/七语/前端配套，本轮先落"敏感路径拒绝清单"这一层，留作
+后续可选增强；② 工作台协议 `ssh/exec` 非 sudo 命令仍无白名单（前端信任面，
+与交互终端同权级），未纳入 MCP 门禁范围；③ `kubectl get secrets`、
+`docker inspect`（容器环境变量）属集群级读取，路径类拒绝清单覆盖不到，
+如需管控须在动词层另行处理；④ 模型仍可调用 `ssh_quick_sudo_profiles_save`/
+`ssh_remove_known_host`/`mcp/settings/set` 修改操作员本机配置（属本地配置
+语义而非远端只读范畴，是否纳入进程级只读开关待定）；⑤ `scripts/test.sh`
+全套未跑（历史已知 smoke_sudo_otp 预存在问题与本轮无关，见上节），本轮按
+"改哪层跑哪层"以 cargo test + smoke_mcp 验证。
+
+**§UI 功能测试跑通（同日续）**：`scripts/smoke_ui_mock.mjs` 从锚点可见性升级为
+真功能走查并全绿。前置：playwright-core 装到仓外 `/tmp/dbx-ui-mock`（项目
+package.json 保持零新依赖），系统 Chrome 走 `channel:"chrome"` headless。
+- **顺带修掉 mock 夹具一个真 bug**：mock 宿主 `ssh/session/attach` 缺正常分支
+  （仅 `failSessionOpen` 抛错，其余落兜底 `{success:true}`），启动时
+  `findReattachSession` → attach 的 sessionId 校验必败，工作台一直停在
+  Error 态（"The attached SSH session changed unexpectedly"）——此前 walkthrough
+  的"绿"只是错误态下锚点也可见。补齐 attach 正常分支（回显 sessionId +
+  `replay.complete`，对齐真实 sidecar 重挂语义）后 mock 工作台真正 Connected。
+- **功能断言新增**：快速命令全局弹层（全局提示/添加行/删除后清空，1/20 计数）；
+  批量发送弹窗（目标行 `user@host`、Current/Read only 徽标、快速命令下拉回填
+  草稿、发送后 "Sent to 1 session(s)" summary、mock 终端 PTY 回显命令）；
+  截图 01-03 存 `docs/screenshots-ui-mock/`（*.png 已 gitignore）。
+- 依赖门控顺手修正：原 `existsSync(...) || existsSync(...)` 不会触发 skip，
+  改为显式判断。连跑两轮稳定 all green；typecheck 0 错、vitest 119 绿。
+
+## 2026-09-05 每连接 sudo 命令白名单（sudoers 式，纯后端 + manifest 轮）
+
+**需求**：连接级 sudo 目前"全有或全无"——Quick Sudo 开启后 `ssh_exec_sudo`
+可跑任意特权命令（仅灾难门兜底）。参照 Linux sudoers 为连接增加特权命令
+白名单：操作员声明允许的 sudo 命令模式，AI/MCP 调用命中才放行。
+
+**契约**：
+- 连接表单新字段 `sudo_whitelist`（`external_config.sudo_whitelist`，text，
+  `visible_when: sudo_source ∈ {custom, global}`）：每行一条（`;` 分隔兼容
+  单行输入，`#` 注释），如 `systemctl restart nginx`、`docker restart *`。
+  manifest 七语 label 全补；空 = 门关闭（向后兼容）。
+- 匹配语义（`sudo_allowlist.rs`，比真实 sudoers 严）：令牌精确匹配；`*`
+  匹配一个参数；结尾 `*` 匹配剩余且须至少一个参数；不写通配 = 仅精确命令
+  （反转 sudoers "不写参数=任意参数"的危险默认）；命令前导 `K=V` 赋值与一个
+  `sudo` 令牌剥离后匹配，`sudo` 旗标（`-u` 等 run-as）不建模、永不匹配。
+
+**实现**：
+- 新模块 `sudo_allowlist.rs`：`parse_entries` / `entries_from_lines` /
+  `command_tokens` / `is_allowed` / `render_entries`（拒绝信息回显允许模式，
+  `sudo -l` 风格，LLM 可自我纠正），单测 5 个。
+- `model.rs`：`StoredConnection.sudo_whitelist: Vec<String>`（原始行），
+  `from_lifecycle_params` 解析 external_config；`JumpHost::to_connection`
+  与 mcp 内联构造点补空默认。
+- 门禁三处：① MCP `call_tool`——`ssh_exec_sudo` 及 `ssh_exec`/`ssh_run_bg`
+  内联 `sudo …`（`runs_under_sudo` 检出，防 NOPASSWD/时间戳缓存绕过）在
+  灾难门之前过白名单；② 工作台 `ssh/exec` `sudo: true` 经
+  `SshRuntime::ensure_sudo_allowed` 过门；③ 内联凭据重拨同一主机按端点
+  身份继承白名单（复用上轮 `registered_connection_matching_inline`，只读门
+  同步收敛到该共享助手）。结构化 `sudo_fs`（工作台 sudo 文件面板，用户主动
+  UI 动作）与只读连接的"全拒 sudo"语义不变。
+
+**验证**：cargo test **207 绿**（新增 sudo_allowlist 5 用例 + mcp
+`sudo_allowlist_gates_privileged_tools`：connectionId 命中/未命中、匹配放行、
+内联 sudo 门、身份继承、异机不受限，并覆盖 external_config 解析）；release
+构建通过；smoke_mcp 回归全绿（stdio 无生命周期注册、白名单门离线不可达，
+由单测覆盖）。manifest JSON 结构校验通过（字段序
+`sudo_use_pty → sudo_whitelist → read_only`）。前端不改（表单宿主渲染）。
+
+**边界与遗留**：① 白名单按"命令文本"匹配，不解析 shell——包 wrapper
+（`timeout 10 systemctl restart nginx`）或引号变形不命中即拒绝（保守方向，
+如需放开再议）；② sudoers 的 run-as（`-u`）/NOEXEC 等高级语义未建模；
+③ 工作台交互终端手敲 sudo 不受此门（与既定信任模型一致：白名单管 AI/MCP
+执行面）；④ `scripts/test.sh` 全套未跑（同前述预存在问题），按层验证。
 ### §8.12 TOTP 多密钥跨调用轮换：进程级 OTP 台账 + 目标作用域（2026-09-04）
 
 **问题**：OTP 轮换/防重放两本台账（`otp_usage` / `committed_totp`）原挂在

@@ -83,7 +83,7 @@ dbx-plugin-ssh --mcp
 
 | 工具 | 说明 |
 | --- | --- |
-| `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。TOTP 支持多密钥（换行/分号分隔）：跨调用自动轮换，优先未过期且未使用过的验证码，重放窗口内已提交的码不再注入。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」）；stdio 模式传 `true` 且带 `connectionId` 时自动转发到运行中的 DBX app（未运行则唤起），在 app 的可见终端里执行。**超过 ~10 秒的命令请改用 `ssh_run_bg`**（宿主等待上限与防重复执行见「长任务与断线恢复」） |
+| `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。TOTP 支持多密钥（换行/分号分隔）：跨调用自动轮换，优先未过期且未使用过的验证码，重放窗口内已提交的码不再注入。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令，配置了连接 sudo 白名单时特权命令还须命中白名单条目（见下节）。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」）；stdio 模式传 `true` 且带 `connectionId` 时自动转发到运行中的 DBX app（未运行则唤起），在 app 的可见终端里执行。**超过 ~10 秒的命令请改用 `ssh_run_bg`**（宿主等待上限与防重复执行见「长任务与断线恢复」） |
 | `ssh_run_bg` | 把长命令以 nohup 方式脱离会话启动，立即返回 `taskId`/`pid`/`logPath`；输出落在服务器 `/tmp/.dbx-ssh-tasks/<taskId>.log`，断线、超时、换会话均不丢。与 `ssh_exec` 同受危险命令确认门与只读写门约束 |
 | `ssh_task_status` | 轮询 `ssh_run_bg` 任务：`state`（running/done/missing）、完成后的 `exitCode`、pid 存活状态与输出尾部（`tailBytes`，200–16000）。通过服务器侧日志文件查询，天然跨连接/跨会话 |
 | `ssh_metrics` | CPU/内存/负载/磁盘/运行时长（只读命令） |
@@ -99,16 +99,31 @@ dbx-plugin-ssh --mcp
 
 ## 生产环境误操作防范
 
-MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此 exec 工具在执行前过
-三层安全门（全部在任何网络 I/O 之前，实现见 `backend/src/mcp_safety.rs`）：
+MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此工具调用在执行前过
+四层安全门（全部在任何网络 I/O 之前，实现见 `backend/src/mcp_safety.rs`）：
 
 1. **只读连接写门**：DBX 连接勾选了"只读"后，写类工具（`ssh_exec_sudo`、
    `ssh_run_bg` 与全部 sftp 写操作）直接拒绝，与工作台 `ensure_writable` 同源。
+   只读判定按连接身份：有 `connectionId` 时查注册表；无 `connectionId` 的内联
+   凭据拨打按 `host + port + username` 与已注册只读连接比对，同一主机换个方式
+   重拨不绕过门禁。
 2. **只读命令白名单**：只读连接上的 `ssh_exec` 只放行**可证明只读**的巡检命令
    （`ls` / `cat` / `df` / `ps` / `systemctl status` / `journalctl` / `docker ps`
    / `git log` 等，含管道组合；重定向、命令替换、`sudo`、白名单外的动词一律
-   拒绝）。白名单而非黑名单：识别不了 = 不放行。
-3. **危险命令确认**：任何连接（含非只读）上，命中已知灾难模式的命令要求显式
+   拒绝）。白名单而非黑名单：识别不了 = 不放行。若干"形似只读、实可变更"的
+   形态按 Unknown 处理：`sort -o`（输出落盘）、`find -fprint/-fprintf/-fls`
+   （结果写文件）、`ip` 深层变更子命令（`route flush`、`link set`、`addr add`）、
+   git 变更形态（`branch <名>`、`branch -D`、`tag <名>`、`tag -d`、`remote add`、
+   `reflog delete`）、`dmesg -c/-C/-n`、`history -c/-w` 等。
+3. **敏感路径拒绝清单**（只读连接）：命令参数或 SFTP 读工具（`sftp_list_dir`
+   / `sftp_read_file` / `sftp_stat` / `sftp_exists` / `sftp_download` /
+   `ssh_task_status`）的路径命中凭据/私钥位置即拒绝——`~/.ssh`、`.gnupg`、
+   `.aws`、`.kube` 目录，`id_rsa` 等 `id_*` / `ssh_host_*_key` 私钥、
+   `*.pem/*.key/*.p12/*.pfx`、`/etc/shadow`、`/etc/sudoers`、`.env`、
+   `.netrc`、`.git-credentials`、`.pgpass`、`my.cnf` 及各类 shell history。
+   针对的是"LLM 被注入后凭只读连接偷凭据"这一现实威胁；普通连接不设限
+   （操作员已授予全权）。纵深防御而非穷举——白名单外动词本来就进不来。
+4. **危险命令确认**：任何连接（含非只读）上，命中已知灾难模式的命令要求显式
    `confirmDestructive: true` 才执行；只读连接上直接拒绝、确认位也无法覆盖。
    覆盖的模式：`rm -rf` 深层系统根（`/`、`/etc`、`/usr` 等 ≤2 层路径；`/tmp`、
    `/var/tmp` 下的常规清理不拦）、`mkfs`/`fdisk`/`wipefs` 等磁盘格式化、
@@ -121,9 +136,29 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
 `DBX_SSH_MCP_READ_ONLY=1 dbx-plugin-ssh --mcp`）后，整个进程强制走只读门——
 给生产环境开一个"只能看不能改"的 MCP 入口，操作员级开关、工具无法自行关闭。
 
+**本地落点防护**（任何连接生效，保护的是操作员本机而非远端）：`sftp_download`
+拒绝把远端内容写到 shell/systemd/cron/launchd 引导路径——`~/.ssh`、`~/.gnupg`、
+`.bashrc`/`.zshrc`/`.profile` 等启动文件、`authorized_keys`、`/etc/cron*`、
+`/var/spool/cron`、`/etc/systemd/system`、`/Library/Launch*` 等，防止远端文件
+落地即本地代码执行。
+
+**每连接 sudo 白名单（sudoers 式）**：连接表单 `sudo 命令白名单`
+（`external_config.sudo_whitelist`）按 sudoers 思路为特权命令设白名单，每行
+一条（单行输入可用 `;` 分隔，`#` 注释）。匹配语义比真实 sudoers 更严：
+令牌精确匹配、`*` 匹配一个参数、结尾 `*` 匹配剩余（须至少一个，如
+`systemctl restart *`）；**不写通配 = 只放行这条精确命令**（反转 sudoers
+"不写参数 = 任意参数"的危险默认）；`sudo` 前缀自动剥离，但 `sudo` 旗标
+（`-u` 等 run-as）不建模、永不匹配。白名单非空时，`ssh_exec_sudo`、
+`ssh_exec`/`ssh_run_bg` 里的内联 `sudo …`（防 NOPASSWD/时间戳缓存绕过）与
+工作台 exec 栏的 sudo 执行都要求命中条目，未命中即拒绝并回显允许模式
+（`sudo -l` 风格，LLM 可自我纠正）；空 = 门关闭（行为同旧版）。结构化
+`sudo_fs` 操作（工作台 sudo 文件面板）是用户主动 UI 动作，不在门内。
+内联凭据重拨同一主机时按端点身份继承该主机的白名单（与只读门同源）。
+
 分类器不做 shell 完整解析（引号内 `;` 仍会切分、`$(...)` 与重定向按 Unknown
 处理），所有偏差方向都是"更严"：最坏情况是把可放行的命令降级拒绝，不会放行
-更危险的命令。新增只读动词/危险模式请同步 `mcp_safety.rs` 的表与单测。
+更危险的命令。新增只读动词/危险模式/敏感路径请同步 `mcp_safety.rs` 的表与
+单测，sudo 白名单语义见 `sudo_allowlist.rs`。
 
 ## 长任务与断线恢复
 
@@ -170,8 +205,8 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
 - sudo + 终端路径不注入密码：`sudo …` 原文进用户 shell，密码/TOTP 由终端内
   auto-sudo 自动应答（已配置时）或人工输入。
 
-既有只读白名单、灾难 `confirmDestructive`、进程级只读开关先于路由判定生效，
-`runInTerminal` 不放宽任何安全门。
+既有只读白名单（含敏感路径拒绝清单）、灾难 `confirmDestructive`、进程级只读
+开关先于路由判定生效，`runInTerminal` 不放宽任何安全门。
 
 ## 与 tiny-rdm mcpctl 的关系
 

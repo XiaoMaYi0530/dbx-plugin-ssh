@@ -7,10 +7,12 @@ mod mcp;
 mod mcp_safety;
 mod metrics;
 mod model;
+mod quick_commands;
 mod sftp_copy;
 mod sftp_ext;
 mod ssh;
 mod sudo_fs;
+mod sudo_allowlist;
 mod sudo_profiles;
 
 use std::path::PathBuf;
@@ -125,6 +127,12 @@ impl Plugin {
                 let sudo = params.get("sudo").and_then(Value::as_bool).unwrap_or(false);
                 let timeout_secs = params.get("timeoutSecs").and_then(Value::as_u64);
                 let exec_id = params.get("execId").and_then(Value::as_str);
+                if sudo {
+                    // Connection-level sudoers-style allowlist (mirrors the
+                    // MCP gate); structured sudo_fs ops stay exempt.
+                    self.runtime
+                        .block_on(self.ssh.ensure_sudo_allowed(&session_id, command))?;
+                }
                 self.runtime.block_on(self.ssh.exec(
                     session_id,
                     exec_id,
@@ -145,6 +153,29 @@ impl Plugin {
                 self.runtime
                     .block_on(self.ssh.resize_terminal(session_id, cols, rows))?;
                 Ok(json!({ "success": true }))
+            }
+            "ssh/terminal/batchInput" => {
+                let session_ids = params
+                    .get("sessionIds")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|list| !list.is_empty())
+                    .ok_or("Missing sessionIds")?;
+                let command = required_string(&params, "command")?;
+                let append_newline = params
+                    .get("appendNewline")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                Ok(self.runtime.block_on(
+                    self.ssh
+                        .batch_terminal_input(&session_ids, command, append_newline),
+                ))
             }
             "ssh/terminal/directoryTracking" => {
                 let session_id = required_string(&params, "sessionId")?;
@@ -471,6 +502,12 @@ impl Plugin {
             "sudo/profiles/delete" => {
                 let id = required_string(&params, "id")?;
                 self.runtime.block_on(self.ssh.profiles_delete(id))
+            }
+            "ssh/quickCommands/list" => Ok(self.ssh.quick_commands_list()),
+            "ssh/quickCommands/save" => self.ssh.quick_commands_save(&params),
+            "ssh/quickCommands/delete" => {
+                let id = required_string(&params, "id")?;
+                self.ssh.quick_commands_delete(id)
             }
             "connection/action" => {
                 let action = required_string(&params, "action")?;

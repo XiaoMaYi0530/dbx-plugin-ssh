@@ -4,8 +4,9 @@
  *
  * Boots the vite dev server, opens frontend/mock.html in headless Chrome
  * (playwright-core, system Chrome channel), asserts the workbench anchors
- * render (session pill, terminal host, SFTP pane, toolbar), and saves
- * screenshots for the docs.
+ * render (session pill, terminal host, SFTP pane, toolbar), functionally
+ * exercises the batch-send dialog and the global quick-commands CRUD against
+ * the mock bridge, and saves screenshots for the docs.
  *
  * Dependency policy: playwright-core is installed OUTSIDE the repo
  * (/tmp/dbx-ui-mock, same pattern as the A-LDAP walkthrough) — the project
@@ -35,11 +36,8 @@ try {
 } catch {
   skip("playwright-core not available at /tmp/dbx-ui-mock (npm install --prefix /tmp/dbx-ui-mock playwright-core)");
 }
-try {
-  existsSync("/Applications/Google Chrome.app") || existsSync("/Applications/Chromium.app");
-} catch {
-  skip("no system Chrome/Chromium");
-}
+const hasChrome = existsSync("/Applications/Google Chrome.app") || existsSync("/Applications/Chromium.app");
+if (!hasChrome) skip("no system Chrome/Chromium");
 
 // --- vite dev server ---
 console.log("==> starting vite dev server");
@@ -77,6 +75,26 @@ async function expect(page, selector, label) {
   }
 }
 
+async function expectText(page, selector, text, label) {
+  const el = page.locator(selector, { hasText: text }).first();
+  try {
+    await el.waitFor({ state: "visible", timeout: 15_000 });
+    console.log(`  ok  ${label} (${selector} ~ "${text}")`);
+  } catch {
+    failures.push(`${label}: "${text}" not visible in ${selector}`);
+    console.log(`  FAIL ${label}: "${text}" not visible in ${selector}`);
+  }
+}
+
+async function check(label, condition, detail = "") {
+  if (condition) {
+    console.log(`  ok  ${label}`);
+  } else {
+    failures.push(`${label}${detail ? `: ${detail}` : ""}`);
+    console.log(`  FAIL ${label}${detail ? `: ${detail}` : ""}`);
+  }
+}
+
 const browser = await chromium.launch({ channel: "chrome", headless: true });
 try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
@@ -95,6 +113,51 @@ try {
   mkdirSync(SHOT_DIR, { recursive: true });
   await page.screenshot({ path: `${SHOT_DIR}/01-workbench.png`, fullPage: false });
   console.log(`  screenshot: docs/screenshots-ui-mock/01-workbench.png`);
+
+  // --- global quick commands: add via the toolbar popover -----------------
+  console.log("==> quick commands: global store add");
+  await page.click('button[title="Quick commands"]');
+  await expect(page, ".quick-commands-popover", "quick commands popover");
+  await expectText(page, ".quick-command-global-hint", "Stored globally", "global-store hint");
+  await page.fill(".quick-command-editor input:not(.mono)", "ui-mock cmd");
+  await page.fill(".quick-command-editor input.mono", "echo ui-mock-batch");
+  await page.click(".quick-command-editor .primary-button");
+  await expectText(page, ".quick-command-row strong", "ui-mock cmd", "quick command row");
+  await page.screenshot({ path: `${SHOT_DIR}/02-quick-commands.png`, fullPage: false });
+  console.log(`  screenshot: docs/screenshots-ui-mock/02-quick-commands.png`);
+
+  // --- batch send: dialog, target inventory, quick pick, send -------------
+  console.log("==> batch send: dialog walkthrough");
+  await page.click('button[title="Batch send"]');
+  await expect(page, ".batch-modal", "batch send modal");
+  await expectText(page, ".batch-target-row", "demo@server.demo.internal", "target row user@host");
+  await expectText(page, ".batch-target-row", "Current", "current-session badge");
+  await page.selectOption(".batch-quick-pick", { label: "ui-mock cmd" });
+  const draft = await page.inputValue(".batch-modal input.mono");
+  await check("quick pick fills the command draft", draft === "echo ui-mock-batch", `draft="${draft}"`);
+  await page.screenshot({ path: `${SHOT_DIR}/03-batch-send.png`, fullPage: false });
+  console.log(`  screenshot: docs/screenshots-ui-mock/03-batch-send.png`);
+  await page.click(".batch-modal footer .primary-button");
+  await expectText(page, ".batch-summary", "Sent to 1 session(s)", "batch send summary");
+  try {
+    // The mock bridge echoes the command into the terminal (PTY semantics).
+    await page.waitForFunction(
+      () => document.querySelector(".terminal-host")?.textContent?.includes("echo ui-mock-batch"),
+      null,
+      { timeout: 10_000 },
+    );
+    console.log('  ok  terminal echo ("echo ui-mock-batch")');
+  } catch {
+    failures.push('terminal echo missing ("echo ui-mock-batch")');
+    console.log('  FAIL terminal echo ("echo ui-mock-batch")');
+  }
+  await page.click(".batch-modal header .icon-button");
+
+  // --- global quick commands: delete --------------------------------------
+  console.log("==> quick commands: delete");
+  await page.click('button[title="Quick commands"]');
+  await page.click(".quick-command-row button.icon-button:last-child");
+  await expectText(page, ".quick-commands-popover .empty.compact", "No quick commands yet", "quick commands empty after delete");
 
   if (pageError.length) {
     failures.push(`page errors: ${pageError.slice(0, 3).join(" | ")}`);

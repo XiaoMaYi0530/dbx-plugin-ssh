@@ -67,8 +67,16 @@ function isPositiveFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
+// 宿主下发的 appearance 允许逐字段缺失（1.0 部分下发、1.1 theme 通道只带颜色令牌）。
+export interface DbxPluginAppearanceInput {
+  colorScheme?: "light" | "dark";
+  colors?: Partial<DbxPluginAppearance["colors"]>;
+  terminal?: Partial<DbxPluginAppearance["terminal"]>;
+  ui?: Partial<NonNullable<DbxPluginAppearance["ui"]>>;
+}
+
 // 返回值保证 ui 字段存在，调用方无需再判空。
-export function resolveAppearance(next?: Partial<DbxPluginAppearance> | null): DbxPluginAppearance & { ui: { fontFamily: string } } {
+export function resolveAppearance(next?: DbxPluginAppearanceInput | null): DbxPluginAppearance & { ui: { fontFamily: string } } {
   const colorScheme = next?.colorScheme === "light" ? "light" : "dark";
   const colors: DbxPluginAppearance["colors"] = { ...DBX_APPEARANCE_PALETTES[colorScheme] };
   const hostColors = next?.colors as Record<string, unknown> | undefined;
