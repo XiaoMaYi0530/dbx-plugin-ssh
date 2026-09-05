@@ -1073,3 +1073,19 @@ package.json 保持零新依赖），系统 Chrome 走 `channel:"chrome"` headle
 **文档**：PROTOCOL.zh-CN.md Quick Sudo 段（台账进程全局 + 作用域/指纹键控 +
 排序语义）、MCP.zh-CN.md 工具表、`totpSecret` 工具 schema 描述补多密钥
 （换行/分号分隔）轮换语义。
+
+## 2026-09-05 启动恢复插件 tab 自动重连（boot 恢复路径 inactive 重试放开）
+
+宿主侧已为启动恢复的插件 tab 重放连接生命周期（host/queryStore 新增
+`reconnectRestoredPluginTabs`，见 shared/PROGRESS-HOST-SUBREPO 第 18 节）。
+配套放宽本插件此前「inactive 立即失败」的假设：
+
+- `openSession(forceNew, bootRestore)`：boot 恢复路径（`onMounted` 的
+  会话打开分支）传 `bootRestore=true`，`Connection is not active` 与其它
+  快失败一起走原有 3 次（2/4/6s）有界重试——宿主重放的 connect 落地后
+  下一次 open 即自愈；重试耗尽仍回落七语 `connectionInactive` 指引。
+- 非 boot 路径（`reconnect`/`reconnectNow`/掉线重连）保持 inactive 立即
+  失败不变：连接确实没被宿主建立时重试不可能成功。
+- 无新增用户可见文案（七语无改动）。
+- 验证：`vue-tsc` 0 错；`vitest run` 12 文件 119 用例全绿。真机复验随
+  host 第 18 节待办一并执行。

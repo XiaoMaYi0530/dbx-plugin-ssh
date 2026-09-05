@@ -1378,7 +1378,7 @@ function normalizeTransferStatus(value: unknown, fallback: TransferTask["status"
   return ["queued", "running", "completed", "cancelled", "failed"].includes(String(value)) ? String(value) as TransferTask["status"] : fallback;
 }
 
-async function openSession(forceNew = false) {
+async function openSession(forceNew = false, bootRestore = false) {
   if (!connectionId.value || !workbenchId.value) return;
   window.clearTimeout(reconnectTimer);
   reconnectAttempt = 0;
@@ -1429,15 +1429,17 @@ async function openSession(forceNew = false) {
   } catch (cause) {
     if (disposed) return;
     const attemptMs = Date.now() - attemptStarted;
-    // "Connection is not active"（宿主重启恢复工作台但未重放 connect 生命周期）
-    // 重试永远不可能成功：立即失败并用本地化文案指引用户重新打开连接。
+    // "Connection is not active"：sidecar 连接注册表还没有该连接。boot 恢复
+    // 场景（宿主启动时为恢复的插件 tab 重放 connect 生命周期）这是暂时态，
+    // 与其它快失败一起在窗口内重试即可自愈；非 boot 路径（手动重连等）重试
+    // 仍不可能成功，保持立即失败并指引从左侧连接重新打开。
     const inactive = isConnectionInactiveError(cause);
-    if (!inactive && openRetryAttempt < OPEN_RETRY_MAX && attemptMs < 8_000) {
+    if (!(inactive && !bootRestore) && openRetryAttempt < OPEN_RETRY_MAX && attemptMs < 8_000) {
       openRetryAttempt += 1;
       terminalState.value = "connecting";
       const delayMs = 2000 * openRetryAttempt;
       reconnectTimer = window.setTimeout(() => {
-        if (!disposed) void openSession(false);
+        if (!disposed) void openSession(false, bootRestore);
       }, delayMs);
       return;
     }
@@ -3885,7 +3887,10 @@ async function initialize() {
     // 存活会话并 attach（replay 恢复终端内容），避免全新拨号重置连接。
     const reattach = await findReattachSession();
     if (reattach) await attachSession(reattach, reattach);
-    else await openSession();
+    // bootRestore: 宿主启动恢复 tab 时会异步重放 connect（见 queryStore
+    // reconnectRestoredPluginTabs），首个 ssh/session/open 可能先于它落地，
+    // inactive 错误在该路径下参与有界重试。
+    else await openSession(false, true);
   }
 }
 
