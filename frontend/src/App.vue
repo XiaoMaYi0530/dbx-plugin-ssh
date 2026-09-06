@@ -62,6 +62,8 @@ import {
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
+import { decideConnectRetry } from "./lib/connectRetry";
+import { focusableElements, nextFocusIndex, pickModalFocusTarget } from "./lib/modalFocus";
 import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
@@ -83,6 +85,7 @@ import { isDbxPluginTheme, onHostThemeChange, themeToAppearance } from "./lib/ho
 import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload } from "./lib/agentTerminal";
 import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRestore";
+import { toolbarTintStyle } from "./lib/toolbarTint";
 import { bridgeBinaryBytes } from "../../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
 import { workbenchMessage } from "./lib/i18n";
@@ -696,14 +699,8 @@ const connectionAuthMethodLabel = computed(() => formatAuthMethodLabel(connectio
   };
   return labels[method];
 }));
-const toolbarStyle = computed(() => {
-  const color = connection.value.color;
-  if (!color) return undefined;
-  return {
-    backgroundColor: colorWithAlpha(color, 0.1),
-    boxShadow: `inset 0 1px 0 ${colorWithAlpha(color, 0.18)}`,
-  };
-});
+// 连接色染色按主题分级（light 压低 alpha 保 muted 文字 AA 对比度，P2-4）。
+const toolbarStyle = computed(() => toolbarTintStyle(connection.value.color, appearance.value.colorScheme));
 const terminalBasis = computed(() => ({ flexBasis: sftpPaneOpen.value ? `${splitRatio.value}%` : "100%" }));
 const orderedPaneClass = computed(() => [
   paneOrder.value === "sftp-left" ? "panes panes--reversed" : "panes",
@@ -1378,14 +1375,17 @@ function normalizeTransferStatus(value: unknown, fallback: TransferTask["status"
   return ["queued", "running", "completed", "cancelled", "failed"].includes(String(value)) ? String(value) as TransferTask["status"] : fallback;
 }
 
-async function openSession(forceNew = false, bootRestore = false) {
+async function openSession(forceNew = false, bootRestore = false, isRetry = false) {
   if (!connectionId.value || !workbenchId.value) return;
   window.clearTimeout(reconnectTimer);
   reconnectAttempt = 0;
   // Boot-time tab restore can race the host's plugin activation and fail the
   // very first ssh/session/open; a bounded retry self-heals the restored
   // terminal instead of parking it on a manual reconnect button.
-  openRetryAttempt = 0;
+  // P1-1：重试计数只在"新入口"（用户动作 / 断线重连 / 初次打开）归零；
+  // 重试定时器重入时必须保留计数，否则 OPEN_RETRY_MAX 永远打不满，
+  // 认证失败等秒级永久错误会无限重试、错误文案永不呈现。
+  if (!isRetry) openRetryAttempt = 0;
   // A session opened over a stale one must not inherit a stuck ZMODEM
   // overlay (zmodemBusy would keep swallowing terminal input).
   cancelZmodemUpload();
@@ -1432,15 +1432,24 @@ async function openSession(forceNew = false, bootRestore = false) {
     // "Connection is not active"：sidecar 连接注册表还没有该连接。boot 恢复
     // 场景（宿主启动时为恢复的插件 tab 重放 connect 生命周期）这是暂时态，
     // 与其它快失败一起在窗口内重试即可自愈；非 boot 路径（手动重连等）重试
-    // 仍不可能成功，保持立即失败并指引从左侧连接重新打开。
+    // 仍不可能成功，保持立即失败并指引从左侧连接重新打开。认证 / host-key
+    // 拒绝是秒级永久错误，重试不可能自愈——跳过重试直接进 error 态，
+    // 呈现 friendly 文案 + Reconnect 出口（P1-1）。决策细节见 connectRetry.ts。
     const inactive = isConnectionInactiveError(cause);
-    if (!(inactive && !bootRestore) && openRetryAttempt < OPEN_RETRY_MAX && attemptMs < 8_000) {
-      openRetryAttempt += 1;
+    const decision = decideConnectRetry({
+      cause,
+      attempt: openRetryAttempt,
+      maxAttempts: OPEN_RETRY_MAX,
+      attemptMs,
+      inactive,
+      bootRestore,
+    });
+    if (decision.kind === "retry") {
+      openRetryAttempt = decision.attempt;
       terminalState.value = "connecting";
-      const delayMs = 2000 * openRetryAttempt;
       reconnectTimer = window.setTimeout(() => {
-        if (!disposed) void openSession(false, bootRestore);
-      }, delayMs);
+        if (!disposed) void openSession(false, bootRestore, true);
+      }, decision.delayMs);
       return;
     }
     terminalState.value = "error";
@@ -3697,10 +3706,100 @@ function copySelectedPaths() {
 }
 
 /**
+ * 弹层焦点管理（P1-2）：打开时焦点进入弹层首控件、Tab 圈定在弹层内、
+ * 关闭后归还触发元素。原生 autofocus 在 Vue 动态插入时不生效，改为
+ * 显式驱动；决策逻辑走 modalFocus 纯函数（有单测），Esc 关闭链沿用
+ * 下方 onDocumentKeydown 的分层退出。
+ */
+// 触发元素栈：与弹层嵌套深度同步 push/pop。右键菜单项这类"打开弹层后自身
+// 随菜单卸载"的触发元素无法承接归还焦点，逐层弹出时跳过已断连元素。
+const modalTriggerStack: HTMLElement[] = [];
+// 弹层外最近聚焦的稳定元素：右键菜单项属瞬态控件（点击打开弹层后随菜单
+// 卸载，无法承接归还焦点），归还目标回退到菜单打开前的焦点宿主；
+// 弹层内聚焦不覆盖该记录。
+let lastStableFocus: HTMLElement | null = null;
+function trackStableFocus(event: FocusEvent) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  if (target.closest(".modal-backdrop") || target.closest(".context-menu")) return;
+  lastStableFocus = target;
+}
+// 与 Esc 关闭链同源的弹层在开状态（hostKey/agent 审批属安全弹窗：
+// 参与聚焦与 Tab 陷阱，但不参与 Esc 关闭）。按模板出现顺序排列，
+// 计数变化驱动聚焦/归还；同层互斥由交互保证。
+const modalOpenStates = computed(() => [
+  previewOpen.value,
+  pasteConfirm.value,
+  attrsTarget.value,
+  deleteTarget.value,
+  batchDeleteOpen.value,
+  chmodTarget.value,
+  newFileDialog.value,
+  operationDialog.value,
+  commandOpen.value,
+  batchOpen.value,
+  profilesOpen.value,
+  settingsOpen.value,
+  hostKeyPrompt.value,
+  agentPromptHead.value,
+]);
+const modalOpenCount = computed(() => modalOpenStates.value.filter(Boolean).length);
+
+/** 当前最顶层弹层容器；无弹层时返回 null（同时只开一层，取首个命中即可）。 */
+function topModalContainer(): HTMLElement | null {
+  if (!modalOpenCount.value) return null;
+  return document.querySelector<HTMLElement>(".modal-backdrop .modal");
+}
+
+function focusTopModal() {
+  pickModalFocusTarget(topModalContainer())?.focus({ preventScroll: true });
+}
+
+watch(modalOpenCount, (count, previous) => {
+  if (count > previous) {
+    // 打开：整组从无到有时记录触发元素供关闭归还；嵌套打开（如命令
+    // 对话框上叠粘贴确认）逐层入栈。触发元素优先取"弹层外稳定焦点"，
+    // 避免抓到已随右键菜单卸载的菜单项。
+    for (let i = previous; i < count; i++) {
+      modalTriggerStack.push(lastStableFocus ?? document.body);
+    }
+    void nextTick(focusTopModal);
+    return;
+  }
+  if (!count) {
+    // 全部关闭：焦点归还触发按钮；触发元素已随右键菜单等卸载时逐层回退，
+    // 找不到任何在档元素则落回 BODY（无焦点宿主可还）。
+    while (modalTriggerStack.length) {
+      const trigger = modalTriggerStack.pop()!;
+      if (trigger.isConnected) {
+        trigger.focus({ preventScroll: true });
+        break;
+      }
+    }
+    return;
+  }
+  // 内层弹层关闭、外层仍在：焦点回落外层弹层首控件。
+  void nextTick(focusTopModal);
+});
+
+/**
  * Esc 关闭链（一次按键关一层）：预览 > 对话框 > 右键菜单 > 工具栏弹出层。
  * 逐层 if-return：无内容打开时按键穿透，不影响终端内 vim 等自身 Esc 语义。
  */
 function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.key === "Tab") {
+    // 弹层 Tab 焦点陷阱（P1-2）：仅当弹层在场时圈定，无弹层不拦截
+    // （终端/shell 内 Tab 补全等语义不受影响）。
+    const container = topModalContainer();
+    if (!container) return;
+    const focusables = focusableElements(container);
+    const currentIndex = focusables.indexOf(document.activeElement as HTMLElement);
+    const index = nextFocusIndex(focusables.length, currentIndex, event.shiftKey);
+    if (index < 0) return;
+    event.preventDefault();
+    focusables[index]?.focus({ preventScroll: true });
+    return;
+  }
   if (event.key !== "Escape") return;
   if (previewOpen.value) {
     closePreview();
@@ -3812,16 +3911,6 @@ function formatUptime(seconds: number) {
   return t("uptimeMinutes", { count: minutes });
 }
 
-function colorWithAlpha(color: string, alpha: number) {
-  const match = color.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
-  if (!match) return `color-mix(in srgb, ${color} ${Math.round(alpha * 100)}%, transparent)`;
-  const hex = match[1].length === 3 ? [...match[1]].map((part) => `${part}${part}`).join("") : match[1];
-  const red = Number.parseInt(hex.slice(0, 2), 16);
-  const green = Number.parseInt(hex.slice(2, 4), 16);
-  const blue = Number.parseInt(hex.slice(4, 6), 16);
-  return `rgb(${red} ${green} ${blue} / ${alpha})`;
-}
-
 function formatModified(value?: number) {
   if (!value) return "";
   return new Intl.DateTimeFormat(locale.value, { dateStyle: "short", timeStyle: "short" }).format(new Date(value * 1000));
@@ -3913,6 +4002,7 @@ watch([splitRatio, paneOrder, sftpPaneOpen, followDirectory, sudoMode, visibleCo
 onMounted(() => {
   document.addEventListener("click", closeMenus);
   document.addEventListener("keydown", onDocumentKeydown);
+  document.addEventListener("focusin", trackStableFocus);
   void hydrateQuickCommands();
   void initialize().catch((cause) => {
     terminalState.value = "error";
@@ -3940,6 +4030,7 @@ onBeforeUnmount(() => {
   }
   document.removeEventListener("click", closeMenus);
   document.removeEventListener("keydown", onDocumentKeydown);
+  document.removeEventListener("focusin", trackStableFocus);
   unsubscribeEvent?.();
   unsubscribeBinary?.();
   unsubscribeAppearance?.();
@@ -4094,10 +4185,10 @@ onBeforeUnmount(() => {
         <div v-if="terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
           <Loader2 v-if="terminalState === 'connecting'" class="spinning large-icon" />
           <svg v-else class="terminal-state-icon" viewBox="0 0 64 64" role="img" aria-label="SSH">
-            <rect x="5" y="8" width="54" height="48" rx="9" fill="#111827" />
-            <rect x="8" y="11" width="48" height="42" rx="6" fill="#1f2937" stroke="#60a5fa" stroke-width="2" />
-            <path d="m17 23 9 9-9 9" fill="none" stroke="#86efac" stroke-linecap="round" stroke-linejoin="round" stroke-width="4" />
-            <path d="M31 41h15" fill="none" stroke="#e5e7eb" stroke-linecap="round" stroke-width="4" />
+            <rect x="5" y="8" width="54" height="48" rx="9" style="fill: color-mix(in srgb, var(--muted) 55%, var(--background))" />
+            <rect x="8" y="11" width="48" height="42" rx="6" style="fill: var(--background); stroke: var(--primary)" stroke-width="2" />
+            <path d="m17 23 9 9-9 9" fill="none" style="stroke: var(--success)" stroke-linecap="round" stroke-linejoin="round" stroke-width="4" />
+            <path d="M31 41h15" fill="none" style="stroke: var(--muted-foreground)" stroke-linecap="round" stroke-width="4" />
           </svg>
           <p :title="terminalErrorDetail || undefined">{{ sessionStatus === "connecting" ? t("connecting") : sessionStatus === "reconnecting" ? (terminalErrorFriendly || terminalError || t("sessionStatus.reconnecting")) : (terminalErrorFriendly || terminalError || t("disconnected")) }}</p>
           <button v-if="terminalState !== 'connecting'" class="primary-button" @click="reconnect">{{ t("reconnect") }}</button>
@@ -4767,11 +4858,11 @@ onBeforeUnmount(() => {
     </section>
     <section v-if="hostKeyPrompt" class="modal-backdrop">
       <article class="modal host-key-modal">
-        <header><h2>Verify SSH host key</h2></header>
-        <p>Confirm this fingerprint before DBX sends credentials.</p>
-        <dl><dt>Server</dt><dd>{{ hostKeyPrompt.host }}:{{ hostKeyPrompt.port }}</dd><dt>Key type</dt><dd>{{ hostKeyPrompt.keyType }}</dd><dt>Fingerprint</dt><dd class="fingerprint">{{ hostKeyPrompt.fingerprint }}</dd></dl>
-        <label class="remember"><input v-model="rememberHostKey" type="checkbox" /> Remember this key</label>
-        <footer><button @click="resolveHostKey(false)">Reject</button><button class="primary-button" @click="resolveHostKey(true)">Trust and connect</button></footer>
+        <header><h2>{{ t("hostKeyDialog.title") }}</h2></header>
+        <p>{{ t("hostKeyDialog.desc") }}</p>
+        <dl><dt>{{ t("hostKeyDialog.server") }}</dt><dd>{{ hostKeyPrompt.host }}:{{ hostKeyPrompt.port }}</dd><dt>{{ t("hostKeyDialog.keyType") }}</dt><dd>{{ hostKeyPrompt.keyType }}</dd><dt>{{ t("hostKeyDialog.fingerprint") }}</dt><dd class="fingerprint">{{ hostKeyPrompt.fingerprint }}</dd></dl>
+        <label class="remember"><input v-model="rememberHostKey" type="checkbox" /> {{ t("hostKeyDialog.remember") }}</label>
+        <footer><button @click="resolveHostKey(false)">{{ t("hostKeyDialog.reject") }}</button><button class="primary-button" @click="resolveHostKey(true)">{{ t("hostKeyDialog.trust") }}</button></footer>
       </article>
     </section>
 

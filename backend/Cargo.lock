@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-plugin-ssh"
-version = "0.4.24"
+version = "0.4.30"
 dependencies = [
  "base64",
  "data-encoding",

@@ -3,17 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- data: 占位 favicon：避免 dev 首载 /favicon.ico 404 控制台噪音（P2-6）。 -->
+    <link rel="icon" href="data:," />
     <title>SSH/SFTP workbench — visual fixture</title>
   </head>
   <body>
     <div id="app"></div>
+    <!-- 先装 mock 宿主，再复用真实入口 main.ts（含 installHostThemeBridge），
+         让 fixture 与生产引导路径一致，语义令牌（--success/--warning/--overlay）不再漂移。 -->
     <script type="module">
       import "./src/mockDbxHost.ts";
-      import "@xterm/xterm/css/xterm.css";
-      import "./src/style.css";
-      import { createApp } from "vue";
-      import App from "./src/App.vue";
-      createApp(App).mount("#app");
+      import "./src/main.ts";
     </script>
   </body>
 </html>

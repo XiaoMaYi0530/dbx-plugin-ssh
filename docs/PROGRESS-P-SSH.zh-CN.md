@@ -1100,3 +1100,134 @@ package.json 保持零新依赖），系统 Chrome 走 `channel:"chrome"` headle
 - JS `applyAppearance` 保留（终端 ANSI 调色板等非 CSS 场景仍需）。
 - 验证：`vue-tsc` 0 错；`vitest run` 13 文件 122 用例全绿（含新增
   `themeSync.spec.ts` 薄 spec）；v0.4.24 发版真机亮色主题下工作台首绘同步。
+
+## 白色主题配色标准化（2026-09-05 第二轮）
+
+四插件联合审查白色主题配色错误，语义令牌与明暗分支在
+`shared/frontend/themeSync.ts` 单点收敛，插件只消费变量。
+
+- 桥新增语义状态色 `--success`/`--success-bg`/`--warning`/`--warning-bg`
+  （跟随宿主 `--color-success*`/`--color-warning*`；Host API 1.0/mock 缺令牌时
+  light 分支回退宿主 tokens.css 规范值 rgb(22 163 74)/rgb(217 119 6)，暗色回退
+  rgb(74 222 128)/rgb(251 191 36)）与模态遮罩 `--overlay`（亮色黑 40%，
+  暗色 `color-mix(var(--background) 70%, transparent)`）。
+- 明暗 CSS 分支统一双属性匹配：`:root[data-theme=…]`（插件 applyAppearance）+
+  `:root[data-dbx-theme=…]`（宿主 SDK applyTheme），谁先到都生效，消除
+  waitForHostApi 轮询窗口期的错配。
+- ssh 本轮替换：会话状态徽章（#22c55e/#eab308/#f97316/#ef4444 → 语义令牌，
+  connecting 黄色白底 1.9:1 不可读问题一并解决）、重连横幅（#f97316 →
+  `--warning`）、`.folder-icon`（#e6ad52 → `--warning`，白底可读）、
+  modal 遮罩（25%/dark 分支 → `--overlay`）、终端空态 SVG 硬编码深色
+  （#111827/#1f2937/#60a5fa/#86efac/#e5e7eb → 主题变量内联 style）、
+  `.terminal-command-marker.failed` → `--destructive`、图标 dark 变体双属性化。
+- 验证：`vue-tsc` 0 错；`vitest run` 13 文件 123 用例全绿（themeSync 薄 spec
+  增补语义令牌/遮罩/light 回退断言）。无新增文案，七语不受影响。
+
+## 主题配色第三轮：progress 着色、预览选区、mock 桥接对齐（2026-09-05）
+
+继续收敛残留的非令牌化配色与一处 fixture 漂移，改动均为前端单层：
+
+- **metrics 磁盘警戒红从未生效**：`.disk-row progress.disk-warn::-progress-value`
+  是无效伪元素（各家实为 `::-webkit-progress-value` / `::-moz-progress-bar`），
+  任何浏览器都不匹配，磁盘 ≥85% 转红的意图从未渲染；同时磁盘/网络行 progress
+  无 `accent-color`，走浏览器默认蓝。改为 `accent-color: var(--primary)` +
+  `.disk-warn { accent-color: var(--destructive) }`（progress 跨浏览器唯一可靠
+  着色点）。重连横幅 progress 补 `accent-color: var(--warning)`。
+- **metrics 悬浮卡进程表头色差**：复用的全局 `.file-header` 带 `var(--background)`
+  底色，在 popover 底色卡片上显出一块色差；加 `.metrics-float .file-header`
+  上下文覆盖为 `var(--popover)`。
+- **文本预览选区**：`TextPreview.vue` CodeMirror 选区色由单值 `#5f7aa855` 改为随
+  colorScheme 切换（dark `#5f6f8a88` / light `#93b4e088`），与 xterm
+  `selectionBackground` 同一观感。
+- **mock.html 漏装主题桥**（规约第 7 条"mock 镜像真实桥形状"）：mock.html 自行
+  复制了 main.ts 引导却缺 `installHostThemeBridge()`，导致 mock 中
+  `--success/--warning/--overlay` 全部未定义——第二轮引入的语义令牌（连接状态点、
+  文件夹图标、重连横幅、模态遮罩）在 mock 里根本显示不出来，视觉验证与生产脱节。
+  改为 mock.html 直接 `import "./src/main.ts"`（与 visual.html 一致），从根上消除
+  这类漂移。`mockDbxHost` 磁盘 fixture 把 `/data` 调到 87%，让 disk-warn 两态
+  可被视觉验证覆盖。
+- 验证：`vue-tsc` 0 错；`vitest run` 13 文件 123 用例全绿；
+  `scripts/smoke_ui_mock.mjs` 全绿。无头 Chromium 对 `mock.html?theme=light|dark`
+  逐项读计算样式并截图：磁盘 48%/0% 行 accent 为 `--primary`，87% 行为
+  `--destructive`（light rgb(231 0 11) / dark rgb(243 98 95)）；`--warning`
+  解析为 light rgb(217 119 6) / dark rgb(251 191 36)，重连横幅 progress accent
+  跟随；连接绿点 `--success`（rgb(22 163 74) / rgb(74 222 128)）、文件夹图标
+  `--warning` 两主题均正确。无新增文案，七语不受影响。
+- 已知 fixture 局限（未改）：mock 启动路径经 `ssh/sessions/list` 附着既有会话、
+  不调用 `ssh/session/open`，`?err=disconnect` 掉线计时器不触发，重连横幅只能靠
+  计算样式探针验证而非全流程截图。
+
+## 批量发送 "The object can not be cloned."（2026-09-06，根因在宿主桥）
+
+真机批量发送报 WebKit DataCloneError。根因：`sendBatchCommand` 把
+`batchSelected.value`（Vue 响应式 Proxy 数组）直接传 `dbxPlugin.invoke`，宿主
+注入 SDK 的 `request()` 裸 `parent.postMessage`，Proxy 无法 structured clone。
+修复在宿主注入 SDK 单点（params 普通化：structuredClone 优先、JSON 往返兜底），
+四插件全部 invoke 调用点一并治愈；详见
+`shared/PROGRESS-HOST-SUBREPO.zh-CN.md` §21。宿主重建后生效，本插件无代码
+改动、无需重发包；mock 页因无 postMessage 克隆边界而不可复现该问题。
+
+## UI 扫描 P1 修复：连接失败错误呈现 + 弹层焦点管理（2026-09-06）
+
+第 1 轮场景化 UI 扫描（`docs/UI_SCAN_FINDINGS.zh-CN.md`）两条 P1 与顺手项 P2-3 的修复轮。
+仅触碰 `frontend/` 内文件：`src/App.vue`、`src/lib/i18n.ts`（七语补键）、
+`src/lib/connectRetry.ts` + `connectRetry.spec.ts`（新建）、`src/lib/modalFocus.ts` +
+`modalFocus.spec.ts`（新建）。未提交 git、未动依赖；kafka/shared 仅读参考未改动。
+
+- **P1-1 认证失败无限重试**：根因是 `openSession()` 每次重入把 `openRetryAttempt`
+  归零，`OPEN_RETRY_MAX=3` 永远打不满，秒级失败的认证错误无限转圈、错误文案永不呈现。
+  修复：`openSession` 增加 `isRetry` 参数，重试定时器重入保留计数、仅新入口归零；
+  重试决策抽为纯函数 `connectRetry.decideConnectRetry()`（backoff 2s·N、单次 ≥8s 快失败
+  窗口、inactive 非 boot 即败、auth/hostKey 永久错误跳过重试立即进 error 态）。
+  error 态复用现有 overlay：`connectError.*` friendly 七语文案 + Reconnect 按钮（出口既有）。
+- **P1-2 弹层焦点管理**：原生 autofocus 对 Vue 动态插入 DOM 无效，全部弹层焦点不进入、
+  Tab 逸出、关闭落 BODY。修复：ssh 内落地 `modalFocus.ts` 纯函数
+  （focusableElements / nextFocusIndex / decideModalKeydown / pickModalFocusTarget），
+  App.vue 弹层开状态计数 watch 驱动"打开聚焦首控件（autofocus 属性改作定位提示）/
+  关闭归还触发元素"，触发元素栈与嵌套深度同步 push/pop；右键菜单项这类打开后即卸载的
+  瞬态触发元素不可承接归还，`focusin` 跟踪"弹层/右键菜单外最近稳定焦点"作回退目标；
+  `onDocumentKeydown` 增加 Tab 焦点陷阱分支（无弹层不拦截，终端 Tab 穿透不受影响），
+  Esc 关闭链原样保留。host-key/agent 审批安全弹窗参与聚焦与陷阱、但不参与 Esc 关闭。
+- **P2-3 host-key 弹窗文案 i18n**：`Verify SSH host key` 等 5 处硬编码英文改走
+  `hostKeyDialog.*` 七语 8 键（en/es/it/ja/pt-BR/zh-CN/zh-TW）。
+
+验证：`pnpm typecheck` 0 错；`pnpm test` 19 文件 182 用例全绿（新增 connectRetry 7 +
+modalFocus 9；既有七语键集合/占位符一致性测试自动看护新键）。浏览器复验
+（vite :5291 + playwright-core + 系统 Chrome，走查脚本与截图均未入库）：
+`?err=authfail` 于 t+0.5s/8s/15s 三观察点稳定呈现 friendly 文案 + Reconnect 出口、
+无转圈、点击有响应；`?rw=1` 下命令对话框/批量发送/删除确认三类弹层 16 项检查全绿
+（首控件聚焦、6×Tab + Shift+Tab 不出弹层、Esc 关闭后焦点归还触发按钮，删除确认不再落 BODY）。
+遗留：P1-1 的真机 sidecar 认证失败重试节奏复核建议随下次真机轮补做；P2-1/P2-2/P2-4/P2-5/P2-6 夹具与打磨项未在本轮处理。
+
+## UI 扫描第 2 轮清理：全部 P2 收口（2026-09-06）
+
+第 1 轮 UI 扫描剩余 P2（P2-1/P2-2/P2-4/P2-5/P2-6）的清理轮。仅触碰
+`frontend/` 内文件：`src/mockDbxHost.ts`、`mock.html`、`src/App.vue`、
+`src/lib/toolbarTint.ts` + `toolbarTint.spec.ts`（新建）、
+`src/mockDbxHost.spec.ts`（新建）。未提交 git、未动依赖；无新增用户可见
+文案，七语不受影响。
+
+- **P2-1 `?err=disconnect` 默认启动失效**：断开注入抽为 `scheduleDisconnect()`，
+  open 与 attach（默认 reattach 启动路径）完成会话后都调用，全局单发不复发。
+  直接打开 `mock.html?err=disconnect` 约 4s 后横幅自动出现，自动重连后恢复。
+- **P2-2 默认首屏终端仅一行 prompt**：open 与 attach 共用同一份
+  `terminalTranscript`（Welcome + OSC 633 周期 + prompt），attach 完成后推送，
+  默认首屏即含 Welcome、命令回显与 command-marker 条（"Shell integration active"），
+  command-marker 视觉验证不再依赖手动重连。
+- **P2-4 light 主题工具栏染色对比度**：染色收口为 `lib/toolbarTint.ts`
+  `toolbarTintStyle()` 纯函数（App.vue 原 `colorWithAlpha` 内联逻辑迁入），
+  dark 保持 10%/18%，light 压到 4%/8%。浏览器实测 light 下会话 pill 对比度
+  4.53:1（修复前 ≈4.22:1，AA 达标）。
+- **P2-5 `?mock=1` 过时注释**：更正为"无条件生效，无开关参数"。
+- **P2-6 dev 首载 404 噪音**：mock.html `<head>` 补 `data:` 占位 favicon，
+  首载 0 条 4xx 资源请求、console 干净。
+
+验证：`pnpm typecheck` 0 错；`pnpm test` 21 文件 191 用例全绿（新增
+toolbarTint 6（含 WCAG ≥4.5:1 回归口径）+ mockDbxHost 3（happy-dom +
+fake timers 锁定 attach 回放与断开单发语义））。浏览器复验（vite :5291 +
+playwright-core + 系统 Chrome，10/10 项通过；走查脚本装于
+`/tmp/uiscan-ssh-r2` 不入库，截图已删）：默认首屏 Welcome/OSC 633/marker 条、
+`?err=disconnect` attach 路径自动断开→横幅→重连恢复、light 染色 alpha 与
+pill 对比度 4.53:1、dark 染色不变、404/console 零噪音。本次顺带解除此前
+PROGRESS 记录的"fixture 局限：重连横幅只能靠计算样式探针验证"——现在可全流程
+浏览器验证。第 1 轮 P1-1 的真机 sidecar 认证失败重试节奏复核遗留项不变。

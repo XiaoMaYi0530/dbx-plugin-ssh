@@ -8,6 +8,8 @@ const fixtureParams = new URLSearchParams(location.search);
 const writable = fixtureParams.get("rw") === "1";
 // ?err=disconnect 在会话建立 4s 后模拟一次传输断开（ssh/session/state
 // disconnected，单次不复发），供重连横幅/倒计时/立即重连/恢复提示的全流程 UI 验证。
+// 断开定时器同时挂在 open 与 attach 两条启动路径上：默认启动走
+// sessions/list → reattach，只挂 open 会让该参数在首屏完全失效（P2-1）。
 const disconnectAfterMs = fixtureParams.get("err") === "disconnect" ? 4000 : 0;
 let disconnectEmitted = false;
 // ?err=authfail 让 ssh/session/open 抛出真实 sidecar 风格的认证失败错误串，
@@ -63,7 +65,7 @@ function emitTerminal(text: string) {
   for (const listener of binaryListeners) listener(event);
 }
 
-// ---- 内存 fixture 树：路径感知的 sftp/list 与写操作（?mock=1 走通侧栏树/新建/压缩）----
+// ---- 内存 fixture 树：路径感知的 sftp/list 与写操作（无条件生效，无开关参数）----
 interface MockNode {
   name: string;
   kind: "directory" | "file";
@@ -164,6 +166,33 @@ const QUICK_COMMANDS_LIMIT = 20;
 const quickCommandsState: { id: string; name: string; command: string; createdAt: number; updatedAt: number }[] = [];
 const settingsState = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "" };
 
+// 模拟 VS Code 风格 shell-integration 周期（OSC 633），让 command-marker 条
+// 在 open 与 reattach 两条启动路径下都有内容可渲染（P2-2）。
+const OSC_633 = "\u001b]633;";
+const BEL = "\u0007";
+const shellIntegrationCycle = [
+  `${OSC_633}P;Cwd=/home/demo${BEL}`,
+  `${OSC_633}A${BEL}`,
+  `${OSC_633}E;systemctl status nginx${BEL}`,
+  "user@server:~$ systemctl status nginx\r\n",
+  `${OSC_633}C${BEL}`,
+  "● nginx.service - A high performance web server\r\n   Active: active (running)\r\n",
+  `${OSC_633}D;0${BEL}`,
+  `${OSC_633}A${BEL}`,
+  "user@server:~$ ",
+].join("");
+const terminalTranscript = `Welcome to DBX SSH/SFTP visual fixture\r\n${shellIntegrationCycle}`;
+
+// ?err=disconnect 注入入口：open 与 attach 完成后都调用一次；全局单发，
+// 重连（再次 open/attach）后不再复发，与真实传输断开的单次语义一致。
+function scheduleDisconnect() {
+  if (!disconnectAfterMs || disconnectEmitted) return;
+  disconnectEmitted = true;
+  setTimeout(() => {
+    for (const listener of eventListeners) listener({ method: "ssh/session/state", params: { sessionId: "visual-session", state: "disconnected" } });
+  }, disconnectAfterMs);
+}
+
 const request: DbxPluginApi["request"] = async <T = unknown>(method: string) =>
   (method === "host.getContext" ? context : null) as T;
 
@@ -176,28 +205,8 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     // so continuing the global counter here would leave a permanent hole at
     // the old tail and spin the client's replay loop.
     sequence = 0;
-    // Simulate a VS Code-style shell integration cycle (OSC 633) so the
-    // command marker strip has something to render in the visual fixture.
-    const osc = "\u001b]633;";
-    const bel = "\u0007";
-    const cycle = [
-      `${osc}P;Cwd=/home/demo${bel}`,
-      `${osc}A${bel}`,
-      `${osc}E;systemctl status nginx${bel}`,
-      "user@server:~$ systemctl status nginx\r\n",
-      `${osc}C${bel}`,
-      "● nginx.service - A high performance web server\r\n   Active: active (running)\r\n",
-      `${osc}D;0${bel}`,
-      `${osc}A${bel}`,
-      "user@server:~$ ",
-    ].join("");
-    setTimeout(() => emitTerminal(`Welcome to DBX SSH/SFTP visual fixture\r\n${cycle}`), 30);
-    if (disconnectAfterMs && !disconnectEmitted) {
-      disconnectEmitted = true;
-      setTimeout(() => {
-        for (const listener of eventListeners) listener({ method: "ssh/session/state", params: { sessionId: "visual-session", state: "disconnected" } });
-      }, disconnectAfterMs);
-    }
+    setTimeout(() => emitTerminal(terminalTranscript), 30);
+    scheduleDisconnect();
     result = { sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, connected: true, sequence: 0, chunkSize: 262144, directoryTrackingSupported: true };
   } else if (method === "ssh/terminal/replay") result = { frameCount: 0, firstAvailableSequence: 1, tailSequence: sequence, complete: true };
   else if (method === "ssh/sessions/list") result = { sessions: failSessionOpen ? [] : [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: !writable, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: "private-key", host: "server.demo.internal", port: 22, username: "demo" }] };
@@ -205,7 +214,10 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     const input = params as Record<string, unknown>;
     if (failSessionOpen) throw new Error("Connection is not active");
     // Mirror the real sidecar: the connection's live session is re-homed to
-    // the requesting workbench and reported with a complete replay.
+    // the requesting workbench and reported with a complete replay. The
+    // transcript (Welcome + OSC 633 cycle) is pushed as live frames right
+    // after attach so the first paint under the default reattach startup
+    // already shows shell-integration content (P2-2), not a bare prompt.
     result = {
       sessionId: String(input.sessionId || "") || "visual-session",
       connectionId: context.connectionId,
@@ -216,7 +228,8 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
       directoryTrackingSupported: true,
       replay: { complete: true, frameCount: 0, firstAvailableSequence: sequence + 1, tailSequence: sequence },
     };
-    setTimeout(() => emitTerminal("user@server:~$ "), 30);
+    setTimeout(() => emitTerminal(terminalTranscript), 30);
+    scheduleDisconnect();
   }
   else if (method === "sftp/list" || method === "sudo/listDir") result = { entries: mockList(String((params as Record<string, unknown>)?.path || "/")) };
   else if (method === "sftp/home") result = { path: "/home/demo" };
@@ -312,7 +325,8 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
       memory: { totalBytes, availableBytes, usedBytes: totalBytes - availableBytes, swapTotalBytes: 2_147_483_648, swapUsedBytes: 0 },
       disks: [
         { filesystem: "/dev/sda1", mount: "/", totalBytes: 52_723_200_512, usedBytes: 24_023_981_056, availableBytes: 26_005_927_936, percentUsed: 48 },
-        { filesystem: "/dev/sdb1", mount: "/data", totalBytes: 105_550_471_168, usedBytes: 58_052_563_968, availableBytes: 47_497_871_360, percentUsed: 55 },
+        // /data 固定给 87%（>=85 警戒阈值），让 disk-warn 红色进度条始终可被视觉验证。
+        { filesystem: "/dev/sdb1", mount: "/data", totalBytes: 105_550_471_168, usedBytes: 91_828_909_916, availableBytes: 13_721_561_252, percentUsed: 87 },
         { filesystem: "tmpfs", mount: "/dev/shm", totalBytes: 8_146_615_296, usedBytes: 0, availableBytes: 8_146_615_296, percentUsed: 0 },
       ],
     };
@@ -429,3 +443,6 @@ window.dbxPlugin = {
     onDrop: () => () => undefined,
   },
 };
+
+// 供单元测试（mockDbxHost.spec.ts）以模块形式动态导入并重置状态。
+export {};

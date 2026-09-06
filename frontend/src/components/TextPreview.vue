@@ -32,7 +32,10 @@ function previewTheme() {
     },
     ".cm-gutters": { backgroundColor: colors.muted, color: colors.mutedForeground, borderRightColor: colors.border },
     ".cm-activeLine, .cm-activeLineGutter": { backgroundColor: colors.accent },
-    ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": { backgroundColor: "#5f7aa855" },
+    // 选区色随明暗切换，与终端 xterm selectionBackground 保持同一观感。
+    ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
+      backgroundColor: props.appearance.colorScheme === "dark" ? "#5f6f8a88" : "#93b4e088",
+    },
   }, { dark: props.appearance.colorScheme === "dark" });
 }
 
