@@ -190,6 +190,107 @@ def main() -> None:
         client.request("ssh/session/close", {"sessionId": session_id})
         print("    closed")
 
+        # ------------------------------------------------------------------
+        # Connection-level session features (setEnv / remoteCommand). Both
+        # cases use dedicated connections so the main chain above keeps
+        # exercising the plain default path. Unreachable container -> SKIP,
+        # not FAIL (the cases need a live sshd by definition).
+        # ------------------------------------------------------------------
+        def container_unreachable(message: str) -> bool:
+            lowered = message.lower()
+            return any(
+                marker in lowered
+                for marker in (
+                    "timed out",
+                    "timeout",
+                    "refused",
+                    "unreachable",
+                    "reset by peer",
+                    "no route",
+                    "failed to connect",
+                    "connect error",
+                )
+            )
+
+        def wait_for_terminal_marker(marker: bytes, seconds: float) -> bool:
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                for frame in list(client.binary_frames):
+                    channel, data = frame
+                    client.binary_frames.remove(frame)
+                    if channel.startswith("ssh/terminal/out/") and marker in data:
+                        return True
+                client.timeout = max(0.5, deadline - time.monotonic())
+                try:
+                    client._pump(None)
+                except SidecarError:
+                    return False
+            return False
+
+        step("setEnv rides on the exec channel; remoteCommand execs instead of a shell")
+        try:
+            # Case 1: connection-level setEnv reaches the exec channel. The
+            # env request is always sent; a server without a matching
+            # AcceptEnv drops the variable silently (same as ssh(1)), which
+            # is indistinguishable from output alone -> SKIP with setup hint.
+            setenv_connection = dict(connection, id="smoke-setenv-connection")
+            setenv_connection["external_config"] = {
+                "authentication": "password",
+                "setEnv": "DBX_SMOKE_ENV=hello_setenv",
+            }
+            client.request("connection/connect", lifecycle_params(setenv_connection),
+                           timeout=60, on_event=auto_accept_challenge)
+            setenv_session = client.request(
+                "ssh/session/open",
+                {"connectionId": setenv_connection["id"],
+                 "workbenchId": "smoke-setenv-workbench", "cols": 120, "rows": 30},
+                timeout=60, on_event=auto_accept_challenge)
+            setenv_session_id = setenv_session.get("sessionId", "smoke-setenv-workbench")
+            result = client.request("ssh/exec", {
+                "sessionId": setenv_session_id,
+                "command": "echo $DBX_SMOKE_ENV",
+            }, timeout=60)
+            output = result.get("output", "")
+            if "hello_setenv" not in output:
+                print("SKIP: setEnv value did not arrive; add "
+                      "'AcceptEnv DBX_SMOKE_ENV' to the test container's "
+                      "sshd_config (then restart sshd) to verify end to end")
+            else:
+                print(f"    exec channel saw setEnv value: {output.strip()}")
+            client.request("ssh/session/close", {"sessionId": setenv_session_id})
+            client.request("connection/disconnect", lifecycle_params(setenv_connection))
+
+            # Case 2: remoteCommand execs the configured command instead of a
+            # shell on ssh/session/open (PTY stays on); the marker output
+            # must show up on the terminal stream without any input.
+            remote_connection = dict(connection, id="smoke-remote-command-connection")
+            remote_connection["external_config"] = {
+                "authentication": "password",
+                "remoteCommand": "echo DBX_REMOTE_COMMAND_MARKER",
+            }
+            client.request("connection/connect", lifecycle_params(remote_connection),
+                           timeout=60, on_event=auto_accept_challenge)
+            remote_session = client.request(
+                "ssh/session/open",
+                {"connectionId": remote_connection["id"],
+                 "workbenchId": "smoke-remote-command-workbench",
+                 "cols": 120, "rows": 30},
+                timeout=60, on_event=auto_accept_challenge)
+            print(f"    remoteCommand session {remote_session.get('sessionId', '?')} opened")
+            if not wait_for_terminal_marker(b"DBX_REMOTE_COMMAND_MARKER", 20):
+                fail("remoteCommand output (DBX_REMOTE_COMMAND_MARKER) "
+                     "did not appear on the terminal stream within 20s")
+            print("    remoteCommand session replayed its marker output")
+            # Like `ssh host command`, the session self-terminates once the
+            # exec'd command exits, so no ssh/session/close here; the
+            # connection-level disconnect reaps whatever is left.
+            client.request("connection/disconnect", lifecycle_params(remote_connection))
+        except SidecarError as error:
+            if container_unreachable(str(error)):
+                print(f"SKIP: session feature cases need the test container ({error})")
+            else:
+                raise
+
         client.close()
         print(f"\nPASS: full sidecar chain OK in {time.monotonic() - started:.1f}s")
     except SidecarError as error:

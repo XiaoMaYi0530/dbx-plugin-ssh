@@ -66,10 +66,10 @@ describe("terminal search seed from selection", () => {
 });
 
 describe("terminal drop acceptance", () => {
-  it("requires a connected, writable, non-zmodem session", () => {
-    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, zmodemBusy: false })).toBe(true);
-    expect(canAcceptTerminalDrop({ connected: false, canWrite: true, zmodemBusy: false })).toBe(false);
-    expect(canAcceptTerminalDrop({ connected: true, canWrite: false, zmodemBusy: false })).toBe(false);
-    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, zmodemBusy: true })).toBe(false);
+  it("requires a connected, writable session with no file transfer protocol owning the stream", () => {
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: false })).toBe(true);
+    expect(canAcceptTerminalDrop({ connected: false, canWrite: true, transferBusy: false })).toBe(false);
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: false, transferBusy: false })).toBe(false);
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: true })).toBe(false);
   });
 });

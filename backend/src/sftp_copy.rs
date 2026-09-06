@@ -269,10 +269,13 @@ impl CopyExecutor<'_> {
                 })
             }
             CopyExecutor::Headless(handle, _) => {
+                // Internal copy plumbing: env-free so output parsing stays
+                // independent of the connection's setEnv overrides.
                 exec::exec_plain(
                     handle,
                     command,
                     std::time::Duration::from_secs(REMOTE_COPY_TIMEOUT_SECS),
+                    &[],
                 )
                 .await
             }

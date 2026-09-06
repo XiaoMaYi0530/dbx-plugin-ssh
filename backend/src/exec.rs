@@ -723,16 +723,99 @@ pub struct ExecOutcome {
     pub exit_code: i32,
 }
 
+/// One CHANNEL_REQUEST "env" entry with its failure policy. Built-in
+/// defaults stay best-effort: default sshd configs only `AcceptEnv LANG`
+/// and `LC_*`, so e.g. the internal `SUDO_ASKPASS` clear is commonly
+/// refused and the caller must not care. Client-specified `setEnv` entries
+/// are strict — a silently dropped variable changes what the remote command
+/// ends up seeing.
+#[derive(Debug, PartialEq, Eq)]
+struct ChannelEnv {
+    key: String,
+    value: String,
+    strict: bool,
+}
+
+/// Merges built-in channel env defaults with the connection's client
+/// `setEnv` entries: user entries win on duplicate keys and every variable
+/// ends up requested exactly once — dedup is decided locally here instead
+/// of relying on server-side ordering of duplicate env requests.
+fn merge_channel_env(
+    defaults: &[(&str, &str)],
+    user_env: &[(String, String)],
+) -> Vec<ChannelEnv> {
+    let mut merged: Vec<ChannelEnv> = defaults
+        .iter()
+        .map(|(key, value)| ChannelEnv {
+            key: (*key).to_string(),
+            value: (*value).to_string(),
+            strict: false,
+        })
+        .collect();
+    for (key, value) in user_env {
+        match merged.iter_mut().find(|entry| entry.key == *key) {
+            Some(slot) => {
+                slot.value = value.clone();
+                slot.strict = true;
+            }
+            None => merged.push(ChannelEnv {
+                key: key.clone(),
+                value: value.clone(),
+                strict: true,
+            }),
+        }
+    }
+    merged
+}
+
+/// Requests the merged environment on a session channel before its
+/// shell/exec request. Strict (user-configured) entries fail the whole
+/// channel setup with the variable named; best-effort defaults keep the
+/// historical swallow-and-continue behavior. russh's `set_env` is
+/// fire-and-forget, so "failure" here means a broken channel/transport —
+/// a server that drops a variable for lack of `AcceptEnv` stays silent by
+/// protocol design, exactly like the ssh(1) client.
+async fn apply_channel_env(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    env: &[ChannelEnv],
+) -> Result<(), String> {
+    for entry in env {
+        if let Err(error) = channel.set_env(true, &entry.key, &entry.value).await {
+            if entry.strict {
+                return Err(format!(
+                    "Failed to set remote environment variable '{}': {error}",
+                    entry.key
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Requests a connection's client-specified `setEnv` entries on a bare
+/// channel (interactive session path; no built-in defaults to merge).
+/// Semantics are the client-specified half of ssh's SetEnv/SendEnv: only
+/// entries from this connection's config are transmitted, never the local
+/// process environment.
+pub(crate) async fn apply_connection_env(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    set_env: &[(String, String)],
+) -> Result<(), String> {
+    apply_channel_env(channel, &merge_channel_env(&[], set_env)).await
+}
+
 /// Runs a command without privilege escalation on a new channel.
 pub async fn exec_plain(
     handle: &Handle<SshClient>,
     command: &str,
     timeout: Duration,
+    set_env: &[(String, String)],
 ) -> Result<ExecOutcome, String> {
     let mut channel = handle
         .channel_open_session()
         .await
         .map_err(|error| format!("Failed to open exec channel: {error}"))?;
+    apply_connection_env(&mut channel, set_env).await?;
     channel
         .exec(true, command.as_bytes())
         .await
@@ -753,6 +836,7 @@ pub async fn exec_with_sudo(
     command: &str,
     timeout: Duration,
     use_pty: bool,
+    set_env: &[(String, String)],
 ) -> Result<ExecOutcome, String> {
     if auth.password.is_empty() {
         let command_line = format!("sudo -n {}", sanitize_sudo_command(command));
@@ -760,6 +844,7 @@ pub async fn exec_with_sudo(
             .channel_open_session()
             .await
             .map_err(|error| format!("Failed to open sudo channel: {error}"))?;
+        apply_connection_env(&mut channel, set_env).await?;
         channel
             .exec(true, command_line.as_bytes())
             .await
@@ -789,7 +874,12 @@ pub async fn exec_with_sudo(
             .request_pty(true, "xterm-256color", 24, 80, 0, 0, &[])
             .await;
     }
-    let _ = channel.set_env(true, "SUDO_ASKPASS", "").await;
+    // Client setEnv entries are merged with (and win over) the internal
+    // SUDO_ASKPASS clear: each variable is requested exactly once with the
+    // user value taking precedence, so the two env sources cannot fight
+    // over the same key via server-side ordering of duplicate requests.
+    let env = merge_channel_env(&[("SUDO_ASKPASS", "")], set_env);
+    apply_channel_env(&mut channel, &env).await?;
     channel
         .exec(true, command_line.as_bytes())
         .await
@@ -2110,5 +2200,58 @@ mod rotation_tests {
             totp_secrets: parse_totp_secrets("654321"),
             ..Default::default()
         }
+    }
+
+    /// User setEnv entries win over built-in defaults on duplicate keys and
+    /// every variable is requested exactly once (the merged list carries no
+    /// duplicates), so the sudo channel cannot see the internal
+    /// SUDO_ASKPASS clear clobber a user-configured value.
+    #[test]
+    fn merge_channel_env_user_entries_win_and_dedup() {
+        let user = vec![
+            ("LANG".to_string(), "C".to_string()),
+            ("SUDO_ASKPASS".to_string(), "/tmp/askpass.sh".to_string()),
+        ];
+        let merged = merge_channel_env(&[("SUDO_ASKPASS", "")], &user);
+        assert_eq!(
+            merged,
+            vec![
+                ChannelEnv {
+                    key: "SUDO_ASKPASS".to_string(),
+                    value: "/tmp/askpass.sh".to_string(),
+                    strict: true,
+                },
+                ChannelEnv {
+                    key: "LANG".to_string(),
+                    value: "C".to_string(),
+                    strict: true,
+                },
+            ],
+            "user value must replace the default and turn the entry strict"
+        );
+    }
+
+    /// Without overlap the defaults keep their best-effort policy (default
+    /// sshd configs commonly refuse SUDO_ASKPASS) and user entries are
+    /// appended strict, in their configured order.
+    #[test]
+    fn merge_channel_env_keeps_defaults_lenient_and_user_strict() {
+        let user = vec![("MY_APP_MODE".to_string(), "debug".to_string())];
+        let merged = merge_channel_env(&[("SUDO_ASKPASS", "")], &user);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].key, "SUDO_ASKPASS");
+        assert!(!merged[0].strict, "built-in defaults stay best-effort");
+        assert_eq!(merged[1].key, "MY_APP_MODE");
+        assert_eq!(merged[1].value, "debug");
+        assert!(merged[1].strict, "user entries fail loudly when refused");
+    }
+
+    /// Empty inputs collapse to an empty request list: connections without
+    /// setEnv must not emit any env request at all.
+    #[test]
+    fn merge_channel_env_empty_inputs_stay_empty() {
+        assert!(merge_channel_env(&[], &[]).is_empty());
+        let user = vec![("A".to_string(), "1".to_string())];
+        assert_eq!(merge_channel_env(&[], &user).len(), 1);
     }
 }

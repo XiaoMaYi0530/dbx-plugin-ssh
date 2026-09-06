@@ -53,7 +53,10 @@ const METRICS_SCRIPT: &str = concat!(
 /// Collects the extended metrics sample over a new exec channel. Read-only
 /// commands only; the extra `sleep 1` is bounded by the timeout below.
 pub async fn collect_metrics(handle: &Handle<SshClient>) -> Result<serde_json::Value, String> {
-    let outcome = exec_plain(handle, METRICS_SCRIPT, std::time::Duration::from_secs(30)).await?;
+    // Plugin-internal collector: no client setEnv so locale overrides on the
+    // connection cannot reshape the output this parser expects.
+    let outcome =
+        exec_plain(handle, METRICS_SCRIPT, std::time::Duration::from_secs(30), &[]).await?;
     if outcome.exit_code != 0 && outcome.output.is_empty() {
         return Err(format!("metrics collection failed: {}", outcome.output));
     }

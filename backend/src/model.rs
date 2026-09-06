@@ -126,6 +126,15 @@ pub struct StoredConnection {
     pub password_prompt_hint: String,
     pub totp_prompt_hint: String,
     pub auth_flow_mode: String,
+    /// Client-specified remote environment — the `SetEnv` half of ssh's
+    /// SetEnv/SendEnv pair (values come from this connection's config, never
+    /// from the local process environment). Parsed and validated eagerly so
+    /// malformed entries fail the connection instead of misconfiguring
+    /// remote commands; applied per channel before shell/exec.
+    pub set_env: Vec<(String, String)>,
+    /// `ssh RemoteCommand`: exec this command instead of a shell on the
+    /// interactive terminal session (PTY stays on). Empty = normal shell.
+    pub remote_command: String,
     /// ProxyJump chain: each entry is dialed before the target, the final hop
     /// reaching `host:port` directly (the runtime tunnel endpoint is skipped).
     pub jump_hosts: Vec<JumpHost>,
@@ -247,6 +256,11 @@ impl JumpHost {
             password_prompt_hint: self.password_prompt_hint.clone(),
             totp_prompt_hint: self.totp_prompt_hint.clone(),
             auth_flow_mode: self.auth_flow_mode.clone(),
+            // Jump hops never inject SetEnv or exec a RemoteCommand: those
+            // features target the final session only (deliberate
+            // simplification, see StoredConnection docs).
+            set_env: Vec::new(),
+            remote_command: String::new(),
             jump_hosts: Vec::new(),
         }
     }
@@ -305,6 +319,17 @@ impl StoredConnection {
         let password_prompt_hint = optional_string(external_config, "password_prompt_hint");
         let totp_prompt_hint = optional_string(external_config, "totp_prompt_hint");
         let auth_flow_mode = optional_string(external_config, "auth_flow_mode");
+        // 会话特性两件套（camelCase 为主；snake_case 别名兼容手改配置/历史
+        // 草稿）。setEnv 严格校验，非法条目让连接直接失败（宁可连不上也
+        // 不错配）；remoteCommand trim 后非空才生效。
+        let set_env = parse_set_env(config_text(
+            external_config,
+            &["setEnv", "set_env"],
+        ))?;
+        let remote_command = config_text(external_config, &["remoteCommand", "remote_command"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         // Legacy 0.4.x flag: only consulted when `sudo_source` is absent, so
         // a re-saved connection (stale `quick_sudo` left behind) follows the
         // explicit source chosen on the form.
@@ -389,8 +414,73 @@ impl StoredConnection {
             password_prompt_hint,
             totp_prompt_hint,
             auth_flow_mode,
+            set_env,
+            remote_command,
             jump_hosts,
         })
+    }
+}
+
+/// First present string among `keys` in the config object.
+fn config_text<'a>(
+    config: Option<&'a serde_json::Map<String, Value>>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| config.and_then(|config| config.get(*key)))
+        .and_then(Value::as_str)
+}
+
+/// Parses the `setEnv` connection field: one `KEY=VALUE` entry per line,
+/// semicolons tolerated as separators (mirrors the `totp_secret` input
+/// convention), blank entries ignored, entries trimmed. Strict by design —
+/// "prefer failing the connection to silently misconfiguring remote
+/// commands": every invalid entry is reported with its content in one
+/// aggregated error. Duplicate keys follow `ssh SetEnv` semantics: the last
+/// entry wins. This is the client-specified half of ssh's SetEnv/SendEnv —
+/// no local environment is ever transmitted.
+pub fn parse_set_env(raw: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for entry in raw.split(['\n', ';']) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = entry.split_once('=') else {
+            errors.push(format!("'{entry}' (missing '=' separator)"));
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            errors.push(format!("'{entry}' (empty key)"));
+            continue;
+        }
+        if key.chars().any(char::is_whitespace) {
+            errors.push(format!("'{entry}' (key must not contain whitespace)"));
+            continue;
+        }
+        if key.contains('\0') {
+            errors.push(format!("'{entry}' (NUL byte in key)"));
+            continue;
+        }
+        if value.contains('\0') {
+            errors.push(format!("'{entry}' (NUL byte in value)"));
+            continue;
+        }
+        match vars.iter_mut().find(|(existing, _)| existing == key) {
+            Some(slot) => slot.1 = value.to_string(),
+            None => vars.push((key.to_string(), value.to_string())),
+        }
+    }
+    if errors.is_empty() {
+        Ok(vars)
+    } else {
+        Err(format!("Invalid setEnv entries: {}", errors.join("; ")))
     }
 }
 
@@ -689,6 +779,8 @@ mod tests {
             "agent_socket",
             "connect_timeout_secs",
             "keepalive_interval_secs",
+            "setEnv",
+            "remoteCommand",
             "sudo_source",
             "sudo_profile",
             "sudo_password",
@@ -1204,6 +1296,8 @@ mod manifest_contract_tests {
             "agent_socket",
             "connect_timeout_secs",
             "keepalive_interval_secs",
+            "setEnv",
+            "remoteCommand",
             "sudo_source",
             "sudo_profile",
             "sudo_use_pty",
@@ -1311,6 +1405,8 @@ mod manifest_contract_tests {
             ("keepalive_interval_secs", Value::from(30)),
             ("sudo_source", Value::from("custom")),
             ("sudo_use_pty", Value::from(false)),
+            ("setEnv", Value::from("")),
+            ("remoteCommand", Value::from("")),
             ("auth_flow_mode", Value::from("password_then_otp")),
             ("read_only", Value::from(false)),
         ];

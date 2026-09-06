@@ -48,6 +48,21 @@ import {
   Zap,
 } from "@lucide/vue";
 import type { Detection as ZmodemDetection, Session as ZmodemSession, Sentry as ZmodemSentry } from "zmodem.js";
+import { TrzszFilter } from "trzsz";
+import {
+  canStartTrzszTransfer,
+  detectTrzszAnnounceFromBytes,
+  initialTrzszProgressState,
+  installTrzszHandlers,
+  isTrzszStopMessage,
+  reduceTrzszProgress,
+  resolveTerminalInputRoute,
+  trzszProgressPercent,
+  type TrzszAnnounce,
+  type TrzszDownloadFile,
+  type TrzszProgressEvent,
+  type TrzszProgressState,
+} from "./lib/terminalTrzsz";
 import { Osc7DirectoryParser } from "./lib/terminalDirectoryTracking";
 import {
   resolveTerminalKeyAction,
@@ -314,6 +329,7 @@ const terminalHost = ref<HTMLElement>();
 const paneContainer = ref<HTMLElement>();
 const uploadInput = ref<HTMLInputElement>();
 const zmodemInput = ref<HTMLInputElement>();
+const trzszInput = ref<HTMLInputElement>();
 const hostContext = ref<Record<string, unknown>>({});
 // 宿主未下发 appearance 前的兜底：DBX `.dark` 规范令牌。
 const appearance = ref(resolveAppearance());
@@ -402,6 +418,15 @@ const zmodemFileName = ref("");
 const zmodemTransferred = ref(0);
 const zmodemTotalSize = ref(0);
 const zmodemSpeed = ref(0);
+// trzsz (trz/tsz)：进度 overlay 状态镜像（真实状态机在 lib/terminalTrzsz.ts）。
+const trzszPhase = ref<TrzszProgressState["phase"]>("idle");
+const trzszDirection = ref<TrzszProgressState["direction"]>("");
+const trzszFileName = ref("");
+const trzszFileIndex = ref(0);
+const trzszFileCount = ref(0);
+const trzszPercent = ref(0);
+const trzszSpeed = ref(0);
+const trzszMessage = ref("");
 const commandOpen = ref(false);
 const commandDraft = ref("");
 const commandUseSudo = ref(true);
@@ -594,6 +619,14 @@ let pendingZmodemFiles: File[] = [];
 let zmodemDetectionTimer = 0;
 let zmodemSampledAt = 0;
 let zmodemSampledBytes = 0;
+// trzsz：filter 常驻（与 zmodem sentry 同一条下行流），进度状态机与速度采样。
+let trzszFilter: TrzszFilter | null = null;
+let trzszProgress: TrzszProgressState = initialTrzszProgressState();
+let trzszSpeedSample: TransferSpeedSample | undefined;
+let trzszDetectionTimer = 0;
+let trzszWatchdogTimer = 0;
+let trzszOverlayTimer = 0;
+let trzszPickResolver: ((files: File[] | undefined) => void) | undefined;
 let pendingTerminalInput = "";
 let activeTerminalSessionId = "";
 const pendingTerminalFrames = new Map<number, { stream: number; data: Uint8Array }>();
@@ -728,6 +761,10 @@ const transferList = computed(() => Object.values(transferTasks).sort((left, rig
 const activeTransfers = computed(() => transferList.value.filter((task) => task.status === "queued" || task.status === "running").length);
 const zmodemBusy = computed(() => zmodemState.value !== "idle");
 const zmodemPercent = computed(() => zmodemTotalSize.value > 0 ? Math.min(100, Math.round((zmodemTransferred.value / zmodemTotalSize.value) * 100)) : 0);
+// 文件传输占用统一语义：ZMODEM 或 trzsz 任一持有终端流即视为 busy。
+const terminalTransferBusy = computed(() => zmodemBusy.value || trzszBusy.value);
+const trzszBusy = computed(() => trzszPhase.value === "waiting" || trzszPhase.value === "transferring");
+const trzszOverlayVisible = computed(() => trzszPhase.value !== "idle");
 const sftpGridStyle = computed(() => ({
   gridTemplateColumns: ["minmax(120px, 1fr)", visibleColumns.value.includes("size") ? "72px" : "", visibleColumns.value.includes("modified") ? "128px" : "", visibleColumns.value.includes("permissions") ? "84px" : ""].filter(Boolean).join(" "),
   minWidth: `${180 + (visibleColumns.value.includes("size") ? 78 : 0) + (visibleColumns.value.includes("modified") ? 134 : 0) + (visibleColumns.value.includes("permissions") ? 90 : 0)}px`,
@@ -866,7 +903,16 @@ function createTerminal() {
     searchMatchState.value = resultCount > 0 ? "match" : "no-match";
   });
   disposeInput = terminal.onData((data) => {
-    if (!session.value || zmodemBusy.value) return;
+    if (!session.value) return;
+    // 文件传输占用路由：trzsz 持有流时，传输中的输入进 filter（Ctrl+C 停传输、
+    // 其余吞掉），等待协商期直接吞掉（防止杂散键入干扰 trz 握手）；zmodem 持有
+    // 流时输入保持阻塞，否则走普通 PTY 键盘写入（8 字节序号前缀已封装）。
+    const route = resolveTerminalInputRoute({ zmodemBusy: zmodemBusy.value, trzszBusy: trzszBusy.value });
+    if (route === "trzsz") {
+      if (trzszPhase.value === "transferring") trzszFilter?.processTerminalInput(data);
+      return;
+    }
+    if (route === "blocked") return;
     trackPendingInput(data);
     sendTerminalBytes(new TextEncoder().encode(data));
   });
@@ -1045,6 +1091,8 @@ function scheduleFit() {
     if (!terminal || !fitAddon || !terminalHost.value?.clientWidth || !terminalHost.value.clientHeight) return;
     try {
       fitAddon.fit();
+      // trzsz 进度条按终端列宽渲染（filter 内部文本进度条虽未启用，列宽保持同步）。
+      trzszFilter?.setTerminalColumns(terminal.cols);
       if (session.value) {
         void window.dbxPlugin.notify("ssh/terminal/resize", { sessionId: session.value.sessionId, cols: terminal.cols, rows: terminal.rows }).catch(() => undefined);
       }
@@ -1121,10 +1169,26 @@ function writeTerminalOutput(data: Uint8Array) {
   terminalWriteThrottle.write(data);
 }
 
+/**
+ * Terminal output dispatch: ZMODEM owns the stream while busy; otherwise the
+ * frame feeds the trzsz filter, which passes it through to the terminal and
+ * watches for the remote `::TRZSZ:TRANSFER:` announce to take over exactly
+ * one transfer. Plain frames thus reach the terminal untouched.
+ */
+function dispatchTerminalOutput(data: Uint8Array) {
+  if (zmodemBusy.value) {
+    writeTerminalOutput(data);
+    return;
+  }
+  const announce = detectTrzszAnnounceFromBytes(data);
+  if (announce) handleTrzszAnnounce(announce);
+  ensureTrzszFilter().processServerOutput(data);
+}
+
 function resetZmodemSentry() {
   zmodemSentry = createZmodemSentry({
     send: sendTerminalBytes,
-    toTerminal: writeTerminalOutput,
+    toTerminal: dispatchTerminalOutput,
     onDetect: handleZmodemDetection,
     onRetract() {},
   });
@@ -1200,6 +1264,224 @@ function cancelZmodemUpload() {
   resetZmodemSentry();
 }
 
+// ---------------------------------------------------------------------------
+// trzsz (trz / tsz)：官方 trzsz.js TrzszFilter 常驻下行流，announce 自动接管。
+// 传输的协议协商/收发全在 filter 内，插件只负责：选文件（浏览器 File API）、
+// 下载落盘（宿主 fileTransfer 优先、浏览器 <a download> 兜底）、进度 overlay。
+// ---------------------------------------------------------------------------
+
+const TRZSZ_DETECTION_TIMEOUT_MS = 5000;
+const TRZSZ_WATCHDOG_TIMEOUT_MS = 15000;
+const TRZSZ_SUCCESS_OVERLAY_MS = 2500;
+
+/** Lazily wires the filter onto the terminal streams (keyboard input + output). */
+function ensureTrzszFilter(): TrzszFilter {
+  if (trzszFilter) return trzszFilter;
+  const filter = new TrzszFilter({
+    writeToTerminal: (output) => {
+      if (typeof output === "string") writeTerminalOutput(new TextEncoder().encode(output));
+      else if (output instanceof Uint8Array) writeTerminalOutput(output);
+      else if (output instanceof ArrayBuffer) writeTerminalOutput(new Uint8Array(output));
+    },
+    // sendToServer 必须走现有 PTY 输入路径（8 字节 BE 序号前缀在 sendTerminalBytes 内封装）。
+    sendToServer: (input) => sendTerminalBytes(typeof input === "string" ? new TextEncoder().encode(input) : Uint8Array.from(input)),
+    terminalColumns: terminal?.cols || 80,
+  });
+  installTrzszHandlers(filter, {
+    pickUploadFiles: pickTrzszUploadFiles,
+    saveDownloadedFiles: saveTrzszDownloadedFiles,
+    emit: applyTrzszEvent,
+  });
+  trzszFilter = filter;
+  return filter;
+}
+
+function handleTrzszAnnounce(announce: TrzszAnnounce) {
+  // Announce 已到：无论等待态由谁进入（菜单触发或远端自行 trz/tsz），
+  // 「等待远端响应」的检测定时器使命完成，必须先解除再判断占用。
+  window.clearTimeout(trzszDetectionTimer);
+  trzszDetectionTimer = 0;
+  if (!canStartTrzszTransfer({ zmodemBusy: zmodemBusy.value, trzszBusy: trzszBusy.value })) return;
+  // 看门狗：announce 后 filter 一直未发起传输（如去重拦截等边缘）时不让
+  // waiting 态永久占用终端输入；filter 打开选文件框时即视为已接管并解除。
+  window.clearTimeout(trzszWatchdogTimer);
+  trzszWatchdogTimer = window.setTimeout(() => {
+    trzszWatchdogTimer = 0;
+    if (trzszPhase.value === "waiting") applyTrzszEvent({ type: "reset" });
+  }, TRZSZ_WATCHDOG_TIMEOUT_MS);
+  applyTrzszEvent({ type: "waiting", direction: announce.direction });
+}
+
+function applyTrzszEvent(event: TrzszProgressEvent) {
+  trzszProgress = reduceTrzszProgress(trzszProgress, event);
+  const state = trzszProgress;
+  trzszPhase.value = state.phase;
+  trzszDirection.value = state.direction;
+  trzszFileName.value = state.fileName;
+  trzszFileIndex.value = state.fileIndex;
+  trzszFileCount.value = state.fileCount;
+  trzszMessage.value = state.message;
+  trzszPercent.value = trzszProgressPercent(state);
+  if (event.type === "step") {
+    trzszSpeedSample = sampleTransferSpeed(trzszSpeedSample, state.totalTransferred, performance.now());
+    trzszSpeed.value = trzszSpeedSample.speed;
+  } else {
+    trzszSpeedSample = undefined;
+    trzszSpeed.value = 0;
+  }
+  switch (event.type) {
+    case "success":
+      showNotice(t("trzszComplete", { count: Math.max(1, state.fileCount) }));
+      window.clearTimeout(trzszOverlayTimer);
+      // 成功态短暂可见后自动收起（失败态常驻，直到下一次传输或会话切换）。
+      trzszOverlayTimer = window.setTimeout(resetTrzszOverlay, TRZSZ_SUCCESS_OVERLAY_MS);
+      break;
+    case "failure":
+      window.clearTimeout(trzszOverlayTimer);
+      // Ctrl+C 主动停止是用户意图，按提示呈现而非错误横幅。
+      if (isTrzszStopMessage(event.message)) {
+        resetTrzszOverlay();
+        showNotice(t("trzszCancelled"));
+      } else {
+        showError(new Error(t("trzszFailed", { error: event.message })), "terminal");
+      }
+      break;
+    case "cancelled":
+      resetTrzszOverlay();
+      break;
+  }
+}
+
+function resetTrzszOverlay() {
+  window.clearTimeout(trzszOverlayTimer);
+  trzszOverlayTimer = 0;
+  applyTrzszEvent({ type: "reset" });
+}
+
+/** Ctrl+C 等价：让 filter 停掉当前传输（协议侧走 stop/清理，随后报 cancelled）。 */
+function cancelTrzszTransfer() {
+  trzszFilter?.stopTransferringFiles();
+}
+
+/**
+ * 会话切换 / 关闭时的静默收尾：停掉在途传输并复位 overlay，避免 busy 态
+ * 卡住终端输入（与 cancelZmodemUpload 同语义）。
+ */
+function teardownTrzsz() {
+  window.clearTimeout(trzszDetectionTimer);
+  trzszDetectionTimer = 0;
+  window.clearTimeout(trzszWatchdogTimer);
+  trzszWatchdogTimer = 0;
+  window.clearTimeout(trzszOverlayTimer);
+  trzszOverlayTimer = 0;
+  trzszFilter?.stopTransferringFiles();
+  trzszProgress = initialTrzszProgressState();
+  trzszSpeedSample = undefined;
+  trzszPhase.value = "idle";
+  trzszDirection.value = "";
+  trzszFileName.value = "";
+  trzszFileIndex.value = 0;
+  trzszFileCount.value = 0;
+  trzszPercent.value = 0;
+  trzszSpeed.value = 0;
+  trzszMessage.value = "";
+}
+
+const trzszStatusLabel = computed(() => {
+  const name = trzszFileName.value;
+  const percent = trzszPercent.value;
+  switch (trzszPhase.value) {
+    case "waiting":
+      return t("trzszWaiting");
+    case "transferring":
+      return trzszDirection.value === "download" ? t("trzszDownloading", { name, percent }) : t("trzszUploading", { name, percent });
+    case "success":
+      return t("trzszComplete", { count: Math.max(1, trzszFileCount.value) });
+    case "failed":
+      return t("trzszFailed", { error: trzszMessage.value });
+    default:
+      return "";
+  }
+});
+
+/** 右键菜单「Upload (trz)」：向 PTY 发送 trz 触发远端，announce 回来后接管。 */
+function chooseTrzszUpload() {
+  terminalMenu.value = undefined;
+  if (!session.value || !canWrite.value || !canStartTrzszTransfer({ zmodemBusy: zmodemBusy.value, trzszBusy: trzszBusy.value })) return;
+  applyTrzszEvent({ type: "waiting", direction: "upload" });
+  trzszDetectionTimer = window.setTimeout(() => {
+    if (trzszPhase.value === "waiting") applyTrzszEvent({ type: "failure", message: t("trzszNotAvailable") });
+  }, TRZSZ_DETECTION_TIMEOUT_MS);
+  sendTerminalBytes(new TextEncoder().encode("trz\r"));
+  terminal?.focus();
+}
+
+/** filter 回调：浏览器 File API 多选（宿主沙箱内不可用 File System Access API）。 */
+function pickTrzszUploadFiles(_directory: boolean): Promise<File[] | undefined> {
+  // filter 已接管（走到选文件这一步），等待态看门狗使命完成。
+  window.clearTimeout(trzszWatchdogTimer);
+  trzszWatchdogTimer = 0;
+  // 上一次未完成的选文件请求按取消处理，避免悬挂的 resolver。
+  const previous = trzszPickResolver;
+  trzszPickResolver = undefined;
+  previous?.(undefined);
+  // WKWebView/旧内核不派发 input 的 cancel 事件：窗口重新拿到焦点后一小段
+  // 时间内 change 仍未触发（resolver 还挂着）即视为用户取消。
+  const onFocus = () => {
+    window.setTimeout(() => {
+      if (trzszPickResolver) onTrzszPickCancel();
+    }, 800);
+  };
+  window.addEventListener("focus", onFocus, { once: true });
+  return new Promise((resolve) => {
+    trzszPickResolver = resolve;
+    trzszInput.value?.click();
+  });
+}
+
+function onTrzszPickInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  input.value = "";
+  const resolve = trzszPickResolver;
+  trzszPickResolver = undefined;
+  resolve?.(files.length ? files : undefined);
+}
+
+function onTrzszPickCancel() {
+  const resolve = trzszPickResolver;
+  trzszPickResolver = undefined;
+  resolve?.(undefined);
+}
+
+/**
+ * 下载落盘：优先宿主 fileTransfer API（optional 1.1 特性，逐文件 beginSave/
+ * write/finish），web/docker 模式缺失时回退浏览器 <a download>（与 SFTP
+ * 下载链路同一兜底写法）。
+ */
+async function saveTrzszDownloadedFiles(files: readonly TrzszDownloadFile[]) {
+  const fileTransfer = window.dbxPlugin.fileTransfer;
+  for (const file of files) {
+    if (file.isDirectory || !file.byteLength) continue;
+    if (!fileTransfer) {
+      saveBrowserDownload(file.chunks, file.fileName);
+      continue;
+    }
+    const target = await fileTransfer.beginSave({ name: file.fileName, size: file.byteLength });
+    try {
+      let offset = 0;
+      for (const chunk of file.chunks) {
+        const write = await fileTransfer.write(target.handleId, offset, chunk);
+        offset = write.nextOffset;
+      }
+      await fileTransfer.finish(target.handleId);
+    } catch (cause) {
+      await fileTransfer.cancel(target.handleId).catch(() => undefined);
+      throw cause;
+    }
+  }
+}
+
 function handleBinary(event: DbxPluginBinaryEvent) {
   const sessionId = activeTerminalSessionId || session.value?.sessionId;
   if (sessionId && event.channel === `ssh/terminal/out/${sessionId}`) {
@@ -1244,7 +1526,7 @@ function drainTerminalFrames() {
         if (zmodemBusy.value) finishZmodemUpload(cause);
         else {
           resetZmodemSentry();
-          writeTerminalOutput(frame.data);
+          dispatchTerminalOutput(frame.data);
         }
       }
     }
@@ -1395,6 +1677,8 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
   // A session opened over a stale one must not inherit a stuck ZMODEM
   // overlay (zmodemBusy would keep swallowing terminal input).
   cancelZmodemUpload();
+  // 同理不继承上一个会话的 trzsz 传输占用（在途传输一并停掉）。
+  teardownTrzsz();
   // 同理不继承上一个会话的 AI 审批队列 / 执行横幅（切换会话清空全部排队挑战）。
   clearAgentPrompts();
   agentRunning.value = undefined;
@@ -1541,6 +1825,8 @@ async function closeSession(updateStatus = true) {
   // Closing mid-ZMODEM aborts the transfer silently instead of leaving the
   // busy overlay and the dead sentry attached to the workbench.
   cancelZmodemUpload();
+  // trzsz 在途传输同样静默停止（死会话上的 sendToServer 会因无 sessionId 空转）。
+  teardownTrzsz();
   pendingTerminalFrames.clear();
   lastSequence = 0;
   terminalInputSequence = 0;
@@ -2915,13 +3201,13 @@ function onDrop(event: DragEvent) {
 
 function onTerminalDragEnter(event: DragEvent) {
   if (!event.dataTransfer?.types.includes("Files")) return;
-  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, zmodemBusy: zmodemBusy.value })) return;
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) return;
   terminalDragActive.value = true;
 }
 
 function onTerminalDrop(event: DragEvent) {
   terminalDragActive.value = false;
-  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, zmodemBusy: zmodemBusy.value })) return;
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) return;
   // Files dropped on the terminal upload into the SFTP current directory —
   // with directory tracking on this is the shell's cwd, so the terminal alone
   // (SFTP pane closed) is a complete upload entry point.
@@ -2979,7 +3265,7 @@ async function sendConfirmedPaste(text: string) {
     terminal?.focus();
     return;
   }
-  if (!session.value || zmodemBusy.value) return;
+  if (!session.value || terminalTransferBusy.value) return;
   trackPendingInput(text);
   sendTerminalBytes(new TextEncoder().encode(text));
   terminal?.focus();
@@ -3189,7 +3475,7 @@ async function deleteQuickCommand(id: string) {
 // ssh/exec 是独立非交互通道，不回显也不共享 shell 状态，不符合语义。
 // 命令原文按键盘输入写入（用户可见可中断），不经过任何 shell 拼接转义。
 function sendQuickCommand(item: QuickCommand) {
-  if (!session.value || zmodemBusy.value || commandRunning.value) return;
+  if (!session.value || terminalTransferBusy.value || commandRunning.value) return;
   quickMenuOpen.value = false;
   const text = item.command.replace(/\r?\n/g, " ").trim();
   if (!text) return;
@@ -4099,6 +4385,11 @@ onBeforeUnmount(() => {
   window.clearInterval(reconnectCountdownTimer);
   window.clearTimeout(noticeTimer);
   window.clearTimeout(zmodemDetectionTimer);
+  window.clearTimeout(trzszDetectionTimer);
+  window.clearTimeout(trzszWatchdogTimer);
+  window.clearTimeout(trzszOverlayTimer);
+  trzszFilter?.stopTransferringFiles();
+  trzszFilter = null;
   window.clearTimeout(zoomNoticeTimer);
   window.clearInterval(metricsTimer);
   stopCommandMarkerTick();
@@ -4296,6 +4587,15 @@ onBeforeUnmount(() => {
           <span>{{ zmodemState === "waiting" ? t("zmodemWaiting") : t("zmodemUploading", { name: zmodemFileName, percent: zmodemPercent }) }}</span>
           <span v-if="zmodemSpeed">{{ formatBytes(zmodemSpeed) }}/s</span>
         </div>
+        <div v-if="trzszOverlayVisible" class="zmodem-status trzsz-status" :class="{ 'trzsz-done': trzszPhase === 'success', 'trzsz-failed': trzszPhase === 'failed' }">
+          <Loader2 v-if="trzszPhase === 'waiting' || trzszPhase === 'transferring'" class="spinning" />
+          <TriangleAlert v-else-if="trzszPhase === 'failed'" />
+          <span class="trzsz-label">{{ trzszStatusLabel }}</span>
+          <progress v-if="trzszPhase === 'transferring'" :value="trzszPercent" max="100" />
+          <span v-if="trzszPhase === 'transferring' && trzszFileCount > 1" class="trzsz-count mono">{{ trzszFileIndex }}/{{ trzszFileCount }}</span>
+          <span v-if="trzszPhase === 'transferring' && trzszSpeed" class="trzsz-speed">{{ formatBytes(trzszSpeed) }}/s</span>
+          <button v-if="trzszBusy" class="trzsz-cancel" :title="t('cancel')" @click="cancelTrzszTransfer"><X /></button>
+        </div>
         <section v-if="metricsOpen" class="metrics-float">
           <header>
             <h2>{{ t("metrics") }}<span v-if="metrics?.hostname" class="metrics-host"> · {{ metrics.hostname }}</span></h2>
@@ -4488,13 +4788,14 @@ onBeforeUnmount(() => {
 
     <nav v-if="terminalMenu" class="context-menu" :style="{ left: terminalMenu.x + 'px', top: terminalMenu.y + 'px' }" @click.stop>
       <button :disabled="!terminal?.hasSelection()" @click="copyTerminalSelection"><Copy />{{ t("terminalCopy") }}</button>
-      <button :disabled="!connected || zmodemBusy" @click="pasteTerminal"><ClipboardPaste />{{ t("terminalPaste") }}</button>
+      <button :disabled="!connected || terminalTransferBusy" @click="pasteTerminal"><ClipboardPaste />{{ t("terminalPaste") }}</button>
       <button @click="selectAllTerminal"><TextSelect />{{ t("terminalSelectAll") }}</button>
       <button @click="openTerminalSearch"><Search />{{ t("terminalSearch.open") }}</button>
       <button @click="clearTerminal"><Eraser />{{ t("terminalClear") }}</button>
       <button :disabled="!connected" @click="toggleQuickSudo()"><ShieldCheck />{{ t("quickSudo.label") }} · {{ quickSudo ? t("quickSudo.on") : t("quickSudo.off") }}</button>
       <hr />
-      <button :disabled="!connected || zmodemBusy || !canWrite" @click="chooseZmodem"><FileUp />{{ t("zmodemUpload") }}</button>
+      <button :disabled="!connected || terminalTransferBusy || !canWrite" @click="chooseZmodem"><FileUp />{{ t("zmodemUpload") }}</button>
+      <button :disabled="!connected || terminalTransferBusy || !canWrite" @click="chooseTrzszUpload"><FileUp />{{ t("trzszUpload") }}</button>
     </nav>
 
     <nav v-if="fileMenu" class="context-menu" :style="{ left: fileMenu.x + 'px', top: fileMenu.y + 'px' }" @click.stop>
@@ -4991,6 +5292,7 @@ onBeforeUnmount(() => {
 
     <input ref="uploadInput" class="hidden" type="file" multiple @change="onUploadInput" />
     <input ref="zmodemInput" class="hidden" type="file" multiple @change="onZmodemInput" />
+    <input ref="trzszInput" class="hidden" type="file" multiple @change="onTrzszPickInput" @cancel="onTrzszPickCancel" />
   </main>
 </template>
 

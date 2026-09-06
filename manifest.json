@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.4.32",
+  "version": "0.4.34",
   "publisher": "xynanan",
   "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
   "icon": "assets/plugin.svg",
@@ -179,6 +179,23 @@
           "binding": "config",
           "default": 30,
           "description": "Keepalive probe interval; 3 missed probes disconnect the session. 0 disables probes."
+        },
+        {
+          "key": "setEnv",
+          "label": "Set environment variables",
+          "type": "textarea",
+          "binding": "config",
+          "default": "",
+          "placeholder": "LANG=zh_CN.UTF-8",
+          "description": "One KEY=VALUE entry per line (semicolons also separate entries), sent to the server on the terminal, exec and sudo channels. Duplicate keys: the last entry wins. Invalid entries fail the connection; values come from this configuration only - the local environment is never transmitted."
+        },
+        {
+          "key": "remoteCommand",
+          "label": "Remote command",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Executed instead of a shell when a terminal session opens (a PTY is still requested). Leave empty for a normal interactive shell; reconnecting re-runs the command."
         },
         {
           "key": "sudo_source",
@@ -431,6 +448,15 @@
             "keepalive_interval_secs": {
               "label": "Intervalo de keepalive (segundos)"
             },
+            "setEnv": {
+              "label": "Variables de entorno (SetEnv)",
+              "description": "Una entrada CLAVE=VALOR por línea (los punto y coma también separan entradas); se envían al servidor en los canales de terminal, exec y sudo. Claves duplicadas: gana la última entrada. Las entradas no válidas hacen fallar la conexión; los valores provienen solo de esta configuración, nunca del entorno local.",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "remoteCommand": {
+              "label": "Comando remoto (RemoteCommand)",
+              "description": "Se ejecuta en lugar de un shell al abrir una sesión de terminal (el PTY se solicita igual). Déjelo vacío para un shell interactivo normal; al reconectar se vuelve a ejecutar el comando."
+            },
             "sudo_source": {
               "label": "Origen de credenciales sudo",
               "options": {
@@ -526,6 +552,15 @@
             "agent_socket": {
               "label": "Socket agent"
             },
+            "setEnv": {
+              "label": "Variabili d'ambiente (SetEnv)",
+              "description": "Una voce CHIAVE=VALORE per riga (il punto e virgola separa le voci); inviate al server sui canali terminale, exec e sudo. Chiavi duplicate: vince l'ultima voce. Le voci non valide fanno fallire la connessione; i valori provengono solo da questa configurazione, mai dall'ambiente locale.",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "remoteCommand": {
+              "label": "Comando remoto (RemoteCommand)",
+              "description": "Viene eseguito al posto di una shell all'apertura della sessione terminale (il PTY resta richiesto). Lasciare vuoto per una shell interattiva normale; alla riconnessione il comando viene rieseguito."
+            },
             "sudo_source": {
               "label": "Origine delle credenziali sudo",
               "options": {
@@ -608,6 +643,15 @@
             },
             "keepalive_interval_secs": {
               "label": "Keepalive 間隔（秒）"
+            },
+            "setEnv": {
+              "label": "環境変数（SetEnv）",
+              "description": "1 行に KEY=VALUE を 1 件（セミコロン区切りも可）。ターミナル・exec・sudo の各チャネルでサーバーへ送信します。同じキーが重複した場合は最後の指定が優先され、不正なエントリがあると接続は失敗します。値はこの設定からのみ取得され、ローカルの環境変数は送信されません。",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "remoteCommand": {
+              "label": "リモートコマンド（RemoteCommand）",
+              "description": "ターミナルセッション確立時にシェルの代わりに実行するコマンド（PTY は従来どおり要求）。空欄なら通常の対話シェルになります。再接続時は同じコマンドを再実行します。"
             },
             "sudo_source": {
               "label": "sudo 認証情報ソース",
@@ -704,6 +748,15 @@
             "agent_socket": {
               "label": "Socket do agente"
             },
+            "setEnv": {
+              "label": "Variáveis de ambiente (SetEnv)",
+              "description": "Uma entrada CHAVE=VALOR por linha (ponto e vírgula também separa entradas); enviadas ao servidor nos canais de terminal, exec e sudo. Chaves duplicadas: a última entrada vence. Entradas inválidas fazem a conexão falhar; os valores vêm apenas desta configuração — o ambiente local nunca é transmitido.",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "remoteCommand": {
+              "label": "Comando remoto (RemoteCommand)",
+              "description": "Executado em vez de um shell quando uma sessão de terminal é aberta (o PTY continua sendo solicitado). Deixe vazio para um shell interativo normal; reconectar executa o comando novamente."
+            },
             "sudo_source": {
               "label": "Origem das credenciais sudo",
               "options": {
@@ -786,6 +839,15 @@
             },
             "keepalive_interval_secs": {
               "label": "Keepalive 间隔（秒）"
+            },
+            "setEnv": {
+              "label": "环境变量（SetEnv）",
+              "description": "每行一条 KEY=VALUE（也可用分号分隔），在终端、exec 与 sudo 通道上发送给服务器。重复的键以最后一条为准；条目非法时连接直接失败。取值仅来自本配置，不会透传本地环境变量。",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "remoteCommand": {
+              "label": "远程命令（RemoteCommand）",
+              "description": "终端会话建立时执行该命令替代 shell（PTY 照常申请）。留空则为普通交互 shell；重连会重新执行同一条命令。"
             },
             "sudo_source": {
               "label": "Sudo 凭据来源",
@@ -887,6 +949,15 @@
             },
             "keepalive_interval_secs": {
               "label": "Keepalive 間隔（秒）"
+            },
+            "setEnv": {
+              "label": "環境變數（SetEnv）",
+              "description": "每行一條 KEY=VALUE（也可以分號分隔），在終端、exec 與 sudo 通道上傳送給伺服器。重複的鍵以最後一條為準；條目非法時連線直接失敗。取值僅來自本設定，不會傳送本地環境變數。",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "remoteCommand": {
+              "label": "遠端命令（RemoteCommand）",
+              "description": "終端工作階段建立時執行該命令替代 shell（PTY 照常要求）。留空則為一般互動 shell；重新連線會重新執行同一條命令。"
             },
             "sudo_source": {
               "label": "Sudo 憑據來源",

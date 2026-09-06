@@ -827,10 +827,25 @@ impl SshRuntime {
             .request_pty(true, "xterm-256color", cols.max(1), rows.max(1), 0, 0, &[])
             .await
             .map_err(|error| format!("Failed to request SSH PTY: {error}"))?;
-        channel
-            .request_shell(true)
-            .await
-            .map_err(|error| format!("Failed to start SSH shell: {error}"))?;
+        // Client-specified SetEnv rides on the interactive session too, in
+        // ssh(1) order: PTY first, env next, shell/exec last. A refused
+        // variable surfaces instead of half-configuring the session.
+        exec::apply_connection_env(&mut channel, &connection.set_env).await?;
+        if connection.remote_command.is_empty() {
+            channel
+                .request_shell(true)
+                .await
+                .map_err(|error| format!("Failed to start SSH shell: {error}"))?;
+        } else {
+            // `ssh RemoteCommand`: exec the configured command instead of a
+            // shell, with the PTY still requested. Like ssh(1), every
+            // (re)connect replays the same command - a dropped session that
+            // the workbench reopens intentionally runs it again.
+            channel
+                .exec(true, connection.remote_command.as_bytes())
+                .await
+                .map_err(|error| format!("Failed to start remote command: {error}"))?;
+        }
 
         let session_id = Uuid::new_v4().to_string();
         let (terminal_tx, mut terminal_rx) = mpsc::channel(256);
@@ -1761,21 +1776,18 @@ impl SshRuntime {
                 })
                 .clamp(5, 300),
         );
-        let connection = if sudo {
-            let connection = self
-                .connections
-                .read()
-                .map_err(|_| "Connection registry is poisoned".to_string())?
-                .get(&session.connection_id)
-                .cloned()
-                .ok_or("Connection is not active; reopen it from DBX".to_string())?;
-            if !connection.sudo_enabled() {
-                return Err("Quick Sudo is disabled for this connection".to_string());
-            }
-            Some(connection)
-        } else {
-            None
-        };
+        // Connection config is needed on both paths now: Quick Sudo
+        // orchestration for sudo, and the client-specified setEnv either way.
+        let connection = self
+            .connections
+            .read()
+            .map_err(|_| "Connection registry is poisoned".to_string())?
+            .get(&session.connection_id)
+            .cloned()
+            .ok_or("Connection is not active; reopen it from DBX".to_string())?;
+        if sudo && !connection.sudo_enabled() {
+            return Err("Quick Sudo is disabled for this connection".to_string());
+        }
         let orchestration = session
             .orchestration
             .read()
@@ -1787,19 +1799,28 @@ impl SshRuntime {
         let handle = session.handle.clone();
         let command = command.to_string();
 
-        let use_pty = connection.as_ref().map(|connection| {
+        let use_pty = if sudo {
             let store = sudo_profiles::load_store(&self.data_dir);
             sudo_profiles::effective_use_pty(
                 connection.sudo_use_pty,
-                effective_sudo_profile(connection, &store).as_ref(),
+                effective_sudo_profile(&connection, &store).as_ref(),
             )
-        })
-        .unwrap_or(false);
+        } else {
+            false
+        };
         let run = async move {
             let outcome = if sudo {
-                exec::exec_with_sudo(&handle, &orchestration, &command, timeout, use_pty).await?
+                exec::exec_with_sudo(
+                    &handle,
+                    &orchestration,
+                    &command,
+                    timeout,
+                    use_pty,
+                    &connection.set_env,
+                )
+                .await?
             } else {
-                exec::exec_plain(&handle, &command, timeout).await?
+                exec::exec_plain(&handle, &command, timeout, &connection.set_env).await?
             };
             Ok(outcome)
         };
@@ -2423,7 +2444,9 @@ impl SshRuntime {
         let session = self.session(session_id).await?;
         let path = normalize_remote_path(path)?;
         let command = format!("df -kP {}", exec::shell_quote(&path));
-        let outcome = exec::exec_plain(&session.handle, &command, Duration::from_secs(20)).await?;
+        // Plugin-internal plumbing: no client setEnv, keeping the df output
+        // parseable regardless of the connection's locale overrides.
+        let outcome = exec::exec_plain(&session.handle, &command, Duration::from_secs(20), &[]).await?;
         exec::parse_disk_usage(&outcome.output)
             .ok_or_else(|| format!("Could not parse disk usage output: {}", outcome.output))
     }

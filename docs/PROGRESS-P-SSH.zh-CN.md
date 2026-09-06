@@ -1278,3 +1278,82 @@ caret + 方向键移焦、zh-TW「批次」在位。复验截图 0 张留存（�
 调试图已删）。新增用户可见文案七语齐（en/zh-CN/zh-TW/es/it/ja/pt-BR）。
 遗留：R3-P1-1 的宿主真实 webview 复核建议保留；zmodem/拖拽上传 headless
 不可达（沿袭第 1 轮）。
+
+## tssh 对标特性追赶：trz/tsz + SetEnv/RemoteCommand（0.4.34，2026-09-07）
+
+> 分支 `feat/ssh-tssh-parity`（worktree `.worktrees/feat-ssh-tssh-parity`，
+> 对标参照 [trzsz-ssh](https://github.com/trzsz/trzsz-ssh)）。并发双工作包
+> （前端/后端文件所有权不相交）+ 主会话集中收口。**范围决策（用户，
+> 2026-09-07）：转发类特性不做**——端口转发（-L/-R/-D）与 Agent 转发
+> （ForwardAgent）均否掉，理由：宿主已有 ssh 隧道实现（连接代拨模型，
+> `dbx-core/src/db/ssh_tunnel.rs`）；宿主能力盘点结论（无 -R、无面向用户的
+> 转发会话 UI、插件桥无任意 host:port 转发接口）已存档
+> `FEATURE_PARITY.zh-CN.md` tssh 补充节。后端工作包原含 Agent 转发，中途
+> 按决策裁剪：其 model.rs 半成品被主会话收编，剥离 `forward_agent` 字段，
+> 保留 SetEnv/RemoteCommand 两字段解析与契约测试。
+
+**工作包 B（前端，trz/tsz 文件传输）**：引入 `trzsz` 1.1.6（trzsz.js 官方
+JS 实现，MIT）——**本插件前端首个依赖豁免**，理由：协议帧收发/转义/tmux
+兼容/MD5 校验全在包内，自研等于重写协议；连带 `tsconfig.json` 加
+`skipLibCheck`（包内 d.ts 引用了未装 scope 的 `xterm` 类型，本项目用
+`@xterm/xterm`，skipLibCheck 是不动第三方文件的最小解法）。集成形态：
+`TrzszFilter` 流式挂接（不用绑 WebSocket 的 TrzszAddon）——PTY 下行帧经
+`processServerOutput` 空闲透传 + announce 扫描（`::TRZSZ:TRANSFER:`），
+传输中输入接管（Ctrl+C 停传）；`sendToServer` 走现有 8 字节序号前缀输入
+路径；与 zmodem 共存互斥（`terminalInteraction.ts` 的占用守卫统一为
+`transferBusy`）；实例级覆写 `handleTrzszUploadFiles/handleTrzszDownloadFiles`
+（浏览器构建硬编码 File System Access API，WKWebView 沙箱没有）——上传走
+隐藏 `<input type=file multiple>`，下载缓冲成 Blob 后宿主 `fileTransfer`
+优先、`<a download>` 兜底；进度 overlay（单/多文件 i/N、百分比、速度、
+取消）；右键菜单「Upload (trz)」向 PTY 发 `trz\r` 触发远端，5s 未响应报错
++15s 看门狗。i18n 七语各 +8 key（trzszUpload/trzszWaiting/trzszUploading/
+trzszDownloading/trzszComplete/trzszFailed/trzszNotAvailable/
+trzszCancelled）。新增 `lib/terminalTrzsz.ts` + 26 条纯函数单测。
+
+**工作包 A（后端，SetEnv + RemoteCommand）**：
+- 连接表单新增 `setEnv`（textarea，多行 `KEY=VALUE`，分号兼容；严格校验：
+  非法条目聚合报错连接失败，"宁可连不上也不错配"；重复 key 后者覆盖）与
+  `remoteCommand`（text，trim 非空生效），七语 label/description/placeholder
+  齐，位于 `keepalive_interval_secs` 与 `sudo_source` 之间；三个
+  manifest↔parser 契约测试为此转绿。
+- SetEnv 注入点：交互 shell 通道（`open_session` PTY 后、shell/exec 前）+
+  `exec_plain`/`exec_with_sudo` 两分支（`exec.rs` 新增纯函数
+  `merge_channel_env`：内置默认 best-effort、用户条目 strict 且同名覆盖，
+  每变量恰请求一次；与既有 `SUDO_ASKPASS` 清空共存，用户值优先）。russh
+  `set_env` 为 fire-and-forget，服务端无 `AcceptEnv` 时静默不生效——与
+  ssh(1) 同语义，PROTOCOL 文档已注明需服务端配合。
+- RemoteCommand：`open_session` 中非空时 `exec` 替代 `request_shell`
+  （PTY 照常）；命令退出即会话终止（与 `ssh host command` 一致）；
+  reattach 重放属预期；MCP/sudo/replay 路径零改动（`mcp.rs` 直构连接点补
+  空默认）。JumpHost 显式不继承两字段（只作用于最终会话）。
+- smoke_test.py 新增两用例：exec 通道 `echo $DBX_SMOKE_ENV` 实测回显、
+  remoteCommand 会话回放含标记输出（测试容器 sshd_config 追加
+  `AcceptEnv DBX_SMOKE_ENV` 并重启，仅测试容器可逆改动）。
+- PROTOCOL.zh-CN.md 同步：RPC 表、连接字段、新章节「会话环境与会话命令
+  （SetEnv / RemoteCommand）」。
+
+**验证（0.4.34，`scripts/test.sh --skip-host` + 手动补跑尾两步）**：
+cargo test **214/214**（基线 211 + 3 契约转绿 + 3 merge 单测）；前端
+typecheck 0 错、vitest **263/263**（基线 237 + 26）、build 过；release 构建
++ .dbxp 打包（0.4.34）+ MCP stdio smoke 过；live smoke：smoke_test PASS
+（含新 setEnv/remoteCommand 用例）、smoke_fs **45/45**、smoke_batch3
+**17/17**、perf 基线过（upload 网络 160 MB/s 量级）、mock UI walkthrough
+全绿。smoke_sudo_otp **8 passed/1 skipped/1 failed**——失败用例
+"same-window replay rotates to the second secret" 为**文档在案的存量回归**
+（0.4.15→0.4.17 sudo 时间戳/OTP 编排改动引入，见上文 ⚠️ 预存在段落），
+本轮 A/B 复核：已安装 0.4.33 副本同样失败、本分支构建同样失败——与本轮
+改动无关，专项排查遗留。test.sh 因此在该步中止（set -e），尾两步
+（perf/UI mock）已手动补跑通过。
+
+**合并注意**：主工作区存在未提交的 0.4.32→0.4.33 版本号 bump
+（manifest.json/Cargo.toml/Cargo.lock）与 UI_SCAN_FINDINGS 文档更新；
+本分支已 bump **0.4.34**（越过 0.4.33），合并时版本行以本分支为准，
+UI_SCAN 文档改动与本分支无交集可并行保留。worktree 内 `host` 为指向主
+工作区子模块的符号链接（path 依赖所需），呈现为 typechange，勿提交。
+
+**遗留**：① trz/tsz 真机实流验证（对装了 trz/tsz 的测试容器跑 `trz`/`tsz`
+全流程 + WKWebView 真机 file picker/cancel 行为）——本轮 headless 无法
+构造，机制层有 26 条单测 + announce 看门狗兜底；② remoteCommand 命令退出
+即断开的产品语义是否保留（备选：退出后回 shell 或提示重连）待用户定；
+③ smoke_sudo_otp 存量回归专项排查（归档在案，非本轮引入）；④ setEnv 在
+默认 sshd 上需 `AcceptEnv` 配合，文档已注明。
