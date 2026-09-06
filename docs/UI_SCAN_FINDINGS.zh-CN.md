@@ -320,6 +320,34 @@
 - **未达到"第 5 轮零新发现"收敛判据**：尚余 1 条实质 P2（R5-P2-1，改动面为一行级）。建议：修复 R5-P2-1（R5-P2-2 明确豁免或一并收口）后，第 6 轮按本轮脚本 A/B 直接复跑——若全绿即可宣布扫描收敛。
 - 复跑资产：脚本留存于 `/tmp/uiscan-ssh-r5`（verify-a.mjs / verify-b.mjs / verify-b2.mjs，不入库）；本轮截图 2 张调试图已全部删除，0 张留存。
 
-__zcode_status=$?
-if [ "$__zcode_status" -eq 0 ]; then pwd -P > '/var/folders/4_/zmg595750zv57pwjdvllgrtc0000gn/T/zcode-ac93780d-13ed-4941-831f-8df5a37f9020-cwd'; fi
-exit "$__zcode_status"
+## 7. 第 6 轮（收敛点验，2026-09-06）
+
+最终判定轮：仅点验 R5-P2-1 修复 + 第 3/5 轮已收口项抽查 5 条，不做全面重扫。
+
+### 7.1 R5-P2-1 点验结论：修复有效，真实验证通过
+
+- **代码路径确认**（`src/App.vue`）：`onDocumentKeydown` Esc 链工具栏弹出层分支条件已含 `metricsOpen`（~3939，与 quickMenuOpen/pathHistoryOpen/columnsOpen/transferPanelOpen/connectionInfoOpen 同列），命中时调 `closeMetrics()`（~3945）；`closeMetrics` 同步置 `metricsOpen=false` 并 `clearInterval(metricsTimer)`（~3369–3372），无轮询泄漏。其余 popover 直接置 false、metrics 走 closeMetrics 的差异化处理正确（metrics 有 5s 轮询 timer）。
+- **真实交互验证（mock.html?rw=1，headless Chrome + playwright-core）——R5 标注的"headless 夹具下浮层不可达（按钮依赖已连接态）"本轮证实不成立**：连接建立后 Gauge 按钮（`.icon-emerald` + `svg.lucide-gauge`，`:disabled="!connected"`）enabled 且可点，浮层可达，Esc 路径已完成浏览器级验证：
+  - 点击打开 `.metrics-float` 成功；打开态 5.6s 内 invoke 台账 `ssh/metrics` +1（5s 轮询在跑）；
+  - **按 Esc → 浮层关闭（residue=0）**；Esc 后再等 5.6s，`ssh/metrics` 计数零增量（**closeMetrics 清轮询实证**）；
+  - 5 轮 toggle 快速开关无残留；全程 0 pageerror。
+  - 原"留真机例行复核"保留项可降级为可选（机制已在真实浏览器事件链上验证）。
+- 基线复跑：`pnpm typecheck` 0 错；`pnpm test` **237/237** 全绿，与 R6 修复标注一致。
+- 资产备忘：工具栏现有 4 个 `icon-emerald` 按钮（Reconnect / Quick Sudo ×2 / Server metrics），脚本定位 Gauge 必须用 `button:has(svg.lucide-gauge)` 精确匹配（`page.click(".icon-emerald")` 会命中首个 Reconnect 造成假阴/假阳）。
+
+### 7.2 抽查结果表（第 3/5 轮已收口项 5 条复跑）
+
+| 抽查项 | 结论 | 证据 |
+| --- | --- | --- |
+| R3-P1-1 幽灵点击 | ✅ 无回退 | 键盘 Enter mkdir：backdrop=0、`sftp/createDirectory` 恰 1 次；守卫窗内真实鼠标（带 mousedown）仍可重开、Esc 可关 |
+| R3-P1-3 目录竞态 | ✅ 无回退 | /etc 延迟 3s + 改道 /var/log：3.5s 后 footer 稳定 /var/log、hosts 不漏渲染；无改道时慢响应正常渲染 /etc（epoch 不过度丢弃） |
+| R3-P2-6 树键盘 | ✅ 无回退 | 6/6 treeitem、6 caret 0 无名、tabindex=0 可达、ArrowDown→idx1 / ArrowUp→idx0 双向移焦、树行 Enter 联动路径栏 |
+| R3-P2-7 zh-TW 批次 | ✅ 无回退 | `[title="批次傳送命令"]` 在位、旧措辞「批量傳送命令」0 节点 |
+| R5 终端搜索（零发现维度抽查） | ✅ 无回退 | Ctrl+F 面板打开、搜 needle 命中 status "1/1" + 2 个 decoration、Esc 关闭面板 |
+
+### 7.3 第 6 轮收敛判定
+
+- 点验 1/1 ✅（R5-P2-1 修复有效且升级为浏览器级实证）；抽查 5/5 ✅（无回退）；新发现：**P0=0、P1=0、P2=0**。
+- R5-P2-2（瞬态 notice 换语）按第 5 轮判定维持"边缘豁免，可不修"。
+- **第 6 轮零新发现，扫描收敛。**
+- 复跑资产：脚本留存 `/tmp/uiscan-ssh-r6/verify-r6.mjs`（不入库）；本轮截图 0 张留存（全程无失败）。
