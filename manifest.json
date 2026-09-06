@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.4.31",
+  "version": "0.4.32",
   "publisher": "xynanan",
   "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
   "icon": "assets/plugin.svg",

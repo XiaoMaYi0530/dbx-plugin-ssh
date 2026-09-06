@@ -1231,3 +1231,50 @@ playwright-core + 系统 Chrome，10/10 项通过；走查脚本装于
 pill 对比度 4.53:1、dark 染色不变、404/console 零噪音。本次顺带解除此前
 PROGRESS 记录的"fixture 局限：重连横幅只能靠计算样式探针验证"——现在可全流程
 浏览器验证。第 1 轮 P1-1 的真机 sidecar 认证失败重试节奏复核遗留项不变。
+
+## UI 扫描第 3 轮修复收口（接手中断半成品）+ 第 4 轮复验记录（2026-09-06）
+
+第 3 轮专家深度测试（`UI_SCAN_FINDINGS.zh-CN.md` 第五章，P1×3 + P2×7）的修复
+由前一 agent 发起后中断。本轮接手做逐条审计：`src/lib/` 下
+ghostClickGuard / requestEpoch / remotePathInput / sftpRename（另有同批
+sftpEntries / fileRowKeydown / 既有 toolbarTint）**均已完成实现、App.vue/
+DirTree.vue 接线、配套 spec 与七语文案**，完成度高于中断时预期，10/10 无需
+补代码；本轮工作为全量回归验证 + 浏览器复验 + 文档收口。仅触碰
+`frontend/` 内文件与两份 docs，未提交 git、未动依赖。
+
+- **R3-P1-1 幽灵点击重开弹层**：`lib/ghostClickGuard.ts`（400ms 抑制窗 +
+  mousedown 前驱判定，真实鼠标点击放行）；焦点归还前 arm，document capture
+  级监听拦截合成 click。7 条单测。
+- **R3-P1-2 / R3-P2-1 Esc 取消仍提交 + Enter 双发**：`lib/sftpRename.ts`
+  `shouldCommitRename`（editingPath 指向校验 + submitting 分支）；Esc/Enter
+  先清 renamingPath，卸载引发的幽灵 blur 被短路。6 条单测。
+- **R3-P1-3 目录加载竞态**：`lib/requestEpoch.ts`；loadDirectory 取单调序号，
+  落地/catch/finally 三处 isCurrent 校验，过期响应整体丢弃。4 条单测。
+- **R3-P2-2 重命名冲突预检**：commitRename 增加 sftp/exists 预检 +
+  window.confirm（七语新 key `sftpRename.overwriteConfirm`），失败路径关编辑
+  态并刷新；mock `sftp/rename` 收口为原子语义（撞名不丢源）+ 2 条夹具单测。
+- **R3-P2-3 坏响应防御**：`lib/sftpEntries.ts` `sanitizeSftpEntries`（非数组
+  → 空数组、坏行丢弃、缺 kind 降级 file），loadDirectory 落地前统一过
+  sanitize。7 条单测。
+- **R3-P2-4 路径栏 `~`/`..`**：`lib/remotePathInput.ts`
+  `resolveRemotePath`（home 展开 + `..` 消解 + 基础归一），路径栏 Enter 走
+  `submitPathInput()`。9 条单测。
+- **R3-P2-5 键盘打开**：`lib/fileRowKeydown.ts` `decideFileRowAction`，文件行
+  Enter 打开 / F2 重命名 / Delete 删除（只读连接仅 Enter）。4 条单测。
+- **R3-P2-6 树键盘 + caret 名**：DirTree.vue 加 role=treeitem、aria-expanded、
+  roving tabindex、Enter/Space/方向键导航；caret 补 aria-label（七语
+  `sftpSide.expandNode/collapseNode`）。组件测试 +5 条。
+- **R3-P2-7 zh-TW「批次」**：i18n zh-TW batchSend* 全组「批量」→「批次」，
+  zh-CN 不变。
+
+验证：`pnpm typecheck` 0 错；`pnpm test` 27 文件 **237 用例全绿**（第 2 轮
+基线 191 + 新增 46）。浏览器复验（vite :5291 + playwright-core + 系统
+Chrome headless，`/tmp/uiscan-ssh-r4b` 不入库）：按第 3 轮复现步骤逐条复验
+**11/11 PASS**（10 条 + P2-2 取消路径变体）——mkdir 键盘 Enter 一次成功关闭
+不重开、Esc 取消重命名 0 invoke、慢 /etc 竞态不回跳、Enter 重命名单发无假
+横幅、撞名 confirm 接受/取消两路均收敛、entries:null/畸形行 0 pageerror、
+`~` 与 `..` 正确消解、键盘 Enter 逐级进目录、树 6/6 treeitem + 0 无名
+caret + 方向键移焦、zh-TW「批次」在位。复验截图 0 张留存（失败才截图，
+调试图已删）。新增用户可见文案七语齐（en/zh-CN/zh-TW/es/it/ja/pt-BR）。
+遗留：R3-P1-1 的宿主真实 webview 复核建议保留；zmodem/拖拽上传 headless
+不可达（沿袭第 1 轮）。

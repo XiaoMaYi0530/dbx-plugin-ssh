@@ -1,20 +1,27 @@
 // @vitest-environment happy-dom
 // DirTree 组件测试：行单击 open、caret 展开/收缩 toggle（阻断 open）、右键 context、
-// 当前目录高亮、懒加载 spinner、展开/收起图标切换、递归子节点渲染与事件冒泡。
-import { describe, expect, it } from "vitest";
+// 当前目录高亮、懒加载 spinner、展开/收起图标切换、递归子节点渲染与事件冒泡；
+// 以及 R3-P2-6 键盘可达：role=treeitem、roving tabindex、aria-expanded、caret
+// accessible name、Enter/Space/方向键导航。
+import { afterEach, describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
 import DirTree from "./DirTree.vue";
 import type { DirTreeNode } from "../lib/sftpDirTree";
 
-// t prop 用确定性假实现：仅翻译根目录文案，其余原样返回 key，断言与 i18n 表解耦。
-const t = (key: string) => (key === "sftpSide.root" ? "ROOT" : key);
+// t prop 用确定性假实现：根目录文案与 {name} 插值可断言，其余原样返回 key。
+const t = (key: string, values?: Record<string, string | number>) => {
+  if (key === "sftpSide.root") return "ROOT";
+  const template = key === "sftpSide.expandNode" ? "expand {name}" : key === "sftpSide.collapseNode" ? "collapse {name}" : key;
+  return template.replace(/\{(\w+)\}/g, (_m, name: string) => String(values?.[name] ?? `{${name}}`));
+};
 
 function node(partial: Partial<DirTreeNode> & { path: string; name: string }): DirTreeNode {
   return { expanded: false, loaded: false, loading: false, children: [], ...partial };
 }
 
 function mountTree(nodes: DirTreeNode[], currentPath = "/") {
-  return mount(DirTree, { props: { nodes, depth: 0, currentPath, t } });
+  // 键盘导航用例依赖 document 级查询与真实 focus 行为，必须挂到 document.body。
+  return mount(DirTree, { attachTo: document.body, props: { nodes, depth: 0, currentPath, t } });
 }
 
 describe("DirTree", () => {
@@ -101,5 +108,72 @@ describe("DirTree", () => {
   it("does not render child rows for an expanded node whose children are empty", () => {
     const wrapper = mountTree([node({ path: "/var", name: "var", expanded: true, loaded: true, children: [] })]);
     expect(wrapper.findAll(".sftp-tree-row")).toHaveLength(1);
+  });
+
+  // ---- R3-P2-6：键盘可达与 aria ----
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("exposes treeitem semantics, aria-expanded and a roving tabindex (R3-P2-6)", () => {
+    const wrapper = mountTree([node({ path: "/var", name: "var", expanded: true }), node({ path: "/etc", name: "etc" })], "/etc");
+    const rows = wrapper.findAll(".sftp-tree-row");
+    expect(rows[0].attributes("role")).toBe("treeitem");
+    expect(rows[0].attributes("aria-expanded")).toBe("true");
+    expect(rows[1].attributes("aria-expanded")).toBe("false");
+    // 当前行 tabindex=0，其余 -1。
+    expect(rows[0].attributes("tabindex")).toBe("-1");
+    expect(rows[1].attributes("tabindex")).toBe("0");
+  });
+
+  it("falls back the roving tabindex to the first row when no row is current", () => {
+    const wrapper = mountTree([node({ path: "/var", name: "var" }), node({ path: "/etc", name: "etc" })], "/nowhere");
+    const rows = wrapper.findAll(".sftp-tree-row");
+    expect(rows[0].attributes("tabindex")).toBe("0");
+    expect(rows[1].attributes("tabindex")).toBe("-1");
+  });
+
+  it("gives the caret an accessible name with expand/collapse semantics (R3-P2-6)", () => {
+    const wrapper = mountTree([node({ path: "/var", name: "var" }), node({ path: "/etc", name: "etc", expanded: true })]);
+    const carets = wrapper.findAll(".sftp-tree-caret");
+    expect(carets[0].attributes("aria-label")).toBe("expand var");
+    expect(carets[1].attributes("aria-label")).toBe("collapse etc");
+  });
+
+  it("names the root caret with the localized root label", () => {
+    const wrapper = mountTree([node({ path: "/", name: "/" })]);
+    expect(wrapper.find(".sftp-tree-caret").attributes("aria-label")).toBe("expand ROOT");
+  });
+
+  it("opens on Enter and toggles on Space without emitting the other action", async () => {
+    const target = node({ path: "/var", name: "var" });
+    const wrapper = mountTree([target]);
+    const row = wrapper.find(".sftp-tree-row");
+    await row.trigger("keydown", { key: "Enter" });
+    expect(wrapper.emitted("open")?.[0]).toEqual([target]);
+    expect(wrapper.emitted("toggle")).toBeUndefined();
+    await row.trigger("keydown", { key: " " });
+    expect(wrapper.emitted("toggle")?.[0]).toEqual([target]);
+    expect(wrapper.emitted("open")).toHaveLength(1);
+  });
+
+  it("moves focus with ArrowDown/ArrowUp across rows (roving navigation, R3-P2-6)", async () => {
+    const wrapper = mountTree([node({ path: "/a", name: "a" }), node({ path: "/b", name: "b" }), node({ path: "/c", name: "c" })]);
+    const rows = wrapper.findAll(".sftp-tree-row");
+    await rows[0].trigger("keydown", { key: "ArrowDown" });
+    expect(document.activeElement).toBe(rows[1].element);
+    await rows[1].trigger("keydown", { key: "ArrowDown" });
+    expect(document.activeElement).toBe(rows[2].element);
+    await rows[2].trigger("keydown", { key: "ArrowUp" });
+    expect(document.activeElement).toBe(rows[1].element);
+  });
+
+  it("does not move focus or preventDefault at the list edges", async () => {
+    const wrapper = mountTree([node({ path: "/a", name: "a" }), node({ path: "/b", name: "b" })]);
+    const rows = wrapper.findAll(".sftp-tree-row");
+    await rows[2]?.trigger("keydown", { key: "ArrowDown" });
+    await rows[0].trigger("keydown", { key: "ArrowUp" });
+    expect(document.activeElement).not.toBe(rows[1].element);
   });
 });

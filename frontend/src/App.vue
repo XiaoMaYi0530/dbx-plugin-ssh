@@ -86,6 +86,12 @@ import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt
 import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRestore";
 import { toolbarTintStyle } from "./lib/toolbarTint";
+import { createGhostClickGuard } from "./lib/ghostClickGuard";
+import { createRequestEpoch } from "./lib/requestEpoch";
+import { sanitizeSftpEntries } from "./lib/sftpEntries";
+import { resolveRemotePath } from "./lib/remotePathInput";
+import { shouldCommitRename } from "./lib/sftpRename";
+import { decideFileRowAction } from "./lib/fileRowKeydown";
 import { bridgeBinaryBytes } from "../../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
 import { workbenchMessage } from "./lib/i18n";
@@ -1814,9 +1820,14 @@ function copyTextToClipboard(value: string, noticeKey: string, values?: Record<s
   void window.dbxPlugin.clipboard?.writeText(value).then(() => showNotice(t(noticeKey, values)));
 }
 
+// R3-P1-3：目录列表加载的单调请求序号。慢链路下"先发 A 后发 B、A 晚到"
+// 会把列表/路径/历史整体回跳；只有最新请求允许落地，过期响应整体丢弃。
+const listEpoch = createRequestEpoch();
+
 async function loadDirectory(path = currentPath.value, fromTerminal = false) {
   if (!session.value) return;
   const normalized = normalizeRemotePath(path);
+  const epochId = listEpoch.next();
   loadingFiles.value = true;
   if (!fromTerminal) sftpError.value = "";
   try {
@@ -1824,7 +1835,10 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false) {
       sessionId: session.value.sessionId,
       path: normalized,
     });
-    entries.value = result.entries;
+    if (!listEpoch.isCurrent(epochId)) return;
+    // R3-P2-3：响应容错——非数组/畸形行走 sanitize（null entries → 空数组、
+    // 缺 kind 的行降级为 file），单行坏数据不再让列表僵死或抛 pageerror。
+    entries.value = sanitizeSftpEntries(result.entries);
     currentPath.value = normalized;
     selectedPath.value = "";
     clearRowSelection();
@@ -1832,11 +1846,12 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false) {
     persistState();
     void refreshDiskUsage();
   } catch (cause) {
+    if (!listEpoch.isCurrent(epochId)) return;
     const message = cause instanceof Error ? cause.message : String(cause);
     if (fromTerminal) showNotice(t("followDirectoryFailed", { path: normalized, error: message }));
     else sftpError.value = message;
   } finally {
-    loadingFiles.value = false;
+    if (listEpoch.isCurrent(epochId)) loadingFiles.value = false;
   }
 }
 
@@ -2293,15 +2308,37 @@ function beginRename(entry: SftpEntry) {
 }
 
 async function commitRename(entry: SftpEntry) {
+  // R3-P1-2 / R3-P2-1：blur 是"卸载/失焦"兜底提交入口。Esc 取消会先清
+  // renamingPath 再卸载输入框，Enter 提交成功后也会清空——两种场景下
+  // editingPath 已不指向本行，blur 到达时被 shouldCommitRename 短路，
+  // 取消语义不再以草稿名逃逸提交、Enter 也不再双发。
+  if (!shouldCommitRename({ editingPath: renamingPath.value, entryUri: entry.uri, submitting: renameSubmitting.value })) return;
   const name = renameDraft.value.trim();
   if (!session.value || !name || name === entry.name) {
     renamingPath.value = "";
     return;
   }
+  const sourcePath = pathFromUri(entry.uri);
+  const targetPath = joinRemote(currentPath.value, name);
   renameSubmitting.value = true;
   try {
-    const sourcePath = pathFromUri(entry.uri);
-    const targetPath = joinRemote(currentPath.value, name);
+    // R3-P2-2：与粘贴对齐的目标存在性预检。OpenSSH rename 撞名语义依
+    // posix-rename 扩展而异，前端先给出明确的覆盖确认；预检失败不阻断，
+    // 交由后端执行时报错。
+    let targetExists = false;
+    try {
+      const probe = await window.dbxPlugin.invoke<{ exists: boolean }>("sftp/exists", {
+        sessionId: session.value.sessionId,
+        path: targetPath,
+      });
+      targetExists = probe.exists === true;
+    } catch {
+      // 预检不可用时保持原语义直接下发。
+    }
+    if (targetExists && !window.confirm(t("sftpRename.overwriteConfirm", { name }))) {
+      renamingPath.value = "";
+      return;
+    }
     if (sudoMode.value) {
       await window.dbxPlugin.invoke("sudo/rename", { sessionId: session.value.sessionId, sourcePath, targetPath });
     } else {
@@ -2310,7 +2347,10 @@ async function commitRename(entry: SftpEntry) {
     renamingPath.value = "";
     await loadDirectory();
   } catch (cause) {
+    // R3-P2-2：失败路径收敛——关闭行内编辑态并刷新列表，不再滞留打开态。
+    renamingPath.value = "";
     showError(cause);
+    await loadDirectory();
   } finally {
     renameSubmitting.value = false;
   }
@@ -2628,6 +2668,28 @@ async function pasteClipboard() {
 function goToPath(path: string) {
   pathHistoryOpen.value = false;
   void loadDirectory(path);
+}
+
+// R3-P2-4：路径栏提交统一入口——`~`（home 已探测时）展开、`.`/`..` 段消解
+// 及基础归一，下游 joinRemote/exists 拼接与路径历史不再携带未规范路径。
+function submitPathInput() {
+  if (!connected.value) return;
+  const target = resolveRemotePath(currentPath.value, sftpHomePath.value || undefined);
+  currentPath.value = target;
+  void loadDirectory(target);
+}
+
+// R3-P2-5：文件行键盘语义——Enter 打开（目录进入/文件预览）、F2 重命名、
+// Delete 删除，对齐主流文件管理器；动作决策走 fileRowKeydown 纯模块（有
+// 单测），重命名输入框内的按键已自带 .stop。
+function onFileRowKeydown(event: KeyboardEvent, entry: SftpEntry) {
+  const action = decideFileRowAction(event.key, canWrite.value);
+  if (!action) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (action === "open") void openEntry(entry);
+  else if (action === "rename") beginRename(entry);
+  else deleteTarget.value = entry;
 }
 
 async function chooseUpload() {
@@ -3718,6 +3780,17 @@ const modalTriggerStack: HTMLElement[] = [];
 // 卸载，无法承接归还焦点），归还目标回退到菜单打开前的焦点宿主；
 // 弹层内聚焦不覆盖该记录。
 let lastStableFocus: HTMLElement | null = null;
+// 幽灵点击守卫（R3-P1-1）：焦点归还后短窗内拦截无 mousedown 前驱的合成
+// click；决策逻辑走 ghostClickGuard 纯模块（有单测），真实鼠标点击放行。
+const ghostClickGuard = createGhostClickGuard();
+function onDocumentMouseDownCapture() {
+  ghostClickGuard.noteMouseDown();
+}
+function onDocumentClickCapture(event: MouseEvent) {
+  if (!ghostClickGuard.shouldSuppress()) return;
+  event.preventDefault();
+  event.stopPropagation();
+}
 function trackStableFocus(event: FocusEvent) {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
@@ -3772,6 +3845,10 @@ watch(modalOpenCount, (count, previous) => {
     while (modalTriggerStack.length) {
       const trigger = modalTriggerStack.pop()!;
       if (trigger.isConnected) {
+        // 幽灵点击守卫（R3-P1-1）：键盘 Enter 提交后归还焦点的瞬间，浏览器
+        // 会在刚聚焦的按钮上派发一次无 mousedown 的合成 click 并重开弹层；
+        // 短窗内拦截该 click，纯键盘流一次 Enter 即成功关闭。
+        ghostClickGuard.arm();
         trigger.focus({ preventScroll: true });
         break;
       }
@@ -3858,13 +3935,14 @@ function onDocumentKeydown(event: KeyboardEvent) {
     blankMenu.value = undefined;
     return;
   }
-  // ---- 工具栏弹出层 ----
-  if (quickMenuOpen.value || pathHistoryOpen.value || columnsOpen.value || transferPanelOpen.value || connectionInfoOpen.value) {
+  // ---- 工具栏弹出层（含指标浮层，R5-P2-1：同列 popover 一并进 Esc 链）----
+  if (quickMenuOpen.value || pathHistoryOpen.value || columnsOpen.value || transferPanelOpen.value || connectionInfoOpen.value || metricsOpen.value) {
     quickMenuOpen.value = false;
     pathHistoryOpen.value = false;
     columnsOpen.value = false;
     transferPanelOpen.value = false;
     connectionInfoOpen.value = false;
+    if (metricsOpen.value) closeMetrics();
   }
 }
 
@@ -4001,6 +4079,8 @@ watch([splitRatio, paneOrder, sftpPaneOpen, followDirectory, sudoMode, visibleCo
 
 onMounted(() => {
   document.addEventListener("click", closeMenus);
+  document.addEventListener("click", onDocumentClickCapture, true);
+  document.addEventListener("mousedown", onDocumentMouseDownCapture, true);
   document.addEventListener("keydown", onDocumentKeydown);
   document.addEventListener("focusin", trackStableFocus);
   void hydrateQuickCommands();
@@ -4029,6 +4109,8 @@ onBeforeUnmount(() => {
     if (terminalWheelHandler) terminalHost.value.removeEventListener("wheel", terminalWheelHandler, true);
   }
   document.removeEventListener("click", closeMenus);
+  document.removeEventListener("click", onDocumentClickCapture, true);
+  document.removeEventListener("mousedown", onDocumentMouseDownCapture, true);
   document.removeEventListener("keydown", onDocumentKeydown);
   document.removeEventListener("focusin", trackStableFocus);
   unsubscribeEvent?.();
@@ -4292,7 +4374,7 @@ onBeforeUnmount(() => {
           <button class="icon-button" :title="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
           <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
           <button class="icon-button icon-cyan" :title="t('refresh')" :disabled="!connected || loadingFiles" @click="loadDirectory()"><RefreshCw :class="{ spinning: loadingFiles }" /></button>
-          <input v-model="currentPath" spellcheck="false" @keydown.enter="loadDirectory()" />
+          <input v-model="currentPath" spellcheck="false" @keydown.enter="submitPathInput" />
           <div class="menu-anchor">
             <button class="icon-button" :title="t('sftpPathHistory.title')" :disabled="!connected" @click.stop="fileMenu = undefined; terminalMenu = undefined; transferPanelOpen = false; columnsOpen = false; pathHistoryOpen = !pathHistoryOpen"><History /></button>
             <div v-if="pathHistoryOpen" class="popover path-history-popover" @click.stop>
@@ -4371,6 +4453,7 @@ onBeforeUnmount(() => {
                 @click="selectFile(entry, $event)"
                 @dblclick="openEntry(entry)"
                 @contextmenu="showFileMenu($event, entry)"
+                @keydown="onFileRowKeydown($event, entry)"
               >
                 <span class="file-name">
                   <Folder v-if="entry.kind === 'directory'" class="folder-icon" />

@@ -109,3 +109,217 @@
 - 走查旅程 15 组 × 参数/视口矩阵，发现条数：P0=0、P1=2、P2=6。
 - 遗留未验证：① P1-1 需真机复核真实 sidecar 认证失败的重试节奏（决定其最终定级是否上探 P0）；② host-key/agent 审批/paste 确认等安全弹窗的浏览器走查（夹具未推对应事件，P2-3 为源码审查结论）；③ zmodem 上传全流程、拖拽上传（headless 无原生拖放）、sudo 分支（mock 的 sudo 路径有固定输出但工作台 sudo 模式开关在只读下禁用，未深入）。
 - 走查用截图已全部删除，未入工作区；`/tmp/uiscan-ssh` 下的脚本为扫描工具产物，不入库。
+
+## 五、第 3 轮（专家视角深度测试，2026-09-06）
+
+> 视角切换：以重度 SSH/SFTP 运维用户 + 测试专家的苛刻眼光做压力/健壮性/键盘流/i18n 深测；**不重复第 1、2 轮已收口项**（P1-1/P1-2、P2-1~P2-6 全部绕开）。全程 mock 夹具 + 运行时 invoke/binary 事件劫持注入，只记录不改代码。
+
+### 5.1 扫描环境
+
+| 项 | 值 |
+| --- | --- |
+| 轮次 | 第 3 轮专家视角深度测试（2026-09-06，前 2 轮全部 P0/P1/P2 已修复收口后的回归基线） |
+| Dev server | 新起 `pnpm vite --port 5291 --strictPort`（http://localhost:5291/mock.html），扫描结束已 kill |
+| 自动化 | playwright-core + 系统 Chrome（channel:"chrome"，headless），独立实例 `/tmp/uiscan-ssh-r3`（不入项目依赖）；8 个场景脚本（perf/perf2/functional/functional2/robust/keyboard/i18n + 定性探针） |
+| 注入手段 | addInitScript 劫持 `window.dbxPlugin`：invoke 补丁链（错误/慢响应/坏格式/大数据注入）、binary 监听捕获（终端洪帧注入，9 字节帧头 + 序号）、事件记录（inputAck/progress）、调用台账（逐 method 计数与参数） |
+| URL 参数 | `?rw=1`（写操作流）、`?err=disconnect`（断开恢复）；mockDbxHost.ts 实测为准 |
+| 视口 | 1440×900 为主 |
+
+### 5.2 新发现清单
+
+统计：**P0 × 0，P1 × 3，P2 × 7**。三条 P1 全部是"键盘/时序/竞态"类深水区问题，常规走查不可达，均以调用台账或 DOM 变异时间线实锤。
+
+#### P1（功能性缺陷）
+
+**R3-P1-1 键盘 Enter 提交 mkdir/newFile 成功后，弹层被"幽灵点击"立即重开（焦点归还 + Enter 激活竞态）**
+- 位置：`App.vue` `modalOpenCount` watch 的焦点归还逻辑（src/App.vue 3758–3783）× mkdir/newFile 对话框（4486–4492、newFile 同构）
+- 复现：`?rw=1` → 工具栏 New folder → 输入名 → 按 Enter。MutationObserver + capture 级 click 记录时间线：t+237ms 弹层关闭（目录已建、列表已刷新）→ **t+239ms "New folder" 工具栏按钮收到一次无 mousedown 的 click** → t+240ms 弹层重开（草稿被重置为空）。New file 对话框同样复现（sftp/touch 1 次、弹层重开）。
+- 影响：纯键盘用户视角 = "按 Enter 后弹窗闪一下又回来"，无法确认成功；最自然的反应是再按一次 Enter → 第二次 createDirectory 撞已存在名 → 错误横幅 "sftp: cannot write /home/demo/ghost-dir" 且弹窗滞留（实测 2 次 invoke）。鼠标用户不受影响（Confirm 按钮路径实测正常关闭）。命令对话框不受影响（运行后不关闭）。
+- 根因：弹层关闭时焦点归还到工具栏触发按钮（P1-2 修复引入的归还链），归还发生在同一 Enter 按键序列内，浏览器在刚获得焦点的按钮上产生激活 click。
+- 建议：焦点归还推迟一帧（rAF/setTimeout 0）；或归还前给触发按钮挂一次性 capture click 抑制；或归还焦点到弹层容器等不可激活元素。真机建议补验（浏览器内核相关行为）。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：新增 `src/lib/ghostClickGuard.ts`（纯函数守卫，7 条单测）——焦点归还前 `arm()` 开 400ms 抑制窗，窗内"无 mousedown 前驱"的合成 click 被 document 捕获级监听器 `preventDefault + stopPropagation`（真实鼠标点击因 mousedown 宽限窗而放行）。接线：`App.vue` modalOpenCount watch 归还焦点前 arm + onMounted/onBeforeUnmount 挂卸 capture 监听。R4b 复验：mkdir 键盘 Enter 提交后 backdrop=0、`sftp/createDirectory` 仅 1 次，关闭态后续 click 不再重开弹层。PASS。
+
+**R3-P1-2 Esc 取消行内重命名，实际仍以草稿名提交了重命名**
+- 位置：`App.vue` 行内重命名输入框 `@blur="commitRename(entry)"`（src/App.vue 4379–4389）
+- 复现：`?rw=1` → server.log 右键 → Rename → 输入 "evil.log" → 按 Escape。invoke 台账记录到 `sftp/rename /home/demo/server.log → /home/demo/evil.log`，刷新后列表确认改名生效。
+- 根因：Escape 只清 `renamingPath` 触发输入框卸载，Chromium 对"被移除的聚焦元素"派发 blur → `commitRename` 以当前草稿名提交。
+- 影响：**数据变更操作逃逸了取消语义**——用户明确按 Esc 放弃，文件却被改名；配合 R3-P2-1 的双发问题，重命名路径整体不可信。
+- 建议：commitRename 入口校验"renamingPath 仍指向本行且非取消中"；Escape 先置 canceling 标志再卸载；或 blur 提交仅在焦点移入同列表其他可交互元素时生效。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：新增 `src/lib/sftpRename.ts` 的 `shouldCommitRename` 守卫（6 条单测）——`commitRename` 入口校验"editingPath 仍指向本行且非提交中"；Esc 处理器先置 `renamingPath = ''` 再卸载输入框，卸载引发的幽灵 blur 到达时 editingPath 已不指向本行而被短路。R4b 复验：Esc 取消重命名 `sftp/rename`/`sudo/rename` 台账 **0 次**、源文件原样、编辑态收敛。PASS。
+
+**R3-P1-3 目录列表加载竞态：慢响应晚到覆盖后导航结果，无请求序号/取消机制**
+- 位置：`App.vue` `loadDirectory()`（src/App.vue 1817–1841）
+- 复现：`?rw=1` → 劫持 sftp/list 使 `/etc` 延迟 3s 返回、`/var/log` 立即返回 → 双击 etc 行（触发加载 /etc）→ 150ms 内在路径栏输入 /var/log 回车 → 500ms 时路径栏与列表均为 /var/log → 3.5s 后观察：**路径栏、列表、页脚全部回跳 /etc**（实测 path=/etc、rows=[hosts]、footer 含 /etc）。
+- 影响：慢链路（跨公网/高峰 SFTP）下"点了 A 又改去 B，视图却跳回 A"是高频真实场景；路径历史也被污染记录。`loadingFiles` 只挡刷新按钮不挡路径栏/树/行双击导航。
+- 建议：loadDirectory 引入单调请求序号，仅最新请求允许写 `entries/currentPath/历史`；或对 in-flight 导航做 AbortSignal。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：新增 `src/lib/requestEpoch.ts`（4 条单测）；`loadDirectory()` 发起前取单调序号，响应落地、catch、finally 三处均以 `isCurrent(epochId)` 校验，过期响应整体丢弃（列表/路径/选中/历史/loading 收尾只允许最新请求写入）。R4b 复验：/etc 延迟 3s + 改道 /var/log，3.5s 后 footer=/var/log、/etc 的 hosts 行未出现、无回跳。PASS。
+
+#### P2（打磨项）
+
+**R3-P2-1 行内重命名 Enter 提交双发 sftp/rename，每次重命名伴随一条假错误横幅**
+- 复现：右键 → Rename → 改名 → Enter。invoke 台账记录 **2 条完全相同的请求**；错误横幅 "sftp: no such file: /home/demo/evil.log"（第二次提交时源已不存在）。
+- 根因：Enter 提交 → `renamingPath` 清空 → 输入框卸载 → blur 再次 `commitRename`（无 renameSubmitting 入口守卫）。
+- 影响：协议噪音 + 用户每次重命名都看到假错误，掩盖真实故障。
+- 建议：commitRename 入口检查 `renameSubmitting`；blur 与 Enter 去重（同 R3-P1-2 一并收口）。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：与 R3-P1-2 同一守卫（`shouldCommitRename`，submitting 分支 + editingPath 短路）——Enter 提交成功清空 `renamingPath` 后输入框卸载的幽灵 blur 被拒。R4b 复验：Enter 重命名 `sftp/rename` 台账恰 1 条、无错误横幅、编辑态关闭、新名落列。PASS。
+
+**R3-P2-2 重命名冲突无前端预检，失败后 UI 不收敛**
+- 复现：deploy.sh 重命名为已存在的 docker-compose.yml → 直接下发、报错横幅 "sftp: cannot write …"；rename 输入框滞留打开态、列表不刷新恢复。
+- 对比：粘贴（pasteClipboard）对目标存在性有 exists 预检 + 覆盖确认（src/App.vue 2586–2603），重命名路径无对应处理，交互不一致。OpenSSH 语义下 rename 撞名行为依 posix-rename 扩展而异，前端不做预检会把语义选择完全丢给后端。
+- 附：mock 夹具的 `sftp/rename` 先 splice 再写、撞名时源节点丢失，属夹具缺陷（真实 SFTP 原子），建议随本项一并修 mock。
+- 建议：与粘贴对齐（exists 预检 + 覆盖确认或直接禁止），失败路径关闭行内编辑态并刷新列表。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：`commitRename` 对齐粘贴语义——先 `sftp/exists` 预检目标，存在时 `window.confirm`（七语新 key `sftpRename.overwriteConfirm`）确认覆盖；失败路径（catch）关闭行内编辑态并刷新列表，不再滞留。mock 夹具 `sftp/rename` 同步收口为原子语义（先摘目标同名节点再摘源落位，撞名不丢源），配 2 条夹具单测（`mockDbxHost.spec.ts`）。R4b 复验：撞名触发 confirm（接受 → 1 次 exists + 1 次 rename、覆盖落位、编辑态收敛；取消 → 0 次 rename、源文件完好）。PASS。
+> 新增用户可见文案已补齐七语（en/zh-CN/zh-TW/es/it/ja/pt-BR）。
+
+**R3-P2-3 后端异常响应防御缺失：entries:null 使列表永久卡 Loading，单条畸形行走不进渲染**
+- 复现（invoke 注入坏格式）：① `sftp/list` 返回 `{entries:null}` → pageerror "TypeError: entries.value is not iterable"，文件区停留在 "Loading..."（rows=0），再次导航可恢复；② 返回含 null 行与缺 kind 字段的行 → 排序比较器抛 "Cannot read properties of null (reading 'kind')"，整个列表渲染 0 行。
+- 影响：App 不崩（工具栏/导航仍可用），但当前视图僵死 + pageerror 上抛。真实 sidecar 契约虽不应返回 null，但网络/版本错配下防御缺失会放大故障面。
+- 建议：`entries.value = Array.isArray(result.entries) ? result.entries : []`；渲染前过滤非对象行；畸形行可考虑占位而非整表丢弃。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：新增 `src/lib/sftpEntries.ts` 的 `sanitizeSftpEntries`（7 条单测）——非数组 → 空数组；null/非对象/无名/无 uri 行丢弃；缺 kind 降级为 file（渲染占位而非整表丢弃/比较器抛错）；非数值 size/modifiedAt 取中性默认。`loadDirectory` 落地前统一过 sanitize。R4b 复验：注入 `{entries:null}` → 空态视图而非永久 Loading、0 pageerror；注入含 null 行 + 缺 kind 行 → 合法行照常渲染、0 pageerror。PASS。
+
+**R3-P2-4 路径栏不支持 `~` 与 `..` 语义**
+- 复现（en 界面路径栏输入）：`~` → 归一成 `/~` 下发 → "sftp: no such directory: /~"；`/home/demo/../etc` → 原样下发 `params.path="/home/demo/../etc"`（invoke 台账证实），mock 报错。尾斜杠/无前导斜杠/双斜杠三种归一均正确。
+- 影响：`~` 是 SSH 重度用户肌肉记忆；`..` 即便真实服务器可解析，前端 currentPath 显示与路径历史也会保留 `..` 字样，下游 joinRemote/exists 拼接基于未规范路径。
+- 建议：路径栏提交前做 `~` → home 展开（已有 sftp/home）与 `..` 段消解（纯字符串或 realpath）。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：新增 `src/lib/remotePathInput.ts` 的 `resolveRemotePath`（9 条单测）——`~`/`~/x` 在 home 已探测时展开（探测失败保持原样交由后端报错）、`.`/`..` 段消解（根上多余 `..` 收敛为 `/`）、trim/decodeURIComponent/前导与重复/尾斜杠归一；路径栏 Enter 统一走新入口 `submitPathInput()`。R4b 复验：`~` → /home/demo（server.log 在列）；`/home/demo/../etc` → /home/etc；`/home/demo/../demo` → /home/demo。PASS。
+
+**R3-P2-5 纯键盘无法"打开"目录或文件：预览/进入目录对键盘用户不可达**
+- 复现：Tab 到目录行（首个 file-row 需 21 次 Tab，无 roving tabindex/方向键导航）→ Enter 仅选中（路径栏仍为 /，实测）；打开目录/文件只能 dblclick；右键菜单可用 ContextMenu/Shift+F10 唤起（位置正常）作为部分缓解，但文本预览本身无键盘入口。
+- 建议：文件行 Enter = 打开（对齐 VS Code/主流文件管理器）、提供方向键导航；至少给选中行加"Enter 打开、F2 重命名、Delete 删除"的键盘语义。
+
+> **【R4 修复标注 2026-09-06】已修复（报告"至少"档语义）**。方式：新增 `src/lib/fileRowKeydown.ts` 的 `decideFileRowAction`（4 条单测）——Enter = 打开（目录进入/文件预览，任意模式）、F2 = 重命名、Delete = 删除（仅可写连接），其余按键不拦截；`App.vue` 文件行 `@keydown` 接线 `onFileRowKeydown`。R4b 复验：键盘 Enter 逐级进入 / → /home → /home/demo、F2 唤起行内重命名、Delete 唤起删除确认弹层。PASS。
+
+**R3-P2-6 目录树行键盘不可达 + 展开 caret 无 accessible name**
+- 实测：`.sftp-tree-row` 为 div，无 tabindex/role（Tab 不可达，仅 caret 子按钮可达）；6 个 `sftp-tree-caret` 按钮是全部 43 个 button 中仅有的"icon-only 且无 aria-label/title"集合（读屏只报 "button"）。
+- 建议：树行加 `role="treeitem"` + tabindex（或 roving tabindex），caret 补 `:aria-label="t('sftpSide.tree') + node.name"` 之类。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：`DirTree.vue` 树行加 `role="treeitem"` + `aria-expanded` + roving tabindex（当前目录行 0、其余 -1，无当前行时首行兜底 0），Enter 打开 / Space 展开 / ArrowUp·ArrowDown 跨行移焦（DOM 顺序 roving）；caret 补 `:aria-label`（七语新 key `sftpSide.expandNode/collapseNode`，根目录用 `sftpSide.root`）。组件测试 +5 条（`DirTree.spec.ts`，attachTo body + 真实 focus 断言）。R4b 复验：6 行全部 treeitem、存在 tabindex=0 可达行、6 个 caret 0 个无名、ArrowDown 移焦成功、树行 Enter 联动路径栏。PASS。
+
+**R3-P2-7 zh-TW 用词：「批量傳送命令」应为「批次」**
+- 实测 zh-TW 界面：工具栏 title "批量傳送命令"、批量对话框整组文案均用「批量」；繁中社区惯例为「批次」（对话框内其余措辞如「目標會話/僅存活」均道地）。仅术语打磨，不影响理解。
+
+> **【R4 修复标注 2026-09-06】已修复**。方式：`i18n.ts` zh-TW 表 batchSend* 全组「批量」→「批次」（batchSendTitle/batchSendHint/batchSendPlaceholder/batchSendSend 等），zh-CN 表保持「批量」不动。R4b 复验（locale 覆盖 zh-TW）：`[title="批次傳送命令"]` 存在、旧措辞节点为 0。PASS。
+
+### 5.3 已复核无问题的维度（测试内容与方式）
+
+| 维度 | 测了什么 / 怎么测 | 结论 |
+| --- | --- | --- |
+| 大列表渲染性能 | 劫持 sftp/list 注入 600 条目（500 目录 + 100 文件）到 /big，测导航→DOM 行数就绪耗时；连续点击 5 行测选中响应 | 渲染 122ms；点击响应均值 53ms/最大 61ms（<100ms 达标）；快速滚动主线程 0ms 阻塞 |
+| 目录树大数据 | 侧栏注入 500 子目录展开/收起/缓存复展，配合 invoke 台账验证懒加载 | 展开渲染 79ms、收起 35ms、缓存复展 69ms 且**仅 1 次 sftp/list**（缓存生效） |
+| 终端洪峰输出 | 二进制通道直注 2000 帧 × 512B（约 1MB），测注入耗时与渲染追平；再注入 30 万行测 scrollback 与内存 | 注入 135ms、渲染追平 7ms（合并写节流有效，顺序保持）；scrollback 稳定 **25050 行**（25000 上限 + 视口，封顶正确）；30 万行后堆 153MB、树点击响应 21ms |
+| 洪峰期间交互 | 注入期间点击工具栏/导航 | 35–41ms 响应，无冻结 |
+| 终端输入有序性 | 快速连发 30 条命令（200 个输入帧），核对 `ssh/terminal/inputAck` 序号 | 200 帧全部 ack 且严格单调递增，无丢失；洪峰后 UI 35ms（注：mock 不回显 PTY 输入，回显属夹具缺口非产品问题） |
+| 特殊文件名全链路 | 注入 emoji/双引号/空格/中文名文件：显示、双击预览、Esc 关闭、过滤搜索 | 全部通过（预览标题/内容正确、Esc 关闭、"🎉"/"space name" 过滤精确命中） |
+| 排序语义 | 注入混合命名（大小写/数字/隐藏文件/CJK/符号前缀）测 name/size 升降序 | 目录始终置前；name 排序数字感知（file2<file10）、大小写不敏感；size 排序数值正确；行为符合 localeCompare(numeric, base) 预期 |
+| 双击/重复提交守卫 | 删除确认按钮连点 2 次、批量发送连点 2 次、命令对话框开-Esc 循环 5 轮 | 删除/批量各仅 1 次 invoke 且弹层正常关（同步 busy 守卫有效）；命令对话框状态一致（mkdir/newFile 的 Enter 路径问题单列 R3-P1-1） |
+| 错误注入与恢复 | sftp/list 抛 "connection reset by peer" | 旧列表保留 + 错误横幅原文呈现 + 下一次导航自动恢复，无状态残留 |
+| 断开重连恢复 | `?err=disconnect` 下先导航到 /etc，断开→自动重连 | 重连后终端 Welcome 回放、当前目录 /etc 列表**自动重载**、无残留横幅/错误 |
+| 焦点可见性 | 键盘 Tab 至 file-row / 工具栏按钮 / 路径栏，取 focus-visible 与计算样式 | file-row 与工具栏按钮有蓝色 outline；路径栏 :focus-visible 有自定义高亮，均可见 |
+| i18n 抽查（en/ja/zh-TW） | 每语言 27 个 title + 11 处可见文本 + placeholder + 右键菜单 10 项 + 命令对话框标题/占位符；检测原始 key 回退与截断 | 三语全部真实翻译、无 key 回退、无截断（唯一瑕疵为 R3-P2-7 用词）；zh-CN 上一轮已抽查不重复 |
+| aria 基线 | 全量 button 扫描 + role="switch" 检查 | switch 均有 aria-checked + 可见标签；仅 R3-P2-6 的 6 个树 caret 无名 |
+
+### 5.4 第 3 轮统计与遗留
+
+- 走查场景 8 组 × 运行时注入矩阵，发现条数：**P0=0、P1=3、P2=7**（另记夹具缺陷 1 处：mock sftp/rename 撞名丢源文件，随 R3-P2-2 收口）。
+- 本轮价值回顾：三条 P1（幽灵点击重开、Esc 重命名照样提交、目录加载竞态）与两条 P2（Enter 双发、坏格式防御）均属第 1 轮常规走查与第 2 轮清理不可达的时序/键盘/对抗注入类问题，全部有 invoke 台账或 DOM 时间线证据。
+- 遗留未验证：① R3-P1-1 的幽灵 click 属浏览器焦点激活行为，建议真机（真实宿主 webview/Chromium 版本）复验；② zmodem/拖拽上传仍无 headless 手段（第 1 轮起持续未覆盖）；③ `?err=disconnect` 与下载传输中途叠加的时序窗口过窄，未构造成功。
+- 扫描脚本与 `/tmp/uiscan-ssh-r3` 运行时产物均不入库；截图 0 张留存（调试图已删）。
+- 报告定稿后独立抽查复核（同日，dev server 重起 + 新写 verify-p1.js）：三条 P1 全部按记录精确复现——P1-1 时间线实测 close(771.9ms)→幽灵 click(773.5ms，BUTTON)→reopen(774.2ms)；P1-2 Esc 后 invoke 台账出现 `sftp/rename server.log→evil-verify.log`；P1-3 /var/log 导航后慢 /etc 响应晚到、路径栏/列表/行内容全部回跳 /etc。报告结论可信，无需修订。
+
+### 5.5 第 4 轮修复与复验记录（2026-09-06）
+
+> 第 4 轮修复 agent 接手上一中断 agent 的半成品（`src/lib/ghostClickGuard.ts`、`requestEpoch.ts`、`remotePathInput.ts`、`sftpRename.ts` 等 + App.vue/DirTree.vue 改动），逐条审计后确认 10/10 已接线且均有配套 spec（实际完成度高于中断时预期，无需补代码）；随后做全量回归与浏览器复验。
+
+| 项 | 修复方式（新增模块 + 接线点） | 单测 | R4b 复验结论 |
+| --- | --- | --- | --- |
+| R3-P1-1 幽灵点击重开弹层 | `lib/ghostClickGuard.ts`（400ms 抑制窗 + mousedown 前驱判定）；App.vue 焦点归还前 arm、document capture 监听拦截合成 click | 7 条 | PASS：mkdir Enter 后 backdrop=0、createDirectory 1 次、无重开 |
+| R3-P1-2 Esc 取消仍提交 | `lib/sftpRename.ts` `shouldCommitRename`；Esc 先清 renamingPath，卸载 blur 被守卫短路 | 6 条 | PASS：Esc 后 rename 台账 0 次、源文件原样 |
+| R3-P1-3 目录加载竞态 | `lib/requestEpoch.ts`；loadDirectory 取号，落地/catch/finally 三处 isCurrent 校验，过期响应整体丢弃 | 4 条 | PASS：慢 /etc 晚到不回跳，footer 稳定 /var/log |
+| R3-P2-1 Enter 双发 | 同 R3-P1-2 守卫（submitting 分支） | 同上 | PASS：rename 恰 1 次、无假错误横幅 |
+| R3-P2-2 冲突无预检 | commitRename 增加 sftp/exists 预检 + window.confirm（七语 `sftpRename.overwriteConfirm`）；失败路径关编辑态并刷新；mock sftp/rename 改原子语义 + 2 条夹具单测 | 2 条（夹具） | PASS：撞名弹 confirm（接受=覆盖 1 次 invoke；取消=0 invoke 源完好）、编辑态收敛 |
+| R3-P2-3 坏响应僵死 | `lib/sftpEntries.ts` `sanitizeSftpEntries`；loadDirectory 落地前统一 sanitize | 7 条 | PASS：entries:null → 空态视图、畸形行不炸比较器、0 pageerror |
+| R3-P2-4 路径栏 `~`/`..` | `lib/remotePathInput.ts` `resolveRemotePath`；路径栏 Enter 走 `submitPathInput()` | 9 条 | PASS：`~`→home、`/home/demo/../etc`→/home/etc、消解后进路径历史 |
+| R3-P2-5 键盘打开 | `lib/fileRowKeydown.ts` `decideFileRowAction`；文件行 Enter 打开 / F2 重命名 / Delete 删除（只读连接仅 Enter） | 4 条 | PASS：Enter 逐级进目录、F2/Delete 唤起对应 UI |
+| R3-P2-6 树键盘 + caret 名 | DirTree.vue：role=treeitem、aria-expanded、roving tabindex、Enter/Space/方向键；caret `:aria-label`（七语 `sftpSide.expandNode/collapseNode`） | 组件 +5 条 | PASS：6/6 treeitem、0 无名 caret、方向键移焦、Enter 联动路径 |
+| R3-P2-7 zh-TW「批次」 | i18n.ts zh-TW batchSend* 全组改「批次」（zh-CN 保持「批量」） | — | PASS：新措辞在位、旧措辞 0 节点 |
+
+复验环境：`pnpm vite --port 5291 --strictPort` + playwright-core/系统 Chrome（headless，`/tmp/uiscan-ssh-r4b`，不入库），mock.html?rw=1，invoke 台账 + sftp/list 劫持 + dialog 拦截；**11/11 PASS**（10 条 + P2-2 取消路径变体）。回归：`pnpm typecheck` 0 错；`pnpm test` **237/237**（基线 191 + 新增 46：6 个新 lib spec + DirTree 组件 5 条 + mock 夹具 2 条等）。新增用户可见文案均已补七语。复验截图 0 张留存（失败才截图，本轮无失败；调试图已删）。R3-P1-1 的真机（宿主 webview）复核建议继续保留。
+## 六、第 5 轮（复核扫描 / 收敛判定轮，2026-09-06）
+
+> 双重任务：① 按原复现步骤逐条复核第 4 轮标注的 10 条 R4 修复（含"修复是否引入新问题"回归探针）；② 换六个此前未覆盖的角度找新问题（重连循环、深层目录、超长终端行、批量多会话、弹层快速开关、i18n 动态切换）。只记录不改代码。
+
+### 6.1 扫描环境
+
+| 项 | 值 |
+| --- | --- |
+| 轮次 | 第 5 轮复核扫描（2026-09-06，第 4 轮修复 + R4b 复验全绿后的收敛判定轮） |
+| Dev server | `pnpm vite --port 5291 --strictPort`（http://localhost:5291/mock.html），扫描结束已 kill |
+| 自动化 | playwright-core + 系统 Chrome（headless，channel:"chrome"），独立实例 `/tmp/uiscan-ssh-r5`（不入库）；脚本 A（修复复核 15 检查）+ 脚本 B/B 补充（六维新角度 6 检查） |
+| 注入手段 | dbxPlugin 赋值陷阱：invoke 台账 + 可插拔 hook（sftp/list、ssh/sessions/list 劫持）、onEvent/onBinary 捕获（合成 disconnected 事件、终端帧直注）、clipboard/sendBinary 台账、onLocaleChange 补层（mock 缺该 optional 通道） |
+| URL 参数 | `?rw=1`、`?err=disconnect` |
+
+### 6.2 修复复核结论表（10/10 ✅，另 5 项回归探针全绿）
+
+脚本 A 共 15 项检查（10 条修复按原复现步骤复验 + 5 项"修复不误伤"回归探针），**15/15 PASS**：
+
+| 项 | 复验结果 | 证据要点 | 回归探针（修复是否引入新问题） |
+| --- | --- | --- | --- |
+| R3-P1-1 幽灵点击重开弹层 | ✅ | mkdir 键盘 Enter 提交后 backdrop=0、`sftp/createDirectory` 恰 1 次 | ✅ 守卫窗内带 mousedown 的真实鼠标点击仍正常重开弹层、Esc 可关（守卫不误伤真实点击） |
+| R3-P1-2 Esc 取消重命名 | ✅ | Esc 后 `sftp/rename`/`sudo/rename` 台账 0 次、编辑态收敛、源文件原样 | ✅ 合法 blur 提交流（焦点移到路径栏）仍提交恰 1 次（守卫不误伤正常 blur 提交） |
+| R3-P1-3 目录加载竞态 | ✅ | /etc 延迟 3s + 改道 /var/log，3.5s 后 footer 稳定 /var/log、hosts 行未出现 | ✅ 无改道时慢响应最终正常渲染 /etc（epoch 序号不过度丢弃） |
+| R3-P2-1 Enter 双发 | ✅ | rename 台账恰 1 条、无错误横幅、编辑态关闭、新名落列 | —（与 P1-2 同守卫，已覆盖） |
+| R3-P2-2 冲突预检 | ✅ | 撞名触发 confirm（含目标名）+ exists 1 次 + 接受后 rename 1 次覆盖落位 | ✅ 取消路径：dismiss 后 rename 0 次、源文件完好、编辑态收敛 |
+| R3-P2-3 坏响应防御 | ✅ | `{entries:null}` → 空态视图（非永久 Loading）；null 行 + 缺 kind 行 → 合法行照常渲染；0 pageerror | — |
+| R3-P2-4 `~`/`..` | ✅ | `~`→/home/demo（server.log 在列）；`/home/demo/../etc`→/home/etc；`/home/demo/../demo`→/home/demo | — |
+| R3-P2-5 键盘打开 | ✅ | Enter 逐级 / → /home → /home/demo、F2 唤起重命名、Delete 唤起删除确认 | ✅ 只读连接下 F2/Delete 均不触发（不越权） |
+| R3-P2-6 树键盘 + caret 名 | ✅ | 6/6 treeitem、tabindex=0 可达行存在、6 个 caret 0 个无名、ArrowDown/ArrowUp 双向移焦、树行 Enter 联动路径栏 | — |
+| R3-P2-7 zh-TW「批次」 | ✅ | `[title="批次傳送命令"]` 在位、旧措辞「批量傳送命令」0 节点 | — |
+
+### 6.3 新发现清单
+
+统计：**P0 × 0，P1 × 0，P2 × 2**（其一为边缘场景，可不修）。六维新角度中四个维度零缺陷（见 6.4）。
+
+**R5-P2-1 指标浮层不在 Esc 分层退出链：键盘用户无法用 Esc 关闭（同列 popover 全部支持）**
+
+> R6 修复标注（2026-09-06）：已修复——metricsOpen 并入工具栏弹出层 Esc 分支（closeMetrics 同步清轮询）。typecheck 0 错、237 用例全绿；headless 夹具下浮层不可达（按钮依赖已连接态），留真机例行复核。
+- 位置：`App.vue` `onDocumentKeydown` 的 Esc 分支（src/App.vue ~3938–3947：quickMenuOpen/pathHistoryOpen/columnsOpen/transferPanelOpen/connectionInfoOpen 五个 popover 均被关闭，`metricsOpen` 不在列表）
+- 复现：点击工具栏 Gauge 图标打开指标浮层（.metrics-float）→ 按 Esc。实测浮层仍开启（residue=1）；快速命令/列选择/路径历史/连接信息 4 个 popover 同场景按 Esc 全部即时关闭。鼠标路径（Gauge 再点 = toggle、浮层 header X）关闭均正常，5 轮快速开关无残留。
+- 影响：与同层级弹出物行为不一致；纯键盘用户必须 Tab 回 toggle 按钮或摸鼠标。属打磨项而非阻断。
+- 建议：Esc 分支补 `metricsOpen.value = false`（或统一收敛为"任何 popover/浮层 Esc 即关"的判定表）。注意 closeMetrics 需同时清 metricsTimer（现实现已处理）。
+
+**R5-P2-2（边缘，可不修）瞬态 notice 在显示窗口内不随 i18n 切换重译**
+- 位置：`App.vue` `showNotice()`（src/App.vue 784–788）：调用点均以 `t()` 现译后**存字符串**入 `notice` ref，3.5s 自动清除；i18n 切换只触发模板重渲染，不会重译已存字符串。
+- 复现：en 界面点 A+ 触发 notice "Terminal font size 14px" → 3.5s 窗口内 `onLocaleChange` 切到 zh-CN → notice 文案保持英文直至消失。
+- 影响面评估：仅"切语言瞬时命中 3.5s 窗口"这一极窄场景；重新触发任意 notice 即用新语言。实测其余动态内容全部即时换语（见 6.4⑥）。错误横幅显示后端原文（本就不该前端翻译）、原生 confirm 为一次性快照，均属合理设计。
+- 建议：可不修；若追求一致可改为存 `{ key, values }` 并在模板处 `t()`。
+
+### 6.4 零发现维度证据（新角度四绿 + 复核无回归）
+
+| 维度 | 测了什么 / 怎么测 | 结论 |
+| --- | --- | --- |
+| ① 重连循环 ×3 状态一致 | `?err=disconnect` 夹具首断 + onEvent 捕获层合成 disconnected 事件再断 2 次；每周期断言：pill 回 connected、横幅清除、当前目录 /etc 自动重载（hosts 在列）、每周期恰 1 次重连（attach 台账，无风暴/双发）；循环后终端 sendBinary 输入链路 15 帧正常、SFTP 导航正常、0 pageerror | PASS，零新发现 |
+| ② 深层目录 12 级 | hook 合成 /d1…/d12 树；路径栏一次直达 12 级（19ms）→ parentFolder 逐级返回 12 步，每步 footer 精确命中且耗时 30–49ms（<300ms 达标）；路径历史含深层条目；heap 20MB 无异常增长；0 pageerror | PASS，零新发现（路径历史为下拉 popover，无面包屑组件；`..` 段消解在 R3-P2-4 已收口，本轮 12 级逐级返回间接复验） |
+| ③ 终端 10k 超长行 | 二进制帧直注 10,016 字符单行（含 MARKER-NEEDLE-42）；渲染追平 27ms；折行 48 个 ≥80 列段行；Ctrl+F 搜索 "MARKER-NEEDLE-42" → 状态 "1/1" + 2 个高亮 decoration 定位成功；三击选中 → 选中复制链路 clipboard.writeText 20,076 字符落账；评估往返 1ms 无主线程冻结；0 pageerror | PASS，零新发现（折行/搜索/复制三条链路全通） |
+| ④ 批量发送 40 会话 | 劫持 sessions/list 注入 40 会话（21 存活 + 19 断开）；目标列表 40 行且可滚动；勾选 3 行 → 滚到底再回顶 → 3 个 checkbox 全部保持勾选；"Live only" 快捷选择 → 21/40；发送 → 结果列表 20 条失败行、可滚动、滚到中部行不丢；summary "1 sent, 20 failed" 正确；0 pageerror | PASS，零新发现 |
+| ⑤ 弹层快速开关 ×5 | 命令对话框/批量弹窗/快速命令/列选择/路径历史/连接信息 6 个弹层各 Esc 开关 5 轮：全部无残留、0 pageerror、文件列表滚动位置保持；指标浮层单独验证（Esc 不关 → R5-P2-1；toggle/X 双路径关闭正常、5 轮快速开关无残留） | 除 R5-P2-1 外零发现 |
+| ⑥ i18n 动态切换 zh-CN→en→ja | onLocaleChange 补层（mock 缺该 optional 通道，已记夹具缺口）；title 属性三语即时换（服务器指标/Server metrics/サーバー指標）；指标浮层与批量弹窗打开状态下切换 → 标题/placeholder 即时换语、无 key 回退；瞬态 notice 例外 → R5-P2-2 | 除 R5-P2-2 外零发现 |
+
+夹具缺口备忘（非产品问题）：mockDbxHost.ts 未实现 `onLocaleChange`（宿主 1.1 optional 通道），动态换语验证依赖扫描侧补层；mock 仅 1 个会话，多会话批量场景依赖 sessions/list 劫持。
+
+### 6.5 第 5 轮统计与收敛判定
+
+- 修复复核：**10/10 ✅**（另 5 项回归探针全绿，R4 修复未引入键盘流误伤/CSS 回归/只读越权等新问题）。
+- 新发现：**P0=0、P1=0、P2=2**（R5-P2-1 指标浮层 Esc 缺口；R5-P2-2 瞬态 notice 换语，边缘可不修）。
+- **未达到"第 5 轮零新发现"收敛判据**：尚余 1 条实质 P2（R5-P2-1，改动面为一行级）。建议：修复 R5-P2-1（R5-P2-2 明确豁免或一并收口）后，第 6 轮按本轮脚本 A/B 直接复跑——若全绿即可宣布扫描收敛。
+- 复跑资产：脚本留存于 `/tmp/uiscan-ssh-r5`（verify-a.mjs / verify-b.mjs / verify-b2.mjs，不入库）；本轮截图 2 张调试图已全部删除，0 张留存。
+
+__zcode_status=$?
+if [ "$__zcode_status" -eq 0 ]; then pwd -P > '/var/folders/4_/zmg595750zv57pwjdvllgrtc0000gn/T/zcode-ac93780d-13ed-4941-831f-8df5a37f9020-cwd'; fi
+exit "$__zcode_status"

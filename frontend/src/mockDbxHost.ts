@@ -258,10 +258,18 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     const node = findMockNode(String(input.sourcePath || ""));
     if (!node) throw new Error(`sftp: no such file: ${input.sourcePath}`);
     const { parent: sourceParent, name: sourceName } = mockParentAndName(String(input.sourcePath || ""));
-    const sourceIndex = sourceParent?.children?.findIndex((child) => child.name === sourceName) ?? -1;
-    sourceParent?.children?.splice(sourceIndex, 1);
-    node.name = String(input.targetPath || "").split("/").pop() || node.name;
-    result = mockWriteEntry(String(input.targetPath || ""), node);
+    const targetPath = normalizeMockPath(String(input.targetPath || ""));
+    const { parent: targetParent, name: targetName } = mockParentAndName(targetPath);
+    if (!sourceParent || !targetParent || targetParent.kind !== "directory" || !targetName) throw new Error(`sftp: cannot write ${targetPath}`);
+    // 原子语义：先摘除目标位置同名节点（覆盖，对应前端 exists 预检确认），
+    // 再摘源、改名、落位——撞名时源文件不再丢失（R3-P2-2 夹具缺陷收口）。
+    const targetIndex = targetParent.children?.findIndex((child) => child.name === targetName && child !== node) ?? -1;
+    if (targetIndex >= 0) targetParent.children!.splice(targetIndex, 1);
+    const sourceIndex = sourceParent.children!.findIndex((child) => child.name === sourceName);
+    sourceParent.children!.splice(sourceIndex, 1);
+    node.name = targetName;
+    targetParent.children!.push(node);
+    result = { success: true };
   }
   else if (method === "sftp/exists") result = { exists: !!findMockNode(String((params as Record<string, unknown>)?.path || "")) };
   else if (method === "sftp/stat") {
