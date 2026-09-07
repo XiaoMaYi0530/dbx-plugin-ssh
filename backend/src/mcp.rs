@@ -666,8 +666,10 @@ impl McpState {
                         let path = required_str(arguments, "path")?;
                         let connection = self.connection(arguments).await?;
                         let command = format!("df -kP {}", exec::shell_quote(&path));
+                        // Plugin-internal plumbing: no client setEnv, keeping
+                        // the df output parseable regardless of locale overrides.
                         let outcome =
-                            exec::exec_plain(&connection, &command, Duration::from_secs(20))
+                            exec::exec_plain(&connection, &command, Duration::from_secs(20), &[])
                                 .await?;
                         exec::parse_disk_usage(&outcome.output).ok_or_else(|| {
                             format!("Could not parse disk usage: {}", outcome.output)
@@ -784,6 +786,12 @@ impl McpState {
             Some(id) => self.dbx_connections.read().await.get(id).cloned(),
             None => None,
         };
+        // The hidden exec channel carries the saved connection's setEnv too,
+        // matching the workbench exec path.
+        let set_env = stored
+            .as_ref()
+            .map(|connection| connection.set_env.clone())
+            .unwrap_or_default();
         if name == "ssh_exec_sudo" {
             let auth = self
                 .resolve_sudo_auth(arguments, sudo_profile, stored)
@@ -800,6 +808,7 @@ impl McpState {
                 command,
                 timeout_secs.unwrap_or(exec::SUDO_EXEC_TIMEOUT),
                 false,
+                &set_env,
             )
             .await
             .map(|outcome| json!({ "output": outcome.output, "exitCode": outcome.exit_code }))
@@ -809,6 +818,7 @@ impl McpState {
                 &connection,
                 command,
                 timeout_secs.unwrap_or(exec::PLAIN_EXEC_TIMEOUT),
+                &set_env,
             )
             .await
             .map(|outcome| json!({ "output": outcome.output, "exitCode": outcome.exit_code }))
@@ -836,7 +846,9 @@ impl McpState {
              echo \"$p\" > \"$f.pid\"; echo \"PID=$p\"; echo \"LOG=$f\""
         );
         let connection = self.connection(arguments).await?;
-        let outcome = exec::exec_plain(&connection, &remote, Duration::from_secs(15)).await?;
+        // Internal staging wrapper: env-free so the wrapper's own output
+        // stays parseable; the user command inherits the server defaults.
+        let outcome = exec::exec_plain(&connection, &remote, Duration::from_secs(15), &[]).await?;
         if outcome.exit_code != 0 {
             return Err(format!(
                 "Failed to stage background task (exit {}): {}",
@@ -876,7 +888,7 @@ impl McpState {
              echo ===TAIL===; tail -c {tail_bytes} \"$f\""
         );
         let connection = self.connection(arguments).await?;
-        let outcome = exec::exec_plain(&connection, &remote, Duration::from_secs(15)).await?;
+        let outcome = exec::exec_plain(&connection, &remote, Duration::from_secs(15), &[]).await?;
         if outcome.exit_code != 0 {
             return Err(format!(
                 "Failed to read task status (exit {}): {}",
@@ -1960,6 +1972,10 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        // MCP tool calls carry their own env/command semantics; connection
+        // SetEnv / RemoteCommand are workbench connection-form features.
+        set_env: Vec::new(),
+        remote_command: String::new(),
         jump_hosts,
     })
 }

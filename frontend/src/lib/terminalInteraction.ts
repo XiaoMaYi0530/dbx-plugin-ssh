@@ -85,8 +85,9 @@ export function terminalSearchSeedFromSelection(selection: string): string {
 /**
  * Whether a file dropped onto the terminal pane can be uploaded right now.
  * Mirrors the SFTP pane's drop gate: needs an active writable session, and a
- * running ZMODEM session owns the terminal data path so drops are refused.
+ * running file transfer protocol (ZMODEM or trzsz) owns the terminal data
+ * path so drops are refused while one is busy.
  */
-export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: boolean; zmodemBusy: boolean }): boolean {
-  return options.connected && options.canWrite && !options.zmodemBusy;
+export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: boolean; transferBusy: boolean }): boolean {
+  return options.connected && options.canWrite && !options.transferBusy;
 }

@@ -256,6 +256,19 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .zmodem-status { position: absolute; z-index: 3; right: 8px; bottom: 8px; left: 8px; display: flex; align-items: center; gap: 7px; border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border)); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 92%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); color: var(--foreground); font-size: 11px; pointer-events: none; }
 .zmodem-status svg { width: 14px; height: 14px; flex: 0 0 14px; }
 .zmodem-status span:first-of-type { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* trzsz overlay reuses the zmodem status card shell and adds transfer-card
+   style progress/state affordances: a thin progress bar, file counter, speed
+   and a working cancel button (the shell itself keeps pointer-events: none). */
+.trzsz-status { flex-wrap: wrap; }
+.trzsz-status.trzsz-done { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.trzsz-status.trzsz-failed { border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); color: var(--destructive); }
+.trzsz-status .trzsz-label { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trzsz-status progress { flex: 0 0 90px; height: 4px; border: 0; accent-color: var(--primary); }
+.trzsz-status .trzsz-count { flex: 0 0 auto; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.trzsz-status .trzsz-speed { flex: 0 0 auto; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.trzsz-status .trzsz-cancel { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 4px; padding: 0; color: var(--muted-foreground); pointer-events: auto; }
+.trzsz-status .trzsz-cancel:hover { background: var(--accent); color: var(--foreground); }
+.trzsz-status .trzsz-cancel svg { width: 12px; height: 12px; flex: 0 0 12px; }
 /* Auto-reconnect banner pinned inside the terminal pane (top edge): keeps the
    frozen terminal content visible below while countdown + progress + a manual
    "reconnect now" action stay in view. */

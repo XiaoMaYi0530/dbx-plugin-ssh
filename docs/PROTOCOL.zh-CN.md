@@ -10,7 +10,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 
 | 方法 | 作用 |
 | --- | --- |
-| `ssh/session/open`、`ssh/session/close` | 创建、关闭 PTY 会话 |
+| `ssh/session/open`、`ssh/session/close` | 创建、关闭 PTY 会话（连接 `remoteCommand` 非空时 exec 该命令替代 shell，`setEnv` 随会话注入） |
 | `ssh/terminal/resize` | 调整 PTY 行列 |
 | `ssh/terminal/replay` | 从指定序号补发终端输出 |
 | `ssh/host-key/resolve` | 处理工作台内的主机密钥确认 |
@@ -47,7 +47,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 
 ## 运行时设置
 
-`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文；另附 `quickSudoProfileId` / `quickSudoProfileName` 报告生效的全局配置绑定（`sudo_source=global` 时含连接表单引用解析结果），未绑定为空串，`sudoSource`（`custom` / `global` / `off`，生效来源），以及 `agentTerminalMode`（`off` / `auto` / `strict`，AI 终端同步模式，见下节））；`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`、可选 `agentTerminalMode`（非法值报错，缺省不改变），以及可选 `quickSudoProfileId`（非空须引用存在的全局配置并持久化绑定，空串解除绑定，缺省不改变；挑选配置会将连接的 `sudo_source` 切到 `global`，解除时 `global` 回落 `custom`）。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐 tiny-rdm 每次输出动态 resolve 的语义）；终端侧监视器随每次设置/配置更新按当前连接状态**重新挂载**：连接时未配置凭据（如密钥认证连接）或 Quick Sudo 处于关闭的会话，在运行时配置密码/TOTP 或重新打开开关后立即开始自动应答，无需重连。`sudoPassword` 等字段级覆盖是 sidecar 本地值，sidecar 重启或重开连接后恢复宿主下发的配置，而 `quickSudoProfileId` 绑定持久化在插件数据目录、重启保留。`agentTerminalMode` 为连接级内存态（重启回默认 `off`）。工作台工具栏提供设置弹窗；宿主连接表单通过 manifest 字段提供持久化配置入口：`sudo_source`（三选一 `custom` 本连接 / `global` 全局配置 / `off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射）、`sudo_profile`（仅 `global` 时显示，声明 `options_action: sudo/profiles/options` 由宿主渲染为动态下拉，无该扩展能力的宿主保留文本回退）、`sudo_password`、`sudo_use_pty`（仅 `custom` 时显示）、2FA 编排四件套 `totp_secret`、`auth_flow_mode`、`password_prompt_hint`、`totp_prompt_hint`（`global` 时隐藏——凭据来源整体由全局配置接管；`custom`/`off` 时常显以服务登录期 keyboard-interactive）、超时与 keepalive、`jump_hosts`。
+`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文；另附 `quickSudoProfileId` / `quickSudoProfileName` 报告生效的全局配置绑定（`sudo_source=global` 时含连接表单引用解析结果），未绑定为空串，`sudoSource`（`custom` / `global` / `off`，生效来源），以及 `agentTerminalMode`（`off` / `auto` / `strict`，AI 终端同步模式，见下节））；`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`、可选 `agentTerminalMode`（非法值报错，缺省不改变），以及可选 `quickSudoProfileId`（非空须引用存在的全局配置并持久化绑定，空串解除绑定，缺省不改变；挑选配置会将连接的 `sudo_source` 切到 `global`，解除时 `global` 回落 `custom`）。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐 tiny-rdm 每次输出动态 resolve 的语义）；终端侧监视器随每次设置/配置更新按当前连接状态**重新挂载**：连接时未配置凭据（如密钥认证连接）或 Quick Sudo 处于关闭的会话，在运行时配置密码/TOTP 或重新打开开关后立即开始自动应答，无需重连。`sudoPassword` 等字段级覆盖是 sidecar 本地值，sidecar 重启或重开连接后恢复宿主下发的配置，而 `quickSudoProfileId` 绑定持久化在插件数据目录、重启保留。`agentTerminalMode` 为连接级内存态（重启回默认 `off`）。工作台工具栏提供设置弹窗；宿主连接表单通过 manifest 字段提供持久化配置入口：`sudo_source`（三选一 `custom` 本连接 / `global` 全局配置 / `off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射）、`sudo_profile`（仅 `global` 时显示，声明 `options_action: sudo/profiles/options` 由宿主渲染为动态下拉，无该扩展能力的宿主保留文本回退）、`sudo_password`、`sudo_use_pty`（仅 `custom` 时显示）、2FA 编排四件套 `totp_secret`、`auth_flow_mode`、`password_prompt_hint`、`totp_prompt_hint`（`global` 时隐藏——凭据来源整体由全局配置接管；`custom`/`off` 时常显以服务登录期 keyboard-interactive）、超时与 keepalive、`jump_hosts`、`setEnv`（会话环境变量）、`remoteCommand`（会话命令，两者详见「会话环境与会话命令（SetEnv / RemoteCommand）」）。
 
 ## AI 终端同步执行（agent terminal mode）
 
@@ -94,9 +94,16 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
 - `external_config.jump_hosts`（最多 3 跳）定义跳板链：每跳包含 `host`、`port`（缺省 22）、`username`、`authentication`（`password` / `private-key` / `private-key-password` / `agent`）及对应凭据字段，可选 `totp_secret` / 提示词 / `auth_flow_mode`。配置跳板后整条链替换 runtime 隧道，末跳直连目标 `host:port`；每跳主机密钥独立校验，登录期 keyboard-interactive 2FA 同样生效。会话关闭时按序断开整条链。
 - keepalive 探测 3 次无应答即判定连接死亡（对齐 tiny-rdm 的 `keepaliveMaxFail`），终端转入断开态、由工作台重连。
 
+## 会话环境与会话命令（SetEnv / RemoteCommand）
+
+对标 ssh(1) `SetEnv` / `RemoteCommand` 的两个连接级会话特性（`external_config`，camelCase；跳板链不继承，仅作用于最终会话）：
+
+- `setEnv`（textarea，默认空串）：每行一条 `KEY=VALUE`（分号亦可作分隔符，空白条目忽略，键值两侧空白去除），在交互终端通道（`ssh/session/open`，PTY 申请后、shell/exec 请求前）与 exec / sudo 命令通道上以 CHANNEL_REQUEST `env` 注入。重复键以最后一条为准——本地合并去重后每个变量恰好请求一次；sudo 通道内部 `SUDO_ASKPASS` 清空默认值让位于用户同名条目（用户值优先，不靠服务器端覆盖顺序）。**默认值**：空串（不发任何 env 请求）。**校验失败行为**：任一条目非法（缺 `=`、键为空或含空白或 NUL、值含 NUL）时连接解析直接失败，并聚合报出全部非法条目——宁可连不上也不错配。语义为客户端显式指定的环境，**不透传本地进程环境变量**；env 请求的注入失败（通道/传输级错误）即报错并命名该变量，不静默吞掉。注意与 ssh(1) 一致的协议现实：env 请求为 fire-and-forget，服务器未 `AcceptEnv` 对应变量时静默丢弃（不发失败应答可观测），此时该变量不生效但连接不失败——需要在远端生效请在服务器 sshd_config 配置 `AcceptEnv`。插件内部管道命令（metrics 采集、磁盘用量、服务器内复制）不注入 setEnv，保证输出解析与连接的语言覆盖解耦。
+- `remoteCommand`（单行文本，默认空串）：非空时 `ssh/session/open` 在申请 PTY 并注入 setEnv 后 exec 该命令**替代 shell request**（PTY 照常申请，对标 `ssh RemoteCommand`）。空串 = 普通交互 shell（默认）。重连或工作台重开会话会**重放同一条命令**，属预期行为（与 ssh(1) 一致：每次新会话都重新执行）。MCP 隐藏 exec 通道、`ssh/exec`、sudo 执行与终端回放（replay）/重连语义不变——remoteCommand 只影响交互会话的启动方式。
+
 ## Quick Sudo 远程执行
 
-`ssh/exec` 参数为 `sessionId`、`command`、`sudo`（可选，默认 false）、`timeoutSecs`（可选，5–300 秒）、`execId`（可选，用于取消），返回 `output` 与 `exitCode`；`ssh/exec/cancel` 携带 `execId` 中止执行中的命令并返回取消错误。
+`ssh/exec` 参数为 `sessionId`、`command`、`sudo`（可选，默认 false）、`timeoutSecs`（可选，5–300 秒）、`execId`（可选，用于取消），返回 `output` 与 `exitCode`；`ssh/exec/cancel` 携带 `execId` 中止执行中的命令并返回取消错误。命令通道（sudo 与非 sudo）会先注入连接的 `setEnv` 条目（见「会话环境与会话命令」），注入失败即报错。
 
 Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
