@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.4.36",
+  "version": "0.4.37",
   "publisher": "xynanan",
   "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
   "icon": "assets/plugin.svg",
@@ -95,7 +95,8 @@
               "label": "No authentication",
               "value": "none"
             }
-          ]
+          ],
+          "description": "SSH always encrypts the connection. A private key passphrase unlocks the key; it is separate from the account password."
         },
         {
           "key": "password",
@@ -165,39 +166,6 @@
           }
         },
         {
-          "key": "connect_timeout_secs",
-          "label": "Connect timeout (seconds)",
-          "type": "number",
-          "binding": "config",
-          "default": 15,
-          "description": "SSH handshake and authentication timeout."
-        },
-        {
-          "key": "keepalive_interval_secs",
-          "label": "Keepalive interval (seconds)",
-          "type": "number",
-          "binding": "config",
-          "default": 30,
-          "description": "Keepalive probe interval; 3 missed probes disconnect the session. 0 disables probes."
-        },
-        {
-          "key": "set_env",
-          "label": "Set environment variables",
-          "type": "textarea",
-          "binding": "config",
-          "default": "",
-          "placeholder": "LANG=zh_CN.UTF-8",
-          "description": "One KEY=VALUE entry per line (semicolons also separate entries), sent to the server on the terminal, exec and sudo channels. Duplicate keys: the last entry wins. Invalid entries fail the connection; values come from this configuration only - the local environment is never transmitted."
-        },
-        {
-          "key": "remote_command",
-          "label": "Remote command",
-          "type": "text",
-          "binding": "config",
-          "default": "",
-          "description": "Executed instead of a shell when a terminal session opens (a PTY is still requested). Leave empty for a normal interactive shell; reconnecting re-runs the command."
-        },
-        {
           "key": "sudo_source",
           "label": "Sudo credential source",
           "type": "select",
@@ -247,18 +215,33 @@
           "description": "Password piped to sudo; leave empty to reuse the login password."
         },
         {
-          "key": "totp_secret",
-          "label": "TOTP secrets",
+          "key": "sudo_use_pty",
+          "label": "Request PTY for sudo commands",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "visible_when": {
+            "field": "sudo_source",
+            "one_of": [
+              "custom"
+            ]
+          },
+          "description": "Some PAM stacks only prompt correctly with a TTY. A bound global profile overrides this with its own preference."
+        },
+        {
+          "key": "sudo_whitelist",
+          "label": "Sudo command whitelist",
           "type": "textarea",
-          "binding": "secret",
+          "binding": "config",
+          "default": "",
           "visible_when": {
             "field": "sudo_source",
             "one_of": [
               "custom",
-              "off"
+              "global"
             ]
           },
-          "description": "One secret per line: otpauth:// URI, base32 key, or a static code. Rotating selection avoids reusing a code in the same window. Also answers login-time keyboard-interactive 2FA."
+          "description": "sudoers-style allowlist for privileged commands, one entry per line (or separated by ';'). Tokens match exactly, '*' matches one argument, a trailing '*' matches the rest (e.g. 'systemctl restart *'). When set, sudo runs only for matching commands; leave empty to disable."
         },
         {
           "key": "auth_flow_mode",
@@ -287,7 +270,21 @@
               "label": "Password only"
             }
           ],
-          "description": "How login and sudo 2FA prompts are answered."
+          "description": "Used for login and sudo prompts. Password-only mode ignores OTP secrets. Global Quick Sudo profiles use their own settings."
+        },
+        {
+          "key": "totp_secret",
+          "label": "TOTP secrets",
+          "type": "textarea",
+          "binding": "secret",
+          "visible_when": {
+            "field": "auth_flow_mode",
+            "one_of": [
+              "password_then_otp",
+              "password_plus_otp"
+            ]
+          },
+          "description": "One secret per line: otpauth:// URI, base32 key, or a static code. Rotating selection avoids reusing a code in the same window. Also answers login-time keyboard-interactive 2FA."
         },
         {
           "key": "password_prompt_hint",
@@ -309,42 +306,46 @@
           "type": "text",
           "binding": "config",
           "visible_when": {
-            "field": "sudo_source",
+            "field": "auth_flow_mode",
             "one_of": [
-              "custom",
-              "off"
+              "password_then_otp",
+              "password_plus_otp"
             ]
           },
           "description": "Custom substring that identifies OTP prompts (e.g. 'duo passcode')."
         },
         {
-          "key": "sudo_use_pty",
-          "label": "Request PTY for sudo commands",
-          "type": "boolean",
+          "key": "connect_timeout_secs",
+          "label": "Connect timeout (seconds)",
+          "type": "number",
           "binding": "config",
-          "default": false,
-          "visible_when": {
-            "field": "sudo_source",
-            "one_of": [
-              "custom"
-            ]
-          },
-          "description": "Some PAM stacks only prompt correctly with a TTY. A bound global profile overrides this with its own preference."
+          "default": 15,
+          "description": "SSH handshake and authentication timeout."
         },
         {
-          "key": "sudo_whitelist",
-          "label": "Sudo command whitelist",
+          "key": "keepalive_interval_secs",
+          "label": "Keepalive interval (seconds)",
+          "type": "number",
+          "binding": "config",
+          "default": 30,
+          "description": "Keepalive probe interval; 3 missed probes disconnect the session. 0 disables probes."
+        },
+        {
+          "key": "set_env",
+          "label": "Set environment variables",
+          "type": "textarea",
+          "binding": "config",
+          "default": "",
+          "placeholder": "LANG=zh_CN.UTF-8",
+          "description": "One KEY=VALUE entry per line (semicolons also separate entries), sent to the server on the terminal, exec and sudo channels. Duplicate keys: the last entry wins. Invalid entries fail the connection; values come from this configuration only - the local environment is never transmitted."
+        },
+        {
+          "key": "remote_command",
+          "label": "Remote command",
           "type": "text",
           "binding": "config",
           "default": "",
-          "visible_when": {
-            "field": "sudo_source",
-            "one_of": [
-              "custom",
-              "global"
-            ]
-          },
-          "description": "sudoers-style allowlist for privileged commands, one entry per line (or separated by ';'). Tokens match exactly, '*' matches one argument, a trailing '*' matches the rest (e.g. 'systemctl restart *'). When set, sudo runs only for matching commands; leave empty to disable."
+          "description": "Executed instead of a shell when a terminal session opens (a PTY is still requested). Leave empty for a normal interactive shell; reconnecting re-runs the command."
         },
         {
           "key": "read_only",
@@ -428,7 +429,8 @@
                 "private-key-password": "Clave privada y después contraseña",
                 "agent": "Agente SSH",
                 "none": "Sin autenticación"
-              }
+              },
+              "description": "SSH siempre cifra la conexión. La frase de la clave privada la desbloquea; es distinta de la contraseña de la cuenta."
             },
             "password": {
               "label": "Contraseña"
@@ -475,7 +477,8 @@
               "label": "Secretos TOTP"
             },
             "auth_flow_mode": {
-              "label": "Flujo 2FA"
+              "label": "Flujo 2FA",
+              "description": "Se aplica al inicio de sesión y a sudo. Solo contraseña no usa OTP. Los perfiles globales Quick Sudo usan sus propios ajustes."
             },
             "password_prompt_hint": {
               "label": "Pista de prompt de contraseña"
@@ -538,7 +541,8 @@
                 "private-key-password": "Chiave privata, poi password",
                 "agent": "SSH Agent",
                 "none": "Nessuna autenticazione"
-              }
+              },
+              "description": "SSH cifra sempre la connessione. La passphrase sblocca la chiave privata ed è diversa dalla password dell’account."
             },
             "password": {
               "label": "Password"
@@ -577,6 +581,9 @@
             },
             "sudo_whitelist": {
               "label": "Whitelist comandi sudo"
+            },
+            "auth_flow_mode": {
+              "description": "Si applica ai prompt di accesso e sudo. Solo password non usa OTP. I profili Quick Sudo globali usano le proprie impostazioni."
             }
           },
           "actions": {
@@ -624,7 +631,8 @@
                 "private-key-password": "秘密鍵の後にパスワード",
                 "agent": "SSH Agent",
                 "none": "認証なし"
-              }
+              },
+              "description": "SSH 接続は常に暗号化されます。秘密鍵のパスフレーズは鍵の解除用で、アカウントのパスワードとは別です。"
             },
             "password": {
               "label": "パスワード"
@@ -671,7 +679,8 @@
               "label": "TOTP シークレット"
             },
             "auth_flow_mode": {
-              "label": "2FA フロー"
+              "label": "2FA フロー",
+              "description": "ログインと sudo に適用します。パスワードのみの場合は OTP を使いません。グローバル Quick Sudo は独自の設定を使います。"
             },
             "password_prompt_hint": {
               "label": "パスワード プロンプト判定語"
@@ -734,7 +743,8 @@
                 "private-key-password": "Chave privada e depois senha",
                 "agent": "Agente SSH",
                 "none": "Sem autenticação"
-              }
+              },
+              "description": "SSH sempre criptografa a conexão. A frase secreta desbloqueia a chave privada e é diferente da senha da conta."
             },
             "password": {
               "label": "Senha"
@@ -773,6 +783,9 @@
             },
             "sudo_whitelist": {
               "label": "Lista de permissões sudo"
+            },
+            "auth_flow_mode": {
+              "description": "Aplica-se aos prompts de login e sudo. Somente senha não usa OTP. Os perfis globais Quick Sudo usam suas próprias configurações."
             }
           },
           "actions": {
@@ -820,7 +833,8 @@
                 "private-key-password": "私钥后密码",
                 "agent": "SSH Agent",
                 "none": "无认证"
-              }
+              },
+              "description": "SSH 连接始终加密。私钥口令用于解锁私钥，与账号密码不同。"
             },
             "password": {
               "label": "密码"
@@ -867,7 +881,8 @@
               "label": "TOTP 密钥"
             },
             "auth_flow_mode": {
-              "label": "2FA 认证流"
+              "label": "2FA 认证流",
+              "description": "用于登录和 sudo 提示。仅密码模式不使用 OTP 密钥；全局 Quick Sudo 配置使用自身设置。"
             },
             "password_prompt_hint": {
               "label": "密码提示词"
@@ -930,7 +945,8 @@
                 "private-key-password": "私鑰後密碼",
                 "agent": "SSH Agent",
                 "none": "無認證"
-              }
+              },
+              "description": "SSH 連線一律加密。私鑰密碼用於解鎖私鑰，與帳號密碼不同。"
             },
             "password": {
               "label": "密碼"
@@ -977,7 +993,8 @@
               "label": "TOTP 金鑰"
             },
             "auth_flow_mode": {
-              "label": "2FA 認證流程"
+              "label": "2FA 認證流程",
+              "description": "用於登入及 sudo 提示。僅密碼模式不使用 OTP 金鑰；全域 Quick Sudo 設定使用自身設定。"
             },
             "password_prompt_hint": {
               "label": "密碼提示詞"

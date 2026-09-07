@@ -872,12 +872,15 @@ mod tests {
             Some(("sudo_source".to_string(), vec!["global".to_string()])),
             "sudo_profile must show only for sudo_source=global"
         );
-        for key in ["totp_secret", "auth_flow_mode", "password_prompt_hint", "totp_prompt_hint"] {
+        for key in ["auth_flow_mode", "password_prompt_hint"] {
             assert_eq!(
                 visible_when(key),
                 Some(("sudo_source".to_string(), vec!["custom".to_string(), "off".to_string()])),
                 "{key} must hide under sudo_source=global (the bound profile owns the whole credential source) and stay visible otherwise"
             );
+        }
+        for key in ["totp_secret", "totp_prompt_hint"] {
+            assert_eq!(visible_when(key), Some(("auth_flow_mode".to_string(), vec!["password_then_otp".to_string(), "password_plus_otp".to_string()])));
         }
     }
 
@@ -1373,10 +1376,8 @@ mod manifest_contract_tests {
             "sudo_profile must be visible only while sudo_source is global"
         );
         for key in [
-            "totp_secret",
             "auth_flow_mode",
             "password_prompt_hint",
-            "totp_prompt_hint",
         ] {
             assert_eq!(
                 condition_field(&field(key), "visible_when"),
@@ -1388,6 +1389,10 @@ mod manifest_contract_tests {
                 Some(vec!["custom".to_string(), "off".to_string()]),
                 "{key} must hide under global (profile owns the source) and stay visible for custom/off"
             );
+        }
+        for key in ["totp_secret", "totp_prompt_hint"] {
+            assert_eq!(condition_field(&field(key), "visible_when"), Some("auth_flow_mode"));
+            assert_eq!(condition_one_of(&field(key), "visible_when"), Some(vec!["password_then_otp".to_string(), "password_plus_otp".to_string()]));
         }
     }
 
