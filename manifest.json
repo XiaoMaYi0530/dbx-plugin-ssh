@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.4.37",
+  "version": "0.4.38",
   "publisher": "xynanan",
   "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
   "icon": "assets/plugin.svg",
@@ -478,7 +478,12 @@
             },
             "auth_flow_mode": {
               "label": "Flujo 2FA",
-              "description": "Se aplica al inicio de sesión y a sudo. Solo contraseña no usa OTP. Los perfiles globales Quick Sudo usan sus propios ajustes."
+              "description": "Se aplica al inicio de sesión y a sudo. Solo contraseña no usa OTP. Los perfiles globales Quick Sudo usan sus propios ajustes.",
+              "options": {
+                "password_then_otp": "Primero contraseña, después OTP",
+                "password_plus_otp": "Contraseña y OTP combinados",
+                "password_only": "Solo contraseña"
+              }
             },
             "password_prompt_hint": {
               "label": "Pista de prompt de contraseña"
@@ -583,7 +588,41 @@
               "label": "Whitelist comandi sudo"
             },
             "auth_flow_mode": {
-              "description": "Si applica ai prompt di accesso e sudo. Solo password non usa OTP. I profili Quick Sudo globali usano le proprie impostazioni."
+              "description": "Si applica ai prompt di accesso e sudo. Solo password non usa OTP. I profili Quick Sudo globali usano le proprie impostazioni.",
+              "label": "Flusso 2FA",
+              "options": {
+                "password_then_otp": "Prima password, poi OTP",
+                "password_plus_otp": "Password e OTP combinati",
+                "password_only": "Solo password"
+              }
+            },
+            "sudo_password": {
+              "label": "Password sudo alternativa",
+              "description": "Lascia vuoto per usare la password di accesso."
+            },
+            "sudo_use_pty": {
+              "label": "Richiedi PTY per sudo",
+              "description": "Abilita per i sistemi PAM che richiedono un terminale."
+            },
+            "totp_secret": {
+              "label": "Segreti TOTP",
+              "description": "Un segreto per riga: URI otpauth://, chiave base32 o codice statico. Usato anche per la 2FA durante l’accesso."
+            },
+            "password_prompt_hint": {
+              "label": "Indicatore del prompt password",
+              "description": "Testo personalizzato che identifica il prompt della password."
+            },
+            "totp_prompt_hint": {
+              "label": "Indicatore del prompt OTP",
+              "description": "Testo personalizzato che identifica il prompt OTP."
+            },
+            "connect_timeout_secs": {
+              "label": "Timeout connessione (secondi)",
+              "description": "Timeout per handshake SSH e autenticazione."
+            },
+            "keepalive_interval_secs": {
+              "label": "Intervallo keepalive (secondi)",
+              "description": "Tre risposte mancanti chiudono la sessione. 0 disabilita il keepalive."
             }
           },
           "actions": {
@@ -680,7 +719,12 @@
             },
             "auth_flow_mode": {
               "label": "2FA フロー",
-              "description": "ログインと sudo に適用します。パスワードのみの場合は OTP を使いません。グローバル Quick Sudo は独自の設定を使います。"
+              "description": "ログインと sudo に適用します。パスワードのみの場合は OTP を使いません。グローバル Quick Sudo は独自の設定を使います。",
+              "options": {
+                "password_then_otp": "パスワードの後に OTP",
+                "password_plus_otp": "パスワードと OTP を連結",
+                "password_only": "パスワードのみ"
+              }
             },
             "password_prompt_hint": {
               "label": "パスワード プロンプト判定語"
@@ -785,7 +829,41 @@
               "label": "Lista de permissões sudo"
             },
             "auth_flow_mode": {
-              "description": "Aplica-se aos prompts de login e sudo. Somente senha não usa OTP. Os perfis globais Quick Sudo usam suas próprias configurações."
+              "description": "Aplica-se aos prompts de login e sudo. Somente senha não usa OTP. Os perfis globais Quick Sudo usam suas próprias configurações.",
+              "label": "Fluxo de 2FA",
+              "options": {
+                "password_then_otp": "Senha primeiro, depois OTP",
+                "password_plus_otp": "Senha e OTP combinados",
+                "password_only": "Somente senha"
+              }
+            },
+            "sudo_password": {
+              "label": "Senha sudo alternativa",
+              "description": "Deixe vazio para usar a senha de login."
+            },
+            "sudo_use_pty": {
+              "label": "Solicitar PTY para sudo",
+              "description": "Ative para sistemas PAM que exigem um terminal."
+            },
+            "totp_secret": {
+              "label": "Segredos TOTP",
+              "description": "Um segredo por linha: URI otpauth://, chave base32 ou código estático. Também usado na 2FA durante o login."
+            },
+            "password_prompt_hint": {
+              "label": "Identificador do prompt de senha",
+              "description": "Texto personalizado que identifica o prompt de senha."
+            },
+            "totp_prompt_hint": {
+              "label": "Identificador do prompt OTP",
+              "description": "Texto personalizado que identifica o prompt OTP."
+            },
+            "connect_timeout_secs": {
+              "label": "Tempo limite de conexão (segundos)",
+              "description": "Tempo limite para handshake SSH e autenticação."
+            },
+            "keepalive_interval_secs": {
+              "label": "Intervalo de keepalive (segundos)",
+              "description": "Três respostas ausentes encerram a sessão. 0 desativa o keepalive."
             }
           },
           "actions": {
@@ -882,7 +960,12 @@
             },
             "auth_flow_mode": {
               "label": "2FA 认证流",
-              "description": "用于登录和 sudo 提示。仅密码模式不使用 OTP 密钥；全局 Quick Sudo 配置使用自身设置。"
+              "description": "用于登录和 sudo 提示。仅密码模式不使用 OTP 密钥；全局 Quick Sudo 配置使用自身设置。",
+              "options": {
+                "password_then_otp": "先密码，再 OTP",
+                "password_plus_otp": "密码与 OTP 组合",
+                "password_only": "仅密码"
+              }
             },
             "password_prompt_hint": {
               "label": "密码提示词"
@@ -994,7 +1077,12 @@
             },
             "auth_flow_mode": {
               "label": "2FA 認證流程",
-              "description": "用於登入及 sudo 提示。僅密碼模式不使用 OTP 金鑰；全域 Quick Sudo 設定使用自身設定。"
+              "description": "用於登入及 sudo 提示。僅密碼模式不使用 OTP 金鑰；全域 Quick Sudo 設定使用自身設定。",
+              "options": {
+                "password_then_otp": "先密碼，再 OTP",
+                "password_plus_otp": "密碼與 OTP 組合",
+                "password_only": "僅密碼"
+              }
             },
             "password_prompt_hint": {
               "label": "密碼提示詞"

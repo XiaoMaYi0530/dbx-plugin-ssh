@@ -21,6 +21,7 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 
 echo "==> backend unit tests"
+node ../shared/connection-forms/verify.mjs ssh
 cargo test --manifest-path backend/Cargo.toml
 
 echo "==> frontend typecheck + tests + build"
