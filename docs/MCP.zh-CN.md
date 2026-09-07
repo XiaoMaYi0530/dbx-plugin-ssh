@@ -81,6 +81,23 @@ dbx-plugin-ssh --mcp
 
 ## 工具一览（27 个，两种方式通用）
 
+### 本地传输路径约束（sftp_upload / sftp_download）
+
+MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地写）的本地
+路径因此受双重约束，任何一条不满足都在拨号前拒绝：
+
+1. **传输根约束**：canonical 化后的本地路径必须落在允许根内。操作者通过
+   `mcp/settings/set` 配置 `localTransferRoot`（绝对路径；`mcp/tools` /
+   `mcp/call` 通道不可达，agent 无法自行扩根）后，允许根即该目录；未配置时
+   默认允许根为**系统临时目录 + 插件数据目录**——覆盖测试夹具与暂存传输的
+   常规场景，用户文档与家目录默认不可达。
+2. **敏感路径黑名单**（任何模式叠加生效）：`.ssh` / `.gnupg` 等凭据库、
+   shell 启动文件（`.bashrc` / `.zshrc` 等）、cron / sudoers / launchd 等
+   引导执行路径一律拒绝——上传侧同样受此约束，防止把本机凭据装箱外送。
+
+路径均先 canonical 化（symlink 与 `..` 归一由 OS 解析），配置根不可解析时
+直接报错而非静默回落。
+
 | 工具 | 说明 |
 | --- | --- |
 | `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。TOTP 支持多密钥（换行/分号分隔）：跨调用自动轮换，优先未过期且未使用过的验证码，重放窗口内已提交的码不再注入。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令，配置了连接 sudo 白名单时特权命令还须命中白名单条目（见下节）。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」）；stdio 模式传 `true` 且带 `connectionId` 时自动转发到运行中的 DBX app（未运行则唤起），在 app 的可见终端里执行。**超过 ~10 秒的命令请改用 `ssh_run_bg`**（宿主等待上限与防重复执行见「长任务与断线恢复」） |
@@ -92,7 +109,7 @@ dbx-plugin-ssh --mcp
 | `ssh_close` | 关闭缓存的连接（方式二按连接键；方式一由 sidecar 生命周期管理） |
 | `sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_pwd` | 浏览、检查远端路径与登录家目录 |
 | `sftp_read_file` / `sftp_write_file` | 读写远端文件（文本或 base64，支持 offset 分页） |
-| `sftp_upload` / `sftp_download` | 本地 ↔ 远端单文件传输（受 `maxUploadBytes` / `maxDownloadBytes` 限制；本地路径校验先于拨号，校验拒绝不清连接池） |
+| `sftp_upload` / `sftp_download` | 本地 ↔ 远端单文件传输（受 `maxUploadBytes` / `maxDownloadBytes` 限制；本地路径校验先于拨号，校验拒绝不清连接池）。本地路径受传输根约束：必须落在 `localTransferRoot`（未配置时为系统临时目录 + 插件数据目录）之内，且任何模式下都拒绝敏感路径（凭据库、shell 启动文件等，见下文「本地传输路径约束」） |
 | `sftp_mkdir` / `sftp_remove` / `sftp_rename` / `sftp_chmod` | 目录与文件管理 |
 | `sftp_disk_usage` | 路径所在挂载的磁盘用量 |
 | `sftp_copy` / `sftp_move` | 服务器内复制 / 剪切（`from` 单值或数组 → `toDir`，逐项返回成败） |

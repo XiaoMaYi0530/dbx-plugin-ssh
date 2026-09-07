@@ -1357,3 +1357,93 @@ UI_SCAN 文档改动与本分支无交集可并行保留。worktree 内 `host` �
 即断开的产品语义是否保留（备选：退出后回 shell 或提示重连）待用户定；
 ③ smoke_sudo_otp 存量回归专项排查（归档在案，非本轮引入）；④ setEnv 在
 默认 sshd 上需 `AcceptEnv` 配合，文档已注明。
+### §8.13 设置弹窗/配置编辑器回显已存原值（2026-09-04）
+
+**问题**：Quick Sudo 设置弹窗与全局配置编辑器的 sudo 密码 / TOTP 密钥输入框
+打开时永远空白，仅靠占位符提示"已配置"——用户看不到自己存的原值
+（`settings/get` 与 `profile_view` 只回布尔位，设计上从不回显），多密钥
+原文（换行/分号串）更是完全无处可查。
+
+**修复**（回显仍是显式、有边界的）：
+- `ssh/settings/get` 新增可选 `revealSecrets: true` → 额外回显本连接配置的
+  `sudoPassword` / `totpSecret` 原始串；缺省响应与此前完全一致（布尔位），
+  MCP 通道不暴露该参数。设置弹窗 `openSettings` 传参预填两个 draft 字段；
+  `refreshSettingsMeta` 保持不回显。
+- 新增 `sudo/profiles/reveal { id }`（工作台专用，**不进 MCP 工具面**，密钥
+  不进 agent 上下文）：返回完整视图含原值；未知 id 报错。配置编辑器
+  `startProfileEdit` 在有已存密钥时异步 reveal 预填（带 id/编辑态守卫，
+  失败回落占位提示）。保存语义不变：空串/清空字段=保持原值，清除走既有
+  清除按钮 / clear 标志。
+- `mockDbxHost.ts` 镜像两个方法当前形状（reveal 回空串壳）。
+
+**测试**：`cargo test` 189 通过（新增 `reveal_returns_raw_secrets_for_the_
+editor`：原值回显 + 未知 id 报错；`views_never_echo_secrets` 证明 list 视图
+仍不回显）。前端 typecheck 0 错、vitest 102 过、build 成功。smoke：
+`smoke_sudo_otp_test.py` 新增 `revealSecrets` 用例（默认不回显断言保留 +
+reveal 回显多密钥原文）；`smoke_fs_test.py` 新增 `sudo/profiles/reveal`
+用例（原值返回 + 未知 id 报错 + list 仍 flag-only）。
+
+**文档**：PROTOCOL.zh-CN.md（`ssh/settings/get` revealSecrets 参数、
+`sudo/profiles/reveal` 方法条目及其"仅工作台、不进 MCP"边界）。宿主渲染的
+连接表单 `totp_secret` 字段属宿主表单体系，不受本插件控制，不在本轮范围。
+
+### §8.14 修复：OTP 预注入后 watcher 重复应答同一提示，烧掉第二密钥的码（2026-09-05，合并最新 master 后）
+
+**合并 master（kafka、ssh 批量快捷命令 + sudo allowlist、shared/frontend
+适配层）后真机 smoke 暴露新问题**：`same-window replay rotates to the
+second secret` FAIL——同窗第二次 sudo 无任何 OTP 提交，防重放台账把两个
+密钥的码都记为已提交。
+
+**根因**（stderr trace + 提交日志双证）：`exec_with_sudo` Phase 1 把密码与
+OTP 码一起预注入 stdin（`totp_answer_logged` → take #1，烧 secret_a 的码），
+但 Phase 2 watcher 的 `otp_answered` 标志仍是 false——shim/PAM 打出的**同
+一个** "Verification code:" 提示被 watcher 当作新提示再次应答（take #2，
+轮换选中 secret_b 的码），写入的码无人消费、直接废弃，但 usage/committed
+双台账已标记。同窗第二次 sudo 时 a、b 两码均已 committed，selection fallback
+选中已提交码被防重放守卫拦截——轮换语义失效。
+
+**修复**：`PromptContext` 增加 `otp_piped` 标志，Phase 1 成功预注入 OTP 码
+时 watcher 的 `otp_answered` 初始为 true（同一提示不再二次应答；预注入被
+防重放跳过时保持 false，后续真实提示照常应答）。
+
+**验证**：cargo test 212 通过；前端 typecheck 0 错 / vitest 119 过 /
+build 成功（合并 master 后全量复验）；真机 smoke：otp 11 passed / 0 failed
+（同窗轮换、第三次硬跳过、错误密钥拒绝、revealSecrets 回显全过），
+fs 46 passed / 0 skipped / 0 failed（含 `sudo/profiles/reveal` 新用例）。
+
+**排障基建**：`smoke_sudo_otp_test.py` FAIL 时打印完整提交日志（定位
+"码谁烧的"）与 sidecar stderr 过滤尾（进程退出后 drain，避免管道阻塞）。
+另注：sidecar 启动依赖可执行文件名 `dbx-plugin-ssh`——非同名副本无法
+initialize（sidecar closed），smoke 直连二进制排障时需保持原名。
+
+### §8.15 MCP 本地传输根约束：sftp_upload/download 路径穿越修复（2026-09-07，合并 totp-rotation 轮）
+
+**背景**：合并 `feat/ssh-totp-rotation` 的收尾 commit 被 Mimosa L3 门槛拦截
+（6 个 high：mcp.rs 1311/1372 为 sftp 传输工具真实暴露面，945/949/1819/1820
+为 sudo_auth 误报，见下）。经用户决策走"先修复再合并"路径。
+
+**修复（真实问题，sftp 两条）**：agent 可指定任意本地路径读（upload 装箱
+外送）写（download 落盘），原仅有下载侧敏感路径黑名单。新增本地传输根
+约束（`mcp.rs` `local_transfer_roots_for` / `ensure_local_transfer_allowed_in`）：
+
+- `mcp/settings` 新增 `localTransferRoot`（绝对路径或空串；持久化进
+  mcp-settings.json）。配置后允许根=该目录；未配置默认=系统临时目录 +
+  插件数据目录。canonical 化后 `starts_with` 判定（macOS `/var` 别名不漏）。
+- 敏感路径黑名单（`.ssh`/`.gnupg`/shell 启动文件/引导执行路径）升级为
+  **双向、任何模式叠加**——upload 侧首次获得防凭据外传校验，配置根内同样
+  拦截。
+- 配置根不可解析时报错而非静默回落；`mcp/settings/set` 是操作者协议面，
+  `mcp/tools`/`mcp/call`（agent 面）不可达——**agent 无法自我扩根**。
+- 单测 +5：门槛约束/黑名单叠加/默认根解析/配置校验/持久化 roundtrip
+  （220 全过）。
+
+**误报论证（sudo_auth 四条，链 `sudo_auth → new → load(sink:path-traversal)`）**：
+`SudoAuth::new` 全链纯字符串处理（`exec.rs` 全文件零 `fs::` 调用），
+`sudo_auth()` 的输入是凭据串，可达的 `load`（McpLimits::load /
+sudo_profiles::load_store）入参均为 data_dir 固定路径——污点链为扫描器对
+泛型名 `new`/`load` 的跨函数混淆，扫描器自身标注 "静态 advisory 需人工确认"。
+未为此改代码（改即迎合误报）；如重扫仍报，需在门槛侧按误报处置。
+
+**遗留**：smoke_mcp.py 的门槛拒绝用例（仓库外根双向拒绝 + 根内敏感路径
+拒绝）因 Mimosa Edit 钩子对该文件的幻影误报（引证 `../`，实测全文零匹配）
+连续拦截写入而暂缓；门槛逻辑已由单测全覆盖，smoke 用例待钩子侧澄清后补。

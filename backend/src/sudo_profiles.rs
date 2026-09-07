@@ -171,6 +171,18 @@ pub fn list_views(store: &SudoProfileStore) -> Vec<Value> {
     profiles.iter().map(profile_view).collect()
 }
 
+/// Workbench-only reveal of one profile including its raw secrets, so the
+/// profile editor can prefill what the user stored. Not reachable from the
+/// MCP surface (list/save views stay flag-only).
+pub fn reveal_profile(store: &SudoProfileStore, id: &str) -> Result<Value, String> {
+    let profile = store
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .ok_or_else(|| "Quick Sudo profile not found".to_string())?;
+    Ok(json!({ "profile": profile_json(profile) }))
+}
+
 fn validate_name(name: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -566,6 +578,19 @@ mod tests {
         assert!(rendered.contains("\"sudoPasswordSet\":true"));
         let view = profile_view(&store.profiles[0].clone());
         assert_eq!(view["totpConfigured"], true);
+    }
+
+    #[test]
+    fn reveal_returns_raw_secrets_for_the_editor() {
+        let secret = test_secret("reveal");
+        let store = store_with("ops", &secret);
+        let revealed = reveal_profile(&store, &store.profiles[0].id).expect("reveal");
+        let profile = revealed["profile"].clone();
+        assert_eq!(profile["sudoPassword"], secret);
+        assert_eq!(profile["totpSecret"], "JBSWY3DPEHPK3PXP");
+        assert_eq!(profile["name"], "ops");
+        // Unknown ids fail instead of returning an empty shell.
+        assert!(reveal_profile(&store, "missing").is_err());
     }
 
     #[test]

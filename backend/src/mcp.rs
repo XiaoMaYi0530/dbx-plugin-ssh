@@ -49,12 +49,17 @@ const DOWNLOAD_LIMIT_CEILING: u64 = 2 * 1024 * 1024 * 1024;
 ///   i.e. the most a single read/download may return (previously the
 ///   `MAX_READ_BYTES` constant);
 /// - `max_upload_bytes`: ceiling for the content of a single
-///   `sftp_write_file` call (new; writes were previously uncapped).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///   `sftp_write_file` call (new; writes were previously uncapped);
+/// - `local_transfer_root`: confinement root for the local side of
+///   `sftp_upload` / `sftp_download`; empty = the default roots (OS temp
+///   dir + plugin data dir). See
+///   [`ensure_local_transfer_allowed_in`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpLimits {
     pub max_read_bytes: u64,
     pub max_upload_bytes: u64,
     pub max_download_bytes: u64,
+    pub local_transfer_root: String,
 }
 
 impl Default for McpLimits {
@@ -63,6 +68,7 @@ impl Default for McpLimits {
             max_read_bytes: 256 * 1024,
             max_upload_bytes: 16 * 1024 * 1024,
             max_download_bytes: 1024 * 1024,
+            local_transfer_root: String::new(),
         }
     }
 }
@@ -76,6 +82,7 @@ impl McpLimits {
             max_read_bytes: self.max_read_bytes.clamp(1, READ_LIMIT_CEILING),
             max_upload_bytes: self.max_upload_bytes.clamp(1, UPLOAD_LIMIT_CEILING),
             max_download_bytes: self.max_download_bytes.clamp(1, DOWNLOAD_LIMIT_CEILING),
+            local_transfer_root: self.local_transfer_root,
         }
     }
 
@@ -89,6 +96,12 @@ impl McpLimits {
             max_read_bytes: field("maxReadBytes", defaults.max_read_bytes),
             max_upload_bytes: field("maxUploadBytes", defaults.max_upload_bytes),
             max_download_bytes: field("maxDownloadBytes", defaults.max_download_bytes),
+            local_transfer_root: value
+                .get("localTransferRoot")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
         }
         .sanitized()
     }
@@ -98,6 +111,7 @@ impl McpLimits {
             "maxReadBytes": self.max_read_bytes,
             "maxUploadBytes": self.max_upload_bytes,
             "maxDownloadBytes": self.max_download_bytes,
+            "localTransferRoot": self.local_transfer_root,
         })
     }
 
@@ -120,6 +134,25 @@ impl McpLimits {
         std::fs::write(path, text)
             .map_err(|error| format!("Failed to write MCP settings {}: {error}", path.display()))
     }
+}
+
+/// Validates the `localTransferRoot` setting: an absolute path string, or
+/// empty to clear the override (falling back to the default transfer
+/// roots).
+fn validated_transfer_root(value: &Value) -> Result<String, String> {
+    let root = value
+        .as_str()
+        .ok_or_else(|| {
+            "localTransferRoot must be a string (absolute path, or empty to reset)".to_string()
+        })?
+        .trim()
+        .to_string();
+    if !root.is_empty() && !Path::new(&root).is_absolute() {
+        return Err(
+            "localTransferRoot must be an absolute path (or empty to reset)".to_string(),
+        );
+    }
+    Ok(root)
 }
 
 /// Validates one `mcp/settings/set` field: an unsigned integer within
@@ -312,8 +345,11 @@ impl McpState {
             limits.max_download_bytes =
                 validated_limit(value, "maxDownloadBytes", DOWNLOAD_LIMIT_CEILING)?;
         }
+        if let Some(value) = updates.get("localTransferRoot") {
+            limits.local_transfer_root = validated_transfer_root(value)?;
+        }
         limits = limits.sanitized();
-        limits.save(&self.limits_path)?;
+        limits.clone().save(&self.limits_path)?;
         *self
             .limits
             .write()
@@ -1303,10 +1339,19 @@ impl McpState {
         }
     }
 
+    /// Containment gate for agent-supplied local transfer paths; see
+    /// [`ensure_local_transfer_allowed_in`] for the policy.
+    fn ensure_local_transfer_allowed(&self, path: &Path) -> Result<(), String> {
+        let configured = self.size_limits().local_transfer_root;
+        let roots = local_transfer_roots_for(&configured, &self.runtime.data_dir())?;
+        ensure_local_transfer_allowed_in(&roots, &configured, path)
+    }
+
     /// `sftp_upload`: transfers one local file to the remote server. The
-    /// local side is validated (readable, within the configured
-    /// `maxUploadBytes`) before any connection I/O so bad paths fail fast;
-    /// those refusals leave the pooled connection untouched. SFTP transport
+    /// local side is validated before any connection I/O (readable, inside
+    /// the allowed transfer roots, clear of the sensitive-path blocklist,
+    /// within the configured `maxUploadBytes`) so bad paths fail fast and
+    /// refusals leave the pooled connection untouched. SFTP transport
     /// errors drop the cached connection so the next call reconnects.
     async fn sftp_upload_tool(&self, arguments: &Value) -> Result<Value, String> {
         let local_path = required_str(arguments, "localPath")?;
@@ -1317,6 +1362,7 @@ impl McpState {
             .unwrap_or(false);
         let local_source = std::fs::canonicalize(&local_path)
             .map_err(|error| format!("Cannot read local file {local_path}: {error}"))?;
+        self.ensure_local_transfer_allowed(&local_source)?;
         let data = std::fs::read(&local_source)
             .map_err(|error| format!("Cannot read local file {}: {error}", local_source.display()))?;
         let upload_limit = self.size_limits().max_upload_bytes;
@@ -1411,6 +1457,9 @@ impl McpState {
                 .join(file_name),
             None => PathBuf::from(file_name),
         };
+        // Containment before dialing: refusals here keep the pooled
+        // connection untouched (same contract as the other local checks).
+        self.ensure_local_transfer_allowed(&local_target)?;
         let outcome = self
             .download_via_sftp(arguments, remote_path, local_path, &local_target)
             .await;
@@ -1745,6 +1794,65 @@ fn is_sensitive_local_path(path: &str) -> bool {
             | ".zlogin" | ".cshrc" | ".tcshrc" | "authorized_keys" | ".netrc"
             | ".git-credentials" | ".npmrc" | ".htpasswd"
     )
+}
+
+/// Resolves the allowed local roots for agent-driven `sftp_upload` /
+/// `sftp_download` transfers: the configured `localTransferRoot` when set
+/// (it must resolve — an unreachable root is an error, never a silent
+/// fallback), otherwise the OS temp dir plus the plugin data dir. Roots
+/// are canonicalized so macOS `/var` → `/private/var` style aliasing
+/// cannot dodge the `starts_with` containment check.
+fn local_transfer_roots_for(configured: &str, data_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    if !configured.is_empty() {
+        return std::fs::canonicalize(configured)
+            .map(|root| vec![root])
+            .map_err(|error| {
+                format!(
+                    "Configured localTransferRoot {configured} cannot be resolved: {error} \
+                     (create the directory or reset it via mcp/settings/set)"
+                )
+            });
+    }
+    Ok([std::env::temp_dir(), data_dir.to_path_buf()]
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(&root).ok())
+        .collect())
+}
+
+/// Containment gate for every agent-supplied local path behind
+/// `sftp_upload` (read side) and `sftp_download` (write side): the
+/// canonical path must stay inside an allowed root and clear the
+/// sensitive-path blocklist (credential stores, shell bootstrap files) in
+/// every mode, so a configured root cannot be used to reach them either.
+/// `path` must already be canonical — symlink and `..` traversal artifacts
+/// are resolved by the caller (`std::fs::canonicalize`, or the
+/// canonical-parent rejoin on the download side).
+fn ensure_local_transfer_allowed_in(
+    roots: &[PathBuf],
+    configured: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if is_sensitive_local_path(&path.to_string_lossy()) {
+        return Err(format!(
+            "Refusing to transfer the local sensitive path {} via sftp_upload/sftp_download",
+            path.display()
+        ));
+    }
+    if roots.iter().any(|root| path.starts_with(root)) {
+        return Ok(());
+    }
+    Err(if configured.is_empty() {
+        format!(
+            "Local path {} is outside the allowed transfer roots (OS temp dir and plugin data \
+             dir); set localTransferRoot via mcp/settings/set to allow more",
+            path.display()
+        )
+    } else {
+        format!(
+            "Local path {} is outside the configured localTransferRoot {configured}",
+            path.display()
+        )
+    })
 }
 
 /// Resolves the optional `quickSudoProfile` argument (id or exact name)
@@ -3222,17 +3330,20 @@ mod tests {
         let defaults = McpLimits::default();
         assert_eq!(defaults.max_read_bytes, 256 * 1024);
         assert_eq!(defaults.max_download_bytes, 1024 * 1024);
+        assert_eq!(defaults.local_transfer_root, "");
         assert_eq!(
             McpLimits {
                 max_read_bytes: 0,
                 max_upload_bytes: u64::MAX,
                 max_download_bytes: 0,
+                local_transfer_root: String::new(),
             }
             .sanitized(),
             McpLimits {
                 max_read_bytes: 1,
                 max_upload_bytes: UPLOAD_LIMIT_CEILING,
                 max_download_bytes: 1,
+                local_transfer_root: String::new(),
             }
         );
         // Values inside the ceilings pass through untouched.
@@ -3240,8 +3351,88 @@ mod tests {
             max_read_bytes: 512 * 1024,
             max_upload_bytes: 64 * 1024 * 1024,
             max_download_bytes: 4 * 1024 * 1024,
+            local_transfer_root: String::new(),
         };
-        assert_eq!(inside.sanitized(), inside);
+        assert_eq!(inside.clone().sanitized(), inside);
+    }
+
+    #[test]
+    fn local_transfer_root_setting_accepts_absolute_and_empty_only() {
+        assert_eq!(validated_transfer_root(&json!("")).unwrap(), "");
+        assert_eq!(
+            validated_transfer_root(&json!("/tmp/transfers")).unwrap(),
+            "/tmp/transfers"
+        );
+        assert!(validated_transfer_root(&json!("relative/path")).is_err());
+        assert!(validated_transfer_root(&json!(42)).is_err());
+    }
+
+    #[test]
+    fn local_transfer_settings_persist_and_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("mcp-limits-test-{}", std::process::id()));
+        let path = dir.join("mcp-settings.json");
+        let _ = std::fs::remove_file(&path);
+        let defaults = McpLimits::load(&path);
+        assert_eq!(defaults.local_transfer_root, "");
+        let mut updated = defaults;
+        updated.local_transfer_root = "/tmp/transfers".to_string();
+        updated.save(&path).unwrap();
+        let reloaded = McpLimits::load(&path);
+        assert_eq!(reloaded.local_transfer_root, "/tmp/transfers");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_transfer_gate_confines_paths_to_allowed_roots() {
+        let scratch = std::env::temp_dir().join(format!("mcp-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let inside_dir = scratch.join("inside");
+        std::fs::create_dir_all(&inside_dir).unwrap();
+        std::fs::write(inside_dir.join("a.bin"), b"x").unwrap();
+        let inside = std::fs::canonicalize(inside_dir.join("a.bin")).unwrap();
+        let roots = vec![std::fs::canonicalize(&inside_dir).unwrap()];
+        // Inside the only configured root passes…
+        assert!(ensure_local_transfer_allowed_in(&roots, "/x", &inside).is_ok());
+        // …anything else (even non-sensitive) is refused…
+        let outside = std::fs::canonicalize("/usr").unwrap_or_else(|_| PathBuf::from("/usr"));
+        let error = ensure_local_transfer_allowed_in(&roots, "/x", &outside).unwrap_err();
+        assert!(error.contains("localTransferRoot"), "{error}");
+        // …and the default-roots message names the setting to widen.
+        let empty_roots: Vec<PathBuf> = vec![];
+        let error = ensure_local_transfer_allowed_in(&empty_roots, "", &inside).unwrap_err();
+        assert!(error.contains("outside the allowed transfer roots"), "{error}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn local_transfer_gate_blocklist_applies_inside_allowed_roots() {
+        let scratch = std::env::temp_dir().join(format!("mcp-gate-bl-{}", std::process::id()));
+        let secret_dir = scratch.join(".ssh");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("id_rsa"), b"k").unwrap();
+        let key = std::fs::canonicalize(secret_dir.join("id_rsa")).unwrap();
+        let rc = std::fs::canonicalize(&scratch).unwrap().join(".bashrc");
+        let roots = vec![std::fs::canonicalize(&scratch).unwrap()];
+        assert!(ensure_local_transfer_allowed_in(&roots, "", &key).is_err());
+        assert!(ensure_local_transfer_allowed_in(&roots, "", &rc).is_err());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn local_transfer_roots_default_to_temp_and_data_dir() {
+        let data_dir = std::env::temp_dir().join(format!("mcp-data-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let roots = local_transfer_roots_for("", &data_dir).unwrap();
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let data = std::fs::canonicalize(&data_dir).unwrap();
+        assert!(roots.contains(&temp), "{roots:?}");
+        assert!(roots.contains(&data), "{roots:?}");
+        // A configured root narrows the policy to exactly that root…
+        let roots = local_transfer_roots_for(data.to_str().unwrap(), &data_dir).unwrap();
+        assert_eq!(roots, vec![data.clone()]);
+        // …and an unresolvable configured root is an error, not a fallback.
+        assert!(local_transfer_roots_for("/nonexistent/mcp-root", &data_dir).is_err());
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]
@@ -3278,8 +3469,9 @@ mod tests {
             max_read_bytes: 128 * 1024,
             max_upload_bytes: 8 * 1024 * 1024,
             max_download_bytes: 2 * 1024 * 1024,
+            local_transfer_root: String::new(),
         };
-        limits.save(&path).unwrap();
+        limits.clone().save(&path).unwrap();
         assert_eq!(McpLimits::load(&path), limits);
         // A fresh state over the same data dir picks the persisted values up
         // (this is how the --mcp stdio process shares the settings).
@@ -3309,6 +3501,8 @@ mod tests {
             json!({ "maxReadBytes": READ_LIMIT_CEILING + 1 }),
             json!({ "maxUploadBytes": "big" }),
             json!({ "maxDownloadBytes": -1 }),
+            json!({ "localTransferRoot": "relative/root" }),
+            json!({ "localTransferRoot": 7 }),
         ] {
             assert!(
                 state.settings_set(&bad).is_err(),
@@ -3320,6 +3514,16 @@ mod tests {
             64 * 1024,
             "rejected updates must not change the settings"
         );
+
+        // The transfer root accepts an absolute path and clears on empty.
+        let with_root = state
+            .settings_set(&json!({ "localTransferRoot": "/tmp/transfers" }))
+            .unwrap();
+        assert_eq!(with_root["localTransferRoot"], "/tmp/transfers");
+        let cleared = state
+            .settings_set(&json!({ "localTransferRoot": "" }))
+            .unwrap();
+        assert_eq!(cleared["localTransferRoot"], "");
 
         // The soft ceilings themselves are accepted.
         let ceilings = state

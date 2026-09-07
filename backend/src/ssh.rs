@@ -2496,8 +2496,17 @@ impl SshRuntime {
     }
 
     /// Reads the live Quick Sudo / 2FA settings for a session's connection.
-    /// Secrets are reported as boolean flags only, never as values.
-    pub async fn settings_get(&self, session_id: &str) -> Result<Value, String> {
+    /// `ssh/settings/get`: workbench settings view. Secret presence is
+    /// reported as boolean flags only; passing `revealSecrets: true` adds
+    /// the raw `sudoPassword` / `totpSecret` configured on the connection
+    /// so the settings dialog can prefill what the user stored (values
+    /// never leave the user's own workbench; the MCP surface has no
+    /// reveal parameter and keeps flag-only responses).
+    pub async fn settings_get(&self, session_id: &str, params: &Value) -> Result<Value, String> {
+        let reveal = params
+            .get("revealSecrets")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let session = self.session(session_id).await?;
         let connection = self
             .connections
@@ -2514,7 +2523,7 @@ impl SshRuntime {
         let profile = connection
             .as_ref()
             .and_then(|connection| effective_sudo_profile(connection, &store));
-        Ok(json!({
+        let mut view = json!({
             "quickSudo": connection.as_ref().map(|c| c.sudo_enabled()).unwrap_or(true),
             "sudoSource": connection
                 .as_ref()
@@ -2532,7 +2541,14 @@ impl SshRuntime {
             "quickSudoProfileId": profile.as_ref().map(|p| p.id.clone()).unwrap_or_default(),
             "quickSudoProfileName": profile.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
             "agentTerminalMode": self.agent_terminal_mode(&session.connection_id).name(),
-        }))
+        });
+        if reveal {
+            if let Some(connection) = &connection {
+                view["sudoPassword"] = Value::String(connection.sudo_password.clone());
+                view["totpSecret"] = Value::String(connection.totp_secret.clone());
+            }
+        }
+        Ok(view)
     }
 
     /// Updates Quick Sudo / 2FA settings at runtime: applies to the stored
@@ -2712,7 +2728,7 @@ impl SshRuntime {
             self.refresh_bound_sessions(std::slice::from_ref(&connection_id))
                 .await;
         }
-        self.settings_get(session_id).await
+        self.settings_get(session_id, updates).await
     }
 
     /// `sudo/profiles/list`: every global Quick Sudo profile as a
@@ -2720,6 +2736,15 @@ impl SshRuntime {
     pub fn profiles_list(&self) -> Value {
         let store = sudo_profiles::load_store(&self.data_dir);
         json!({ "profiles": sudo_profiles::list_views(&store) })
+    }
+
+    /// `sudo/profiles/reveal`: workbench-only view of one profile including
+    /// its raw secrets, so the profile editor can prefill what the user
+    /// stored. Deliberately not exposed as an MCP tool — agent contexts
+    /// keep seeing flags only.
+    pub fn profiles_reveal(&self, id: &str) -> Result<Value, String> {
+        let store = sudo_profiles::load_store(&self.data_dir);
+        sudo_profiles::reveal_profile(&store, id)
     }
 
     /// `ssh/quickCommands/list`: global quick commands shared by every

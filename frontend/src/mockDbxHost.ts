@@ -349,7 +349,11 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { success: true };
   }
   else if (method === "ssh/settings/get") {
-    result = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "" };
+    const base = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "" };
+    // revealSecrets: true 时镜像真实桥的回显形状（mock 不存原值，回空串）。
+    result = (params as Record<string, unknown>).revealSecrets === true
+      ? { ...base, sudoPassword: "", totpSecret: "" }
+      : base;
   }
   else if (method === "ssh/settings/set") {
     const input = params as Record<string, unknown>;
@@ -402,6 +406,7 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   }
   else if (method === "ssh/exec/cancel") result = { success: true };
   else if (method === "sudo/profiles/list") result = { profiles: [] };
+  else if (method === "sudo/profiles/reveal") result = { profile: {} };
   else if (method === "sudo/profiles/save" || method === "sudo/profiles/delete") result = { success: true };
   else if (method === "ssh/knownHosts/list") result = { entries: [] };
   else if (method === "keys/discover") result = { keys: [] };

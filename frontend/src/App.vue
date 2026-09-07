@@ -233,6 +233,9 @@ interface SshSettings {
   authFlowMode: string;
   passwordPromptHint: string;
   totpPromptHint: string;
+  // revealSecrets: true 时回显的本连接原始凭据（设置弹窗预填用）。
+  sudoPassword?: string;
+  totpSecret?: string;
   // 全局 quick sudo 配置来源（空串 = 使用本连接自己的凭据）。
   quickSudoProfileId?: string;
   quickSudoProfileName?: string;
@@ -3694,7 +3697,8 @@ async function openSettings() {
   void loadMcpSettings();
   void loadSudoProfiles();
   try {
-    const meta = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/get", { sessionId: session.value?.sessionId });
+    // revealSecrets: 预填已存原值（原始凭据串），避免只能看到"已配置"占位。
+    const meta = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/get", { sessionId: session.value?.sessionId, revealSecrets: true });
     settingsMeta.value = meta;
     settingsDraft.quickSudo = meta.quickSudo;
     settingsDraft.sudoUsePty = meta.sudoUsePty;
@@ -3704,8 +3708,8 @@ async function openSettings() {
     settingsDraft.quickSudoProfileId = meta.quickSudoProfileId || "";
     const agentMode = meta.agentTerminalMode;
     settingsDraft.agentTerminalMode = agentMode && (AGENT_MODES as readonly string[]).includes(agentMode) ? agentMode : "off";
-    settingsDraft.sudoPassword = "";
-    settingsDraft.totpSecret = "";
+    settingsDraft.sudoPassword = meta.sudoPassword || "";
+    settingsDraft.totpSecret = meta.totpSecret || "";
   } catch (cause) {
     showError(cause);
   } finally {
@@ -3778,6 +3782,19 @@ function startProfileEdit(profile: SudoProfileView) {
   profileDraftHadPassword.value = profile.sudoPasswordSet;
   profileDraftHadTotp.value = profile.totpConfigured;
   profileEditing.value = true;
+  // 回显已存原值供编辑（工作台专用 reveal 方法；失败保持占位提示）。
+  if (profile.sudoPasswordSet || profile.totpConfigured) {
+    const editingId = profile.id;
+    void window.dbxPlugin
+      .invoke<{ profile: { sudoPassword?: string; totpSecret?: string } }>("sudo/profiles/reveal", { id: editingId })
+      .then((revealed) => {
+        if (profileEditing.value && profileDraft.id === editingId) {
+          profileDraft.sudoPassword = revealed.profile?.sudoPassword || "";
+          profileDraft.totpSecret = revealed.profile?.totpSecret || "";
+        }
+      })
+      .catch(() => undefined);
+  }
 }
 
 async function saveProfileDraft() {
