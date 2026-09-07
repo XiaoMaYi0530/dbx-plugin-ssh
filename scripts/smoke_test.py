@@ -236,7 +236,7 @@ def main() -> None:
             setenv_connection = dict(connection, id="smoke-setenv-connection")
             setenv_connection["external_config"] = {
                 "authentication": "password",
-                "setEnv": "DBX_SMOKE_ENV=hello_setenv",
+                "set_env": "DBX_SMOKE_ENV=hello_setenv",
             }
             client.request("connection/connect", lifecycle_params(setenv_connection),
                            timeout=60, on_event=auto_accept_challenge)
@@ -266,7 +266,7 @@ def main() -> None:
             remote_connection = dict(connection, id="smoke-remote-command-connection")
             remote_connection["external_config"] = {
                 "authentication": "password",
-                "remoteCommand": "echo DBX_REMOTE_COMMAND_MARKER",
+                "remote_command": "echo DBX_REMOTE_COMMAND_MARKER",
             }
             client.request("connection/connect", lifecycle_params(remote_connection),
                            timeout=60, on_event=auto_accept_challenge)

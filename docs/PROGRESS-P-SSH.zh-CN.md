@@ -1447,3 +1447,24 @@ sudo_profiles::load_store）入参均为 data_dir 固定路径——污点链为
 **遗留**：smoke_mcp.py 的门槛拒绝用例（仓库外根双向拒绝 + 根内敏感路径
 拒绝）因 Mimosa Edit 钩子对该文件的幻影误报（引证 `../`，实测全文零匹配）
 连续拦截写入而暂缓；门槛逻辑已由单测全覆盖，smoke 用例待钩子侧澄清后补。
+
+## 0.4.35 安装被宿主兼容性校验拦截：setEnv/remoteCommand 表单 key 改 snake_case（2026-09-07）
+
+**现象**：`install.sh` 装 0.4.35 连续两次失败（重编 installer 后复现一致，
+非构建缓存坑）——宿主 `dbx-core/src/plugins/manifest.rs` 报
+`Contribution at index 0 field 11/12 has an invalid or duplicate key` +
+六语 localization（es/it/ja/pt-BR/zh-CN/zh-TW）的
+`io.dbx.ssh.connection/setEnv|remoteCommand` invalid field entry。
+
+**根因**：0.4.34 tssh 对标轮把两个连接表单字段 key 起成了 camelCase
+（`setEnv`/`remoteCommand`），而宿主 `valid_identifier` 只允许小写字母/数字
+加 `.`/`-`/`_`——不允许大写。打包期未拦截（CLI 不跑宿主兼容校验），
+安装期才爆。en 未被点名是因为 en 文案走字段定义默认 label，本就没有
+contribution fields 条目。
+
+**修复**：manifest 字段 key 与六语条目统一改 `set_env`/`remote_command`
+（sidecar 解析本就双名兼容 `model.rs` `["setEnv", "set_env"]`，存量 camelCase
+连接不受影响；宿主表单此后按新 key 存 config，旧存量在表单中回显为空、
+拨号行为不变）。连带同步：`model.rs` 三个防漂移测试数组、
+`smoke_test.py` 构造配置改用规范 key、PROTOCOL §「会话环境与会话命令」
+与 FEATURE_PARITY tssh 节字段名更正。

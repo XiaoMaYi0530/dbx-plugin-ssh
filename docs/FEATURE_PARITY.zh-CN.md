@@ -121,8 +121,8 @@ deferred（本批不做）：多会话分屏、端口转发、SecretRef/审计�
 | tssh 能力 | 插件状态 | 说明 |
 | --- | --- | --- |
 | trz/tsz 文件传输 | ✅ 已有 | 前端集成 trzsz.js 1.1.6（`TrzszFilter` 流式挂接，与 zmodem 共存互斥；announce 自动接管 + 右键 Upload (trz) 触发；上传走 File API、下载宿主 fileTransfer 优先/浏览器 `<a download>` 兜底；WKWebView 无 File System Access API 的接缝已覆写处理）。唯一依赖豁免，理由见 PROGRESS |
-| SetEnv | ✅ 已有 | 连接表单 `setEnv`（textarea，多行 `KEY=VALUE`，分号兼容，严格校验非法条目即连接失败）；交互 shell 通道 + exec/sudo 命令通道统一注入（`exec.rs merge_channel_env`，用户条目覆盖内置默认）；fire-and-forget 语义与 ssh(1) 一致（服务端无 AcceptEnv 时静默不生效，文档已注明） |
-| RemoteCommand | ✅ 已有 | 连接表单 `remoteCommand`（非空生效）：交互会话 PTY 照常、exec 替代 shell request；命令退出即会话终止（与 `ssh host command` 同语义）；reattach 重放属预期 |
+| SetEnv | ✅ 已有 | 连接表单 `set_env`（textarea，多行 `KEY=VALUE`，分号兼容，严格校验非法条目即连接失败；0.4.35 前表单 key 为 `setEnv`，sidecar 兼容读取）；交互 shell 通道 + exec/sudo 命令通道统一注入（`exec.rs merge_channel_env`，用户条目覆盖内置默认）；fire-and-forget 语义与 ssh(1) 一致（服务端无 AcceptEnv 时静默不生效，文档已注明） |
+| RemoteCommand | ✅ 已有 | 连接表单 `remote_command`（非空生效；0.4.35 前表单 key 为 `remoteCommand`，sidecar 兼容读取）：交互会话 PTY 照常、exec 替代 shell request；命令退出即会话终止（与 `ssh host command` 同语义）；reattach 重放属预期 |
 | 端口转发（-L/-R/-D） | ❌ 不做 | **2026-09-07 用户决策**：宿主已有 ssh 隧道实现（连接代拨模型，`dbx-core/src/db/ssh_tunnel.rs` 支持 -L/-D 内部转发），插件不重复。宿主盘点结论：宿主无 -R、无面向用户的转发会话 UI、插件桥无任意 host:port 转发接口；若未来需要，需宿主侧立项（通用转发 API + 工作台面板） |
 | Agent 转发（ForwardAgent/-A） | ❌ 不做 | **2026-09-07 用户决策**：转发类特性不做（认证侧 ssh-agent 已支持：SSH_AUTH_SOCK/自定义 socket/Pageant/agent 内证书身份，见 `ssh.rs authenticate_agent`） |
 | mosh/UDP 漫游、X11、GSSAPI、ControlMaster、SSH console | ❌ 不做 | 需自研服务端组件/大额自研、或宿主已承担（连接管理/凭据）、或 GUI 客户端不适用；理由见 review 结论 |
