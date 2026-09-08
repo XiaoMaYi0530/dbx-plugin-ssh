@@ -20,8 +20,7 @@
 ## 2026-08-29 本机基线（darwin-arm64，batch3 + S-A/S-B/X-B/A-SSH 全轮收口终值）
 
 > B-SSH-COLLECT 收口基线（未提交 batch3 + 历轮增强工作区，2026-08-29 全量复测）；上方 Windows
-> 平台矩阵为早期验收记录，本机未复核、不做改动。明细见 `PROGRESS-COLLECT-FINAL.zh-CN.md`
-> 与 `PROGRESS-TESTBASELINE.zh-CN.md`。
+> 平台矩阵为早期验收记录，本机未复核、不做改动。明细记录文档已随批次退役删除（见 git 历史）。
 
 | 套件 | 结果 |
 | --- | --- |
@@ -43,7 +42,7 @@ vitest **86/86**（基线 79 → 86：terminalWriteThrottle 6 + terminalDrop 准
 仍保持未验收（环境/CI 依赖）：DBX Web/Docker、长稳与突发、大文件 100 MiB/1 GiB、五平台包、
 宿主 plugin_tools_bridge 集成段（WIP-SKIP，宿主合流后必跑）。
 
-## 下一批增强建议（2026-08-29 收口后余量，详见 PROGRESS-COLLECT-FINAL.zh-CN.md）
+## 下一批增强建议（2026-08-29 收口后余量）
 
 仓内已完成并关单：smoke_test.py kind 字段对齐（O1）、smoke_batch3 目录级用例（O4）、
 i18n 七语全量对齐断言、终端标记条运行中时长 tick、sudo 保活/OTP 端到端真机 smoke

@@ -97,6 +97,11 @@ impl SudoSource {
 #[derive(Debug, Clone)]
 pub struct StoredConnection {
     pub id: String,
+    /// Display name from the lifecycle payload (`connection.name`); `None`
+    /// for payloads without one (older hosts, inline MCP dials). Powers the
+    /// `connectionName` lookup on the MCP surface and the metadata-only
+    /// `ssh_list_connections` view. Never a credential.
+    pub name: Option<String>,
     pub host: String,
     pub port: u16,
     pub runtime_host: String,
@@ -239,6 +244,9 @@ impl JumpHost {
     pub fn to_connection(&self, id: &str, timeout_secs: u64, keepalive_secs: u64) -> StoredConnection {
         StoredConnection {
             id: id.to_string(),
+            // Jump hops are referenced by position in the chain, never by
+            // name on the MCP surface.
+            name: None,
             host: self.host.clone(),
             port: self.port,
             runtime_host: self.host.clone(),
@@ -287,6 +295,14 @@ impl StoredConnection {
             .and_then(Value::as_object)
             .ok_or("Missing connection payload")?;
         let id = string_field(connection, "id")?;
+        // Display name is optional (older payloads omit it); trimmed so the
+        // MCP connectionName lookup matches what the workbench shows.
+        let name = connection
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let host = validate_host_field(string_field(connection, "host")?)?;
         let port = connection
             .get("port")
@@ -384,6 +400,7 @@ impl StoredConnection {
         }
         Ok(Self {
             id,
+            name,
             host,
             port,
             runtime_host,

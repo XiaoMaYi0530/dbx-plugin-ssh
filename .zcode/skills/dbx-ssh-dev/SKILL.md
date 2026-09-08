@@ -6,9 +6,8 @@ description: DBX SSH/SFTP 插件的开发规范、构建、测试与安装全流
 # DBX SSH/SFTP 插件开发规范
 
 本项目是 DBX 数据库客户端的 SSH/SFTP 插件：Vue/Vite 沙箱前端 + Rust sidecar，
-通过 `dbx-plugin` CLI 打包为 `.dbxp` 安装进 DBX。能力对标 tiny-rdm（本地参照：
-`/Users/Jinpy/GolandProjects/tiny-rdm`），DBX 已有能力（隧道/代理、连接管理、
-外观）**整合不重复实现**。
+通过 `dbx-plugin` CLI 打包为 `.dbxp` 安装进 DBX。能力面覆盖隧道/代理、连接管理、
+外观（DBX 已有能力，**整合不重复实现**）与终端/SFTP/sudo 全链路。
 
 > 仓库位于 `~/btroot/dbx-plugins/ssh-sftp`（插件族工作区，兄弟目录
 > ldap/、files/、shared/ 为 LDAP/Files 插件与公共文档，见工作区 README）。

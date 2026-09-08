@@ -142,8 +142,11 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .terminal-pane { position: relative; flex-grow: 0; flex-shrink: 0; overflow: hidden; background: var(--ssh-terminal-background); }
 .terminal-pane.drag-active { background: color-mix(in srgb, var(--primary) 5%, var(--ssh-terminal-background)); }
 .terminal-pane .drop-overlay strong { max-width: 92%; font-size: 13px; word-break: break-all; }
-.terminal-host { position: absolute; inset: 0; padding: 5px 0 5px 10px; background: var(--ssh-terminal-background); }
-.terminal-host .xterm { height: 100%; background: var(--ssh-terminal-background); }
+/* 内边距必须挂在 .xterm（terminal.element）而非宿主 div 上：FitAddon 只读
+   element 自身的 padding 做行数扣减，挂在宿主上会多算一行、底行溢出可视区
+   （命令条打开时正好被压在条下）。底部 8px 是常驻呼吸间距。 */
+.terminal-host { position: absolute; inset: 0; background: var(--ssh-terminal-background); }
+.terminal-host .xterm { height: 100%; padding: 5px 0 8px 10px; background: var(--ssh-terminal-background); }
 .terminal-host .xterm-viewport { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted-foreground) 48%, transparent) transparent !important; }
 .terminal-overlay { position: absolute; z-index: 2; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 24px; background: var(--ssh-terminal-background); color: var(--muted-foreground); text-align: center; }
 .terminal-overlay p { margin: 0; font-size: 12px; }
@@ -331,10 +334,11 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .command-output { display: flex; min-height: 96px; max-height: 40vh; overflow: auto; flex-direction: column; align-items: flex-start; gap: 8px; margin: 0; border: 1px solid var(--border); border-radius: 6px; padding: 12px; background: color-mix(in srgb, var(--muted) 45%, transparent); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .command-exit { color: var(--muted-foreground); font-size: 10px; }
 
-/* 批量发送命令条（Electerm quick-command bar 风格）：常驻贴终端底部，回车即发送。 */
-.terminal-pane.batch-bar-open .terminal-host { inset: 0 0 37px 0; }
+/* 批量发送命令条（Electerm quick-command bar 风格）：常驻贴终端底部，回车即发送。
+   命令条约 35px 高，宿主让位 42px 留出 7px 间隙；浮层偏移同步上移。 */
+.terminal-pane.batch-bar-open .terminal-host { inset: 0 0 42px 0; }
 .terminal-pane.batch-bar-open .terminal-command-marker,
-.terminal-pane.batch-bar-open .zmodem-status { bottom: 45px; }
+.terminal-pane.batch-bar-open .zmodem-status { bottom: 50px; }
 .batch-bar { position: absolute; z-index: 5; right: 0; bottom: 0; left: 0; display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding: 4px 8px; background: var(--background); }
 .batch-bar-targets { display: inline-flex; flex: 0 1 auto; min-width: 0; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; white-space: nowrap; }
 .batch-bar-targets:hover { background: color-mix(in srgb, var(--muted) 55%, transparent); }
@@ -346,7 +350,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .batch-bar-send { color: var(--success); }
 /* 底部条上的 popover 向上展开（默认向下会被裁切）。 */
 .batch-bar .batch-targets-popover { right: auto; bottom: calc(100% + 6px); left: 0; top: auto; display: flex; width: min(380px, calc(100vw - 32px)); max-height: min(320px, 60vh); flex-direction: column; gap: 6px; overflow: auto; padding: 8px; }
-.batch-bar-status { position: absolute; z-index: 5; right: 8px; bottom: 41px; left: 8px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 94%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); font-size: 11px; }
+.batch-bar-status { position: absolute; z-index: 5; right: 8px; bottom: 48px; left: 8px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 94%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); font-size: 11px; }
 .batch-bar-status p { margin: 0; }
 .batch-bar-status .icon-button { flex: 0 0 auto; margin-left: auto; }
 .batch-send-hint { margin: 0; font-size: 11px; }

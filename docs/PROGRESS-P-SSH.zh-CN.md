@@ -163,8 +163,8 @@ tooltipDuration/tooltipDirectory`、`sftpBatch.progress`。既有“七语 key �
 ## 8. Quick Sudo 全局配置集中管理（2026-08-30）
 
 需求：多套全局 quick sudo 配置集中管理，单连接可选「全局配置」或「本连接自输入」，
-UI 与 MCP 双通道支持 quick sudo / auto sudo。设计与契约见
-`docs/IMPL_PLAN_QUICK_SUDO.zh-CN.md`（推翻 FEATURE_PARITY L41 既有「不做」结论）。
+UI 与 MCP 双通道支持 quick sudo / auto sudo。设计契约记录随专项实施计划文档退役删除
+（本轮推翻 FEATURE_PARITY L41 既有「不做」结论）。
 
 - `backend/src/sudo_profiles.rs`（新建）：`<plugin_data_dir>/quick-sudo-profiles.json`
   版本化存储（`profiles` + `bindings`，0600，tmp+rename 原子写，损坏按空库），
@@ -199,7 +199,7 @@ MCP 回环）；`pnpm typecheck` 0 错误；`pnpm test` vitest 3 spec **58/58**�
 
 安全评估：全局配置密钥落盘为插件数据目录明文 JSON（0600）——为「凭据走 secret
 binding 不持久化」红线的显式例外（宿主 secret binding 仅支持连接级字段、无全局命名
-凭据通道；与 tiny-rdm 未启用 local-vault 档等价），已在 IMPL_PLAN §0/§9 记录权衡，
+凭据通道），已在 IMPL_PLAN §0/§9 记录权衡，
 存储层收敛于 sudo_profiles 单模块，后续可替换 OS keyring。密钥仅在 list/save/get
 以布尔位呈现，不进日志、不参与 shell 拼接。
 
@@ -230,8 +230,8 @@ binding 不持久化」红线的显式例外（宿主 secret binding 仅支持�
 
 ## 9. MCP 完善与 ZCode 接入（2026-08-30 晚）
 
-需求：完善 ssh 的 MCP 工具面并接入 ZCode 实测。对标 tiny-rdm 演化版 MCP CTL
-工具面后补齐缺口（`SFTPTransfer` / `sftpPwd`），并确认 ZCode 客户端接入路径。
+需求：完善 ssh 的 MCP 工具面并接入 ZCode 实测。补齐 MCP 工具面缺口
+（`SFTPTransfer` / `sftpPwd`），并确认 ZCode 客户端接入路径。
 
 - `backend/src/mcp.rs`：新增三工具（22 → **25**）——
   - `sftp_upload`：本地文件 → 远端（单文件）。本地侧校验（可读、≤`maxUploadBytes`）
@@ -308,8 +308,8 @@ destructive gate / read-only server gate 两节新增输出）。另对 DBX 内 
 
 上游需求：AI/MCP 命令在终端 UI 同步执行——过程完整可见、可中断、可审批、可人工
 介入（教学/接管语义）。设计经用户确认四决策：仅 MCP/AI 命令路由；分级审批；
-无终端会话报错引导；超时返回部分输出命令继续跑。实施计划：
-`docs/IMPL_PLAN_AGENT_TERMINAL.zh-CN.md`（后端/前端并行 agent 实施，主会话接线）。
+无终端会话报错引导；超时返回部分输出命令继续跑。实施按专项计划执行
+（计划文档已随批次退役删除）：后端/前端并行 agent 实施，主会话接线。
 
 - `backend/src/agent_terminal.rs`（新）：`AgentTerminalMode`（off/auto/strict）、
   `CommandRisk`、`decide` 策略矩阵、`sanitize_command`（剥 C0 控制、留 `\n`/`\t`，
@@ -450,8 +450,7 @@ cargo 170 tests / vitest 68 tests / 容器 smoke_fs 44·smoke_mcp all green。
    会话引导 / exec 门禁 / PTY / settings 的配置解析；`settings/set` 绑定
    变化联动 source，`settings/get` 新增 `sudoSource`。单测 3 个新用例 +
    manifest 一致性用例更新；七语文案补齐（es/it/ja/pt-BR/zh-CN/zh-TW）。
-   协议/对标/实施文档同步（PROTOCOL §运行时设置/§sudo、FEATURE_PARITY、
-   IMPL_PLAN_QUICK_SUDO §11）。
+   协议/对标文档同步（PROTOCOL §运行时设置/§sudo、FEATURE_PARITY）。
 
 ### §8.2 MCP 直调走声明的 sudo 来源 + 诊断日志（0.4.x 轮增补）
 
@@ -757,7 +756,8 @@ jinpy.he）。存量 MCP 会话需重连/重启才拿到新 schema。
 
 **剩余风险**：`connectionId` 不带 `runInTerminal` 时在 stdio 模式不解析存储凭据
 （仍需内联参数，行为与之前一致）；`ssh_list_connections` 发现工具未做（可选后续，
-需定数据源：rusqlite 或宿主桥端点）。
+需定数据源：rusqlite 或宿主桥端点）。——本条欠账已于 §8.16 清账（宿主桥端点方案
++ stdio 桥接兜底，`connectionId` 零凭据可用）。
 
 ### §8.10 切 tab 重连/闪屏修复：重挂载 reattach 存活会话（2026-09-02）
 
@@ -866,17 +866,17 @@ install_plugin --release` 重编（不动源码树/锁文件）。
 
 ## 2026-09-04 批量发送命令 + 全局快速命令（0.4.17 → 0.4.18）
 
-**需求**：① 参考 tiny-rdm 在多个打开的会话批量发送命令；② 快速命令原存工作台
+**需求**：① 支持在多个打开的会话批量发送命令；② 快速命令原存工作台
 localStorage，宿主 webview 存储按工作台分区 → 表现为"和连接绑定"，改为插件级
 全局存储，沉淀公共脚本。
 
-**契约**（详见 `IMPL_PLAN_BATCH_QUICK.zh-CN.md` 与 PROTOCOL 新节）：
+**契约**（详见 PROTOCOL 新节）：
 - 新增 `ssh/quickCommands/list|save|delete`：全局快速命令 CRUD，存储
   `<data_dir>/quick-commands.json`（原子写 + 0600 + 坏文件降级，照抄
   quick-sudo-profiles 模式）；上限 20 条、name ≤60、command ≤500；save 返回
   完整清单供工作台直接采纳权威顺序，delete 对未知 id 回 `removed:false`。
 - 新增 `ssh/terminal/batchInput`：`{sessionIds[], command, appendNewline?=true}`，
-  把命令写入各会话 PTY（对齐 tiny-rdm batch send：输出回显在各自终端、不收集
+  把命令写入各会话 PTY（对齐批量发送语义：输出回显在各自终端、不收集
   远端输出），返回逐会话 `{results[{sessionId,success,error?}], sent, failed}`；
   会话不存在/队列满记目标级失败不整体报错；命令归一 `\n`→`\r`、上限 256 KiB。
 - `ssh/sessions/list` 行**追加**只读展示字段 `host`/`port`/`username`
@@ -902,7 +902,7 @@ batchInput 真机 PTY 回显 marker 验证 + endpoint 字段），回归 smoke_t
 smoke_fs_test（45 PASS）/ smoke_batch3_test（17 PASS）全绿。
 
 **说明**：多会话标签/分屏仍 deferred（宿主职责），但批量发送以跨连接会话为
-目标集合已不受"单 workbench"限制（FEATURE_PARITY_BATCH3 deferred 表已注记）。
+目标集合已不受"单 workbench"限制（原批次对标文档 deferred 表已注记，该文档已随批次退役删除）。
 快速命令旧 localStorage 键仅作迁移种子，删除逻辑保留七语不涉及新键。
 
 **⚠️ 预存在问题（与本次改动无关，待专项排查）**：`scripts/test.sh` 全套验证在
@@ -1047,12 +1047,12 @@ package.json 保持零新依赖），系统 Chrome 走 `channel:"chrome"` headle
 
 **修复**（exec.rs，分支 `feat/ssh-totp-rotation`）：
 - 两本台账改 sidecar **进程全局**（`OnceLock<Mutex<HashMap>>`），对齐
-  tiny-rdm 服务级 `markOTPUsage` 语义；
+  服务级标记 OTP 已用的语义；
 - 键控升级：`目标作用域(user@host:port) | 密钥 SHA-256 指纹(16hex，只存指纹)
   | 窗口 | 码`；作用域隔离保证共用同一密钥的多个连接互不吞码（A 机烧掉的码
   B 机仍可提交），同机跨调用/跨会话记账连续；
 - 静态码 usage 键去掉时间戳分量（原 `now+30` 逐秒漂移，跨调用记账失效）；
-- 选择算法对齐 tiny-rdm `resolveRotatingOTP` 排序（未用优先 → 剩余有效时长
+- 选择算法对齐轮换验证码优先级排序语义（未用优先 → 剩余有效时长
   最长 → 配置顺序稳定兜底），替换原"首个剩余 ≥5s 未用项"简化循环；防重放
   硬跳过语义不变；
 - 作用域由凭据解析点注入：`ssh.rs sudo_auth_for`（连接配置）与
@@ -1480,9 +1480,9 @@ contribution fields 条目。
 - 协议层 keepalive：`bbb9c81`（2026-08-29）起三条拨号路径（正式连接/跳板每跳/
   host-key 探测）均配置 russh `keepalive_interval`（默认 30s）+ `keepalive_max: 3`
   （want_reply 全局请求，等效 OpenSSH `ServerAliveInterval`；任一收到的数据
-  重置计数），对齐 tiny-rdm `keepaliveInterval=30s`/`keepaliveMaxFail=3`。
+  重置计数），对齐 keepaliveInterval=30s / keepaliveMaxFail=3。
 - Quick Sudo 时间戳保活：sudo 执行成功后注册 `sudo -nv` 循环（4 分钟周期、
-  连续 2 次失败自停、断连确定性中止），即 tiny-rdm `sudoKeepaliveLoop` 对标。
+  连续 2 次失败自停、断连确定性中止）。
 
 **新能力：终端活动保活 `terminal_keepalive_secs`（默认 0 关闭）**
 - manifest 连接表单字段（binding `config`，number，0 关闭；en + 六语
@@ -1517,7 +1517,7 @@ d84787d 连接表单重构重排了 manifest 字段顺序但未同步测试期�
 ## 批量发送交互改版：终端底部命令条（Electerm quick-command bar 风格，2026-09-08）
 
 原"工具栏按钮 + 弹窗"批量发送改为**常驻贴在终端底部的单行命令条**（思路来源
-Electerm quick-command bar；批量语义仍对齐 tiny-rdm batch send），纯前端改动，
+Electerm quick-command bar；批量发送语义不变），纯前端改动，
 协议面不变（`ssh/terminal/batchInput`、`ssh/quickCommands/*`、`ssh/sessions/list`
 原样复用）。
 
@@ -1601,3 +1601,66 @@ vue-tsc 0 错、vitest 268 全绿、前端 build 通过；release 二进制上
 「终端内 Quick Sudo」节补并发排队语义。剩余风险：真机 TOTP 容器下的多会话
 并发 sudo 流未端到端演练（单测已钉住核心时序）；跨工作台同步依赖宿主全局
 事件广播（当前 `app_handle.emit` 实现为全局，若宿主改为定点投递需跟进）。
+
+### 命令条遮挡终端底行修复（同日第二轮反馈）
+
+**现象**：终端内容滚到底部被命令条遮住；即使不开命令条，底行也略有溢出。
+
+**根因**：FitAddon 计算行数读的是 `terminal.element`（`.xterm`）自身的
+computed padding 做扣减，而原布局把 `padding: 5px 0 5px 10px` 挂在宿主
+`.terminal-host` 上——fit 比实际可视区多算约 10px，底行渲染到 `.xterm`
+框外；命令条打开时这段溢出正好压在条下。
+
+**修复**（`style.css`）：内边距原样移到 `.terminal-host .xterm` 上
+（box-sizing 全局 border-box 已有，fit 从 element 读 padding 后行数精确），
+底部间距 5px → 8px 作为常驻呼吸间距；命令条让位 37px → 42px（条 ~35px +
+7px 间隙），command-marker / zmodem-status 偏移 45px → 50px，结果浮条
+41px → 48px。ResizeObserver 观察宿主 div，inset 变化自动 refit，无需前端
+逻辑改动。前端 build + vitest 268 全绿复验通过。
+
+### §8.16 MCP 连接发现与凭据免内联：stdio 桥接兜底 + ssh_list_connections + connectionName（2026-09-08）
+
+**痛点**：独立 stdio MCP 会话（ZCode 等 AI 终端直拉 `dbx-plugin-ssh --mcp`）里
+`dbx_connections` 注册表恒为空，带 `connectionId` 调用必报 "not registered with
+this plugin session"，agent 只能手挖 DBX 应用 SQLite（connections +
+connection_secrets 两表）再内联凭据，一轮"找连接"耗七八次工具调用，且密码进工具
+参数。
+
+**改动**（插件 `backend/src/` 三文件 + 宿主子仓库本地补丁一处，未 commit）：
+1. **L1 桥接兜底**（mcp.rs `bridge_forward_plan` / `forward_tool_via_bridge`）：
+   stdio 下连接类工具带未注册 `connectionId` 时，本地安全闸（进程只读总闸、
+   destructive 确认）之后整次调用经 `app_bridge` 转发运行中 DBX 应用的
+   `/call-plugin-tool`（ensure 探活 + 自动唤起应用，凭据全程不过工具参数）；
+   桥不可用回落原内联路径。`bridge_fallback` 字段隔离测试；runInTerminal 路径
+   不变（本就直连桥）。
+2. **L2 `ssh_list_connections`**（app_bridge.rs `list_plugin_connections` +
+   mcp.rs `connection_list_result`）：无参工具，出 id/name/host/port/username/
+   authentication/readOnly 元数据（密码位只出 `passwordSet` 布尔，单测断言输出
+   不含密钥值与 `"password":` 字段）；数据源 = 宿主桥 ∪ 本会话注册表，桥无路由/
+   不可达降级 `source:"session-registry"` + note。
+3. **L3 `connectionName`**（model.rs lifecycle 补 name 字段 + `registered_
+   connection_by_ref` 统一查找）：注册表按名匹配、重名报错列候选；stdio 下经
+   桥列表按名解析出 id 再转发；闸门层重名保守按只读 / sudo 白名单直接报错。
+4. **L0 文案**：not registered 与 runInTerminal 两条报错改自愈指引（起 DBX /
+   ssh_list_connections / 内联三选一）。
+5. **宿主侧**（host/src-tauri/commands/mcp_bridge.rs，子仓库本地补丁）：新增
+   `POST /list-plugin-connections` 路由，`PluginConnectionSummary` 封闭白名单
+   结构体（仅 7 个 camelCase 元数据字段，单测断言凭据字段零泄漏），按
+   plugin_id 过滤、名称排序。
+
+**验证**：插件 cargo test 230 绿（新增 8 + 扩展 2）；scripts/smoke_mcp.py 对
+release 二进制 28 工具全绿；宿主 `cargo check -p dbx` + mcp_bridge 单测 16 绿。
+真机 E2E（新二进制 spawn stdio 对运行中 DBX 应用）：tools/list 含新工具；
+`ssh_list_connections` 旧应用下降级出 note；**`ssh_exec` 仅 `connectionId`
+零凭据内联经桥转发真机执行 aliyun-hk 返回 omni-hk**；`connectionName` 旧应用
+下返回新自愈文案（宿主路由上线后此路即通）。
+
+**文档同步**：docs/MCP.zh-CN.md（新工具行、stdio 桥接兜底节、连接寻址节、
+工具计数 28）、docs/PROTOCOL.zh-CN.md（路由 + connectionName + lifecycle
+name）、用户级 skill dbx-ssh-sftp-dev（连接发现四步 playbook 替换查表
+workaround + 故障速查行）。
+
+**剩余风险**：宿主路由需随 DBX.app 重构建后真机复验列表与 name→桥解析链；
+sftp 池类只读工具桥宕回落文案仍为存量 "Connection is not established"（未统一
+新指引）；connectionName-only 传输失败时 `drop_connection`/`ssh_close` 池
+key 无法按名清理（id 调用不受影响）。

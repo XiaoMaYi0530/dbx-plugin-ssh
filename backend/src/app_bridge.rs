@@ -62,6 +62,10 @@ pub fn bridge_port(app_data_dir: Option<&Path>) -> Option<u16> {
         .filter(|port| *port > 0)
 }
 
+/// Read budget for the connection-list route: the app only reads its
+/// connection store — no tool timeout and no approval can run behind it.
+const LIST_READ_BUDGET: Duration = Duration::from_secs(10);
+
 /// Builds the `/call-plugin-tool` JSON body (snake_case fields, per the
 /// bridge contract).
 fn request_body(connection_id: &str, tool: &str, arguments: &Value, timeout_ms: u64) -> Value {
@@ -72,6 +76,12 @@ fn request_body(connection_id: &str, tool: &str, arguments: &Value, timeout_ms: 
         "arguments": arguments,
         "timeout_ms": timeout_ms,
     })
+}
+
+/// Builds the `/list-plugin-connections` JSON body (snake_case envelope,
+/// same family as `/call-plugin-tool`; no per-call fields).
+fn list_connections_request_body() -> Value {
+    json!({ "plugin_id": PLUGIN_ID })
 }
 
 /// Splits a minimal HTTP response into `(status_code, body)`. No chunked
@@ -90,30 +100,26 @@ fn split_http_response(raw: &str) -> Result<(u16, &str), String> {
     Ok((status, body))
 }
 
-/// Forwards one tool call through the app bridge. The 200 body is the app's
-/// `mcp/call` result (already MCP-content wrapped) and is returned verbatim;
-/// any other status becomes `Err` carrying the body text.
-pub async fn call_plugin_tool(
-    connection_id: &str,
-    tool: &str,
-    arguments: Value,
-    timeout: Duration,
-) -> Result<Value, String> {
+/// One hand-written POST to the app bridge: connect, single-write the
+/// request, read to EOF, split the response. A 200 yields `Ok(body)`;
+/// anything else (or any transport failure) becomes `Err` carrying the
+/// shared "DBX app bridge" failure prefix. `read_timeout_hint` is appended
+/// verbatim to the read-timeout message so each route can explain what may
+/// still be running behind the wait.
+async fn post_bridge(
+    path: &str,
+    body: Vec<u8>,
+    read_budget: Duration,
+    read_timeout_hint: &str,
+) -> Result<String, String> {
     let Some(port) = bridge_port(None) else {
         return Err(
             "DBX app bridge port not found: the DBX app has not published mcp-bridge-port"
                 .to_string(),
         );
     };
-    let body = serde_json::to_vec(&request_body(
-        connection_id,
-        tool,
-        &arguments,
-        timeout.as_millis() as u64,
-    ))
-    .map_err(|error| format!("Failed to encode the DBX app bridge request: {error}"))?;
     let mut request = format!(
-        "POST /call-plugin-tool HTTP/1.1\r\n\
+        "POST {path} HTTP/1.1\r\n\
          Host: 127.0.0.1:{port}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
@@ -140,16 +146,15 @@ pub async fn call_plugin_tool(
         .map_err(|error| format!("DBX app bridge write failed: {error}"))?;
 
     // Read to EOF: the app closes the socket after answering, and the
-    // teaching-mode approval (up to 120s) runs inside this window, so the
-    // read budget is the tool timeout plus the approval margin.
+    // budget belongs to the route (tool timeout plus approval margin for
+    // /call-plugin-tool, a plain store read for the list route).
     let mut raw = Vec::new();
-    let read_budget = timeout + APPROVAL_READ_MARGIN;
     match tokio::time::timeout(read_budget, stream.read_to_end(&mut raw)).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => return Err(format!("DBX app bridge read failed: {error}")),
         Err(_) => {
             return Err(format!(
-                "DBX app bridge read timed out after {:?} (an approval may still be pending in the app)",
+                "DBX app bridge read timed out after {:?} {read_timeout_hint}",
                 read_budget
             ))
         }
@@ -157,13 +162,68 @@ pub async fn call_plugin_tool(
     let raw = String::from_utf8_lossy(&raw).into_owned();
     let (status, body) = split_http_response(&raw)?;
     if status == 200 {
-        return serde_json::from_str::<Value>(body.trim())
-            .map_err(|error| format!("DBX app bridge returned invalid JSON: {error}"));
+        return Ok(body.trim().to_string());
     }
     Err(format!(
         "DBX app bridge returned HTTP {status}: {}",
         body.trim()
     ))
+}
+
+/// Forwards one tool call through the app bridge. The 200 body is the app's
+/// `mcp/call` result (already MCP-content wrapped) and is returned verbatim;
+/// any other status becomes `Err` carrying the body text.
+pub async fn call_plugin_tool(
+    connection_id: &str,
+    tool: &str,
+    arguments: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let body = serde_json::to_vec(&request_body(
+        connection_id,
+        tool,
+        &arguments,
+        timeout.as_millis() as u64,
+    ))
+    .map_err(|error| format!("Failed to encode the DBX app bridge request: {error}"))?;
+    let text = post_bridge(
+        "/call-plugin-tool",
+        body,
+        timeout + APPROVAL_READ_MARGIN,
+        "(an approval may still be pending in the app)",
+    )
+    .await?;
+    serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("DBX app bridge returned invalid JSON: {error}"))
+}
+
+/// Fetches the app's saved-connection list for this plugin through the
+/// bridge (`POST /list-plugin-connections`). The 200 body is
+/// `{"connections": [...]}` with metadata-only connection objects
+/// (id/name/host/port/username/authentication/readOnly, camelCase —
+/// near-verbatim tool output; the contract never includes any credential
+/// field). Any other outcome (older app without the route, refused call,
+/// app not running) becomes `Err`; callers degrade to their session
+/// registry instead of failing.
+pub async fn list_plugin_connections() -> Result<Vec<Value>, String> {
+    let body = serde_json::to_vec(&list_connections_request_body())
+        .map_err(|error| format!("Failed to encode the DBX app bridge request: {error}"))?;
+    let text = post_bridge(
+        "/list-plugin-connections",
+        body,
+        LIST_READ_BUDGET,
+        "(the app may be busy or not expose this route)",
+    )
+    .await?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("DBX app bridge returned invalid JSON: {error}"))?;
+    let connections = value
+        .get("connections")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "DBX app bridge list response is missing the connections array".to_string()
+        })?;
+    Ok(connections.clone())
 }
 
 /// Ensures the app's bridge is reachable: returns the published port
@@ -270,6 +330,14 @@ mod tests {
         assert_eq!(object["tool"], "ssh_exec");
         assert_eq!(object["arguments"]["command"], "uptime");
         assert_eq!(object["timeout_ms"], 300_000);
+    }
+
+    #[test]
+    fn list_connections_request_body_is_the_bare_plugin_envelope() {
+        let body = list_connections_request_body();
+        let object = body.as_object().unwrap();
+        assert_eq!(object.len(), 1, "the list route takes no per-call fields");
+        assert_eq!(object["plugin_id"], "io.dbx.ssh");
     }
 
     #[test]

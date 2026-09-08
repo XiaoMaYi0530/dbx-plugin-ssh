@@ -277,6 +277,11 @@ pub struct McpState {
     /// Operator-level kill switch: `DBX_SSH_MCP_READ_ONLY` forces every
     /// tool call (bridge and standalone alike) through the read-only gates.
     global_read_only: bool,
+    /// L1 stdio bridge fallback switch: forwards unregistered-`connectionId`
+    /// calls to the running DBX app through the local TCP bridge. Always on
+    /// in production; tests flip it off to keep decision paths hermetic (no
+    /// real app bridge on the box).
+    bridge_fallback: bool,
 }
 
 /// Truthy values accepted for `DBX_SSH_MCP_READ_ONLY`.
@@ -298,6 +303,7 @@ impl McpState {
             limits: RwLock::new(limits),
             limits_path,
             global_read_only: env_read_only(),
+            bridge_fallback: true,
         }
     }
 
@@ -313,6 +319,7 @@ impl McpState {
             limits: RwLock::new(limits),
             limits_path,
             global_read_only: env_read_only(),
+            bridge_fallback: true,
         }
     }
 
@@ -415,6 +422,10 @@ impl McpState {
         arguments: &Value,
         emitter: Option<&PluginEmitter>,
     ) -> Result<Value, String> {
+        // Registry reference validation first: an ambiguous connectionName
+        // reports its candidates (id + host) here, before any coarser gate
+        // can mask the disambiguation error.
+        self.registered_connection_by_ref(arguments).await?;
         // Safety gates, ordered cheapest-first and all evaluated before any
         // network I/O:
         // 1. Read-only gate: write-class tools are rejected when the DBX
@@ -452,7 +463,7 @@ impl McpState {
             // declares one. Covers `ssh_exec_sudo` plus inline `sudo …` in
             // `ssh_exec`/`ssh_run_bg` (NOPASSWD / cached-stamp bypasses).
             if name == "ssh_exec_sudo" || mcp_safety::runs_under_sudo(command) {
-                let allowlist = self.sudo_allowlist_for(arguments).await;
+                let allowlist = self.sudo_allowlist_for(arguments).await?;
                 if !allowlist.is_empty() && !sudo_allowlist::is_allowed(&allowlist, command) {
                     return Err(format!(
                         "sudo command is not allowed by this connection's whitelist. \
@@ -489,6 +500,33 @@ impl McpState {
                 _ => {}
             }
         }
+        // L1 stdio bridge fallback: a call referencing a `connectionId` that
+        // is NOT in this session's lifecycle registry (the normal state of a
+        // standalone `--mcp` session) is forwarded to the running DBX app's
+        // own sidecar through the local TCP bridge, so saved connections work
+        // without inline credentials and credentials never travel in tool
+        // arguments. Gate semantics across the forward: the local gates above
+        // stay in front of it (the DBX_SSH_MCP_READ_ONLY kill switch and the
+        // command-text checks are arguments-only and must not be dodged),
+        // while the registry-metadata gates (per-connection read-only flag,
+        // sudo whitelist) cannot resolve here by definition — the app-side
+        // sidecar enforces them against its own lifecycle registration.
+        if emitter.is_none() {
+            if let Some((connection_id, forwarded)) =
+                self.bridge_forward_plan(name, arguments).await?
+            {
+                if let Ok(result) = self
+                    .forward_tool_via_bridge(name, &connection_id, &forwarded)
+                    .await
+                {
+                    return Ok(result);
+                }
+                // Bridge unreachable or refused (app down, unwakeable, older
+                // app): fall through to the inline path so the original
+                // guidance error — now carrying the self-heal hints — is
+                // what the caller sees.
+            }
+        }
         let text = self.run_tool(name, arguments, emitter).await?;
         // The app-bridge forward returns the app's MCP content envelope
         // verbatim (`app_bridge::call_plugin_tool`); wrapping again would
@@ -510,28 +548,70 @@ impl McpState {
         self.global_read_only || self.registered_connection_is_read_only(arguments).await
     }
 
+    /// Unified lifecycle-registry lookup for a call's connection reference:
+    /// `connectionId` wins (exact registry id); `connectionName` is the
+    /// fallback (exact, trimmed — same convention as the Quick Sudo profile
+    /// reference). `Ok(None)` = no reference resolved (the callers keep
+    /// their existing inline fallbacks); `Err` = ambiguous name, listing
+    /// every candidate id + host so the caller can disambiguate by id.
+    async fn registered_connection_by_ref(
+        &self,
+        arguments: &Value,
+    ) -> Result<Option<StoredConnection>, String> {
+        let id = arguments
+            .get("connectionId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let name = arguments
+            .get("connectionName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let registry = self.dbx_connections.read().await;
+        if let Some(id) = id {
+            if let Some(connection) = registry.get(id) {
+                return Ok(Some(connection.clone()));
+            }
+            // A stale id alongside a usable name falls through to the name
+            // match; without a name the miss stays a miss (unchanged
+            // behavior — the caller raises its own guidance error).
+            if name.is_none() {
+                return Ok(None);
+            }
+        }
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let candidates: Vec<&StoredConnection> = registry
+            .values()
+            .filter(|connection| connection.name.as_deref() == Some(name))
+            .collect();
+        match candidates.len() {
+            1 => Ok(Some(candidates[0].clone())),
+            0 => Ok(None),
+            _ => Err(format!(
+                "Connection name '{name}' is ambiguous: {}; pass connectionId instead",
+                render_connection_candidates(&candidates)
+            )),
+        }
+    }
+
     /// True when the arguments reference a DBX-registered connection that was
     /// registered as read-only through `mcp/call` lifecycle payloads.
     ///
-    /// Without a resolvable `connectionId` the gate falls back to endpoint
+    /// Without a resolvable reference the gate falls back to endpoint
     /// identity (host + port + username): keying read-only by connectionId
     /// alone would let a caller walk around a read-only registration by
     /// re-dialing the same host with inline credentials.
     async fn registered_connection_is_read_only(&self, arguments: &Value) -> bool {
-        if let Some(id) = arguments
-            .get("connectionId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
-            return self
-                .dbx_connections
-                .read()
-                .await
-                .get(id)
-                .map(|connection| connection.read_only)
-                .unwrap_or(false);
+        match self.registered_connection_by_ref(arguments).await {
+            Ok(Some(connection)) => connection.read_only,
+            // Ambiguous connectionName: conservatively read-only; the
+            // disambiguation error with every candidate surfaces from the
+            // execution path.
+            Err(_) => true,
+            Ok(None) => self.inline_dial_is_registered_read_only(arguments).await,
         }
-        self.inline_dial_is_registered_read_only(arguments).await
     }
 
     /// True when the inline dial arguments (host/port/username) identify the
@@ -577,33 +657,145 @@ impl McpState {
     }
 
     /// Resolves the connection's sudoers-style allowlist: by `connectionId`
-    /// through the lifecycle registry, else by inline endpoint identity (the
-    /// same fallback as the read-only gate, so re-dialing a whitelisted host
-    /// with inline credentials cannot skip the list). Empty = not configured.
-    async fn sudo_allowlist_for(&self, arguments: &Value) -> Vec<Vec<String>> {
+    /// (or `connectionName`) through the lifecycle registry, else by inline
+    /// endpoint identity (the same fallback as the read-only gate, so
+    /// re-dialing a whitelisted host with inline credentials cannot skip the
+    /// list). Empty = not configured. An ambiguous connectionName is an
+    /// error, not a silent gate-off.
+    async fn sudo_allowlist_for(&self, arguments: &Value) -> Result<Vec<Vec<String>>, String> {
+        Ok(match self.registered_connection_by_ref(arguments).await? {
+            Some(connection) => (!connection.sudo_whitelist.is_empty())
+                .then(|| sudo_allowlist::entries_from_lines(&connection.sudo_whitelist))
+                .unwrap_or_default(),
+            None => self
+                .registered_connection_matching_inline(arguments)
+                .await
+                .and_then(|connection| {
+                    (!connection.sudo_whitelist.is_empty())
+                        .then(|| sudo_allowlist::entries_from_lines(&connection.sudo_whitelist))
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    /// L1 stdio bridge fallback decision: `Ok(Some((connection_id,
+    /// arguments)))` when the call must be forwarded through the DBX app
+    /// bridge, `Ok(None)` when the local path owns the call (registered
+    /// reference, no connection reference, local-only tool, runInTerminal
+    /// routing, or a name the bridge list cannot resolve — the inline path
+    /// then raises its own guidance error), `Err` for an actionable
+    /// disambiguation failure from the bridge list.
+    async fn bridge_forward_plan(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<Option<(String, Value)>, String> {
+        if !self.bridge_fallback || !is_connection_bound_tool(name) {
+            return Ok(None);
+        }
+        // runInTerminal routing already owns its own bridge forward
+        // (`ssh_exec_app_bridge`), which never required a registry entry;
+        // keep that path exclusive so a down bridge cannot stack two
+        // sequential wake-and-wait attempts.
+        if arguments.get("runInTerminal").and_then(Value::as_bool) == Some(true) {
+            return Ok(None);
+        }
         if let Some(id) = arguments
             .get("connectionId")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
         {
-            return self
-                .dbx_connections
-                .read()
-                .await
-                .get(id)
-                .and_then(|connection| {
-                    (!connection.sudo_whitelist.is_empty())
-                        .then(|| sudo_allowlist::entries_from_lines(&connection.sudo_whitelist))
-                })
-                .unwrap_or_default();
+            let registered = self.dbx_connections.read().await.contains_key(id);
+            // Registered: the local path runs unchanged (embedded-bridge
+            // semantics). Unregistered: forward as-is — the app-side sidecar
+            // holds the connection's credentials, read-only flag, and sudo
+            // whitelist, and answers with its own MCP envelope.
+            return Ok((!registered).then(|| (id.to_string(), arguments.clone())));
         }
-        self.registered_connection_matching_inline(arguments)
+        let Some(name_ref) = arguments
+            .get("connectionName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        // connectionName without connectionId: a registry hit (unique or
+        // ambiguous) stays local — `connection()` resolves it through the
+        // same registry and reports ambiguity itself. Only a stdio session
+        // with no registry entry needs the bridge list to resolve
+        // name → id before forwarding.
+        match self.registered_connection_by_ref(arguments).await {
+            Ok(Some(_)) | Err(_) => Ok(None),
+            Ok(None) => match self.resolve_connection_name_via_bridge(name_ref).await {
+                Ok(id) => {
+                    let mut forwarded = arguments.clone();
+                    if let Some(map) = forwarded.as_object_mut() {
+                        map.insert("connectionId".to_string(), json!(id));
+                    }
+                    Ok(Some((id, forwarded)))
+                }
+                // Bridge list unavailable or the name is not in it: fall
+                // through so the inline path reports (for an unavailable
+                // bridge) or the resolution error above already did (for a
+                // bad name).
+                Err(_) => Ok(None),
+            },
+        }
+    }
+
+    /// stdio connectionName resolution: reads the bridge list (no app
+    /// wake-up — a down bridge simply fails the resolution and the call
+    /// degrades) and matches by exact trimmed name.
+    async fn resolve_connection_name_via_bridge(&self, name: &str) -> Result<String, String> {
+        let entries = app_bridge::list_plugin_connections().await?;
+        resolve_name_in_bridge_list(&entries, name)
+    }
+
+    /// Forwards one connection-bound tool call through the DBX app bridge
+    /// (L1). Same wake-and-verify contract as `ssh_exec_app_bridge`; the
+    /// tool timeout follows the `timeoutSecs` argument with the same 5–300s
+    /// clamp ssh_exec applies. The 200 body is the app's MCP content
+    /// envelope and is returned verbatim.
+    async fn forward_tool_via_bridge(
+        &self,
+        name: &str,
+        connection_id: &str,
+        arguments: &Value,
+    ) -> Result<Value, String> {
+        app_bridge::ensure_app_bridge(app_bridge::DEFAULT_ENSURE_WAIT).await?;
+        let timeout_secs = arguments
+            .get("timeoutSecs")
+            .and_then(Value::as_u64)
+            .map(|secs| secs.clamp(5, 300))
+            .unwrap_or(300);
+        app_bridge::call_plugin_tool(
+            connection_id,
+            name,
+            arguments.clone(),
+            Duration::from_secs(timeout_secs),
+        )
+        .await
+    }
+
+    /// `ssh_list_connections`: saved-connection discovery for stdio agents.
+    /// The bridge list comes first (metadata only — the app never returns
+    /// credentials), merged with this session's lifecycle registry
+    /// (deduplicated by id; registry entries may add credential-presence
+    /// flags because they carry the secrets). A bridge that answers nothing
+    /// (app down, or an older app without the /list-plugin-connections
+    /// route) degrades to the registry alone plus an upgrade note instead of
+    /// failing.
+    async fn ssh_list_connections_tool(&self) -> Result<Value, String> {
+        let registry: Vec<StoredConnection> = self
+            .dbx_connections
+            .read()
             .await
-            .and_then(|connection| {
-                (!connection.sudo_whitelist.is_empty())
-                    .then(|| sudo_allowlist::entries_from_lines(&connection.sudo_whitelist))
-            })
-            .unwrap_or_default()
+            .values()
+            .cloned()
+            .collect();
+        let bridge = app_bridge::list_plugin_connections().await;
+        Ok(connection_list_result(bridge, &registry))
     }
 
     async fn run_tool(
@@ -675,6 +867,7 @@ impl McpState {
                     .collect();
                 Ok(json!({ "knownHosts": entries }))
             }
+            "ssh_list_connections" => self.ssh_list_connections_tool().await,
             "ssh_remove_known_host" => {
                 let host = required_str(arguments, "host")?;
                 let port = arguments
@@ -799,7 +992,7 @@ impl McpState {
                 // visible terminal.
                 let Some(connection_id) = connection_id else {
                     return Err(
-                        "runInTerminal needs a saved DBX connection: pass connectionId (the connection must exist in the DBX app) so the command can run in the app's visible terminal"
+                        "runInTerminal needs a saved DBX connection: pass connectionId (the connection must exist in the DBX app) so the command can run in the app's visible terminal. Saved connection ids can be listed with ssh_list_connections."
                             .to_string(),
                     );
                 };
@@ -809,7 +1002,7 @@ impl McpState {
             }
             (Some(_), None) if run_in_terminal == Some(true) => {
                 return Err(
-                    "runInTerminal requires a lifecycle connectionId from the DBX embedded bridge"
+                    "runInTerminal requires a lifecycle connectionId from the DBX embedded bridge. Saved connection ids can be listed with ssh_list_connections."
                         .to_string(),
                 );
             }
@@ -818,10 +1011,13 @@ impl McpState {
         // Saved DBX connections declare their Quick Sudo source (form field
         // sudo_source); the hidden exec channel honors it exactly like the
         // workbench instead of requiring inline credentials on every call.
-        let stored = match connection_id {
-            Some(id) => self.dbx_connections.read().await.get(id).cloned(),
-            None => None,
-        };
+        // The unified lookup also honors connectionName; an ambiguous name
+        // degrades to None here (the dial below reports it).
+        let stored = self
+            .registered_connection_by_ref(arguments)
+            .await
+            .ok()
+            .flatten();
         // The hidden exec channel carries the saved connection's setEnv too,
         // matching the workbench exec path.
         let set_env = stored
@@ -1555,15 +1751,46 @@ impl McpState {
     }
 
     async fn connection(&self, arguments: &Value) -> Result<Arc<Handle<SshClient>>, String> {
-        // DBX bridge calls reference a saved connection by id; inline calls
-        // (standalone --mcp mode) derive the pool key from the credentials.
+        // DBX bridge calls reference a saved connection by id (or name);
+        // inline calls (standalone --mcp mode) derive the pool key from the
+        // credentials. The unified lookup resolves connectionId first, then
+        // connectionName, and fails on ambiguity with every candidate.
         let explicit_id = arguments
             .get("connectionId")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
-        let pool_id = match explicit_id {
-            Some(id) => id.to_string(),
-            None => connection_pool_id(arguments),
+        let explicit_name = arguments
+            .get("connectionName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let registered = self.registered_connection_by_ref(arguments).await?;
+        let (pool_id, connection) = match registered {
+            // The real registry id is the pool key either way, so pooled
+            // handles line up with the app-side and forwarded calls.
+            Some(connection) => (connection.id.clone(), Some(connection)),
+            None => {
+                if let Some(id) = explicit_id {
+                    // Unregistered id: a pooled handle may still exist (an
+                    // earlier registration left one behind), so the pool hit
+                    // below gets its chance before the guidance error fires.
+                    (id.to_string(), None)
+                } else if let Some(name) = explicit_name {
+                    // Unregistered name: no pool key can be derived, so the
+                    // self-heal error fires immediately (L0).
+                    return Err(format!(
+                        "No connection named '{name}' is registered with this plugin session and \
+                         the DBX app bridge is unavailable. Start the DBX app, list saved \
+                         connections with ssh_list_connections, or provide inline credentials \
+                         (host/username plus password or privateKeyPath)."
+                    ));
+                } else {
+                    (
+                        connection_pool_id(arguments),
+                        Some(stored_connection_from_arguments(arguments)?),
+                    )
+                }
+            }
         };
         {
             let guard = self.connections.read().await;
@@ -1571,17 +1798,19 @@ impl McpState {
                 return Ok(entry.handle.clone());
             }
         }
-        let connection = match explicit_id {
-            Some(id) => {
-                let registered = {
-                    let dbx = self.dbx_connections.read().await;
-                    dbx.get(id).cloned()
-                };
-                registered.ok_or_else(|| {
-                    format!("Connection {id} is not registered with this plugin session")
-                })?
+        // Unregistered connectionId with no pooled handle: with the L1
+        // bridge fallback active this only fires when the DBX app bridge is
+        // also unavailable, so the message carries the full self-heal path.
+        let connection = match connection {
+            Some(connection) => connection,
+            None => {
+                return Err(format!(
+                    "Connection {pool_id} is not registered with this plugin session and the DBX \
+                     app bridge is unavailable. Start the DBX app, list saved connections with \
+                     ssh_list_connections, or provide inline credentials (host/username plus \
+                     password or privateKeyPath)."
+                ))
             }
-            None => stored_connection_from_arguments(arguments)?,
         };
         let (handle, jumps) = self.runtime.connect_headless(&connection).await?;
         let mut guard = self.connections.write().await;
@@ -1699,6 +1928,133 @@ fn connection_pool_key(arguments: &Value) -> String {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| connection_pool_id(arguments))
+}
+
+/// Tools whose execution targets a saved connection: in stdio mode an
+/// unregistered `connectionId` is forwarded through the DBX app bridge (L1
+/// fallback) instead of failing the local registry lookup. Local-only tools
+/// are deliberately absent: `ssh_close` keeps local pool semantics,
+/// `ssh_test_connection` is a local dial, known-hosts / quick-sudo /
+/// settings tools never target a connection, and `ssh_list_connections` is
+/// the discovery surface itself. `sftp_upload` / `sftp_download` forward
+/// too: bridge and stdio sidecar run on the same machine, so `localPath`
+/// stays valid on the app side (its sidecar re-applies the local transfer
+/// gates with the shared plugin settings).
+fn is_connection_bound_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "ssh_exec"
+            | "ssh_exec_sudo"
+            | "ssh_run_bg"
+            | "ssh_task_status"
+            | "ssh_metrics"
+            | "sftp_list_dir"
+            | "sftp_stat"
+            | "sftp_exists"
+            | "sftp_pwd"
+            | "sftp_read_file"
+            | "sftp_write_file"
+            | "sftp_mkdir"
+            | "sftp_remove"
+            | "sftp_rename"
+            | "sftp_chmod"
+            | "sftp_copy"
+            | "sftp_move"
+            | "sftp_disk_usage"
+            | "sftp_upload"
+            | "sftp_download"
+    )
+}
+
+/// Registry entry as a list view: metadata plus credential PRESENCE flags
+/// only (same discipline as the Quick Sudo profile views — never values).
+fn registry_connection_view(connection: &StoredConnection) -> Value {
+    json!({
+        "id": connection.id,
+        "name": connection.name,
+        "host": connection.host,
+        "port": connection.port,
+        "username": connection.username,
+        "authentication": connection.authentication.method_name(),
+        "readOnly": connection.read_only,
+        "passwordSet": !connection.password.is_empty(),
+    })
+}
+
+/// Merges the bridge connection list (preferred, when the app answered)
+/// with the session registry, deduplicated by id (bridge data wins).
+/// Returns the tool payload: `source` records the data origin, and the
+/// degraded branch carries a note pointing at the app start/upgrade
+/// requirement. Bridge entries are credential-free by contract; registry
+/// views expose presence flags only.
+fn connection_list_result(
+    bridge: Result<Vec<Value>, String>,
+    registry: &[StoredConnection],
+) -> Value {
+    match bridge {
+        Ok(entries) => {
+            let listed: std::collections::HashSet<String> = entries
+                .iter()
+                .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            let mut merged = entries;
+            for connection in registry
+                .iter()
+                .filter(|connection| !listed.contains(&connection.id))
+            {
+                merged.push(registry_connection_view(connection));
+            }
+            json!({ "connections": merged, "source": "dbx-app-bridge" })
+        }
+        Err(_) => json!({
+            "connections": registry
+                .iter()
+                .map(registry_connection_view)
+                .collect::<Vec<_>>(),
+            "source": "session-registry",
+            "note": "The DBX app bridge did not answer the saved-connection list (the app is not running, or this DBX version predates the /list-plugin-connections route). Only connections registered in this session are shown; start or upgrade the DBX app to get the full saved-connection list.",
+        }),
+    }
+}
+
+/// Pure name→id resolution over a bridge connection list: exactly one
+/// trimmed-name hit yields its id; zero hits and multiple hits are errors,
+/// the latter listing every candidate id + host for disambiguation.
+fn resolve_name_in_bridge_list(entries: &[Value], name: &str) -> Result<String, String> {
+    let wanted = name.trim();
+    let mut hits: Vec<(&str, &str)> = Vec::new();
+    for entry in entries {
+        let entry_name = entry.get("name").and_then(Value::as_str).map(str::trim);
+        if entry_name != Some(wanted) {
+            continue;
+        }
+        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+            let host = entry.get("host").and_then(Value::as_str).unwrap_or("");
+            hits.push((id, host));
+        }
+    }
+    match hits.len() {
+        1 => Ok(hits[0].0.to_string()),
+        0 => Err(format!(
+            "No connection named '{wanted}' in the DBX app's saved-connection list"
+        )),
+        _ => Err(format!(
+            "Connection name '{wanted}' is ambiguous: {}; pass connectionId instead",
+            hits.iter()
+                .map(|(id, host)| format!("{id} (host {host})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Renders registry candidates for the ambiguous-connectionName error.
+fn render_connection_candidates(connections: &[&StoredConnection]) -> String {
+    connections
+        .iter()
+        .map(|connection| format!("{} (host {})", connection.id, connection.host))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Tools that mutate remote state and must be rejected on read-only
@@ -2017,6 +2373,8 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
     Ok(StoredConnection {
         sudo_whitelist: Vec::new(),
         id: connection_pool_id(arguments),
+        // Inline MCP dials carry no display name.
+        name: None,
         host: host.to_string(),
         port,
         runtime_host: host.to_string(),
@@ -2165,7 +2523,8 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
         // it for terminal routing (runInTerminal) and stored-connection
         // resolution, and an undeclared argument is dropped by schema
         // validation before the sidecar ever sees the call.
-        "connectionId": { "type": "string", "description": "Saved DBX connection id. With runInTerminal: true, a stdio-mode call is forwarded through the DBX app bridge to the connection's visible workbench terminal; on the embedded bridge it also resolves the stored connection's Quick Sudo source and read-only flag" },
+        "connectionId": { "type": "string", "description": "Saved DBX connection id (list ids with ssh_list_connections, or in the DBX app). With runInTerminal: true, a stdio-mode call is forwarded through the DBX app bridge to the connection's visible workbench terminal; on the embedded bridge it also resolves the stored connection's Quick Sudo source and read-only flag. In stdio mode an id unknown to this session is forwarded to the running DBX app, so no inline credentials are needed" },
+        "connectionName": { "type": "string", "description": "Saved DBX connection name, an alternative to connectionId: resolved against this session's registry first, then through ssh_list_connections in stdio mode. Ambiguous names are refused with their candidate ids" },
         "host": { "type": "string", "description": "Remote SSH host" },
         "port": { "type": "integer", "description": "SSH port (default 22)" },
         "username": { "type": "string", "description": "Login user" },
@@ -2278,6 +2637,11 @@ pub fn tool_definitions() -> Value {
         {
             "name": "ssh_list_known_hosts",
             "description": "List entries of the plugin's known_hosts store (the system ~/.ssh/known_hosts is never modified).",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "ssh_list_connections",
+            "description": "List the DBX app's saved SSH connections for this plugin (id, name, host, port, username, authentication method, read-only flag) merged with connections registered in this MCP session. Metadata only: credentials are never included. Use an entry's id as connectionId, or its name as connectionName, on the connection-bound tools.",
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
@@ -2812,7 +3176,9 @@ mod tests {
     fn connection_tools_declare_connection_id() {
         // Strict MCP hosts drop arguments the input schema does not declare,
         // so a missing connectionId makes runInTerminal unreachable from
-        // stdio mode before the dispatcher ever reads it.
+        // stdio mode before the dispatcher ever reads it. connectionName is
+        // declared for the same reason (the L3 registry-name lookup reads
+        // it, and strict hosts would silently drop it otherwise).
         let tools = tool_definitions();
         let array = tools.as_array().unwrap();
         for name in [
@@ -2825,14 +3191,19 @@ mod tests {
             "sftp_list_dir",
             "sftp_upload",
         ] {
-            let schema = array
+            let properties = array
                 .iter()
                 .find(|tool| tool["name"] == name)
                 .unwrap_or_else(|| panic!("tool {name} missing from definitions"))
                 ["inputSchema"]["properties"]
-                .get("connectionId")
-                .unwrap_or_else(|| panic!("tool {name} schema does not declare connectionId"));
-            assert_eq!(schema["type"], "string", "tool {name} connectionId type");
+                .as_object()
+                .unwrap_or_else(|| panic!("tool {name} schema has no properties object"));
+            for key in ["connectionId", "connectionName"] {
+                let schema = properties
+                    .get(key)
+                    .unwrap_or_else(|| panic!("tool {name} schema does not declare {key}"));
+                assert_eq!(schema["type"], "string", "tool {name} {key} type");
+            }
         }
     }
 
@@ -2904,6 +3275,7 @@ mod tests {
             "ssh_close",
             "ssh_test_connection",
             "ssh_list_known_hosts",
+            "ssh_list_connections",
             "ssh_remove_known_host",
             "ssh_quick_sudo_profiles_list",
             "ssh_quick_sudo_profiles_save",
@@ -2929,6 +3301,27 @@ mod tests {
         assert!(tools
             .iter()
             .all(|tool| tool["inputSchema"]["type"] == "object"));
+
+        // The discovery tool takes no arguments (same shape as
+        // ssh_list_known_hosts) and points at the reference parameters.
+        let discovery = tools
+            .iter()
+            .find(|t| t["name"] == "ssh_list_connections")
+            .unwrap();
+        assert!(
+            discovery["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "ssh_list_connections must take no arguments"
+        );
+        assert!(
+            discovery["description"]
+                .as_str()
+                .unwrap()
+                .contains("connectionId"),
+            "description must explain how to use the entries"
+        );
 
         // The read tool exposes the offset knob so MCP clients can page
         // through files; the metrics tool advertises the extended dimensions.
@@ -3618,6 +4011,11 @@ mod tests {
             refused.contains("runInTerminal needs a saved DBX connection"),
             "unexpected: {refused}"
         );
+        // L0 self-heal hint appended to the guidance error.
+        assert!(
+            refused.contains("ssh_list_connections"),
+            "expected the discovery-tool hint, got: {refused}"
+        );
 
         // The same refusal covers the sudo tool; runInTerminal absent or
         // false keeps the existing hidden-channel behavior (which then fails
@@ -3647,6 +4045,272 @@ mod tests {
         assert!(
             !hidden.contains("runInTerminal"),
             "false must keep the hidden channel: {hidden}"
+        );
+    }
+
+    /// L0: with the bridge fallback disabled (hermetic stand-in for "the
+    /// bridge is also unavailable"), an unregistered connectionId reports
+    /// the full self-heal path instead of the old bare message.
+    #[tokio::test]
+    async fn unregistered_connection_id_error_carries_selfheal_hints() {
+        let mut state = state();
+        state.bridge_fallback = false;
+        let error = state
+            .call_tool("ssh_metrics", &json!({ "connectionId": "ghost" }), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains(
+                "not registered with this plugin session and the DBX app bridge is unavailable"
+            ),
+            "unexpected: {error}"
+        );
+        assert!(
+            error.contains("ssh_list_connections") && error.contains("inline credentials"),
+            "expected the self-heal hints, got: {error}"
+        );
+    }
+
+    /// L1: the forward decision reads only the registry — a registered id
+    /// stays local, an unregistered id forwards with the original
+    /// arguments, local-only tools and runInTerminal routing never forward,
+    /// and the kill switch disables the fallback entirely.
+    #[tokio::test]
+    async fn bridge_forward_plan_decides_by_registry() {
+        let mut state = state();
+        state.bridge_fallback = true;
+        let stored = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-fwd",
+                "name": "Prod",
+                "host": "192.0.2.10",
+                "port": 22,
+                "username": "ops",
+                "password": format!("pw-{}", uuid::Uuid::new_v4()),
+            }
+        }))
+        .unwrap();
+        state
+            .dbx_connections
+            .write()
+            .await
+            .insert("conn-fwd".to_string(), stored);
+
+        // Registered id: local path owns the call.
+        let plan = state
+            .bridge_forward_plan(
+                "ssh_exec",
+                &json!({ "connectionId": "conn-fwd", "command": "uptime" }),
+            )
+            .await
+            .unwrap();
+        assert!(plan.is_none(), "registered id must stay local");
+
+        // Unregistered id: forward with the arguments untouched.
+        let (id, args) = state
+            .bridge_forward_plan(
+                "ssh_exec",
+                &json!({ "connectionId": "ghost", "command": "uptime" }),
+            )
+            .await
+            .unwrap()
+            .expect("unregistered id must forward");
+        assert_eq!(id, "ghost");
+        assert_eq!(args["command"], "uptime");
+
+        // Local-only tools never forward, even with an unregistered id.
+        let plan = state
+            .bridge_forward_plan("ssh_close", &json!({ "connectionId": "ghost" }))
+            .await
+            .unwrap();
+        assert!(plan.is_none(), "ssh_close keeps local semantics");
+
+        // Registry name hit stays local (connection() resolves it).
+        let plan = state
+            .bridge_forward_plan(
+                "sftp_list_dir",
+                &json!({ "connectionName": "Prod", "path": "/tmp" }),
+            )
+            .await
+            .unwrap();
+        assert!(plan.is_none(), "registry name hit stays local");
+
+        // No connection reference: local path.
+        let plan = state
+            .bridge_forward_plan("ssh_metrics", &json!({}))
+            .await
+            .unwrap();
+        assert!(plan.is_none());
+
+        // runInTerminal keeps its exclusive forward path.
+        let plan = state
+            .bridge_forward_plan(
+                "ssh_exec",
+                &json!({ "connectionId": "ghost", "command": "uptime", "runInTerminal": true }),
+            )
+            .await
+            .unwrap();
+        assert!(plan.is_none(), "runInTerminal owns its bridge forward");
+
+        // Fallback disabled: never forward.
+        state.bridge_fallback = false;
+        let plan = state
+            .bridge_forward_plan(
+                "ssh_exec",
+                &json!({ "connectionId": "ghost", "command": "uptime" }),
+            )
+            .await
+            .unwrap();
+        assert!(plan.is_none(), "disabled fallback must not forward");
+    }
+
+    /// L2: list views expose metadata plus credential PRESENCE flags only —
+    /// the runtime-composed secret never appears in any branch, and the
+    /// degraded branch carries the start/upgrade note.
+    #[test]
+    fn connection_list_views_never_echo_credentials() {
+        let secret = format!("pw-{}", uuid::Uuid::new_v4());
+        let stored = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-list",
+                "name": "Web",
+                "host": "web.example.test",
+                "port": 2222,
+                "username": "deploy",
+                "password": secret,
+                "read_only": true,
+            }
+        }))
+        .unwrap();
+        assert_eq!(stored.name.as_deref(), Some("Web"));
+
+        // Degraded branch: registry alone + note.
+        let degraded = connection_list_result(Err("bridge down".to_string()), &[stored.clone()]);
+        assert_eq!(degraded["source"], "session-registry");
+        assert!(
+            degraded["note"]
+                .as_str()
+                .unwrap()
+                .contains("upgrade the DBX app"),
+            "expected the upgrade note: {degraded}"
+        );
+        let entry = &degraded["connections"][0];
+        assert_eq!(entry["id"], "conn-list");
+        assert_eq!(entry["name"], "Web");
+        assert_eq!(entry["host"], "web.example.test");
+        assert_eq!(entry["port"], 2222);
+        assert_eq!(entry["username"], "deploy");
+        assert_eq!(entry["authentication"], "password");
+        assert_eq!(entry["readOnly"], true);
+        assert_eq!(entry["passwordSet"], true);
+        let rendered = degraded.to_string();
+        assert!(!rendered.contains(&secret), "secret leaked: {rendered}");
+        assert!(
+            !rendered.contains("\"password\":"),
+            "raw credential field leaked: {rendered}"
+        );
+
+        // Bridge branch: bridge data wins by id, registry-only ids append,
+        // and no note is attached.
+        let bridge_entry = json!({
+            "id": "conn-list", "name": "Web", "host": "web.example.test",
+            "port": 2222, "username": "deploy", "authentication": "password",
+            "readOnly": false,
+        });
+        let extra = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-extra", "host": "db.example.test", "port": 22,
+                "username": "ops", "password": format!("pw-{}", uuid::Uuid::new_v4()),
+            }
+        }))
+        .unwrap();
+        let merged = connection_list_result(Ok(vec![bridge_entry]), &[stored, extra]);
+        assert_eq!(merged["source"], "dbx-app-bridge");
+        assert!(merged.get("note").is_none(), "bridge hit must not degrade");
+        let entries = merged["connections"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "bridge entry + registry-only append");
+        assert_eq!(entries[0]["id"], "conn-list");
+        // Bridge entries carry no credential flags (contract: absent means
+        // the app did not send one).
+        assert!(entries[0].get("passwordSet").is_none());
+        assert_eq!(entries[1]["id"], "conn-extra");
+    }
+
+    /// L3 stdio name resolution over the bridge list: unique hit, ambiguous
+    /// (both candidates listed with host), and missing.
+    #[test]
+    fn resolve_name_in_bridge_list_disambiguates() {
+        let entries = vec![
+            json!({ "id": "a", "name": "Web", "host": "h1" }),
+            // Trailing space in the payload name still matches after trim.
+            json!({ "id": "b", "name": "Web ", "host": "h2" }),
+            json!({ "id": "c", "name": "DB", "host": "h3" }),
+        ];
+        assert_eq!(resolve_name_in_bridge_list(&entries, "DB").unwrap(), "c");
+        let error = resolve_name_in_bridge_list(&entries, "Web").unwrap_err();
+        assert!(
+            error.contains("ambiguous")
+                && error.contains("a")
+                && error.contains("b")
+                && error.contains("h1")
+                && error.contains("h2"),
+            "expected candidates in the error: {error}"
+        );
+        assert!(
+            resolve_name_in_bridge_list(&entries, "ghost")
+                .unwrap_err()
+                .contains("No connection named"),
+            "missing name must be a clear error"
+        );
+    }
+
+    /// L3: lifecycle payloads carry the display name through; absent names
+    /// stay None (older hosts, inline dials).
+    #[test]
+    fn lifecycle_name_roundtrip_and_optional_default() {
+        let named = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "c1", "name": "  Bastion  ", "host": "h", "port": 22,
+                "username": "u", "password": "p",
+            }
+        }))
+        .unwrap();
+        assert_eq!(named.name.as_deref(), Some("Bastion"));
+        let unnamed = StoredConnection::from_lifecycle_params(&json!({
+            "connection": { "id": "c2", "host": "h", "port": 22, "username": "u", "password": "p" }
+        }))
+        .unwrap();
+        assert_eq!(unnamed.name, None);
+    }
+
+    /// L3: two same-named registry entries make the reference ambiguous —
+    /// the error lists every candidate id + host so the caller can
+    /// disambiguate by id.
+    #[tokio::test]
+    async fn ambiguous_connection_name_lists_candidates() {
+        let state = state();
+        for (id, host) in [("conn-x", "10.0.0.1"), ("conn-y", "10.0.0.2")] {
+            let stored = StoredConnection::from_lifecycle_params(&json!({
+                "connection": {
+                    "id": id, "name": "Twin", "host": host, "port": 22,
+                    "username": "ops",
+                    "password": format!("pw-{}", uuid::Uuid::new_v4()),
+                }
+            }))
+            .unwrap();
+            state.dbx_connections.write().await.insert(id.to_string(), stored);
+        }
+        let error = state
+            .call_tool("ssh_metrics", &json!({ "connectionName": "Twin" }), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("ambiguous")
+                && error.contains("conn-x")
+                && error.contains("conn-y")
+                && error.contains("10.0.0.1")
+                && error.contains("10.0.0.2"),
+            "expected every candidate in the error: {error}"
         );
     }
 
@@ -3799,5 +4463,70 @@ mod dbx_bridge_tests {
             .err()
             .unwrap();
         assert!(err.contains("host"), "unexpected error: {err}");
+    }
+
+    /// L3: a lifecycle-registered connection is resolvable by its display
+    /// name — the call gets past the registry lookup and fails on the
+    /// missing tool parameter instead, proving name → connection routing.
+    #[tokio::test]
+    async fn connection_name_resolves_through_registry() {
+        let mut state = McpState::shared(Arc::new(SshRuntime::new(
+            std::env::temp_dir().join("dbx-mcp-name-test"),
+        )));
+        // Hermetic: keep the name-miss path off the real app bridge.
+        state.bridge_fallback = false;
+        let lifecycle = json!({
+            "connection": {
+                "id": "conn-named",
+                "name": "Prod bastion",
+                "host": "192.0.2.10",
+                "port": 22,
+                "username": "ops",
+                "password": "secret",
+            },
+            "runtime": { "host": "192.0.2.10", "port": 22 },
+            "operationId": "op-name",
+        });
+        let listed = state
+            .call_dbx_with(
+                &json!({ "tool": "ssh_list_known_hosts", "arguments": {}, "lifecycle": lifecycle }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(listed["content"][0]["text"].as_str().unwrap().contains("knownHosts"));
+
+        // connectionName (exact, as stored) reaches the tool's own parameter
+        // validation: the registry lookup passed.
+        let err = state
+            .call_dbx_with(
+                &json!({
+                    "tool": "ssh_exec",
+                    "arguments": { "connectionName": "Prod bastion" },
+                }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("command"), "unexpected error: {err}");
+
+        // An unknown name gets the self-heal guidance (no bridge available
+        // in tests is the same degradation as an older app).
+        let err = state
+            .call_dbx_with(
+                &json!({
+                    "tool": "ssh_exec",
+                    "arguments": { "connectionName": "ghost", "command": "true" },
+                }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("No connection named 'ghost'") && err.contains("ssh_list_connections"),
+            "unexpected error: {err}"
+        );
     }
 }

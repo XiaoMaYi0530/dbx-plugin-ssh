@@ -1,15 +1,14 @@
-# 与 tiny-rdm 的 SSH/SFTP 特性对标清单
+# SSH/SFTP 特性能力清单
 
-基线：`/Users/Jinpy/GolandProjects/tiny-rdm`（本地源码）。
 插件现状：`backend/src/main.rs` 方法表（**67 个分发方法臂、68 个方法名**——`ssh/host-key/resolve`
 与 `connection/challenge/resolve` 共用一臂（main.rs:174），含 sftp/copy、sftp/move、ssh/host-key/check；
 2026-08-29 收口复核，修正如下的「68 臂」口径）。
-原则：一比一补齐 tiny-rdm 的 SSH/SFTP 能力面；DBX 已由宿主承担的能力（连接管理、
+原则：补齐完整 SSH/SFTP 能力面；DBX 已由宿主承担的能力（连接管理、
 profile 分组、全局外观）不重复实现。
 
 ## 能力对照总表
 
-| tiny-rdm 能力 | tiny-rdm 位置 | 插件状态 | 优先级 |
+| 能力 | 参照位置 | 插件状态 | 优先级 |
 | --- | --- | --- | --- |
 | SFTP 基础（list/read/mkdir/rename/chmod/delete/upload/download/传输槽） | sftp_service.go | ✅ 已有（`sftp/read` 另支持可选 `offset` 分片续读，对齐 ReadFile(offset,length)） | — |
 | 目录磁盘占用 diskUsage | sftp_service.go | ✅ 已有 | — |
@@ -20,8 +19,8 @@ profile 分组、全局外观）不重复实现。
 | 会话状态规范化展示（连接中/已连接/重连中/已断开/错误） | frontend/src/modules/ssh/session-status.js | ✅ 已有（`sessionStatus.ts` 移植 + reconnecting 扩展，S-B；多会话择优不适用未移植） | — |
 | 命令输出净化（控制序列剥离/回显移除） | frontend/src/modules/ssh/terminal-output.js | ✅ 已有（`terminalOutputText.ts` 通用部分移植；`.mcp_ctl_*` hook 特判不适用） | — |
 | 命令历史（弹窗历史区/↑↓ 浏览/一键重发） | SshPage 命令历史 | ✅ 已有（`frontend/src/lib/commandHistory.ts` 环形 100 条 + App.vue 接线；疑似凭据/超长/多行命令不落 localStorage，A-SSH） | — |
-| 快速命令栏（CRUD/发送语义） | tiny-rdm QuickCommand | ✅ 已有（`frontend/src/lib/quickCommands.ts` 上限 20 + 工具栏 Zap 下拉；发送走 PTY 键盘写入原文保留交互 shell 状态，A-SSH。2026-09-04 起存储升级为**全局**：`ssh/quickCommands/*` + sidecar `quick-commands.json`，所有连接/工作台共享，localStorage 旧数据一次性迁移，见 IMPL_PLAN_BATCH_QUICK） | — |
-| 批量发送（多会话发送命令） | useBatchSend/SshBatchSendPanel | ✅ 已有（`ssh/terminal/batchInput` 写入各会话 PTY；交互 2026-09-08 改版为终端底部常驻命令条（思路 Electerm quick-command bar）：回车即发送、目标选择 popover（全选/仅存活/刷新）、快速命令下拉切换回填、内联保存为快速命令（`ssh/quickCommands/*` 全局共享 ≤20）、结果浮条逐会话汇总；发送成功清空入历史、↑↓ 回选；跨工作台草稿/开关经 `ssh/batchBar/state` 广播同步；危险命令复用粘贴确认；输出不收集回显在各自终端，与 tiny-rdm 语义一致；并发同靶 OTP 提示撞重放保护时延迟到下一窗口自动补答（2026-09-08） | — |
+| 快速命令栏（CRUD/发送语义） | QuickCommand | ✅ 已有（`frontend/src/lib/quickCommands.ts` 上限 20 + 工具栏 Zap 下拉；发送走 PTY 键盘写入原文保留交互 shell 状态，A-SSH。2026-09-04 起存储升级为**全局**：`ssh/quickCommands/*` + sidecar `quick-commands.json`，所有连接/工作台共享，localStorage 旧数据一次性迁移） | — |
+| 批量发送（多会话发送命令） | useBatchSend/SshBatchSendPanel | ✅ 已有（`ssh/terminal/batchInput` 写入各会话 PTY；交互 2026-09-08 改版为终端底部常驻命令条（思路 Electerm quick-command bar）：回车即发送、目标选择 popover（全选/仅存活/刷新）、快速命令下拉切换回填、内联保存为快速命令（`ssh/quickCommands/*` 全局共享 ≤20）、结果浮条逐会话汇总；发送成功清空入历史、↑↓ 回选；跨工作台草稿/开关经 `ssh/batchBar/state` 广播同步；危险命令复用粘贴确认；输出不收集回显在各自终端；并发同靶 OTP 提示撞重放保护时延迟到下一窗口自动补答（2026-09-08） | — |
 | 连接信息面板（Host/Port/User/认证方式/只读/延迟） | 连接信息摘要 | ✅ 已有（App.vue `connection-info-popover`；`ssh/sessions/list` 行新增只读 `authMethod`（model.rs:46 `method_name()`、ssh.rs:599/609/1236/1249），延迟走既有 ssh/exec echo 探测，A-SSH） | — |
 | 终端字体缩放（Ctrl/⌘ 滚轮、复位、持久化） | batch3 工作包 A 第 3 条细化 | ✅ 已有（`frontend/src/lib/terminalZoom.ts` `clampFontSize` 绝对字号 [8,32] + App.vue A+/A− 按钮与 localStorage 持久化，A-SSH） | — |
 | known_hosts 管理（list/remove，宿主侧文件） | ssh_service.go ListKnownHosts/RemoveKnownHost | ✅ 已有（第一批，实测通过） | — |
@@ -40,7 +39,7 @@ profile 分组、全局外观）不重复实现。
 | MCP 尺寸限制策略（max read/upload/download） | PreferencesMCPSFTP | ✅ mcp/settings/get|set（持久化，重启重载，--mcp 同源） | P2 完成 |
 | MCP 本地↔远端传输 + 家目录（sftp_upload / sftp_download / sftp_pwd） | SFTPTransfer / sftpPwd | ✅ 已有（2026-08-30）：25 工具齐；单文件传输受 maxUpload/maxDownload 限制，本地路径校验先于拨号、校验拒绝不清连接池；`smoke_mcp.py --host` 真机回环（SHA-256 双端比对） | P2 完成 |
 | Profile MCP 策略开关 | UpdateProfileMCPPolicy | ⚠️ 由 DBX 侧承担，插件不重复 | 不做 |
-| Profile 级快速 sudo / 执行模式 | UpdateProfileQuickSudo / UpdateProfileSSHExecution | ✅ 已有（2026-08-30，**推翻 2026-08-29「不做」结论**）：全局多套 Quick Sudo 配置集中管理（`sudo/profiles/list|save|delete`，`<plugin_data_dir>/quick-sudo-profiles.json` 持久化，密钥永不回显）+ 连接级绑定选择（`ssh/settings/set quickSudoProfileId`，选全局或本连接，插件侧持久化、重连保留）+ 终端 auto sudo / exec / MCP（`ssh_quick_sudo_profiles_*`、`ssh_exec_sudo quickSudoProfile`）全通道生效；详见 `IMPL_PLAN_QUICK_SUDO.zh-CN.md`；2026-08-31（0.4.2）连接表单升级 `sudo_source` 三选一：不开 / 本连接自定义 / 全局配置（`sudo_profile` 引用，visible_when 联动，存量连接按 `quick_sudo` 映射兼容）；2026-08-31（0.4.5）表单 `sudo_profile` 升级动态下拉（`sudo_profile` 字段声明 `options_action: sudo/profiles/options`，宿主拉取配置列表渲染 select，无该扩展能力的宿主文本回退），`global` 模式隐藏 2FA 四件套（`totp_secret`/`auth_flow_mode`/hints——凭据来源整体由全局配置接管），终端监视器改为随设置/配置更新**重新挂载**（修复连接时无凭据、后在工作台配置 quick sudo 不生效的问题，对齐 tiny-rdm 每次输出动态 resolve） | P1 完成 |
+| Profile 级快速 sudo / 执行模式 | UpdateProfileQuickSudo / UpdateProfileSSHExecution | ✅ 已有（2026-08-30，**推翻 2026-08-29「不做」结论**）：全局多套 Quick Sudo 配置集中管理（`sudo/profiles/list|save|delete`，`<plugin_data_dir>/quick-sudo-profiles.json` 持久化，密钥永不回显）+ 连接级绑定选择（`ssh/settings/set quickSudoProfileId`，选全局或本连接，插件侧持久化、重连保留）+ 终端 auto sudo / exec / MCP（`ssh_quick_sudo_profiles_*`、`ssh_exec_sudo quickSudoProfile`）全通道生效；2026-08-31（0.4.2）连接表单升级 `sudo_source` 三选一：不开 / 本连接自定义 / 全局配置（`sudo_profile` 引用，visible_when 联动，存量连接按 `quick_sudo` 映射兼容）；2026-08-31（0.4.5）表单 `sudo_profile` 升级动态下拉（`sudo_profile` 字段声明 `options_action: sudo/profiles/options`，宿主拉取配置列表渲染 select，无该扩展能力的宿主文本回退），`global` 模式隐藏 2FA 四件套（`totp_secret`/`auth_flow_mode`/hints——凭据来源整体由全局配置接管），终端监视器改为随设置/配置更新**重新挂载**（修复连接时无凭据、后在工作台配置 quick sudo 不生效的问题，对齐每次输出动态 resolve 的语义） | P1 完成 |
 | Profile 分组/排序 | SaveProfileOrganization | DBX 连接管理已承担 | 不做 |
 | **SSH 隧道 / 跳板 / 代理（ProxyJump）** | 自建 jump 链 | **整合 DBX 已有能力，不重复实现**：隧道/代理在 DBX 连接编辑"隧道/代理"标签配置（tunnel_profiles）；DBX 先解析传输层，把实际入口以 `runtime.host/port` 传给插件，插件 dial 使用 runtime 端点、主机密钥校验仍以原始 `connection.host/port` 为身份。插件表单已移除 `jump_hosts` 字段避免双轨配置；sidecar 对历史数据保持兼容 | 整合 |
 
@@ -49,11 +48,11 @@ profile 分组、全局外观）不重复实现。
 1. `backend/src/sudo_fs.rs` — Sudo 文件操作族（P0）
    - `sudo_fs::{stat, exists, touch, list_dir, read_file, write_file, mkdir, remove, remove_all, chmod, rename}`
    - 复用 `exec.rs` 的 sudo 编排（AuthFlowMode/SudoAuth/Hints）与 ssh.rs 的会话池
-   - 语义对齐 tiny-rdm：stat 走 `stat -c`，list 走 `ls -la --time-style=+%s` 解析，
+   - 语义：stat 走 `stat -c`，list 走 `ls -la --time-style=+%s` 解析，
      read 走 `dd`/`base64`，write 走 `dd of=`，remove_all 防符号链接跟随
 2. `backend/src/sftp_ext.rs` — 基础补齐（P0）
    - `sftp_ext::{stat, exists, touch, write_file}`（russh-sftp 原生实现，非 sudo）
-   - `sftp_ext::{archive, extract}`：tar.gz 打包/解压（远端 `tar` 命令实现，对齐 tiny-rdm）
+   - `sftp_ext::{archive, extract}`：tar.gz 打包/解压（远端 `tar` 命令实现）
 3. `backend/src/keys.rs` — 密钥发现（P0）
    - `keys::discover()`：扫描 `~/.ssh`（id_rsa/ed25519/ecdsa/…、config 内 IdentityFile），
      返回路径 + 算法 + 指纹（SHA256），不返回私钥内容
@@ -63,14 +62,14 @@ profile 分组、全局外观）不重复实现。
 
 ## 第三批任务（已落地，2026-08-28 基线）
 
-2026-08 全量差距复审（tiny-rdm 演化版 MCP CTL 基线）后立项，四个并发工作包：
+2026-08 全量差距复审后立项，四个并发工作包：
 A 终端体验（搜索/字体缩放/WebLinks/风险粘贴防护/滚动缓冲 25k）、
 B SFTP 面板（搜索过滤/多选批量/新建文件/属性弹窗/路径历史/sudo 编辑/服务器内复制粘贴；
 0.4.x 增补：面板可收起/打开按钮 + 默认不打开偏好、DBX 重启恢复的
 「Connection is not active」快速失败提示，见 PROGRESS-P-SSH §8.3）、
 C 后端补齐（sftp/copy+move、sudo 时间戳保活、OTP 防重放）、
 D 指标增强（网络接口速率/Top 进程/分区展示）。
-实施细节、文件所有权与验收标准见 `FEATURE_PARITY_BATCH3.zh-CN.md`。
+实施细节、文件所有权与验收标准记录在批次对标文档中（已随批次退役删除，见 git 历史）。
 四包代码、单测与 smoke 均已通过（并发期间 cargo test 100/100、vitest 21/21、smoke_batch3 7/7）；
 合流后 S-A 第二轮（metrics inode/topMemory、sftp/read offset、快照缓存）与 S-B
 （OSC 633 命令标记、会话状态展示、输出净化）继续追加；X-B 轮落地 top5 建议仓内四项
@@ -79,8 +78,8 @@ D 指标增强（网络接口速率/Top 进程/分区展示）。
 `ssh/sessions/list` 增量 `authMethod` 契约）/字体缩放绝对字号钳制。收口终值基线
 （2026-08-29 全量复测）：cargo test 109/109、vitest 51/51、五份 smoke 全绿
 （smoke_test PASS、smoke_fs 17、smoke_mcp 19 tools、smoke_batch3 17、smoke_sudo_otp 10）、
-出包 0.2.2 sha256 `a67bb683…f347e`（明细见 `PROGRESS-COLLECT-FINAL.zh-CN.md` 与
-`PROGRESS-TESTBASELINE.zh-CN.md`）。A-SSH 各项归属见 BATCH3「A-SSH 轮核对」节。
+出包 0.2.2 sha256 `a67bb683…f347e`（明细记录文档已随批次退役删除，见 git 历史）。
+A-SSH 各项归属见原批次「A-SSH 轮核对」记录（该文档已删除）。
 git 提交与宿主管线集成验收留待主会话合流后执行。
 deferred（本批不做）：多会话分屏、端口转发、SecretRef/审计、远程 SQL——原因见该文档。
 

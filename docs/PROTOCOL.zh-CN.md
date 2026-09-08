@@ -20,7 +20,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/metrics` | 采集服务器指标（CPU/内存/负载/磁盘（含 inode 使用率）+ 网络接口速率 + Top CPU/内存进程，只读命令；`cached: true` 返回上次快照） |
 | `ssh/host-key/check` | 连接维度主机密钥预检（探针三态：已知 / 变更 / 未知，不发认证） |
 | `ssh/settings/get`、`ssh/settings/set` | 读取/运行时更新 Quick Sudo 编排设置 |
-| `mcp/tools`、`mcp/call` | MCP 工具发现与执行（供 DBX MCP 桥 `dbx_call_plugin_tool` 调用；连接凭据以标准 lifecycle payload 转发，按 `connectionId` 池化） |
+| `mcp/tools`、`mcp/call` | MCP 工具发现与执行（供 DBX MCP 桥 `dbx_call_plugin_tool` 调用；连接凭据以标准 lifecycle payload 转发，按 `connectionId` 池化，payload 新增 `name` 字段携带连接名）。连接类工具新增可选 `connectionName`（与 `connectionId` 二选一，注册表按名匹配，重名报错并列出候选）；stdio 独立模式对未注册 `connectionId` 的调用自动经宿主桥 `POST /list-plugin-connections` 转发到运行中的 DBX 应用执行——请求 `{"plugin_id":"io.dbx.ssh"}`、响应 `{"connections":[{id,name,host,port,username,authentication,readOnly}]}`（仅元数据，密钥只出布尔标志位），桥不可用回落内联凭据；新增 `ssh_list_connections` 工具即消费该路由，降级时仅回本会话注册表并附 `note` |
 | `mcp/settings/get`、`mcp/settings/set` | MCP SFTP 尺寸限制策略（maxRead/maxUpload/maxDownload，持久化，`--mcp` 同源生效）；`localTransferRoot` 配置 `sftp_upload`/`sftp_download` 本地传输根（绝对路径或空串回落默认根=临时目录+插件数据目录；敏感路径黑名单任何模式叠加生效） |
 | `sftp/chmod` | 修改远端路径权限位（八进制） |
 | `sftp/diskUsage` | 路径所在挂载的磁盘用量 |
@@ -41,14 +41,14 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `connection/action` | 连接表单动作（manifest `connection-provider.actions` 声明）：`action=quick-sudo-profiles` 返回全局配置清单与本连接绑定状态的纯文本摘要（`{message, fieldValues}`） |
 | `keys/discover` | 本地 SSH 私钥发现（不返回私钥内容） |
 | `ssh/knownHosts/list`、`ssh/knownHosts/remove` | known_hosts 条目管理（含 `@cert-authority` / `@revoked` 标记条目） |
-| `ssh/sessions/list` | 只读会话清单：sidecar 当前跟踪的活跃会话（对齐 tiny-rdm ListSessions） |
+| `ssh/sessions/list` | 只读会话清单：sidecar 当前跟踪的活跃会话 |
 | `ssh/quickCommands/list`、`ssh/quickCommands/save`、`ssh/quickCommands/delete` | 全局快速命令管理（用户自定义常用命令片段，插件数据目录持久化，所有连接/工作台共享） |
-| `ssh/terminal/batchInput` | 批量发送：把同一条命令写入多个已打开会话的交互终端（PTY 键盘语义，对齐 tiny-rdm batch send），返回逐会话发送结果 |
+| `ssh/terminal/batchInput` | 批量发送：把同一条命令写入多个已打开会话的交互终端（PTY 键盘语义），返回逐会话发送结果 |
 | `ssh/batchBar/state`（notify） | 批量发送命令条的跨工作台状态同步：工作台把 `{ source, draft, quickPickId, open }` 以通知送达 sidecar，sidecar 原样以同名事件广播给所有插件 webview，各端按 `source` 过滤自己的回声；纯转发不落存储，旧版 sidecar 未注册时调用方静默降级 |
 
 ## 运行时设置
 
-`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文；传 `revealSecrets: true` 时额外回显本连接配置的 `sudoPassword` / `totpSecret` 原始串（多密钥原文），供工作台设置弹窗预填已存原值——该参数仅工作台使用，MCP 通道不暴露，缺省响应与此前完全一致；另附 `quickSudoProfileId` / `quickSudoProfileName` 报告生效的全局配置绑定（`sudo_source=global` 时含连接表单引用解析结果），未绑定为空串，`sudoSource`（`custom` / `global` / `off`，生效来源），以及 `agentTerminalMode`（`off` / `auto` / `strict`，AI 终端同步模式，见下节））；`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`、可选 `agentTerminalMode`（非法值报错，缺省不改变），以及可选 `quickSudoProfileId`（非空须引用存在的全局配置并持久化绑定，空串解除绑定，缺省不改变；挑选配置会将连接的 `sudo_source` 切到 `global`，解除时 `global` 回落 `custom`）。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐 tiny-rdm 每次输出动态 resolve 的语义）；终端侧监视器随每次设置/配置更新按当前连接状态**重新挂载**：连接时未配置凭据（如密钥认证连接）或 Quick Sudo 处于关闭的会话，在运行时配置密码/TOTP 或重新打开开关后立即开始自动应答，无需重连。`sudoPassword` 等字段级覆盖是 sidecar 本地值，sidecar 重启或重开连接后恢复宿主下发的配置，而 `quickSudoProfileId` 绑定持久化在插件数据目录、重启保留。`agentTerminalMode` 为连接级内存态（重启回默认 `off`）。工作台工具栏提供设置弹窗；宿主连接表单通过 manifest 字段提供持久化配置入口：`sudo_source`（三选一 `custom` 本连接 / `global` 全局配置 / `off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射）、`sudo_profile`（仅 `global` 时显示，声明 `options_action: sudo/profiles/options` 由宿主渲染为动态下拉，无该扩展能力的宿主保留文本回退）、`sudo_password`、`sudo_use_pty`（仅 `custom` 时显示）、2FA 编排四件套 `totp_secret`、`auth_flow_mode`、`password_prompt_hint`、`totp_prompt_hint`（`global` 时隐藏——凭据来源整体由全局配置接管；`custom`/`off` 时常显以服务登录期 keyboard-interactive）、超时与 keepalive、`jump_hosts`、`set_env`（会话环境变量）、`remote_command`（会话命令，两者详见「会话环境与会话命令（SetEnv / RemoteCommand）」）。
+`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文；传 `revealSecrets: true` 时额外回显本连接配置的 `sudoPassword` / `totpSecret` 原始串（多密钥原文），供工作台设置弹窗预填已存原值——该参数仅工作台使用，MCP 通道不暴露，缺省响应与此前完全一致；另附 `quickSudoProfileId` / `quickSudoProfileName` 报告生效的全局配置绑定（`sudo_source=global` 时含连接表单引用解析结果），未绑定为空串，`sudoSource`（`custom` / `global` / `off`，生效来源），以及 `agentTerminalMode`（`off` / `auto` / `strict`，AI 终端同步模式，见下节））；`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`、可选 `agentTerminalMode`（非法值报错，缺省不改变），以及可选 `quickSudoProfileId`（非空须引用存在的全局配置并持久化绑定，空串解除绑定，缺省不改变；挑选配置会将连接的 `sudo_source` 切到 `global`，解除时 `global` 回落 `custom`）。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐每次输出动态 resolve 的语义）；终端侧监视器随每次设置/配置更新按当前连接状态**重新挂载**：连接时未配置凭据（如密钥认证连接）或 Quick Sudo 处于关闭的会话，在运行时配置密码/TOTP 或重新打开开关后立即开始自动应答，无需重连。`sudoPassword` 等字段级覆盖是 sidecar 本地值，sidecar 重启或重开连接后恢复宿主下发的配置，而 `quickSudoProfileId` 绑定持久化在插件数据目录、重启保留。`agentTerminalMode` 为连接级内存态（重启回默认 `off`）。工作台工具栏提供设置弹窗；宿主连接表单通过 manifest 字段提供持久化配置入口：`sudo_source`（三选一 `custom` 本连接 / `global` 全局配置 / `off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射）、`sudo_profile`（仅 `global` 时显示，声明 `options_action: sudo/profiles/options` 由宿主渲染为动态下拉，无该扩展能力的宿主保留文本回退）、`sudo_password`、`sudo_use_pty`（仅 `custom` 时显示）、2FA 编排四件套 `totp_secret`、`auth_flow_mode`、`password_prompt_hint`、`totp_prompt_hint`（`global` 时隐藏——凭据来源整体由全局配置接管；`custom`/`off` 时常显以服务登录期 keyboard-interactive）、超时与 keepalive、`jump_hosts`、`set_env`（会话环境变量）、`remote_command`（会话命令，两者详见「会话环境与会话命令（SetEnv / RemoteCommand）」）。
 
 ## AI 终端同步执行（agent terminal mode）
 
@@ -80,7 +80,7 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
 
 ## Quick Sudo 全局配置
 
-`sudo/profiles/*` 管理跨连接复用的多套 Quick Sudo 配置（对齐 tiny-rdm 的全局 Manual Sudo + Profile 级 QuickSudo 覆盖），持久化于 `<plugin_data_dir>/quick-sudo-profiles.json`（版本化 JSON：`profiles` + `bindings`，Unix 权限 0600，原子写；损坏按空库处理）。每套配置含：`name`（唯一，trim 后 1–64 字符）、`sudoPassword`、`totpSecret`、`authFlowMode`（`password_only` / `password_plus_otp` / `password_then_otp`）、`passwordPromptHint`、`totpPromptHint`、`sudoUsePty`。上限 20 套。
+`sudo/profiles/*` 管理跨连接复用的多套 Quick Sudo 配置（全局配置 + 连接级覆盖语义），持久化于 `<plugin_data_dir>/quick-sudo-profiles.json`（版本化 JSON：`profiles` + `bindings`，Unix 权限 0600，原子写；损坏按空库处理）。每套配置含：`name`（唯一，trim 后 1–64 字符）、`sudoPassword`、`totpSecret`、`authFlowMode`（`password_only` / `password_plus_otp` / `password_then_otp`）、`passwordPromptHint`、`totpPromptHint`、`sudoUsePty`。上限 20 套。
 
 - `sudo/profiles/list`：返回 `{ profiles: [视图…] }`，按名称排序；视图含 `id`、`name`、`sudoPasswordSet`、`totpConfigured`、`authFlowMode`、提示词、`sudoUsePty`、`createdAt`、`updatedAt`，**永不携带密钥明文**。
 - `sudo/profiles/reveal`：参数 `id`；返回 `{ profile: 完整视图 }`（含 `sudoPassword` / `totpSecret` 原值），供工作台配置编辑器预填已存原值；未知 id 报错。**仅工作台方法，不进 MCP 工具面**——MCP 通道（list/save/工具 schema）只见布尔标记，密钥不进 agent 上下文。
@@ -94,7 +94,7 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
 ## 跳板机（ProxyJump）与连接存活
 
 - `external_config.jump_hosts`（最多 3 跳）定义跳板链：每跳包含 `host`、`port`（缺省 22）、`username`、`authentication`（`password` / `private-key` / `private-key-password` / `agent`）及对应凭据字段，可选 `totp_secret` / 提示词 / `auth_flow_mode`。配置跳板后整条链替换 runtime 隧道，末跳直连目标 `host:port`；每跳主机密钥独立校验，登录期 keyboard-interactive 2FA 同样生效。会话关闭时按序断开整条链。
-- 协议层 keepalive：russh 按 `keepalive_interval_secs`（连接表单字段，缺省 30 秒，0 关闭）周期发送带应答的 keepalive 全局请求（等效 OpenSSH `ServerAliveInterval`），连续 3 次无应答即判定连接死亡（对齐 tiny-rdm 的 `keepaliveMaxFail`），终端转入断开态、由工作台重连；跳板链每跳同参。
+- 协议层 keepalive：russh 按 `keepalive_interval_secs`（连接表单字段，缺省 30 秒，0 关闭）周期发送带应答的 keepalive 全局请求（等效 OpenSSH `ServerAliveInterval`），连续 3 次无应答即判定连接死亡，终端转入断开态、由工作台重连；跳板链每跳同参。
 - 终端活动保活（`terminal_keepalive_secs`，连接表单字段，默认 0 关闭）：按配置间隔向交互终端 PTY 注入"空格+退格"（净零输入——空命令行不入 shell history，全屏程序内仅光标往返），用于对抗按键盘活动判空闲的服务器侧策略（`TMOUT`、堡垒机审计），协议层探测对此无效。解析侧钳制 5–3600 秒（`model.rs` `clamp_terminal_keepalive`）；仅作用于终端会话（MCP exec 通道不注入），会话关闭即随读写循环退出。`ssh/sessions/list` 以 `terminalKeepaliveSecs` 上报生效值。
 
 ## 会话环境与会话命令（SetEnv / RemoteCommand）
@@ -108,11 +108,11 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
 
 `ssh/exec` 参数为 `sessionId`、`command`、`sudo`（可选，默认 false）、`timeoutSecs`（可选，5–300 秒）、`execId`（可选，用于取消），返回 `output` 与 `exitCode`；`ssh/exec/cancel` 携带 `execId` 中止执行中的命令并返回取消错误。命令通道（sudo 与非 sudo）会先注入连接的 `set_env` 条目（见「会话环境与会话命令」），注入失败即报错。
 
-Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
+Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 - 命令以 `sudo -S -p '' sh -c '…'` 执行，密码写入 stdin（优先 `connection_secrets.sudo_password`，缺省回退登录密码）；未配置密码时回退 `sudo -n`（NOPASSWD 或已缓存时间戳）。
 - 执行期间持续监控提示流，识别密码 / TOTP / 组合提示（内置中英文模式，可用 `external_config.password_prompt_hint`、`totp_prompt_hint` 自定义），并依据 `external_config.auth_flow_mode`（`password_only` / `password_plus_otp` / `password_then_otp`，默认 `password_then_otp`）自动应答。
-- TOTP 密钥来自 `connection_secrets.totp_secret`，支持 `otpauth://totp/…` URI、base32 密钥或 4–10 位静态码；按 RFC 6238（SHA1/SHA256/SHA512，6–8 位）现场计算验证码。多个密钥按行/分号分隔，轮换选择对齐 tiny-rdm 的 resolveRotatingOTP：未用过的验证码优先、剩余有效时长最长者优先，配置顺序兜底。**同一验证码在提交后的重放窗口（自身有效窗 + ±1 步长）内不会被再次注入**——服务器普遍接受相邻窗口验证码，重复提交必然失败；命中窗口时自动应答直接跳过（不再等待用户输入），并在编排日志标注 `otp auto-answer skipped`。使用/防重放两本台账驻留 **sidecar 进程全局**（按 **目标作用域** `user@host:port` + 密钥 SHA-256 指纹 + 窗口 + 验证码键控，只存指纹不存密钥），跨 exec 调用、跨终端会话共享——MCP `ssh_exec_sudo` 每次调用独立解析编排实例，轮换状态依然连续；作用域隔离使共用同一密钥的多个连接互不吞码（A 机烧掉的码在 B 机仍可提交）；静态码的 usage 记账不随 `now+窗口` 漂移（键控不含时间戳）。sidecar 重启即清零。
+- TOTP 密钥来自 `connection_secrets.totp_secret`，支持 `otpauth://totp/…` URI、base32 密钥或 4–10 位静态码；按 RFC 6238（SHA1/SHA256/SHA512，6–8 位）现场计算验证码。多个密钥按行/分号分隔，轮换选择规则：未用过的验证码优先、剩余有效时长最长者优先，配置顺序兜底。**同一验证码在提交后的重放窗口（自身有效窗 + ±1 步长）内不会被再次注入**——服务器普遍接受相邻窗口验证码，重复提交必然失败；命中窗口时自动应答直接跳过（不再等待用户输入），并在编排日志标注 `otp auto-answer skipped`。使用/防重放两本台账驻留 **sidecar 进程全局**（按 **目标作用域** `user@host:port` + 密钥 SHA-256 指纹 + 窗口 + 验证码键控，只存指纹不存密钥），跨 exec 调用、跨终端会话共享——MCP `ssh_exec_sudo` 每次调用独立解析编排实例，轮换状态依然连续；作用域隔离使共用同一密钥的多个连接互不吞码（A 机烧掉的码在 B 机仍可提交）；静态码的 usage 记账不随 `now+窗口` 漂移（键控不含时间戳）。sidecar 重启即清零。
 - `external_config.sudo_source` 选择凭据来源：`custom` 本连接凭据（默认）、`global` 全局 Quick Sudo 配置（`sudo_profile` 按名称或 id 引用，未解析到时回落工作台绑定，再退化为本连接凭据，连接不失败）、`off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射（true→`custom`、false→`off`）。`sudo_use_pty` 可为需要 TTY 的 PAM 栈请求 PTY（默认关闭，此时提示走 stderr；`global` 模式下配置自带的 PTY 偏好优先）。
 - 检测到 `sorry, try again` 等认证失败标记立即报错；认证应答最多三轮。sudo 执行成功后按连接启动 `sudo -nv` 保活循环：每 4 分钟（`SUDO_KEEPALIVE_INTERVAL`）校验/续期时间戳，连续 2 次（`SUDO_KEEPALIVE_MAX_FAILURES`）校验失败自动停止（时间戳已失效，下次 sudo 执行会重新注册）；同一连接只保留一个循环，连接断开或会话清理时确定性中止。
 - 只读连接拒绝 sudo 执行；密码与 TOTP 密钥仅停留在 sidecar 内存中，不下发工作台。
@@ -123,16 +123,16 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 ## 终端内 Quick Sudo
 
-工作台终端输出流经与 tiny-rdm `detectAndHandleSudo` 相同的状态机：
+工作台终端输出流经统一的 sudo 检测与自动应答状态机：
 
 - 出现 sudo 密码提示（`[sudo] password for …` / `Password:`）时自动注入密码并回车；sudo 需要的 2FA 验证码在配置了 `totp_prompt_hint`（或处于 `password_plus_otp` 模式）时自动应答，每个认证序列只应答一次。
-- 通用提示仅在配置自定义提示词时应答，避免误答其他交互程序（与 tiny-rdm 的保守策略一致）。
+- 通用提示仅在配置自定义提示词时应答，避免误答其他交互程序（保守策略）。
 - **并发同靶排队**：批量发送把 sudo 命令写入同一 host:port 的多个会话时，各会话的 OTP 提示几乎同时出现，而当前窗口唯一的码已被先到的会话提交、重放保护拒绝重复注入——后到的提示不再永远搁置，而是推迟到下一个 TOTP 窗口边界（+1s）由终端读循环（250ms tick）自动补答新窗口的码（静态恢复码不变，不推迟）；期间检测到 shell 提示符即照常复位。
 - 检测到 shell 提示符（行尾 `$` / `#`）即重置状态机。`sudo_source=off`（旧 `quick_sudo=false` 同义）或只读连接时整体停用；每次自动应答（含推迟补答）发出 `ssh/auto-sudo` 事件（`kind` 为 `password` / `otp`）供宿主审计。
 
 ## Sudo 文件操作
 
-`sudo/*` 方法族在不以 root 登录的前提下管理远端 root 文件，一比一对齐 tiny-rdm 的 Sudo 文件操作族（`StatSudo` / `ListDirSudo` / `ReadFileSudo` / `WriteFileSudo` / `MkdirSudo` / `RemoveSudo` / `RemoveAllSudo` / `ChmodSudo` / `RenameSudo`）。全部方法复用 `ssh/exec` 的 Quick Sudo 编排（密码 / TOTP 自动应答、`auth_flow_mode`、提示词、`sudo -nv` 保活），在远端以 sudo 权限执行命令并解析输出：stat 走 `stat -c`，list 走 `ls -la --time-style=+%s`，read 走 `dd` / `base64`，write 走 `dd of=`。
+`sudo/*` 方法族在不以 root 登录的前提下管理远端 root 文件，覆盖完整的 Sudo 文件操作族（`StatSudo` / `ListDirSudo` / `ReadFileSudo` / `WriteFileSudo` / `MkdirSudo` / `RemoveSudo` / `RemoveAllSudo` / `ChmodSudo` / `RenameSudo`）。全部方法复用 `ssh/exec` 的 Quick Sudo 编排（密码 / TOTP 自动应答、`auth_flow_mode`、提示词、`sudo -nv` 保活），在远端以 sudo 权限执行命令并解析输出：stat 走 `stat -c`，list 走 `ls -la --time-style=+%s`，read 走 `dd` / `base64`，write 走 `dd of=`。
 
 公共参数：每个方法都必填 `sessionId`（string，会话 id），下文参数表不再重复列出。共同错误情形：
 
@@ -186,7 +186,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 ### sudo/writeFile
 
-整体覆写小文件（对应 tiny-rdm `WriteFileSudo`）。
+整体覆写小文件。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -221,7 +221,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 | --- | --- | --- | --- |
 | `path` | string | 是 | 待删除路径 |
 
-递归删除，不跟随符号链接——只删除链接本身，不触碰其指向的目标（对齐 tiny-rdm `RemoveAllSudo` 的防误删语义）。错误：路径不存在；只读连接；sudo 不可用。
+递归删除，不跟随符号链接——只删除链接本身，不触碰其指向的目标（防误删语义）。错误：路径不存在；只读连接；sudo 不可用。
 
 ### sudo/chmod
 
@@ -243,7 +243,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 ## 扩展文件操作
 
-`sftp/*` 扩展方法基于 russh-sftp 原生协议与远端 `tar` 命令，补齐 tiny-rdm `sftp_service.go` 的 `Stat` / `Exists` / `Touch` / `WriteFile` / `Archive` / `Extract` 能力，走常规 SFTP 通道（无 sudo）。公共参数：均必填 `sessionId`（string，会话 id），下文参数表不再重复列出；写操作（`touch` / `write` / `archive` / `extract`）被只读连接拒绝。
+`sftp/*` 扩展方法基于 russh-sftp 原生协议与远端 `tar` 命令，提供 `Stat` / `Exists` / `Touch` / `WriteFile` / `Archive` / `Extract` 能力，走常规 SFTP 通道（无 sudo）。公共参数：均必填 `sessionId`（string，会话 id），下文参数表不再重复列出；写操作（`touch` / `write` / `archive` / `extract`）被只读连接拒绝。
 
 ### sftp/stat
 
@@ -259,7 +259,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 ### sftp/read
 
-小文件直读（非传输槽，对应 tiny-rdm `ReadFile` 的偏移分片语义）。
+小文件直读（非传输槽，支持 `offset` 偏移分片语义）。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -279,7 +279,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 ### sftp/write
 
-小文件直写（非传输槽，对应 tiny-rdm `WriteFile`）。
+小文件直写（非传输槽）。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -309,7 +309,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 ### sftp/copy
 
-服务器内复制（对应 tiny-rdm 的 server-internal copy & paste，`FsCopyMove` 语义）。源被复制**进** `toDir`，保留各自的基名；目录递归复制并保留权限（远端 `cp -a --`）。
+服务器内复制（server-internal copy & paste 语义）。源被复制**进** `toDir`，保留各自的基名；目录递归复制并保留权限（远端 `cp -a --`）。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -321,7 +321,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 ### sftp/move
 
-服务器内剪切 / 移动。参数与返回结构同 `sftp/copy`；远端 `mv -f --`（`overwrite: false` 时先探测目标，存在则按项报错），移动完成后源路径不复存在。sudo 模式不做（tiny-rdm 亦无 sudo copy/move）。远端 `cp` / `mv` 的执行预算为 300 秒。
+服务器内剪切 / 移动。参数与返回结构同 `sftp/copy`；远端 `mv -f --`（`overwrite: false` 时先探测目标，存在则按项报错），移动完成后源路径不复存在。sudo 模式不做。远端 `cp` / `mv` 的执行预算为 300 秒。
 
 ## 服务器指标
 
@@ -372,7 +372,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 ## 本地密钥与 known_hosts
 
-本地能力，不依赖任何连接，均不携带 `sessionId`。对应 tiny-rdm 的 `DiscoverKeys` 与 `ListKnownHosts` / `RemoveKnownHost`。两类方法都只返回元信息（路径、算法、指纹），绝不返回私钥内容或口令。
+本地能力，不依赖任何连接，均不携带 `sessionId`。两类方法都只返回元信息（路径、算法、指纹），绝不返回私钥内容或口令。
 
 ### keys/discover
 
@@ -435,7 +435,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 全局快速命令：用户自定义的常用命令片段（名称 + 命令原文），持久化在
 `DBX_PLUGIN_DATA_DIR/quick-commands.json`（原子写、Unix 0600、坏文件降级为空清单），
-**所有连接与工作台共享一份**（对齐 tiny-rdm 快速命令的全局语义；此前存工作台
+**所有连接与工作台共享一份**（全局共享语义；此前存工作台
 localStorage 会因宿主 webview 存储分区表现为"绑连接"，已废弃该存储）。
 上限 20 条、`name` ≤ 60 字符、`command` ≤ 500 字符（与前端 `lib/quickCommands.ts`
 常量一致）。命令不含凭据字段，无脱敏需求，但文件权限与 sudo 配置存储保持同款收紧。
@@ -448,7 +448,7 @@ localStorage 会因宿主 webview 存储分区表现为"绑连接"，已废弃�
 
 ### ssh/terminal/batchInput
 
-批量发送命令（对齐 tiny-rdm batch send）：把同一条命令写入多个**已打开**会话的
+批量发送命令：把同一条命令写入多个**已打开**会话的
 交互终端（PTY 键盘语义）——输出回显在各自会话的终端里，`cd`/`env` 等状态留在
 各 shell；方法本身不收集远端输出与退出码，只返回逐会话**发送**结果。
 

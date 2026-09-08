@@ -8,7 +8,7 @@ DBX 的 MCP 服务器（`dbx mcp` 或桌面内置 MCP）内置两个通用插件
 
 | 工具 | 说明 |
 | --- | --- |
-| `dbx_list_plugin_tools` | 列出所有已装插件贡献的 MCP 工具（含本插件的 25 个 SSH/SFTP 工具及其 JSON Schema） |
+| `dbx_list_plugin_tools` | 列出所有已装插件贡献的 MCP 工具（含本插件的 28 个 SSH/SFTP 工具及其 JSON Schema） |
 | `dbx_call_plugin_tool` | 调用插件工具；传 `connectionId` 即引用 DBX 已保存的 SSH 连接，凭据由 DBX 解析转发，**工具参数里不出现任何密码** |
 
 典型调用流（MCP 客户端视角）：
@@ -51,7 +51,25 @@ dbx_call_plugin_tool {
 dbx-plugin-ssh --mcp
 ```
 
-此模式下没有 DBX 连接存储，凭据随每次调用内联传入（`host`/`username`/`password` 或 `privateKeyPath`，及 Quick Sudo/2FA 编排字段、`jumpHosts` 跳板链），按 `username@host:port` 进程内池化。未知主机密钥采用 **TOFU 首次信任**（记录后变化仍拒绝）。MCP 模式与 DBX 插件模式互斥：同一进程只运行其中一种。
+此模式下没有 DBX 连接存储，凭据随每次调用内联传入（`host`/`username`/`password` 或 `privateKeyPath`，及 Quick Sudo/2FA 编排字段、`jumpHosts` 跳板链），按 `username@host:port` 进程内池化。未知主机密钥采用 **TOFU 首次信任**（记录后变化仍拒绝）。MCP 模式与 DBX 插件模式互斥：同一进程只运行其中一种。带 `connectionId` / `connectionName` 的调用另有桥接兜底，见下节。
+
+### stdio 桥接兜底（免内联凭据）
+
+stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec_sudo` / `ssh_run_bg` / `ssh_task_status` / `ssh_metrics` / `sftp_*` 全家）时，若该 id 未在本会话注册，整次调用自动转发给运行中的 DBX 应用本地 TCP 桥执行——应用未运行会自动唤起，凭据由应用侧解析，**不经工具参数**；桥不可用（应用无法唤起、桥端口不可达等）时回落原内联凭据路径，工具面形状不变。
+
+转发语义注意：
+
+- 命令在**应用侧** sidecar 执行，本会话的进程级只读开关（`DBX_SSH_MCP_READ_ONLY`）与每连接 sudo 白名单闸门**不适用**——由应用侧连接自身的只读标志与连接配置生效。
+- 未注册 id 的报错文案给出三条出路：启动 DBX 应用 / 用 `ssh_list_connections` 列出 id / 提供内联凭据。
+- 完整列表能力要求应用版本含 `POST /list-plugin-connections` 桥路由，旧版应用上 `ssh_list_connections` 降级为"仅本会话注册表"并附 `note` 说明。
+
+### connectionId 从哪来
+
+按以下顺序发现，凭据暴露面逐级增大：
+
+1. **`ssh_list_connections`**（首选，无参数）：列出已保存连接元数据（id / name / host / port / username / authentication / readOnly），**只出元数据、任何密钥只出布尔标志位，绝不出值**；`source` 字段标明数据来源（`dbx-app-bridge` 应用桥 / `session-registry` 本会话注册表），降级时附 `note` 说明。
+2. **`connectionName`**：连接类工具可用连接名代替 `connectionId`，stdio 下按名解析出 id 后同样走桥接转发；重名报错并列出候选。
+3. **内联凭据（最后兜底）**：桥不可用时才考虑。凭据所在位置为 DBX 应用数据 `com.dbx.app/dbx.db` 的 `connections` 与 `connection_secrets` 表——凭据会进工具参数与 LLM 上下文（暴露面），仅限本机可信会话使用。
 
 ### 接入 ZCode（stdio 客户端）
 
@@ -72,14 +90,15 @@ dbx-plugin-ssh --mcp
 }
 ```
 
-- 会话启动时自动连接；`tools/list` 即 25 个工具，无需 DBX 在场。
-- 凭据内联传参（或在 DBX 桥模式可用时优先走方式一）；数据目录默认
+- 会话启动时自动连接；`tools/list` 即 28 个工具，无需 DBX 在场。
+- 凭据内联传参、带 `connectionId` / `connectionName` 时自动桥接转发（见上节），
+  或在 DBX 桥模式可用时优先走方式一；数据目录默认
   `/tmp/dbx-plugin-data/io.dbx.ssh`，可用 `DBX_PLUGIN_DATA_DIR` 重定向
   （known_hosts / `mcp-settings.json` / Quick Sudo 全局配置都在其中）。
 - 真机回环验证：`DBX_SSH_SMOKE_PASSWORD=… python3 scripts/smoke_mcp.py
   --host <host> --port <port> --username <user>`（凭据走环境变量，不落盘）。
 
-## 工具一览（27 个，两种方式通用）
+## 工具一览（28 个，两种方式通用）
 
 ### 本地传输路径约束（sftp_upload / sftp_download）
 
@@ -100,6 +119,7 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 
 | 工具 | 说明 |
 | --- | --- |
+| `ssh_list_connections` | 列出已保存连接的元数据（id / name / host / port / username / authentication / readOnly），参数无；**仅元数据，任何密钥只出布尔标志位，绝不出值**。数据源为 DBX 应用本地桥（`source: "dbx-app-bridge"`）；桥不可用或应用版本过旧时降级为"仅本会话注册表"（`source: "session-registry"`）并附 `note` 字段说明（详见「方式二」的「connectionId 从哪来」） |
 | `ssh_exec` / `ssh_exec_sudo` | 非交互远程命令；sudo 版注入密码并自动应答 2FA/TOTP。TOTP 支持多密钥（换行/分号分隔）：跨调用自动轮换，优先未过期且未使用过的验证码，重放窗口内已提交的码不再注入。两者均受危险命令确认门约束（见下节），只读连接上 `ssh_exec` 仅放行白名单巡检命令，配置了连接 sudo 白名单时特权命令还须命中白名单条目（见下节）。两者均支持可选 `runInTerminal`（见「AI 终端同步执行」）；stdio 模式传 `true` 且带 `connectionId` 时自动转发到运行中的 DBX app（未运行则唤起），在 app 的可见终端里执行。**超过 ~10 秒的命令请改用 `ssh_run_bg`**（宿主等待上限与防重复执行见「长任务与断线恢复」） |
 | `ssh_run_bg` | 把长命令以 nohup 方式脱离会话启动，立即返回 `taskId`/`pid`/`logPath`；输出落在服务器 `/tmp/.dbx-ssh-tasks/<taskId>.log`，断线、超时、换会话均不丢。与 `ssh_exec` 同受危险命令确认门与只读写门约束 |
 | `ssh_task_status` | 轮询 `ssh_run_bg` 任务：`state`（running/done/missing）、完成后的 `exitCode`、pid 存活状态与输出尾部（`tailBytes`，200–16000）。通过服务器侧日志文件查询，天然跨连接/跨会话 |
@@ -113,6 +133,8 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 | `sftp_mkdir` / `sftp_remove` / `sftp_rename` / `sftp_chmod` | 目录与文件管理 |
 | `sftp_disk_usage` | 路径所在挂载的磁盘用量 |
 | `sftp_copy` / `sftp_move` | 服务器内复制 / 剪切（`from` 单值或数组 → `toDir`，逐项返回成败） |
+
+**连接寻址（connectionId / connectionName 二选一）**：上表除 `ssh_list_connections`、known_hosts 管理与本地工具外的连接类工具，都可用 `connectionId` 或 `connectionName` 定位连接。`connectionName` 传连接名，注册表按名匹配，重名直接报错并列出候选 id（要求改用 `connectionId` 精确定位）；stdio 模式下按名解析出 id 后同样走桥接转发。两者都缺省时回落内联凭据拨号。
 
 ## 生产环境误操作防范
 
@@ -210,9 +232,12 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
   转发要求 `connectionId` 指向 DBX 已保存的连接（凭据由 app 侧解析，不经 stdio 调用方）。
   `connectionId` 已随全部连接类工具的 inputSchema 声明（0.4.12：`ssh_*` / `sftp_*` 共
   22 个），严格校验的 stdio 客户端（如 ZCode）不会再以「未声明参数」拒绝该字段；
-  连接 id 可从 DBX 连接存储查得（`connections` 表 `id` 列，连接名在 `config_json.name`）。
+  连接 id 可用 `ssh_list_connections` 列出（见「connectionId 从哪来」；DBX 连接存储
+  `connections` 表 `id` 列、连接名在 `config_json.name` 为最后兜底）。
 - 该连接没有打开的终端会话时报错引导（"open the SSH workbench terminal first"），
-  不回退到隐藏执行——可见才执行是该模式的承诺。
+  不回退到隐藏执行——可见才执行是该模式的承诺；runInTerminal 相关两条报错
+  （未注册连接 / 无终端会话）末尾均追加提示"可用 `ssh_list_connections` 列出
+  已保存连接 id"。
 - 连接级默认行为由工作台设置 `agentTerminalMode` 决定（`off` 默认不路由 /
   `auto` 分级审批 / `strict` 每条必审，协议见 PROTOCOL「AI 终端同步执行」）；
   `runInTerminal` 显式值优先于连接模式。
@@ -225,6 +250,6 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
 既有只读白名单（含敏感路径拒绝清单）、灾难 `confirmDestructive`、进程级只读
 开关先于路由判定生效，`runInTerminal` 不放宽任何安全门。
 
-## 与 tiny-rdm mcpctl 的关系
+## MCP 工具命名与语义
 
-工具命名与语义对齐 tiny-rdm 的 `ssh_exec` / `ssh_exec_sudo` / `sftp_*` 工具族。tiny-rdm 用本地 profile 存储 + 审批；本插件在 DBX 桥模式下凭据与审批归宿主（DBX 连接存储 + MCP scope），独立模式用内联凭据 + TOFU，并额外提供 `ssh_metrics`、`sftp_chmod`、`sftp_disk_usage` 与 known_hosts 管理。
+工具命名与语义沿用 `ssh_exec` / `ssh_exec_sudo` / `sftp_*` 工具族约定。本插件在 DBX 桥模式下凭据与审批归宿主（DBX 连接存储 + MCP scope），独立模式用内联凭据 + TOFU，并额外提供 `ssh_metrics`、`sftp_chmod`、`sftp_disk_usage` 与 known_hosts 管理。

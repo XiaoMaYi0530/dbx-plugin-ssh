@@ -46,6 +46,3 @@ before running `dbx-plugin package .`.
 
 The visual fixture is available at `frontend/visual.html` when running Vite.
 It supplies deterministic SSH/SFTP data for 1440×900 and 1920×1080 UI checks.
-
-Framework validation notes are maintained in
-[`docs/FRAMEWORK_FEEDBACK.zh-CN.md`](docs/FRAMEWORK_FEEDBACK.zh-CN.md).
