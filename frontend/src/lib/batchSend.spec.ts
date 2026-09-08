@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   batchTargetLabel,
+  deriveBatchCommandName,
   normalizeBatchTargets,
+  quickPickCommandById,
   selectBatchTargets,
   summarizeBatchResults,
   toggleBatchTarget,
@@ -87,5 +89,37 @@ describe("summarizeBatchResults", () => {
   it("treats malformed payloads as zero counts", () => {
     expect(summarizeBatchResults(undefined)).toEqual({ rows: [], sent: 0, failed: 0 });
     expect(summarizeBatchResults("nope" as unknown as unknown[]).failed).toBe(0);
+  });
+});
+
+describe("deriveBatchCommandName", () => {
+  it("flattens whitespace and keeps short commands intact", () => {
+    expect(deriveBatchCommandName("  systemctl   status\nnginx  ")).toBe("systemctl status nginx");
+  });
+
+  it("truncates long commands with an ellipsis", () => {
+    const name = deriveBatchCommandName("a".repeat(40));
+    expect(name.length).toBe(30);
+    expect(name.endsWith("…")).toBe(true);
+  });
+
+  it("returns empty for blank commands", () => {
+    expect(deriveBatchCommandName("   ")).toBe("");
+  });
+});
+
+describe("quickPickCommandById", () => {
+  const commands = [
+    { id: "c1", name: "df", command: "df -h" },
+    { id: "c2", name: "uptime", command: "uptime" },
+  ];
+
+  it("returns the command text for a known id", () => {
+    expect(quickPickCommandById(commands, "c2")).toBe("uptime");
+  });
+
+  it("returns empty for unknown or empty ids", () => {
+    expect(quickPickCommandById(commands, "missing")).toBe("");
+    expect(quickPickCommandById(commands, "")).toBe("");
   });
 });

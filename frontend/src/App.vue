@@ -38,6 +38,7 @@ import {
   Save,
   Scissors,
   Search,
+  Send,
   Settings,
   ShieldCheck,
   SquareTerminal,
@@ -85,8 +86,8 @@ import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousC
 import { expandSelection, filterSftpEntries, type SftpTypeFilter } from "./lib/sftpFileFilters";
 import { pushPathHistory, sanitizePathHistories } from "./lib/sftpPathHistory";
 import { browseCommandHistory, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
-import { normalizeQuickCommands, type QuickCommand } from "./lib/quickCommands";
-import { batchTargetLabel, normalizeBatchTargets, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
+import { normalizeQuickCommands, QUICK_COMMANDS_LIMIT, type QuickCommand } from "./lib/quickCommands";
+import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, type KnownAuthMethod } from "./lib/connectionInfo";
 import { clampFontSize } from "./lib/terminalZoom";
 import { commandMarkerTooltip, formatCommandDuration, Osc633CommandParser, runningCommandElapsedMs, type Osc633StreamUpdates } from "./lib/terminalCommandMarkers";
@@ -447,9 +448,21 @@ const quickCommands = ref<QuickCommand[]>(loadQuickCommands());
 const quickMenuOpen = ref(false);
 const quickSaving = ref(false);
 const quickDraft = reactive<{ id?: string; name: string; command: string }>({ name: "", command: "" });
-// 批量发送：目标来自 ssh/sessions/list（跨连接全部活跃会话），命令写入各
-// 会话交互终端（PTY 键盘语义，输出回显在各自终端，对齐 tiny-rdm batch send）。
-const batchOpen = ref(false);
+// 批量发送命令条（Electerm quick-command bar 风格）：常驻贴在终端底部，回车
+// 即发送。目标来自 ssh/sessions/list（跨连接全部活跃会话），命令写入各会话
+// 交互终端（PTY 键盘语义，输出回显在各自终端，对齐 tiny-rdm batch send）。
+const BATCH_BAR_OPEN_KEY = "ssh-batch-bar-open";
+
+function loadBatchBarOpen(): boolean {
+  try {
+    return window.localStorage.getItem(BATCH_BAR_OPEN_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+const batchBarOpen = ref(loadBatchBarOpen());
+const batchTargetsOpen = ref(false);
 const batchLoading = ref(false);
 const batchSending = ref(false);
 const batchTargets = ref<BatchSendTarget[]>([]);
@@ -457,6 +470,20 @@ const batchSelected = ref<string[]>([]);
 const batchDraft = ref("");
 const batchError = ref("");
 const batchSummary = ref<BatchSendSummary>();
+const batchQuickPickId = ref("");
+// 保存为快速命令的内联名称态（保存走 ssh/quickCommands/save，全局共享）。
+const batchSaveMode = ref(false);
+const batchSaveName = ref("");
+const batchSaving = ref(false);
+// 命令条 ↑↓ 浏览历史（与命令弹窗共用 commandHistory 一份存储）。
+const batchHistoryIndex = ref(-1);
+const batchHistoryBackup = ref("");
+// 跨工作台同步源标识：sidecar 把本端状态广播给所有 webview，各端按 source
+// 过滤回声；sidecar 缺该方法（旧版二进制）时静默降级，只影响同步。
+const batchBarSourceId = typeof crypto.randomUUID === "function"
+  ? crypto.randomUUID()
+  : `bar-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+let batchBroadcastTimer: number | undefined;
 // 连接信息面板（只读摘要 + echo 往返延迟）。
 const connectionInfoOpen = ref(false);
 const connectionLatency = ref<number | null>(null);
@@ -1577,6 +1604,11 @@ function drainTerminalFrames() {
 }
 
 function handleEvent(event: DbxPluginEvent) {
+  if (event.method === "ssh/batchBar/state") {
+    const params = event.params as { source?: string; draft?: string; quickPickId?: string; open?: boolean };
+    if (params.source && params.source !== batchBarSourceId) applyRemoteBatchBarState(params);
+    return;
+  }
   if (event.method === "ssh/terminal/inputAck") {
     const sequence = Number(event.params.sequence);
     const waiter = terminalInputAckWaiters.get(sequence);
@@ -3491,19 +3523,72 @@ function sendQuickCommand(item: QuickCommand) {
 // 批量发送：跨连接把命令写入多个已打开会话的交互终端（tiny-rdm batch send）
 // ---------------------------------------------------------------------------
 
-async function openBatchDialog() {
-  batchOpen.value = true;
-  batchError.value = "";
-  batchSummary.value = undefined;
-  quickMenuOpen.value = false;
-  commandOpen.value = false;
+/** 命令条开关：持久化（localStorage），打开时顺带刷新目标列表。 */
+function toggleBatchBar() {
+  batchBarOpen.value = !batchBarOpen.value;
+  try {
+    window.localStorage.setItem(BATCH_BAR_OPEN_KEY, batchBarOpen.value ? "1" : "0");
+  } catch {
+    // 存储不可用时仅失去记忆，功能不受影响。
+  }
+  if (batchBarOpen.value) {
+    void refreshBatchTargets();
+  } else {
+    batchTargetsOpen.value = false;
+    batchSaveMode.value = false;
+  }
+  broadcastBatchBarState(true);
+}
+
+/** 本地命令条状态广播（输入去抖 150ms，开关/清空等离散动作立即发）。 */
+function broadcastBatchBarState(immediate = false) {
+  if (batchBroadcastTimer !== undefined) window.clearTimeout(batchBroadcastTimer);
+  const send = () => {
+    batchBroadcastTimer = undefined;
+    void window.dbxPlugin
+      .notify("ssh/batchBar/state", {
+        source: batchBarSourceId,
+        draft: batchDraft.value,
+        quickPickId: batchQuickPickId.value,
+        open: batchBarOpen.value,
+      })
+      .catch(() => undefined);
+  };
+  if (immediate) {
+    send();
+  } else {
+    batchBroadcastTimer = window.setTimeout(send, 150);
+  }
+}
+
+/** 应用其他工作台广播来的命令条状态（不含保存态/弹出层，不打断本端输入焦点）。 */
+function applyRemoteBatchBarState(params: { draft?: unknown; quickPickId?: unknown; open?: unknown }) {
+  if (typeof params.draft === "string") batchDraft.value = params.draft;
+  if (typeof params.quickPickId === "string") batchQuickPickId.value = params.quickPickId;
+  batchHistoryIndex.value = -1;
+  if (typeof params.open === "boolean" && params.open !== batchBarOpen.value) {
+    batchBarOpen.value = params.open;
+    try {
+      window.localStorage.setItem(BATCH_BAR_OPEN_KEY, batchBarOpen.value ? "1" : "0");
+    } catch {
+      // 同 toggleBatchBar：存储不可用只失去记忆。
+    }
+    if (params.open && !batchTargets.value.length) void refreshBatchTargets();
+  }
+}
+
+async function refreshBatchTargets() {
   batchLoading.value = true;
-  batchDraft.value = "";
+  batchError.value = "";
   try {
     const response = await window.dbxPlugin.invoke<{ sessions: unknown }>("ssh/sessions/list");
     batchTargets.value = normalizeBatchTargets(response.sessions);
-    // 默认只预选当前会话：批量写入影响所有被选主机，宁缺毋滥。
-    batchSelected.value = session.value?.sessionId ? [session.value.sessionId] : [];
+    // 剔除已关闭会话；选择为空时默认只预选当前会话（批量写入影响所有被选主机，宁缺毋滥）。
+    const known = new Set(batchTargets.value.map((target) => target.sessionId));
+    batchSelected.value = batchSelected.value.filter((id) => known.has(id));
+    if (!batchSelected.value.length) {
+      batchSelected.value = session.value?.sessionId && known.has(session.value.sessionId) ? [session.value.sessionId] : [];
+    }
   } catch (cause) {
     batchTargets.value = [];
     batchSelected.value = [];
@@ -3511,6 +3596,11 @@ async function openBatchDialog() {
   } finally {
     batchLoading.value = false;
   }
+}
+
+function toggleBatchTargetsPopover() {
+  batchTargetsOpen.value = !batchTargetsOpen.value;
+  if (batchTargetsOpen.value) void refreshBatchTargets();
 }
 
 function toggleBatchTargetId(sessionId: string) {
@@ -3521,9 +3611,28 @@ function pickBatchTargets(mode: "all" | "connected") {
   batchSelected.value = selectBatchTargets(batchTargets.value, mode);
 }
 
-function applyBatchQuickPick(event: Event) {
-  const value = (event.target as HTMLSelectElement).value;
-  if (value) batchDraft.value = value;
+// 下拉切换命令：回填输入框（Electerm 语义），发送仍由回车/发送按钮触发。
+function applyBatchQuickPick() {
+  const command = quickPickCommandById(quickCommands.value, batchQuickPickId.value);
+  if (command) {
+    batchDraft.value = command;
+    batchHistoryIndex.value = -1;
+    broadcastBatchBarState(true);
+  }
+}
+
+// 命令条 ↑↓ 浏览历史（与命令弹窗同一份 commandHistory，弹窗/命令条互相可见）。
+function browseBatchHistoryUp() {
+  batchHistoryBackup.value = batchHistoryIndex.value === -1 ? batchDraft.value : batchHistoryBackup.value;
+  const step = browseCommandHistory(commandHistory.value, batchHistoryIndex.value, "up", batchHistoryBackup.value);
+  batchHistoryIndex.value = step.index;
+  batchDraft.value = step.draft;
+}
+
+function browseBatchHistoryDown() {
+  const step = browseCommandHistory(commandHistory.value, batchHistoryIndex.value, "down", batchHistoryBackup.value);
+  batchHistoryIndex.value = step.index;
+  batchDraft.value = step.draft;
 }
 
 function batchSessionLabel(sessionId: string): string {
@@ -3536,22 +3645,82 @@ async function sendBatchCommand() {
   if (!command || !batchSelected.value.length || batchSending.value) return;
   // 危险/超长命令复用粘贴红色确认弹窗（同一套 dangerousCommands 规则）。
   const confirmed = await confirmRiskyPaste(command);
-  if (!confirmed || !batchOpen.value) return;
+  if (!confirmed) return;
   batchSending.value = true;
   batchError.value = "";
+  batchSummary.value = undefined;
   try {
     const response = await window.dbxPlugin.invoke<{ results: unknown }>("ssh/terminal/batchInput", {
       sessionIds: batchSelected.value,
       command,
     });
     batchSummary.value = summarizeBatchResults(response.results);
-    if (batchSummary.value.sent) batchDraft.value = "";
+    if (batchSummary.value.sent) {
+      // 发送成功即清空输入与下拉选中（对齐原弹窗语义），命令入历史供 ↑↓ 回选。
+      commandHistory.value = pushCommandHistory(commandHistory.value, command);
+      persistCommandHistory();
+      batchDraft.value = "";
+      batchQuickPickId.value = "";
+      batchHistoryIndex.value = -1;
+      batchHistoryBackup.value = "";
+      broadcastBatchBarState(true);
+    }
   } catch (cause) {
     batchError.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
     batchSending.value = false;
   }
 }
+
+function dismissBatchResult() {
+  batchSummary.value = undefined;
+  batchError.value = "";
+}
+
+// ---- 命令条内联保存为快速命令（与工具栏 Zap 弹层同一后端，全局共享）----
+
+function openBatchBarSave() {
+  const command = batchDraft.value.trim();
+  if (!command || quickCommands.value.length >= QUICK_COMMANDS_LIMIT) return;
+  batchSaveMode.value = true;
+  batchSaveName.value = deriveBatchCommandName(command);
+}
+
+async function confirmBatchBarSave() {
+  const command = batchDraft.value.trim();
+  if (!command || batchSaving.value || quickCommands.value.length >= QUICK_COMMANDS_LIMIT) return;
+  batchSaving.value = true;
+  try {
+    const response = await window.dbxPlugin.invoke<{ commands: unknown }>("ssh/quickCommands/save", {
+      id: "",
+      name: batchSaveName.value.trim(),
+      command,
+    });
+    quickCommands.value = normalizeQuickCommands(response.commands);
+    batchSaveMode.value = false;
+    batchSaveName.value = "";
+    batchQuickPickId.value = quickCommands.value.find((item) => item.command === command)?.id ?? "";
+  } catch (cause) {
+    showError(cause, "terminal");
+  } finally {
+    batchSaving.value = false;
+  }
+}
+
+function cancelBatchBarSave() {
+  batchSaveMode.value = false;
+  batchSaveName.value = "";
+}
+
+// 连接建立后刷新目标计数；断开时收起命令条的弹出层/保存态。
+watch(connected, (value) => {
+  if (value && batchBarOpen.value) {
+    void refreshBatchTargets();
+  } else if (!value) {
+    batchTargetsOpen.value = false;
+    batchSaveMode.value = false;
+  }
+});
 
 // ---------------------------------------------------------------------------
 // 连接信息面板（只读）
@@ -4113,7 +4282,6 @@ const modalOpenStates = computed(() => [
   newFileDialog.value,
   operationDialog.value,
   commandOpen.value,
-  batchOpen.value,
   profilesOpen.value,
   settingsOpen.value,
   hostKeyPrompt.value,
@@ -4218,10 +4386,6 @@ function onDocumentKeydown(event: KeyboardEvent) {
     commandOpen.value = false;
     return;
   }
-  if (batchOpen.value) {
-    batchOpen.value = false;
-    return;
-  }
   if (profilesOpen.value) {
     profilesOpen.value = false;
     return;
@@ -4239,12 +4403,14 @@ function onDocumentKeydown(event: KeyboardEvent) {
     return;
   }
   // ---- 工具栏弹出层（含指标浮层，R5-P2-1：同列 popover 一并进 Esc 链）----
-  if (quickMenuOpen.value || pathHistoryOpen.value || columnsOpen.value || transferPanelOpen.value || connectionInfoOpen.value || metricsOpen.value) {
+  if (quickMenuOpen.value || pathHistoryOpen.value || columnsOpen.value || transferPanelOpen.value || connectionInfoOpen.value || metricsOpen.value || batchTargetsOpen.value || batchSaveMode.value) {
     quickMenuOpen.value = false;
     pathHistoryOpen.value = false;
     columnsOpen.value = false;
     transferPanelOpen.value = false;
     connectionInfoOpen.value = false;
+    batchTargetsOpen.value = false;
+    if (batchSaveMode.value) cancelBatchBarSave();
     if (metricsOpen.value) closeMetrics();
   }
 }
@@ -4408,6 +4574,7 @@ onBeforeUnmount(() => {
   trzszFilter?.stopTransferringFiles();
   trzszFilter = null;
   window.clearTimeout(zoomNoticeTimer);
+  window.clearTimeout(batchBroadcastTimer);
   window.clearInterval(metricsTimer);
   stopCommandMarkerTick();
   stopAgentPromptTimer();
@@ -4472,7 +4639,7 @@ onBeforeUnmount(() => {
         </label>
         <span class="toolbar-separator" aria-hidden="true" />
         <button class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
-        <button class="icon-button icon-neutral" :title="t('batchSendTitle')" :disabled="!connected" @click="openBatchDialog"><ListChecks /></button>
+        <button class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-amber" :title="t('quickCommands')" :disabled="!connected" @click.stop="toggleQuickMenu"><Zap /></button>
           <section v-if="quickMenuOpen" class="popover quick-commands-popover" @click.stop>
@@ -4548,7 +4715,7 @@ onBeforeUnmount(() => {
     <div v-if="sftpError" class="error-banner"><span>{{ sftpError }}</span><button @click="sftpError = ''"><X /></button></div>
 
     <section ref="paneContainer" :class="orderedPaneClass">
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
         <div ref="terminalHost" class="terminal-host" />
         <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint", { path: currentPath }) }}</strong></div>
         <TerminalSearchPanel
@@ -4681,6 +4848,91 @@ onBeforeUnmount(() => {
               <p class="metrics-hint muted">{{ t("metricsRefreshHint") }}</p>
             </template>
           </div>
+        </section>
+        <!-- 批量发送结果浮条：显示在命令条上方，可手动关闭。 -->
+        <div v-if="connected && batchBarOpen && (batchSummary || batchError)" class="batch-bar-status" role="status">
+          <template v-if="batchSummary">
+            <p :class="batchSummary.failed ? 'task-error' : 'muted'">
+              {{ batchSummary.failed ? t("batchSendPartial", { sent: batchSummary.sent, failed: batchSummary.failed }) : t("batchSendSent", { count: batchSummary.sent }) }}
+            </p>
+            <div v-if="batchSummary.failed" class="batch-result-list">
+              <span v-for="row in batchSummary.rows.filter((item) => !item.success)" :key="row.sessionId" class="batch-result-row mono">
+                {{ batchSessionLabel(row.sessionId) }} · {{ row.error || t("batchSendFailed") }}
+              </span>
+            </div>
+          </template>
+          <p v-else class="task-error">{{ batchError }}</p>
+          <button class="icon-button" :title="t('close')" @click="dismissBatchResult"><X /></button>
+        </div>
+        <!-- 批量发送命令条（Electerm quick-command bar）：贴终端底部，回车即发送；
+             目标选择/快速命令切换/保存为快速命令均在条上完成。 -->
+        <section v-if="connected && batchBarOpen" class="batch-bar" @contextmenu.stop @mousedown.stop @click.stop>
+          <div class="menu-anchor">
+            <button class="batch-bar-targets" :title="t('batchSendTitle')" @click.stop="toggleBatchTargetsPopover"><ListChecks /><span>{{ t("batchSendTargets", { count: batchSelected.length, total: batchTargets.length }) }}</span></button>
+            <section v-if="batchTargetsOpen" class="popover batch-targets-popover" @click.stop>
+              <p class="muted batch-send-hint">{{ t("batchSendHint") }}</p>
+              <div class="command-history-header">
+                <span>{{ t("batchSendTargets", { count: batchSelected.length, total: batchTargets.length }) }}</span>
+                <span class="batch-target-actions">
+                  <button class="link-button" @click="pickBatchTargets('connected')">{{ t("batchSendConnected") }}</button>
+                  <button class="link-button" @click="pickBatchTargets('all')">{{ t("batchSendAll") }}</button>
+                  <button class="link-button" :disabled="batchLoading" @click="refreshBatchTargets">{{ t("refresh") }}</button>
+                </span>
+              </div>
+              <div v-if="batchLoading && !batchTargets.length" class="empty compact"><Loader2 class="spinning" /><span>{{ t("batchSendLoading") }}</span></div>
+              <div v-else-if="!batchTargets.length" class="empty compact">{{ t("batchSendNoSessions") }}</div>
+              <div v-else class="batch-target-list">
+                <label v-for="target in batchTargets" :key="target.sessionId" class="batch-target-row" :class="{ offline: target.connected === false }">
+                  <input type="checkbox" :checked="batchSelected.includes(target.sessionId)" @change="toggleBatchTargetId(target.sessionId)" />
+                  <span class="mono">{{ batchTargetLabel(target) }}</span>
+                  <span v-if="target.sessionId === session?.sessionId" class="batch-badge">{{ t("batchSendCurrent") }}</span>
+                  <span v-if="target.connected === false" class="batch-badge batch-badge-warn">{{ t("batchSendDisconnected") }}</span>
+                  <span v-if="target.readOnly" class="read-only-badge">{{ t("readOnly") }}</span>
+                </label>
+              </div>
+            </section>
+          </div>
+          <select v-if="!batchSaveMode && quickCommands.length" v-model="batchQuickPickId" class="batch-bar-quick" :title="t('batchSendQuickPick')" @change="applyBatchQuickPick">
+            <option value="">{{ t("batchSendQuickPick") }}</option>
+            <option v-for="item in quickCommands" :key="item.id" :value="item.id">{{ item.name }}</option>
+          </select>
+          <input
+            v-if="batchSaveMode"
+            v-model="batchSaveName"
+            class="batch-bar-input"
+            :placeholder="t('quickCommandsName')"
+            :maxlength="60"
+            autofocus
+            :disabled="batchSaving"
+            @keydown.enter="confirmBatchBarSave"
+          />
+          <input
+            v-else
+            v-model="batchDraft"
+            class="batch-bar-input mono"
+            spellcheck="false"
+            :placeholder="t('batchSendPlaceholder')"
+            :disabled="batchSending"
+            @input="broadcastBatchBarState()"
+            @keydown.up.prevent="browseBatchHistoryUp"
+            @keydown.down.prevent="browseBatchHistoryDown"
+            @keydown.enter="sendBatchCommand"
+          />
+          <template v-if="batchSaveMode">
+            <button class="icon-button icon-emerald" :title="t('save')" :disabled="batchSaving" @click="confirmBatchBarSave"><Save /></button>
+            <button class="icon-button" :title="t('cancel')" :disabled="batchSaving" @click="cancelBatchBarSave"><X /></button>
+          </template>
+          <button
+            v-else
+            class="icon-button"
+            :title="quickCommands.length >= QUICK_COMMANDS_LIMIT ? t('quickCommandsLimit', { count: quickCommands.length, limit: QUICK_COMMANDS_LIMIT }) : t('batchBarSave')"
+            :disabled="!batchDraft.trim() || quickCommands.length >= QUICK_COMMANDS_LIMIT"
+            @click="openBatchBarSave"
+          ><Save /></button>
+          <button class="icon-button icon-emerald batch-bar-send" :title="t('batchSendSend')" :disabled="batchSending || !batchDraft.trim() || !batchSelected.length" @click="sendBatchCommand">
+            <Loader2 v-if="batchSending" class="spinning" />
+            <Send v-else />
+          </button>
         </section>
       </section>
 
@@ -4935,67 +5187,6 @@ onBeforeUnmount(() => {
             <Loader2 v-if="commandRunning" class="spinning" />
             <SquareTerminal v-else />
             {{ t("commandRun") }}
-          </button>
-        </footer>
-      </article>
-    </section>
-
-    <section v-if="batchOpen" class="modal-backdrop" @mousedown.self="batchOpen = false">
-      <article class="modal batch-modal">
-        <header><h2>{{ t("batchSendTitle") }}</h2><button class="icon-button" @click="batchOpen = false"><X /></button></header>
-        <p class="muted batch-send-hint">{{ t("batchSendHint") }}</p>
-        <div class="batch-targets">
-          <div class="command-history-header">
-            <span>{{ t("batchSendTargets", { count: batchSelected.length, total: batchTargets.length }) }}</span>
-            <span class="batch-target-actions">
-              <button class="link-button" @click="pickBatchTargets('connected')">{{ t("batchSendConnected") }}</button>
-              <button class="link-button" @click="pickBatchTargets('all')">{{ t("batchSendAll") }}</button>
-            </span>
-          </div>
-          <div v-if="batchLoading" class="empty compact"><Loader2 class="spinning" /><span>{{ t("batchSendLoading") }}</span></div>
-          <div v-else-if="!batchTargets.length" class="empty compact">{{ t("batchSendNoSessions") }}</div>
-          <div v-else class="batch-target-list">
-            <label v-for="target in batchTargets" :key="target.sessionId" class="batch-target-row" :class="{ offline: target.connected === false }">
-              <input type="checkbox" :checked="batchSelected.includes(target.sessionId)" @change="toggleBatchTargetId(target.sessionId)" />
-              <span class="mono">{{ batchTargetLabel(target) }}</span>
-              <span v-if="target.sessionId === session?.sessionId" class="batch-badge">{{ t("batchSendCurrent") }}</span>
-              <span v-if="target.connected === false" class="batch-badge batch-badge-warn">{{ t("batchSendDisconnected") }}</span>
-              <span v-if="target.readOnly" class="read-only-badge">{{ t("readOnly") }}</span>
-            </label>
-          </div>
-        </div>
-        <div v-if="quickCommands.length" class="batch-quick-pick-row">
-          <select class="batch-quick-pick" @change="applyBatchQuickPick">
-            <option value="">{{ t("batchSendQuickPick") }}</option>
-            <option v-for="item in quickCommands" :key="item.id" :value="item.command">{{ item.name }}</option>
-          </select>
-        </div>
-        <input
-          v-model="batchDraft"
-          class="mono"
-          spellcheck="false"
-          autofocus
-          :placeholder="t('batchSendPlaceholder')"
-          :disabled="batchSending"
-          @keydown.enter="sendBatchCommand"
-        />
-        <div v-if="batchSummary" class="batch-summary">
-          <p :class="batchSummary.failed ? 'task-error' : 'muted'">
-            {{ batchSummary.failed ? t("batchSendPartial", { sent: batchSummary.sent, failed: batchSummary.failed }) : t("batchSendSent", { count: batchSummary.sent }) }}
-          </p>
-          <div v-if="batchSummary.failed" class="batch-result-list">
-            <span v-for="row in batchSummary.rows.filter((item) => !item.success)" :key="row.sessionId" class="batch-result-row mono">
-              {{ batchSessionLabel(row.sessionId) }} · {{ row.error || t("batchSendFailed") }}
-            </span>
-          </div>
-        </div>
-        <p v-if="batchError" class="task-error">{{ batchError }}</p>
-        <footer>
-          <button @click="batchOpen = false">{{ t("close") }}</button>
-          <button class="primary-button" :disabled="!batchDraft.trim() || !batchSelected.length || batchSending" @click="sendBatchCommand">
-            <Loader2 v-if="batchSending" class="spinning" />
-            <ListChecks v-else />
-            {{ t("batchSendSend") }}
           </button>
         </footer>
       </article>

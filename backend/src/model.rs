@@ -110,6 +110,11 @@ pub struct StoredConnection {
     pub agent_socket: String,
     pub connect_timeout_secs: u64,
     pub keepalive_interval_secs: u64,
+    /// Interactive-terminal activity keepalive: interval in seconds for
+    /// injecting space+backspace into the PTY so server-side idle policies
+    /// (TMOUT, bastion keystroke audits) never fire. 0 = off; the parser
+    /// clamps enabled values into 5..=3600.
+    pub terminal_keepalive_secs: u64,
     pub read_only: bool,
     /// Quick Sudo orchestration: sudo password override, TOTP secret, and
     /// prompt hints. Secrets come from `connection_secrets`, tuning from
@@ -246,6 +251,9 @@ impl JumpHost {
             agent_socket: self.agent_socket.clone(),
             connect_timeout_secs: timeout_secs.max(1),
             keepalive_interval_secs: keepalive_secs,
+            // Jump hops carry no interactive terminal, so no activity
+            // keepalive either.
+            terminal_keepalive_secs: 0,
             read_only: false,
             sudo_password: String::new(),
             totp_secret: self.totp_secret.clone(),
@@ -386,15 +394,21 @@ impl StoredConnection {
             private_key_path,
             private_key_passphrase,
             agent_socket,
-            connect_timeout_secs: connection
-                .get("connect_timeout_secs")
-                .and_then(Value::as_u64)
+            connect_timeout_secs: config_u64(external_config, connection, "connect_timeout_secs")
                 .unwrap_or(15)
                 .max(1),
-            keepalive_interval_secs: connection
-                .get("keepalive_interval_secs")
-                .and_then(Value::as_u64)
-                .unwrap_or(30),
+            keepalive_interval_secs: config_u64(
+                external_config,
+                connection,
+                "keepalive_interval_secs",
+            )
+            .unwrap_or(30),
+            terminal_keepalive_secs: clamp_terminal_keepalive(config_u64(
+                external_config,
+                connection,
+                "terminal_keepalive_secs",
+            )
+            .unwrap_or(0)),
             // 只读门禁收敛：连接表单 read_only（插件特定配置项）∥ 宿主标准
             // read_only（ConnectionConfig 通用设置）。
             read_only: external_config
@@ -429,6 +443,32 @@ fn config_text<'a>(
     keys.iter()
         .find_map(|key| config.and_then(|config| config.get(*key)))
         .and_then(Value::as_str)
+}
+
+/// Terminal activity keepalive: 0 disables, anything else is bounded so a
+/// typo can neither hammer the PTY (5s floor) nor idle for days (1h ceiling).
+fn clamp_terminal_keepalive(raw: u64) -> u64 {
+    if raw == 0 {
+        0
+    } else {
+        raw.clamp(5, 3600)
+    }
+}
+
+/// Numeric `binding: config` field: the connection form writes these into
+/// `external_config`; the top-level connection object stays as fallback for
+/// hand-edited configs and older payloads (same convergence as `read_only`,
+/// which the timeout/keepalive fields previously lacked — the form values
+/// never reached the parser and the defaults always won).
+fn config_u64(
+    external_config: Option<&serde_json::Map<String, Value>>,
+    connection: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<u64> {
+    external_config
+        .and_then(|config| config.get(key))
+        .or_else(|| connection.get(key))
+        .and_then(Value::as_u64)
 }
 
 /// Parses the `setEnv` connection field: one `KEY=VALUE` entry per line,
@@ -777,19 +817,20 @@ mod tests {
             "private_key_path",
             "private_key_passphrase",
             "agent_socket",
-            "connect_timeout_secs",
-            "keepalive_interval_secs",
-            "set_env",
-            "remote_command",
             "sudo_source",
             "sudo_profile",
             "sudo_password",
-            "totp_secret",
-            "auth_flow_mode",
-            "password_prompt_hint",
-            "totp_prompt_hint",
             "sudo_use_pty",
             "sudo_whitelist",
+            "auth_flow_mode",
+            "totp_secret",
+            "password_prompt_hint",
+            "totp_prompt_hint",
+            "connect_timeout_secs",
+            "keepalive_interval_secs",
+            "terminal_keepalive_secs",
+            "set_env",
+            "remote_command",
             "read_only",
         ];
         assert_eq!(keys, expected, "manifest field list drifted from parsing");
@@ -1299,6 +1340,7 @@ mod manifest_contract_tests {
             "agent_socket",
             "connect_timeout_secs",
             "keepalive_interval_secs",
+            "terminal_keepalive_secs",
             "set_env",
             "remote_command",
             "sudo_source",
@@ -1408,6 +1450,7 @@ mod manifest_contract_tests {
             ("authentication", Value::from("password")),
             ("connect_timeout_secs", Value::from(15)),
             ("keepalive_interval_secs", Value::from(30)),
+            ("terminal_keepalive_secs", Value::from(0)),
             ("sudo_source", Value::from("custom")),
             ("sudo_use_pty", Value::from(false)),
             ("set_env", Value::from("")),
@@ -1433,6 +1476,7 @@ mod manifest_contract_tests {
                     "authentication": "password",
                     "connect_timeout_secs": 15,
                     "keepalive_interval_secs": 30,
+                    "terminal_keepalive_secs": 0,
                     "sudo_source": "custom",
                     "sudo_use_pty": false,
                     "auth_flow_mode": "password_then_otp",
@@ -1444,10 +1488,58 @@ mod manifest_contract_tests {
         assert_eq!(connection.authentication, AuthenticationMethod::Password);
         assert_eq!(connection.connect_timeout_secs, 15);
         assert_eq!(connection.keepalive_interval_secs, 30);
+        assert_eq!(connection.terminal_keepalive_secs, 0);
         assert!(connection.sudo_enabled());
         assert!(!connection.sudo_use_pty);
         assert_eq!(connection.auth_flow_mode, "password_then_otp");
         assert!(!connection.read_only);
+    }
+
+    /// The terminal activity keepalive is opt-in: absent config means off,
+    /// an enabled value is clamped into 5..=3600 regardless of what the
+    /// connection form passes through.
+    #[test]
+    fn terminal_keepalive_is_opt_in_and_clamped() {
+        assert_eq!(clamp_terminal_keepalive(0), 0);
+        assert_eq!(clamp_terminal_keepalive(1), 5);
+        assert_eq!(clamp_terminal_keepalive(4), 5);
+        assert_eq!(clamp_terminal_keepalive(30), 30);
+        assert_eq!(clamp_terminal_keepalive(3600), 3600);
+        assert_eq!(clamp_terminal_keepalive(100_000), 3600);
+
+        let enabled = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "keepalive-on",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": "secret",
+                "external_config": {
+                    "terminal_keepalive_secs": 90,
+                    "keepalive_interval_secs": 60,
+                    "connect_timeout_secs": 20
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(enabled.terminal_keepalive_secs, 90);
+        // Form-driven timeout/keepalive must win over the defaults too (the
+        // parser reads external_config with a top-level fallback).
+        assert_eq!(enabled.keepalive_interval_secs, 60);
+        assert_eq!(enabled.connect_timeout_secs, 20);
+
+        let off = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "keepalive-off",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": "secret",
+                "external_config": { "terminal_keepalive_secs": 0 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(off.terminal_keepalive_secs, 0);
     }
 
     /// The private_key_path required chain covers private-key-password (the

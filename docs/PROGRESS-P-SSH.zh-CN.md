@@ -1468,3 +1468,136 @@ contribution fields 条目。
 拨号行为不变）。连带同步：`model.rs` 三个防漂移测试数组、
 `smoke_test.py` 构造配置改用规范 key、PROTOCOL §「会话环境与会话命令」
 与 FEATURE_PARITY tssh 节字段名更正。
+
+## 连接保活盘点 + 终端活动保活（opt-in）+ external_config 解析修复（2026-09-08）
+
+**背景**：用户报告公司策略下 SSH 连接/sudo 状态被空闲超时掐断，要求"添加保活"。
+先盘点发现两层保活早已存在，真正缺口有二：服务器侧按键盘活动判空闲的策略
+（`TMOUT`、堡垒机审计）协议层探测无效；且 `keepalive_interval_secs` 表单值
+从未真正生效（见下）。
+
+**现状盘点（不改即有）**：
+- 协议层 keepalive：`bbb9c81`（2026-08-29）起三条拨号路径（正式连接/跳板每跳/
+  host-key 探测）均配置 russh `keepalive_interval`（默认 30s）+ `keepalive_max: 3`
+  （want_reply 全局请求，等效 OpenSSH `ServerAliveInterval`；任一收到的数据
+  重置计数），对齐 tiny-rdm `keepaliveInterval=30s`/`keepaliveMaxFail=3`。
+- Quick Sudo 时间戳保活：sudo 执行成功后注册 `sudo -nv` 循环（4 分钟周期、
+  连续 2 次失败自停、断连确定性中止），即 tiny-rdm `sudoKeepaliveLoop` 对标。
+
+**新能力：终端活动保活 `terminal_keepalive_secs`（默认 0 关闭）**
+- manifest 连接表单字段（binding `config`，number，0 关闭；en + 六语
+  label/description 全补）；`model.rs` 解析 + `clamp_terminal_keepalive`
+  钳制 5–3600s；跳板 `to_connection` 与 MCP `StoredConnection` 固定 0。
+- `ssh.rs` `open_session` 按连接配置 spawn 每会话任务，经 `terminal_tx` 注入
+  `TERMINAL_KEEPALIVE_INPUT`（`" \x7f"` 空格+退格：空命令行不入 history，
+  全屏程序内仅光标往返）；只持有命令 sender，会话读循环退出（关闭/断连）
+  即随 `send` 失败终止。`ssh/sessions/list` 新增 `terminalKeepaliveSecs` 上报。
+- **开发期自抓回归**：首版任务循环漏写循环内 `tick`（`while send.is_ok(){}`）
+  退化 busy-loop，真机 15s 灌 7705 帧——调试脚本抓到后修复为
+  `loop { tick; send; }`，复测 15s 恰 3 次注入、回显每帧 <20 字节。
+
+**修复 1：`connect_timeout_secs`/`keepalive_interval_secs` 表单值从未生效**
+宿主 `buildPluginConnectionConfig` 把全部 `binding: config` 字段写入
+`external_config`（PROGRESS-HOST-SUBREPO §700 实锤），而这两个字段解析只读
+顶层 `connection` 对象——表单值被静默丢弃、默认值 15/30 恒生效（keepalive
+靠默认 30s 碰巧可用）。按 `read_only` 收敛先例改为
+`config_u64(external_config ∥ connection)`，新增单测钉住表单值生效。
+
+**修复 2：基线失败测试 `manifest_connection_fields_stay_in_sync_with_parsing`**
+d84787d 连接表单重构重排了 manifest 字段顺序但未同步测试期望数组（基线即
+红）。按现 manifest 顺序更新，并纳入新字段 `terminal_keepalive_secs`。
+
+**测试**：cargo test 221 全绿（含新增 `terminal_keepalive_is_opt_in_and_clamped`、
+`session_info_payload` 断言扩展）；新增
+`scripts/smoke_terminal_keepalive_test.py`（真机：sessions/list 上报 + 空闲窗
+观测注入回显 + 会话存活，14s）；`smoke_test.py` PASS、`smoke_fs_test.py`
+46/46 对新二进制回归通过。文档：PROTOCOL §「跳板机与连接存活」+ sessions/list
+字段表。
+
+## 批量发送交互改版：终端底部命令条（Electerm quick-command bar 风格，2026-09-08）
+
+原"工具栏按钮 + 弹窗"批量发送改为**常驻贴在终端底部的单行命令条**（思路来源
+Electerm quick-command bar；批量语义仍对齐 tiny-rdm batch send），纯前端改动，
+协议面不变（`ssh/terminal/batchInput`、`ssh/quickCommands/*`、`ssh/sessions/list`
+原样复用）。
+
+**命令条组成**（`connected` 时显示；工具栏 ListChecks 按钮改为开关，is-active
+态 + localStorage `ssh-batch-bar-open` 持久化，默认开）：
+
+- 目标选择按钮 `目标 {count}/{total}` → 向上展开 popover（复用原目标列表：
+  复选框、当前/已断开/只读徽标、全选/仅存活/刷新；顶部保留 batchSendHint 说明）。
+- 快速命令 `<select>`：切换即回填输入框（不自动发送，回车/发送键触发）。
+- 命令输入框：**回车即发送**；发送后命令保留在输入框（回车即重发的高频路径，
+  Electerm 语义），危险/超长命令仍复用 `confirmRiskyPaste` 红色确认。
+- 保存按钮（Save 图标）：切换为内联名称输入（默认名 = 命令压平空白截断 30 字），
+  走 `ssh/quickCommands/save` 全局共享（≤20 条，超限置灰并提示）；保存成功后
+  下拉自动选中该命令。
+- 发送按钮（Send 图标 + Loader2 忙态）。
+
+**结果浮条**：发送汇总/错误显示在命令条上方的浮条（复用 zmodem-status 视觉），
+失败逐会话列出，手动关闭。
+
+**布局细节**：`.terminal-pane.batch-bar-open` 时 `.terminal-host` inset 底部
+让位 37px（ResizeObserver 自动 refit xterm）；command-marker / zmodem-status
+底部偏移同步上移避让；目标 popover 改为向上展开（默认向下会被底部裁切）；
+命令条根节点 `@contextmenu.stop` 防误触终端右键菜单；Esc 关闭链纳入目标
+popover 与保存名称态（原弹窗的 modalOpenStates/Esc 分支移除）。
+
+**目标列表行为**：连接建立 watch 自动刷新；刷新时剔除已关闭会话，选择为空才
+兜底预选当前会话（原弹窗每次打开重置，命令条改为粘滞选择）。
+
+**代码**：`App.vue`（状态/函数/模板）；`lib/batchSend.ts` 新增纯函数
+`deriveBatchCommandName`/`quickPickCommandById`；`style.css` 弹窗样式段改写为
+命令条样式段。i18n 七语新增 `batchBarSave`，其余文案复用 batchSend*/quickCommands*。
+
+**测试**：vitest 268 全绿（新增 5 用例：默认名压平/截断/空串、下拉按 id 取命令
+含未知 id）；`vue-tsc` 0 错误；前端 build 通过（UI 自包含产物写入 `ui/`）。
+后端与协议零改动，无新增 smoke 用例（batchInput/quickCommands 已有覆盖）。
+
+## 批量命令条首轮反馈修复：清空/历史/跨工作台同步 + 并发同靶 OTP 延迟补答（2026-09-08）
+
+命令条上线后首轮真机反馈四项修复，其中 OTP 一项为后端行为修复（用户明确
+诉求："totp 全用过了，应答时等待一下、延迟应答，而不是中断输入"）。
+
+**1. 目标 popover 刷新按钮图标过大**：link-button 内 lucide 图标未约束尺寸，
+去掉图标改纯文字（与"全选/仅存活"兄弟链接一致）。
+
+**2. 跨工作台状态同步**（原"各自为政"）：命令条草稿/快速命令下拉选中/开关
+状态现在跨工作台同步。新增 sidecar 方法 `ssh/batchBar/state`（notify 语义）：
+工作台把 `{ source, draft, quickPickId, open }` 送达 sidecar，sidecar 原样
+以同名事件广播给**所有**插件 webview（宿主 `app_handle.emit` 全局广播，各
+端 `onEvent` 收到后按 `source` 过滤自己的回声）。输入去抖 150ms，开关/下拉
+/发送清空立即发；sidecar 不落存储、纯转发；旧版二进制未注册时前端静默降级
+（只影响同步不影响本端）。远端应用不打断本端焦点，不触碰保存态/弹出层。
+
+**3. 发送后清空**：回车发送成功（sent>0）即清空输入框与下拉选中并入命令
+历史（对齐原弹窗语义）；全部失败时保留草稿便于重试。
+
+**4. ↑/↓ 历史浏览**：命令条输入框复用与命令弹窗同一份 `commandHistory`
+（环形 100、去重、疑似凭据不落盘），↑↓ 语义与弹窗一致（进入浏览态备份
+草稿、越过最新一条恢复）。
+
+**5. 并发同靶 OTP 延迟补答（后端）**：批量发送 sudo 命令到同一 host:port
+的多个会话时，各会话 OTP 提示几乎同时出现，当前窗口唯一的码被先到会话
+提交后，重放保护（committed ledger，±1 step）会拒绝重复注入——原行为直接
+跳过应答，后到会话永远晾在提示符上（用户被迫手动干预"中断输入"）。现在：
+
+- `exec.rs`：`SudoAuth::answer_for_with_retry`（终端 watcher 专用变体）在
+  OTP 承载型回答撞重放保护时返回 `(None, 下一个窗口边界+1s)`；`TerminalAutoSudo`
+  新增 `otp_deferred_kind/until` 推迟态，`take_deferred_otp(now)` 到期重试、
+  拿到新窗口码即注入并清推迟态，仍被抢则顺延下一窗口；shell 提示符复位、
+  直接应答成功均清推迟态；静态恢复码不变不推迟（重试无意义）。
+- `ssh.rs`：终端读循环既有的 250ms directory tick 臂上挂 `take_deferred_
+  otp(unix_now_secs())`，到期即向 PTY 注入码并回车，发 `ssh/auto-sudo`
+  事件（`kind=otp`）——与其他会话的应答在时间上天然错开 ≥1 个窗口。
+- MCP exec 路径应答语义不变（仍走 `answer_for`/`take_totp_answer` 硬跳过）。
+
+**验证**：cargo test 222 全绿（新增
+`concurrent_same_target_otp_prompt_defers_then_answers_next_window`：账本
+时间回拨模拟窗口滚动，钉住"撞重放→推迟→到期补答→一次性"全链路）；
+vue-tsc 0 错、vitest 268 全绿、前端 build 通过；release 二进制上
+`ssh/batchBar/state` 冒烟 PASS（`{'broadcast': true}`），smoke_fs_test.py
+新增对应用例（未注册旧二进制上 SKIP）。协议文档：RPC 表新增方法行 +
+「终端内 Quick Sudo」节补并发排队语义。剩余风险：真机 TOTP 容器下的多会话
+并发 sudo 流未端到端演练（单测已钉住核心时序）；跨工作台同步依赖宿主全局
+事件广播（当前 `app_handle.emit` 实现为全局，若宿主改为定点投递需跟进）。

@@ -120,3 +120,15 @@ export function summarizeBatchResults(raw: unknown): BatchSendSummary {
     failed: rows.filter((row) => !row.success).length,
   };
 }
+
+/** 命令条保存快速命令时的默认名称：压平空白后截断（超长以省略号收尾）。 */
+export function deriveBatchCommandName(command: string, maxLength = 30): string {
+  const flat = command.replace(/\s+/g, " ").trim();
+  if (flat.length <= maxLength) return flat;
+  return `${flat.slice(0, Math.max(1, maxLength - 1))}…`;
+}
+
+/** 命令条下拉切换：按 id 取快速命令文本；未知 id 返回空串（保持原输入）。 */
+export function quickPickCommandById(commands: { id: string; command: string }[], id: string): string {
+  return commands.find((item) => item.id === id)?.command ?? "";
+}

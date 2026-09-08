@@ -2041,6 +2041,9 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
             .unwrap_or(15)
             .max(1),
         keepalive_interval_secs: 30,
+        // MCP drives exec channels, never the user's interactive PTY —
+        // activity injection doesn't apply here.
+        terminal_keepalive_secs: 0,
         read_only: false,
         sudo_password: arguments
             .get("sudoPassword")

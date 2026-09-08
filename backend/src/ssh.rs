@@ -452,6 +452,13 @@ enum TerminalCommand {
     Close,
 }
 
+/// Terminal activity keepalive payload: space + backspace. Net-zero on a
+/// shell prompt (an empty line never enters history), movement-only in
+/// full-screen apps; protocol-level keepalives don't count as keyboard
+/// activity, and idle policies that watch the PTY (TMOUT, bastion audits)
+/// only real input resets.
+const TERMINAL_KEEPALIVE_INPUT: &[u8] = b" \x7f";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteShell {
     Bash,
@@ -687,6 +694,7 @@ fn session_info_payload(
     read_only: bool,
     connected: bool,
     sudo_keepalive: bool,
+    terminal_keepalive_secs: u64,
     created_at_secs: u64,
     auth_method: &str,
     endpoint: &ConnectionEndpoint,
@@ -698,6 +706,7 @@ fn session_info_payload(
         "readOnly": read_only,
         "connected": connected,
         "sudoKeepalive": sudo_keepalive,
+        "terminalKeepaliveSecs": terminal_keepalive_secs,
         "createdAt": created_at_secs,
         "authMethod": auth_method,
         "host": endpoint.host,
@@ -885,6 +894,33 @@ impl SshRuntime {
             .await
             .insert(session_id.clone(), entry.clone());
 
+        // Terminal activity keepalive (opt-in per connection): resets
+        // server-side idle policies that watch PTY input, which protocol
+        // keepalives don't satisfy. Holds only the command sender, so the
+        // loop ends as soon as the session's read loop drops its receiver.
+        if connection.terminal_keepalive_secs > 0 {
+            let terminal_tx = entry.terminal_tx.clone();
+            let interval_secs = connection.terminal_keepalive_secs;
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The interval's first tick fires immediately; the session
+                // just opened, so nothing needs resetting yet.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    if terminal_tx
+                        .send(TerminalCommand::Input(TERMINAL_KEEPALIVE_INPUT.to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        // Read loop gone — the session is closed.
+                        break;
+                    }
+                }
+            });
+        }
+
         let task_id = session_id.clone();
         let directory_marker_id = session_id.clone();
         let sessions = self.sessions.clone();
@@ -908,6 +944,24 @@ impl SshRuntime {
                                 &replay,
                                 &emitter,
                             ).await;
+                        }
+                        // 推迟的 OTP 应答：TOTP 窗口滚动后自动补答（并发同靶
+                        // sudo 提示撞重放保护时的排队语义）。先取值再写通道，
+                        // 让互斥锁守卫在 .await 前释放。
+                        let deferred_otp = entry
+                            .auto_sudo
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .as_mut()
+                            .and_then(|auto| auto.take_deferred_otp(unix_now_secs()));
+                        if let Some((kind, answer)) = deferred_otp {
+                            let mut payload = answer.into_bytes();
+                            payload.push(b'\r');
+                            if channel.data(&payload[..]).await.is_err() { break; }
+                            let _ = emitter.event("ssh/auto-sudo", json!({
+                                "sessionId": task_id,
+                                "kind": if kind == exec::AutoSudoKind::Totp { "otp" } else { "password" },
+                            }));
                         }
                     }
                     command = terminal_rx.recv() => match command {
@@ -1403,6 +1457,7 @@ impl SshRuntime {
                     entry.read_only,
                     entry.connected.load(Ordering::Acquire),
                     keepalives.contains(&entry.connection_id),
+                    connection.map(|c| c.terminal_keepalive_secs).unwrap_or(0),
                     entry.created_at_secs,
                     auth_method,
                     &endpoint,
@@ -4166,13 +4221,14 @@ mod tests {
             port: 2222,
             username: "ops".to_string(),
         };
-        let row = session_info_payload("sess-1", "conn-1", "wb-1", true, true, true, 1_700_000_123, "private-key", &endpoint);
+        let row = session_info_payload("sess-1", "conn-1", "wb-1", true, true, true, 90, 1_700_000_123, "private-key", &endpoint);
         assert_eq!(row["sessionId"], json!("sess-1"));
         assert_eq!(row["connectionId"], json!("conn-1"));
         assert_eq!(row["workbenchId"], json!("wb-1"));
         assert_eq!(row["readOnly"], json!(true));
         assert_eq!(row["connected"], json!(true));
         assert_eq!(row["sudoKeepalive"], json!(true));
+        assert_eq!(row["terminalKeepaliveSecs"], json!(90));
         assert_eq!(row["createdAt"], json!(1_700_000_123));
         assert_eq!(row["authMethod"], json!("private-key"));
         assert_eq!(row["host"], json!("prod-01"));

@@ -509,6 +509,15 @@ impl Plugin {
                 let id = required_string(&params, "id")?;
                 self.ssh.quick_commands_delete(id)
             }
+            "ssh/batchBar/state" => {
+                // 批量发送命令条的跨工作台状态同步：把调用方（source 标识的
+                // webview）的草稿/下拉选择/开关原样广播给所有插件 webview，
+                // 各端按 source 过滤掉自己的回声。纯转发，sidecar 不落存储。
+                emitter
+                    .event("ssh/batchBar/state", params)
+                    .map_err(|error| error.message)?;
+                Ok(json!({ "broadcast": true }))
+            }
             "connection/action" => {
                 let action = required_string(&params, "action")?;
                 match action {

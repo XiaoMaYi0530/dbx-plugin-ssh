@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.4.38",
+  "version": "0.4.40",
   "publisher": "xynanan",
   "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
   "icon": "assets/plugin.svg",
@@ -331,6 +331,14 @@
           "description": "Keepalive probe interval; 3 missed probes disconnect the session. 0 disables probes."
         },
         {
+          "key": "terminal_keepalive_secs",
+          "label": "Terminal activity keepalive (seconds)",
+          "type": "number",
+          "binding": "config",
+          "default": 0,
+          "description": "Injects space+backspace into the interactive terminal at this interval so server-side idle policies (TMOUT, bastion audits) never trigger. 0 disables."
+        },
+        {
           "key": "set_env",
           "label": "Set environment variables",
           "type": "textarea",
@@ -449,6 +457,10 @@
             },
             "keepalive_interval_secs": {
               "label": "Intervalo de keepalive (segundos)"
+            },
+            "terminal_keepalive_secs": {
+              "label": "Keepalive de actividad del terminal (segundos)",
+              "description": "Inyecta espacio+retroceso en el terminal interactivo a este intervalo para que las políticas de inactividad del servidor (TMOUT, auditoría del bastión) nunca se activen. 0 lo desactiva."
             },
             "set_env": {
               "label": "Variables de entorno (SetEnv)",
@@ -623,6 +635,10 @@
             "keepalive_interval_secs": {
               "label": "Intervallo keepalive (secondi)",
               "description": "Tre risposte mancanti chiudono la sessione. 0 disabilita il keepalive."
+            },
+            "terminal_keepalive_secs": {
+              "label": "Keepalive attività del terminale (secondi)",
+              "description": "Inietta spazio+backspace nel terminale interattivo a questo intervallo, così le policy di inattività lato server (TMOUT, audit del bastion) non si attivano mai. 0 disabilita."
             }
           },
           "actions": {
@@ -690,6 +706,10 @@
             },
             "keepalive_interval_secs": {
               "label": "Keepalive 間隔（秒）"
+            },
+            "terminal_keepalive_secs": {
+              "label": "ターミナル活動キープアライブ（秒）",
+              "description": "この間隔で対話ターミナルにスペース+バックスペースを注入し、サーバー側のアイドルポリシー（TMOUT、踏み台監査）が発動しないようにします。0 で無効。"
             },
             "set_env": {
               "label": "環境変数（SetEnv）",
@@ -864,6 +884,10 @@
             "keepalive_interval_secs": {
               "label": "Intervalo de keepalive (segundos)",
               "description": "Três respostas ausentes encerram a sessão. 0 desativa o keepalive."
+            },
+            "terminal_keepalive_secs": {
+              "label": "Keepalive de atividade do terminal (segundos)",
+              "description": "Injeta espaço+backspace no terminal interativo nesse intervalo para que políticas de ociosidade do servidor (TMOUT, auditoria do bastion) nunca sejam acionadas. 0 desativa."
             }
           },
           "actions": {
@@ -931,6 +955,10 @@
             },
             "keepalive_interval_secs": {
               "label": "Keepalive 间隔（秒）"
+            },
+            "terminal_keepalive_secs": {
+              "label": "终端活动保活（秒）",
+              "description": "按该间隔向交互终端注入空格+退格（不产生命令痕迹），避免服务器侧空闲策略（TMOUT、堡垒机审计）断开终端。0 表示关闭。"
             },
             "set_env": {
               "label": "环境变量（SetEnv）",
@@ -1048,6 +1076,10 @@
             },
             "keepalive_interval_secs": {
               "label": "Keepalive 間隔（秒）"
+            },
+            "terminal_keepalive_secs": {
+              "label": "終端活動保活（秒）",
+              "description": "按該間隔向互動終端注入空格+退格鍵（不產生命令痕跡），避免伺服器端閒置策略（TMOUT、堡壘機稽核）中斷終端。0 表示關閉。"
             },
             "set_env": {
               "label": "環境變數（SetEnv）",

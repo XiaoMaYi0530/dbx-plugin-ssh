@@ -209,6 +209,48 @@ impl SudoAuth {
         }
     }
 
+    /// [`Self::answer_for`] 的终端 watcher 变体：OTP 承载型回答（Totp，以及
+    /// password_plus_otp 的 Combined）在"唯一可用码已提交且重放窗口未关"时
+    /// 返回 `(None, Some(下次可答时刻))`，由调用方推迟到下一个窗口重试；
+    /// 其余情形与 `answer_for` 完全一致（永不推迟）。静态恢复码不变，
+    /// 重试无意义，同样不推迟。
+    pub(crate) fn answer_for_with_retry(&self, kind: PromptKind) -> (Option<String>, Option<u64>) {
+        let otp_bearing = matches!(kind, PromptKind::Totp)
+            || (kind == PromptKind::Combined && self.flow_mode() == AuthFlowMode::PasswordPlusOtp);
+        if !otp_bearing {
+            return (self.answer_for(kind), None);
+        }
+        match self.take_totp_answer() {
+            Ok(code) => {
+                let answer = if kind == PromptKind::Combined {
+                    format!("{}{code}", self.password)
+                } else {
+                    code
+                };
+                (Some(answer), None)
+            }
+            Err(reason) => {
+                eprintln!("[ssh] otp auto-answer deferred: {reason}");
+                (None, self.otp_retry_boundary())
+            }
+        }
+    }
+
+    /// 下一个 TOTP 窗口边界（+1s 余量）：此刻之后 `take_totp_answer` 会选中
+    /// 全新窗口的码。仅当存在轮转密钥时才有意义；纯静态密钥返回 None。
+    fn otp_retry_boundary(&self) -> Option<u64> {
+        let now = unix_now();
+        let period = self
+            .totp_secrets
+            .iter()
+            .filter_map(|secret| match secret {
+                TotpSecret::Key { period, .. } => Some(*period),
+                TotpSecret::Static(_) => None,
+            })
+            .min()?;
+        Some((now / period + 1) * period + 1)
+    }
+
     /// Picks the code to auto-submit for an OTP prompt, or explains why the
     /// submission must be skipped: a code that was already injected while its
     /// acceptance window (±1 step) is still open must not be replayed
@@ -1401,6 +1443,13 @@ pub struct TerminalAutoSudo {
     sudo_pending: bool,
     password_sent: bool,
     otp_sent: bool,
+    /// 推迟的 OTP 应答（并发同靶场景）：同一 otp_ledger_scope（user@host:port）
+    /// 的多个终端会话几乎同时弹出 OTP 提示时，当前窗口唯一的码已被先到的
+    /// 会话提交，重放保护会拒绝重复注入——后到的提示不应就此晾死，而是
+    /// 记下"下一个窗口再答"，由终端读循环周期性重试（`take_deferred_otp`）。
+    /// 仅轮转密钥（Key）适用；静态恢复码永远不变，重试无意义。
+    otp_deferred_kind: Option<PromptKind>,
+    otp_deferred_until: Option<u64>,
 }
 
 impl TerminalAutoSudo {
@@ -1410,6 +1459,8 @@ impl TerminalAutoSudo {
             sudo_pending: false,
             password_sent: false,
             otp_sent: false,
+            otp_deferred_kind: None,
+            otp_deferred_until: None,
         }
     }
 
@@ -1430,6 +1481,8 @@ impl TerminalAutoSudo {
             self.sudo_pending = false;
             self.password_sent = false;
             self.otp_sent = false;
+            self.otp_deferred_kind = None;
+            self.otp_deferred_until = None;
             return None;
         }
         let lower = normalized.to_lowercase();
@@ -1480,7 +1533,14 @@ impl TerminalAutoSudo {
         if !can_respond_to_prompt(mode, kind, self.password_sent) {
             return None;
         }
-        let answer = auth.answer_for(kind)?;
+        let (answer, otp_retry_at) = auth.answer_for_with_retry(kind);
+        let Some(answer) = answer else {
+            // 码已在重放窗口内被同靶的其他会话提交：不注入、不晾死，
+            // 推迟到下一个 TOTP 窗口由读循环重试补答。
+            self.otp_deferred_kind = Some(kind);
+            self.otp_deferred_until = otp_retry_at;
+            return None;
+        };
         let auto_kind = match kind {
             PromptKind::Totp => AutoSudoKind::Totp,
             _ => AutoSudoKind::Password,
@@ -1495,6 +1555,47 @@ impl TerminalAutoSudo {
         }
         self.sudo_pending = true;
         Some((auto_kind, answer))
+    }
+
+    /// 重试被推迟的 OTP 应答；由终端读循环周期性调用（`now` 为调用方传入的
+    /// 当前 unix 秒，便于测试注入）。仅当提示序列仍挂起（未被 shell prompt
+    /// 复位，也尚未直接应答过 OTP）且推迟时刻已到时才尝试；拿到新窗口的码
+    /// 即清掉推迟态并返回应答，仍拿不到则顺延到下一个窗口。
+    pub fn take_deferred_otp(&mut self, now: u64) -> Option<(AutoSudoKind, String)> {
+        if self.otp_sent {
+            self.otp_deferred_kind = None;
+            self.otp_deferred_until = None;
+            return None;
+        }
+        let kind = self.otp_deferred_kind?;
+        let due = self.otp_deferred_until?;
+        if now < due {
+            return None;
+        }
+        let auth = self
+            .auth
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let (answer, retry_at) = auth.answer_for_with_retry(kind);
+        match answer {
+            Some(text) => {
+                self.otp_deferred_kind = None;
+                self.otp_deferred_until = None;
+                self.otp_sent = true;
+                let auto_kind = if kind == PromptKind::Totp {
+                    AutoSudoKind::Totp
+                } else {
+                    AutoSudoKind::Password
+                };
+                Some((auto_kind, text))
+            }
+            None => {
+                // 新窗口的码又被同靶会话抢了：继续顺延（重试时刻必然后移）。
+                self.otp_deferred_until = retry_at.or(self.otp_deferred_until);
+                None
+            }
+        }
     }
 }
 
@@ -1899,6 +2000,57 @@ mod tests {
         auth.password = String::new();
         let mut auto = TerminalAutoSudo::new(Arc::new(RwLock::new(auth)));
         assert_eq!(auto.observe("[sudo] password for user: "), None);
+    }
+
+    // 并发同靶 sudo：同一 otp_ledger_scope 的另一个会话已提交当前窗口唯一的码，
+    // 后到的 OTP 提示应推迟到窗口滚动后补答，而不是永远晾在提示符上。
+    #[test]
+    fn concurrent_same_target_otp_prompt_defers_then_answers_next_window() {
+        let _otp_ledger = otp_ledger_test_guard();
+        let mut auth = terminal_auth();
+        auth.totp_prompt_hint = "verification code".into();
+        auth.totp_secrets = vec![TotpSecret::Key {
+            key: RFC_KEY.to_vec(),
+            digits: 6,
+            period: 30,
+            algorithm: TotpAlgorithm::Sha1,
+        }];
+        let scope = auth.otp_ledger_scope.clone();
+        let fingerprint = otp_secret_fingerprint(&auth.totp_secrets[0]);
+
+        // 模拟会话 A：已提交当前窗口的码（提交账本在重放窗口内）。
+        let now = unix_now();
+        let period = 30u64;
+        let counter = now / period;
+        let code = hotp(RFC_KEY, counter, 6, TotpAlgorithm::Sha1);
+        committed_otp_ledger()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                format!("{scope}|{fingerprint}|{code}"),
+                totp_replay_window_expiry((counter + 1) * period, period),
+            );
+
+        // 会话 B：密码已答，OTP 提示撞上重放保护 → 跳过并进入推迟态。
+        let mut auto = TerminalAutoSudo::new(Arc::new(RwLock::new(auth)));
+        assert_eq!(
+            auto.observe("[sudo] password for user: "),
+            Some((AutoSudoKind::Password, "pw".to_string()))
+        );
+        assert_eq!(auto.observe("verification code: "), None);
+        // 窗口未滚动前不得补答。
+        assert_eq!(auto.take_deferred_otp(now), None);
+
+        // 窗口滚动：旧提交过期（回拨账本时间模拟时钟前进），推迟重试到期。
+        let boundary = (counter + 1) * period + 1;
+        committed_otp_ledger()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(format!("{scope}|{fingerprint}|{code}"), now.saturating_sub(1));
+        let answered = auto.take_deferred_otp(boundary);
+        assert_eq!(answered.map(|(kind, _)| kind), Some(AutoSudoKind::Totp));
+        // 推迟态一次性：补答后不再重复注入。
+        assert_eq!(auto.take_deferred_otp(boundary), None);
     }
 
     #[test]

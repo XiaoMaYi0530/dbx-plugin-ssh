@@ -343,6 +343,17 @@ def main() -> None:
                 raise AssertionError(f"missing profiles key: {json.dumps(result)[:160]}")
             print(f"    {len(result['profiles'])} profile(s) initially")
 
+        def case_batch_bar_state_broadcast():
+            # 纯广播方法：无 SSH 会话依赖，只要应答 Ok 即视为注册且可用。
+            result = req("ssh/batchBar/state", {
+                "source": "smoke-source",
+                "draft": "echo smoke",
+                "quickPickId": "",
+                "open": True,
+            })
+            if result.get("broadcast") is not True:
+                raise AssertionError(f"want broadcast=true: {json.dumps(result)[:160]}")
+
         def case_profiles_save_create():
             result = req("sudo/profiles/save", {
                 "name": "smoke-ops",
@@ -867,6 +878,7 @@ def main() -> None:
                    case_profiles_delete, needs="sudo/profiles/save create")
 
         print("\n--- keys group ---")
+        report.run("ssh/batchBar/state broadcast", "ssh/batchBar/state", case_batch_bar_state_broadcast)
         report.run("keys/discover", "keys/discover", case_keys_discover)
         report.run("ssh/knownHosts/list", "ssh/knownHosts/list", case_known_hosts)
 

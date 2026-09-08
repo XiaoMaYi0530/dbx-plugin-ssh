@@ -44,6 +44,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/sessions/list` | 只读会话清单：sidecar 当前跟踪的活跃会话（对齐 tiny-rdm ListSessions） |
 | `ssh/quickCommands/list`、`ssh/quickCommands/save`、`ssh/quickCommands/delete` | 全局快速命令管理（用户自定义常用命令片段，插件数据目录持久化，所有连接/工作台共享） |
 | `ssh/terminal/batchInput` | 批量发送：把同一条命令写入多个已打开会话的交互终端（PTY 键盘语义，对齐 tiny-rdm batch send），返回逐会话发送结果 |
+| `ssh/batchBar/state`（notify） | 批量发送命令条的跨工作台状态同步：工作台把 `{ source, draft, quickPickId, open }` 以通知送达 sidecar，sidecar 原样以同名事件广播给所有插件 webview，各端按 `source` 过滤自己的回声；纯转发不落存储，旧版 sidecar 未注册时调用方静默降级 |
 
 ## 运行时设置
 
@@ -93,7 +94,8 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
 ## 跳板机（ProxyJump）与连接存活
 
 - `external_config.jump_hosts`（最多 3 跳）定义跳板链：每跳包含 `host`、`port`（缺省 22）、`username`、`authentication`（`password` / `private-key` / `private-key-password` / `agent`）及对应凭据字段，可选 `totp_secret` / 提示词 / `auth_flow_mode`。配置跳板后整条链替换 runtime 隧道，末跳直连目标 `host:port`；每跳主机密钥独立校验，登录期 keyboard-interactive 2FA 同样生效。会话关闭时按序断开整条链。
-- keepalive 探测 3 次无应答即判定连接死亡（对齐 tiny-rdm 的 `keepaliveMaxFail`），终端转入断开态、由工作台重连。
+- 协议层 keepalive：russh 按 `keepalive_interval_secs`（连接表单字段，缺省 30 秒，0 关闭）周期发送带应答的 keepalive 全局请求（等效 OpenSSH `ServerAliveInterval`），连续 3 次无应答即判定连接死亡（对齐 tiny-rdm 的 `keepaliveMaxFail`），终端转入断开态、由工作台重连；跳板链每跳同参。
+- 终端活动保活（`terminal_keepalive_secs`，连接表单字段，默认 0 关闭）：按配置间隔向交互终端 PTY 注入"空格+退格"（净零输入——空命令行不入 shell history，全屏程序内仅光标往返），用于对抗按键盘活动判空闲的服务器侧策略（`TMOUT`、堡垒机审计），协议层探测对此无效。解析侧钳制 5–3600 秒（`model.rs` `clamp_terminal_keepalive`）；仅作用于终端会话（MCP exec 通道不注入），会话关闭即随读写循环退出。`ssh/sessions/list` 以 `terminalKeepaliveSecs` 上报生效值。
 
 ## 会话环境与会话命令（SetEnv / RemoteCommand）
 
@@ -125,7 +127,8 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 
 - 出现 sudo 密码提示（`[sudo] password for …` / `Password:`）时自动注入密码并回车；sudo 需要的 2FA 验证码在配置了 `totp_prompt_hint`（或处于 `password_plus_otp` 模式）时自动应答，每个认证序列只应答一次。
 - 通用提示仅在配置自定义提示词时应答，避免误答其他交互程序（与 tiny-rdm 的保守策略一致）。
-- 检测到 shell 提示符（行尾 `$` / `#`）即重置状态机。`sudo_source=off`（旧 `quick_sudo=false` 同义）或只读连接时整体停用；每次自动应答发出 `ssh/auto-sudo` 事件（`kind` 为 `password` / `otp`）供宿主审计。
+- **并发同靶排队**：批量发送把 sudo 命令写入同一 host:port 的多个会话时，各会话的 OTP 提示几乎同时出现，而当前窗口唯一的码已被先到的会话提交、重放保护拒绝重复注入——后到的提示不再永远搁置，而是推迟到下一个 TOTP 窗口边界（+1s）由终端读循环（250ms tick）自动补答新窗口的码（静态恢复码不变，不推迟）；期间检测到 shell 提示符即照常复位。
+- 检测到 shell 提示符（行尾 `$` / `#`）即重置状态机。`sudo_source=off`（旧 `quick_sudo=false` 同义）或只读连接时整体停用；每次自动应答（含推迟补答）发出 `ssh/auto-sudo` 事件（`kind` 为 `password` / `otp`）供宿主审计。
 
 ## Sudo 文件操作
 
@@ -419,6 +422,7 @@ Quick Sudo（`sudo: true`）移植自 tiny-rdm 的 sudo 执行服务：
 | `readOnly` | bool | 只读连接标志 |
 | `connected` | bool | 会话是否存活（传输层断开后为 `false`） |
 | `sudoKeepalive` | bool | 该连接是否运行 Quick Sudo 时间戳保活循环 |
+| `terminalKeepaliveSecs` | number | 终端活动保活间隔（秒，0=关闭）；回显该连接 `terminal_keepalive_secs` 的生效值 |
 | `createdAt` | number | 会话创建时刻（Unix 秒） |
 | `authMethod` | string | 该连接的认证方式名（`password` / `private-key` / `private-key-password` / `agent` / `none`；连接不在注册表时回退 `password`）。仅方法名，**不含任何凭据材料**；供工作台连接信息面板只读展示 |
 | `host` | string | 所属连接主机名/IP（连接不在注册表时为空串）；只读展示字段 |
