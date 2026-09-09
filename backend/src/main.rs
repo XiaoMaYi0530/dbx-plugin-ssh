@@ -15,6 +15,7 @@ mod sudo_fs;
 mod sudo_allowlist;
 mod sudo_profiles;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -396,6 +397,11 @@ impl Plugin {
                 self.ssh
                     .resolve_agent_challenge(challenge_id, decision, command)?;
                 Ok(json!({ "success": true }))
+            }
+            "ssh/agent/mode/get" => {
+                let connection_id = required_string(&params, "connectionId")?;
+                self.runtime
+                    .block_on(self.ssh.agent_mode_get(&connection_id))
             }
             "ssh/settings/get" => {
                 let session_id = required_string(&params, "sessionId")?;
@@ -832,15 +838,60 @@ fn to_plugin_error(error: String) -> PluginError {
     PluginError::new(-32000, error)
 }
 
-fn plugin_data_dir() -> PathBuf {
-    let data_dir = std::env::var_os("DBX_PLUGIN_DATA_DIR")
-        .map(PathBuf::from)
+/// Pure resolver for the plugin data directory so the fallback order is unit
+/// testable without mutating process environment state (`lookup` abstracts
+/// `std::env::var_os`). An env var counts as set only when present and
+/// non-blank after trimming. Fallback order, first available wins:
+///
+/// 1. `DBX_PLUGIN_DATA_DIR` — host-injected explicit override (future
+///    integration point).
+/// 2. `DBX_DATA_DIR` → `<DBX_DATA_DIR>/plugin-data/io.dbx.ssh` (portable/web
+///    host mode; `plugin-data/` avoids the installer-managed registration
+///    tree).
+/// 3. Platform standard user data dir: macOS `$HOME/Library/Application
+///    Support`, other unix `${XDG_DATA_HOME:-$HOME/.local/share}`, Windows
+///    `%APPDATA%`.
+/// 4. `std::env::temp_dir()` — last resort so this function never fails.
+fn resolve_plugin_data_dir(lookup: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let env = |key: &str| {
+        lookup(key).filter(|value| !value.to_string_lossy().trim().is_empty())
+    };
+    if let Some(dir) = env("DBX_PLUGIN_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dbx_data_dir) = env("DBX_DATA_DIR") {
+        return PathBuf::from(dbx_data_dir)
+            .join("plugin-data")
+            .join("io.dbx.ssh");
+    }
+    let platform_base = if cfg!(windows) {
+        env("APPDATA").map(PathBuf::from)
+    } else {
+        env("HOME").map(|home| {
+            let home = PathBuf::from(home);
+            if cfg!(target_os = "macos") {
+                home.join("Library").join("Application Support")
+            } else {
+                env("XDG_DATA_HOME").map_or_else(
+                    || home.join(".local").join("share"),
+                    PathBuf::from,
+                )
+            }
+        })
+    };
+    platform_base
+        .map(|base| base.join("dbx-plugin-data").join("io.dbx.ssh"))
         .unwrap_or_else(|| {
             std::env::temp_dir()
                 .join("dbx-plugin-data")
                 .join("io.dbx.ssh")
-        });
-    // The env var is the plugin's only path input; resolve symlinks and `..`
+        })
+}
+
+fn plugin_data_dir() -> PathBuf {
+    // Closure (not the generic `var_os` fn item) so the HRTB bound unifies.
+    let data_dir = resolve_plugin_data_dir(|key| std::env::var_os(key));
+    // The env vars are the plugin's only path inputs; resolve symlinks and `..`
     // once at the boundary so every store path below it is canonical.
     let _ = std::fs::create_dir_all(&data_dir);
     std::fs::canonicalize(&data_dir).unwrap_or(data_dir)
@@ -886,6 +937,110 @@ mod tests {
         assert_eq!(optional_u64(&json!({ "offset": -3 }), "offset", 0), 0);
         assert_eq!(optional_u64(&json!({ "offset": "later" }), "offset", 7), 7);
         assert_eq!(optional_u64(&json!({ "offset": null }), "offset", 7), 7);
+    }
+
+    fn lookup_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(*value))
+        }
+    }
+
+    #[test]
+    fn plugin_data_dir_env_var_takes_priority() {
+        let dir = resolve_plugin_data_dir(lookup_from(&[
+            ("DBX_PLUGIN_DATA_DIR", "/tmp/explicit-plugin-data"),
+            ("DBX_DATA_DIR", "/tmp/unused-dbx-data"),
+            ("HOME", "/Users/unused"),
+        ]));
+        assert_eq!(dir, PathBuf::from("/tmp/explicit-plugin-data"));
+    }
+
+    #[test]
+    fn blank_env_values_are_treated_as_unset() {
+        // A blank DBX_PLUGIN_DATA_DIR must not win; DBX_DATA_DIR still applies.
+        let dir = resolve_plugin_data_dir(lookup_from(&[
+            ("DBX_PLUGIN_DATA_DIR", "   "),
+            ("DBX_DATA_DIR", "/tmp/dbx-root"),
+            ("HOME", "/Users/unused"),
+        ]));
+        assert_eq!(
+            dir,
+            PathBuf::from("/tmp/dbx-root")
+                .join("plugin-data")
+                .join("io.dbx.ssh")
+        );
+    }
+
+    #[test]
+    fn dbx_data_dir_maps_into_plugin_data_tree() {
+        let dir = resolve_plugin_data_dir(lookup_from(&[
+            ("DBX_DATA_DIR", "/tmp/dbx-root"),
+            ("HOME", "/Users/unused"),
+        ]));
+        assert_eq!(
+            dir,
+            PathBuf::from("/tmp/dbx-root")
+                .join("plugin-data")
+                .join("io.dbx.ssh")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_home_falls_back_to_application_support() {
+        let dir = resolve_plugin_data_dir(lookup_from(&[("HOME", "/Users/tester")]));
+        assert_eq!(
+            dir,
+            PathBuf::from("/Users/tester")
+                .join("Library/Application Support")
+                .join("dbx-plugin-data")
+                .join("io.dbx.ssh")
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_xdg_data_home_is_preferred_over_local_share() {
+        let with_xdg = resolve_plugin_data_dir(lookup_from(&[
+            ("XDG_DATA_HOME", "/xdg/data"),
+            ("HOME", "/Users/tester"),
+        ]));
+        assert_eq!(
+            with_xdg,
+            PathBuf::from("/xdg/data/dbx-plugin-data/io.dbx.ssh")
+        );
+        let without_xdg =
+            resolve_plugin_data_dir(lookup_from(&[("HOME", "/Users/tester")]));
+        assert_eq!(
+            without_xdg,
+            PathBuf::from("/Users/tester/.local/share/dbx-plugin-data/io.dbx.ssh")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_falls_back_to_appdata() {
+        let dir = resolve_plugin_data_dir(lookup_from(&[("APPDATA", r"C:\Users\tester\AppData\Roaming")]));
+        assert_eq!(
+            dir,
+            PathBuf::from(r"C:\Users\tester\AppData\Roaming")
+                .join("dbx-plugin-data")
+                .join("io.dbx.ssh")
+        );
+    }
+
+    #[test]
+    fn all_sources_missing_falls_back_to_temp_dir() {
+        let dir = resolve_plugin_data_dir(lookup_from(&[]));
+        assert_eq!(
+            dir,
+            std::env::temp_dir()
+                .join("dbx-plugin-data")
+                .join("io.dbx.ssh")
+        );
     }
 
     #[test]

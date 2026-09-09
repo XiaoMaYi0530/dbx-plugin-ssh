@@ -10,6 +10,7 @@ import {
   ArrowLeftRight,
   ArrowUp,
   ArrowUpDown,
+  Bot,
   ClipboardPaste,
   Columns3,
   Copy,
@@ -98,7 +99,7 @@ import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI, type DbxPluginAppearanceInput } from "./lib/appearance";
 import { isDbxPluginTheme, onHostThemeChange, themeToAppearance } from "./lib/hostTheme";
-import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload } from "./lib/agentTerminal";
+import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload, type AgentTerminalMode } from "./lib/agentTerminal";
 import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRestore";
 import { toolbarTintStyle } from "./lib/toolbarTint";
@@ -502,6 +503,11 @@ const settingsOpen = ref(false);
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
 const settingsMeta = ref<SshSettings>();
+// 终端 MCP 模式快速开关（工具栏弹出层）：连接级 agentTerminalMode 的就地入口，
+// 与设置弹窗共用 ssh/settings/set，值语义见 lib/agentTerminal.ts。
+const agentModeOpen = ref(false);
+const agentMode = ref<AgentTerminalMode>("off");
+const agentModeBusy = ref(false);
 const settingsDraft = reactive({
   quickSudo: true,
   sudoUsePty: false,
@@ -732,6 +738,11 @@ const quickSudoTitle = computed(() => `${t("quickSudo.label")}: ${quickSudo.valu
 const agentTerminalModeHint = computed(() => t(
   settingsDraft.agentTerminalMode === "auto" ? "agentTerminalAutoHint"
   : settingsDraft.agentTerminalMode === "strict" ? "agentTerminalStrictHint"
+  : "agentTerminalOffHint",
+));
+const agentModeHint = computed(() => t(
+  agentMode.value === "auto" ? "agentTerminalAutoHint"
+  : agentMode.value === "strict" ? "agentTerminalStrictHint"
   : "agentTerminalOffHint",
 ));
 // Hover tooltip for the terminal command marker strip: full command, exit
@@ -3720,6 +3731,11 @@ watch(connected, (value) => {
     batchTargetsOpen.value = false;
     batchSaveMode.value = false;
   }
+  if (value) {
+    void refreshAgentMode();
+  } else {
+    agentModeOpen.value = false;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -3749,6 +3765,49 @@ function toggleConnectionInfo() {
   if (next) {
     void measureLatency();
     void refreshConnectionAuthMethod();
+  }
+}
+
+function toggleAgentModeMenu() {
+  const next = !agentModeOpen.value;
+  fileMenu.value = undefined;
+  terminalMenu.value = undefined;
+  transferPanelOpen.value = false;
+  columnsOpen.value = false;
+  pathHistoryOpen.value = false;
+  connectionInfoOpen.value = false;
+  quickMenuOpen.value = false;
+  agentModeOpen.value = next;
+  if (next) void refreshAgentMode();
+}
+
+/// 读取当前连接的 agentTerminalMode（与设置弹窗同一 ssh/settings/get 视图）；
+/// 失败保留上次已知值，仅影响按钮态不影响终端。
+async function refreshAgentMode() {
+  const sessionId = session.value?.sessionId;
+  if (!sessionId) return;
+  try {
+    const meta = await window.dbxPlugin.invoke<{ agentTerminalMode?: string }>("ssh/settings/get", { sessionId });
+    const mode = meta.agentTerminalMode;
+    agentMode.value = mode && (AGENT_MODES as readonly string[]).includes(mode) ? (mode as AgentTerminalMode) : "off";
+  } catch {
+    // 静默降级：读不到就保持现状（默认 off），不打断终端使用。
+  }
+}
+
+/// 切换即生效（ssh/settings/set），成功后本地同步并收起弹出层。
+async function applyAgentMode(mode: AgentTerminalMode) {
+  const sessionId = session.value?.sessionId;
+  if (!sessionId || agentModeBusy.value) return;
+  agentModeBusy.value = true;
+  try {
+    await window.dbxPlugin.invoke("ssh/settings/set", { sessionId, agentTerminalMode: mode });
+    agentMode.value = mode;
+    agentModeOpen.value = false;
+  } catch (cause) {
+    showError(cause, "terminal");
+  } finally {
+    agentModeBusy.value = false;
   }
 }
 
@@ -4665,6 +4724,17 @@ onBeforeUnmount(() => {
             </footer>
           </section>
         </div>
+        <div class="menu-anchor">
+          <button class="icon-button" :class="agentMode === 'off' ? 'icon-neutral' : 'icon-emerald is-active'" :title="t('agentTerminalQuickHint')" :disabled="!connected" @click.stop="toggleAgentModeMenu"><Bot /></button>
+          <section v-if="agentModeOpen" class="popover agent-mode-popover" @click.stop>
+            <h3>{{ t("agentTerminalSection") }}</h3>
+            <label v-for="mode in AGENT_MODES" :key="mode" class="agent-mode-option">
+              <input type="radio" name="agent-mode" :checked="agentMode === mode" :disabled="agentModeBusy" @change="applyAgentMode(mode)" />
+              <span>{{ t(`agentTerminal${mode === "off" ? "Off" : mode === "auto" ? "Auto" : "Strict"}`) }}</span>
+            </label>
+            <p class="muted agent-mode-note">{{ agentModeHint }}</p>
+          </section>
+        </div>
         <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-neutral" :title="t('connectionInfo')" @click.stop="toggleConnectionInfo"><Info /></button>
@@ -5572,6 +5642,12 @@ onBeforeUnmount(() => {
 .connection-info-grid dd { display: flex; min-width: 0; align-items: center; gap: 8px; margin: 0; overflow-wrap: anywhere; }
 .connection-info-grid .task-error { font-size: 10px; }
 .connection-info-grid .link-button { flex: 0 0 auto; align-self: center; font-size: 10px; }
+
+/* 终端 MCP 模式快速开关（工具栏弹出层，与设置弹窗共用三档文案） */
+.agent-mode-popover { width: min(280px, calc(100vw - 24px)); padding: 8px 12px 12px; }
+.agent-mode-popover h3 { margin: 4px 0 8px; font-size: 12px; }
+.agent-mode-option { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 12px; cursor: pointer; }
+.agent-mode-note { margin: 8px 0 0; font-size: 11px; }
 
 /* AI 终端同步执行：执行横幅（终端底部，避开命令标记条）+ 审批弹窗 */
 .agent-run-banner { position: absolute; z-index: 3; right: 8px; bottom: 36px; left: 8px; display: flex; align-items: center; gap: 8px; border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border)); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 92%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); font-size: 11px; }

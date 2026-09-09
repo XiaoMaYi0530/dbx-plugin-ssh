@@ -1664,3 +1664,106 @@ workaround + 故障速查行）。
 sftp 池类只读工具桥宕回落文案仍为存量 "Connection is not established"（未统一
 新指引）；connectionName-only 传输失败时 `drop_connection`/`ssh_close` 池
 key 无法按名清理（id 调用不受影响）。
+
+## 工作台滚动条隐藏：条体不再常驻显示（2026-09-09）
+
+`style.css` 全局滚动条由"6px thin 常驻"改为全部隐藏（`scrollbar-width: none` +
+`::-webkit-scrollbar { display: none }`），滚动仍由滚轮/触控板/键盘驱动；xterm
+`.xterm-viewport` 的 `scrollbar-width: thin !important` 同步改 none。原先对
+webkit 伪元素定制宽高会把滚动条从悬浮态固化为占位常驻态，与宿主观感不符。
+改动仅 `ssh/frontend/src/style.css`；验证：`pnpm typecheck` 0 错、`pnpm test`
+28 文件 268 用例全绿。
+
+## 终端 MCP 模式开关 + MCP 转发不再抢焦点（2026-09-09）
+
+用户报障两则：① stdio MCP 每次调用都立刻把 DBX 窗口顶到前台，打断其他工作；
+② 命令没有出现在终端里（疑似仍走静默会话）。期望：终端上可直接开关"终端 MCP
+模式"——开启后 MCP 命令经终端可见执行（审计/学习），关闭走静默隐藏通道。
+
+**根因（两条都坐实）**：
+1. 抢焦点：宿主 `mcp_bridge.rs::handle_call_plugin_tool` 对每次 `/call-plugin-tool`
+   **无条件** emit `mcp-open-connection-workbench`，宿主前端监听器（useTauriEvents.ts）
+   打开工作台后调 `focusCurrentWindow()`——由于 stdio 会话的连接类调用总是经 L1
+   桥转发，**连纯静默调用也开标签+抢焦点**。
+2. 无终端回显：路由矩阵里 `route = runInTerminal.unwrap_or(mode != Off)`，stdio
+   调用不传 `runInTerminal` 且连接模式默认 `off` → 全部走隐藏通道（符合设计但
+   不符合用户预期——模式只能在工作台设置弹窗深处设置，无终端就地入口）。
+
+**改动**：
+1. **宿主前端 `apps/desktop/src/composables/useTauriEvents.ts`**：
+   `mcp-open-connection-workbench` 监听器删除 `focusCurrentWindow()`——标签照常
+   打开/切换（命令进真实 PTY、缓冲可回看），但不再抢 OS 焦点。
+2. **宿主 Rust `src-tauri/src/commands/mcp_bridge.rs`**：`/call-plugin-tool` 改为
+   条件 emit——`is_terminal_routed_exec(tool)`（仅 `ssh_exec`/`ssh_exec_sudo`）且
+   （显式 `runInTerminal: true` 或（缺省时探针 `ssh/agent/mode/get` 确认模式非
+   `off`））才打开工作台；探针 5s 超时、任何失败（旧版插件无该方法等）回落静默
+   路径，绝不因探针失败而开标签。sftp/metrics 等隐藏通道工具转发不再开标签。
+3. **插件后端**：新增 RPC `ssh/agent/mode/get`（`{connectionId}` →
+   `{agentTerminalMode, hasTerminalSession}`，未知连接降级 `off`/`false` 不报错，
+   `ssh.rs::agent_mode_get` + `main.rs` 分发臂）；`ssh_exec`/`ssh_exec_sudo` 工具
+   schema 的 `runInTerminal` 描述补"缺省时由连接级终端 MCP 模式决定"。
+4. **插件前端**：工作台按钮行新增「终端 MCP 模式」快速开关（`Bot` 图标弹出层，
+   三档单选就地生效，复用设置弹窗的三档文案；非 `off` 图标高亮；连接建立时经
+   `ssh/settings/get` 同步初值，切换即 `ssh/settings/set`）；文案新增
+   `agentTerminalQuickHint` 七语全补。
+
+**路由语义（改后）**：终端模式开关（`agentTerminalMode`）一经在终端打开，stdio
+MCP 的 `ssh_exec`/`ssh_exec_sudo`（不传 `runInTerminal`）经宿主桥转发到 embedded
+sidecar 后按模式路由——`auto`/`strict` 下命令进可见终端（auto 低危直注、提权/高危
+弹审批），`off` 走静默隐藏通道；`runInTerminal` 显式值仍最优先。宿主仅在确认要走
+终端时才开工作台标签，且开标签不再抢焦点。
+
+**测试**：backend cargo 231 tests（新增 `agent_mode_get_reports_mode_and_live_
+session_presence`）；前端 vitest 28 文件 268 用例 + vue-tsc 0 错；宿主 vue-tsc
+0 错、`cargo +1.97.1 check` 过、mcp_bridge 新增 `only_ssh_exec_tools_may_open_
+the_workbench_terminal` 单测；smoke_fs agent 组新增 `agent mode get probe`
+（模式/会话存在性 + ghost 连接降级）。
+
+**文档**：PROTOCOL（RPC 表新行 + stdio 行为修正——旧"stdio 传 true 报错"已过时
+实为转发；工具栏快速开关节）、MCP（开关 + 静默不打扰两节）。
+
+**剩余风险/后续**：
+- e2e `e2e_agent_app_bridge.py` 未加 mode-on 自动用例：模式置位需 embedded
+  sidecar RPC（GUI 开关），脚本层无法注入；安全 hook 对该文件整体拦截写入后按
+  规约还原，mode-on 全链路以手动验证替代——终端开 auto 后 stdio `ssh_exec` 不带
+  `runInTerminal` 应在终端可见执行且 DBX 不抢焦点。
+- 宿主两处改动（前端监听器 + 桥条件 emit）需重建 DBX.app 生效；正式版用户在
+  上游吸收补丁前可临时用 worktree debug 构建验证。
+
+## 插件数据目录 fallback 由 $TMPDIR 改为持久化路径（2026-09-09）
+
+**根因**：DBX 宿主拉起 sidecar 时从未注入 `DBX_PLUGIN_DATA_DIR`（只注入
+`DBX_PLUGIN_ID`/`DBX_PLUGIN_VERSION`/`DBX_APP_VERSION`/`DBX_HOST_API_VERSION`/
+`DBX_PLUGIN_PROTOCOL_VERSION`），插件一直走
+`std::env::temp_dir()/dbx-plugin-data/io.dbx.ssh` 兜底；macOS 的 `$TMPDIR`
+（/var/folders/.../T/）在重启时清空，Quick Sudo 配置、快捷命令、mcp-settings、
+插件 known_hosts 全部丢失（机器重启后实际发生；kafka 插件同构，已同日修复）。
+
+**修复**：`main.rs::plugin_data_dir()` 拆出纯函数
+`resolve_plugin_data_dir(lookup: impl Fn(&str) -> Option<OsString>)`（生产传
+`std::env::var_os` 的闭包包装，测试传注入表，不用 `set_var` 避免并行测试竞态），
+按序取第一个可用项（"可用"= 存在且 trim 后非空）：① `DBX_PLUGIN_DATA_DIR`
+原样使用（宿主显式注入，未来方案 A 接入点）；② `DBX_DATA_DIR` →
+`<DBX_DATA_DIR>/plugin-data/io.dbx.ssh`（便携/web 模式，`plugin-data/` 避开
+安装器管理的注册树）；③ 平台标准用户数据目录下 `dbx-plugin-data/io.dbx.ssh`
+（macOS `$HOME/Library/Application Support`、其他 unix
+`${XDG_DATA_HOME:-$HOME/.local/share}`、Windows `%APPDATA%`；平台分支用
+`cfg!` 运行时常量，同一二进制内可测）；④ 全缺才回落
+`std::env::temp_dir()/dbx-plugin-data/io.dbx.ssh`，函数永不失败。
+create_dir_all + canonicalize 边界行为保持不变。backend 中无第二处同语义目录
+解析（其余 `temp_dir` 均为测试临时文件或 `local_transfer_roots_for` 的 sftp
+本地传输白名单，语义不同不动）。
+
+**测试（TDD）**：先写 6 个用例（DBX_PLUGIN_DATA_DIR 优先 / 空串视为未设 /
+`DBX_DATA_DIR` 生效 / macOS HOME 路径 / 全缺回落 temp_dir / unix XDG 与
+windows APPDATA 分支按 `#[cfg]` 留对应平台）确认失败
+（`cannot find function resolve_plugin_data_dir`），实现后全绿；
+`cargo test` 236 用例全过，`cargo build` 干净。本机 darwin 实际解析到
+`/Users/Jinpy/Library/Application Support/dbx-plugin-data/io.dbx.ssh`。
+
+**文档**：PROTOCOL「主机密钥」小节首次提及 `DBX_PLUGIN_DATA_DIR` 处补数据
+目录解析顺序说明。
+
+**剩余风险/后续**：已迁移历史数据在旧 `$TMPDIR` 路径且机器未重启的窗口期内
+不会自动搬家（一次迁移不做，避免与宿主方案 A 冲突）；宿主未来注入
+`DBX_PLUGIN_DATA_DIR`（方案 A）后 ① 自动生效，无插件侧改动。

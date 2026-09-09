@@ -240,7 +240,14 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
   已保存连接 id"。
 - 连接级默认行为由工作台设置 `agentTerminalMode` 决定（`off` 默认不路由 /
   `auto` 分级审批 / `strict` 每条必审，协议见 PROTOCOL「AI 终端同步执行」）；
-  `runInTerminal` 显式值优先于连接模式。
+  `runInTerminal` 显式值优先于连接模式。**终端工具栏快速开关**：工作台按钮行
+  新增「终端 MCP 模式」弹出层（`Bot` 图标，非 `off` 高亮），就地切换连接级模式——
+  开启后 MCP exec 命令（即使不传 `runInTerminal`）都经该终端可见执行（审计/学习），
+  关闭则全部走静默隐藏通道。
+- **静默调用不打扰**：宿主桥转发前按「工具是否为 ssh_exec 族 + 显式 `runInTerminal`
+  + 连接模式探针（`ssh/agent/mode/get`，任何失败回落 `off`）」判定是否需要打开
+  工作台标签；静默调用（隐藏通道）不再自动开标签，事件监听也不再抢 macOS 窗口
+  焦点——标签在后台就位、命令写入终端缓冲，用户回到 DBX 时可完整回看。
 - 审批：`auto` 下 elevated（sudo / 灾难命中）与 `strict` 下全部命令会触发工作台
   弹窗（完整命令原文 + 风险徽标 + 倒计时，默认 120s 超时即拒绝）；AI 侧表现为
   明确的 denied/timed out 错误。

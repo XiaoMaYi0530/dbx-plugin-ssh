@@ -553,6 +553,19 @@ def main() -> None:
             if got != "auto":
                 raise AssertionError(f"agentTerminalMode={got!r}, want 'auto'")
 
+        def case_agent_mode_get_probe():
+            # Connection-scoped probe consumed by the host bridge: the live
+            # connection reports its mode plus session presence, while an
+            # unknown id degrades to off/False instead of erroring.
+            probe = req("ssh/agent/mode/get", {"connectionId": connection_id})
+            if probe.get("agentTerminalMode") != "auto":
+                raise AssertionError(f"probe mode={probe.get('agentTerminalMode')!r}, want 'auto'")
+            if probe.get("hasTerminalSession") is not True:
+                raise AssertionError(f"probe hasTerminalSession={probe.get('hasTerminalSession')!r}, want True")
+            ghost = req("ssh/agent/mode/get", {"connectionId": "smoke-fs-ghost-conn"})
+            if ghost.get("agentTerminalMode") != "off" or ghost.get("hasTerminalSession") is not False:
+                raise AssertionError(f"ghost probe={ghost!r}, want off/False")
+
         def case_agent_no_session_error():
             try:
                 call_tool_embedded("ssh_exec", {"command": "echo smoke", "runInTerminal": True},
@@ -884,6 +897,8 @@ def main() -> None:
 
         print("\n--- agent terminal group ---")
         report.run("agent mode settings round-trip", "ssh/settings/set", case_agent_mode_roundtrip)
+        report.run("agent mode get probe", "ssh/agent/mode/get", case_agent_mode_get_probe,
+                   needs="agent mode settings round-trip")
         report.run("connection/connect agent conn", "connection/connect",
                    lambda: req("connection/connect", lifecycle_params(agent_connection)))
         report.run("agent exec without session errors with guidance", "mcp/call",

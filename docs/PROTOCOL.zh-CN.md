@@ -17,6 +17,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/exec` | 在会话连接上执行远程命令，可选 Quick Sudo 提权 |
 | `ssh/exec/cancel` | 中止进行中的远程命令（按 `execId`） |
 | `ssh/agent/resolve` | 处理 AI 终端同步执行的命令审批（按 `challengeId`，一次性） |
+| `ssh/agent/mode/get` | 连接级 AI 终端模式探针（供宿主 MCP 桥转发前判定路由）：`{connectionId}` → `{agentTerminalMode: "off"\|"auto"\|"strict", hasTerminalSession: bool}`；未知连接降级为 `off` + `false` 而非报错，宿主侧任何失败同样回落静默路径 |
 | `ssh/metrics` | 采集服务器指标（CPU/内存/负载/磁盘（含 inode 使用率）+ 网络接口速率 + Top CPU/内存进程，只读命令；`cached: true` 返回上次快照） |
 | `ssh/host-key/check` | 连接维度主机密钥预检（探针三态：已知 / 变更 / 未知，不发认证） |
 | `ssh/settings/get`、`ssh/settings/set` | 读取/运行时更新 Quick Sudo 编排设置 |
@@ -64,7 +65,14 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
 | `strict` | 审批后注入 | 审批后注入 |
 
 - 调用级覆盖：工具可选参数 `runInTerminal`（`true` 强制终端路径、`false` 强制隐藏
-  通道、缺省按连接模式）。stdio `--mcp` 模式传 `true` 报错（与工作台不同进程，无 UI）。
+  通道、缺省按连接模式）。stdio `--mcp` 模式的连接类调用自动经宿主桥转发到运行中的
+  DBX 应用执行（embedded sidecar 按同一矩阵决策），因此连接级模式开关在 stdio 场景
+  同样生效；宿主桥仅在显式 `runInTerminal: true` 或探针确认模式非 `off` 时才打开
+  工作台标签，静默调用不再开标签也不再抢窗口焦点。
+- 终端工具栏快速开关：工作台按钮行新增「终端 MCP 模式」弹出层（`Bot` 图标，非 `off`
+  时高亮），就地读写连接级 `agentTerminalMode`（与设置弹窗共用 `ssh/settings/get` /
+  `ssh/settings/set`）；开启后 MCP 命令在本终端可见执行（审计/学习），关闭走静默
+  隐藏通道。
 - 无终端会话：报错 `No open terminal session for this connection; open the SSH
   workbench terminal first`（可见才执行的承诺）。
 - 审批：发 `ssh/agent/prompt` 事件并阻塞等待；`ssh/agent/resolve {challengeId,
@@ -367,6 +375,8 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 ## 主机密钥
 
 `DBX_PLUGIN_DATA_DIR/known_hosts` 保存插件确认过的主机密钥，同时只读系统 `known_hosts`。未知主机通过 `ssh/host-key/prompt` 事件交给工作台确认；已知主机密钥变化直接拒绝，不能用一次确认覆盖。
+
+插件数据目录解析顺序（取第一个可用项，"可用"= 环境变量存在且 trim 后非空）：① `DBX_PLUGIN_DATA_DIR` 原样使用（宿主显式注入，未来方案 A 接入点）；② `DBX_DATA_DIR` → `<DBX_DATA_DIR>/plugin-data/io.dbx.ssh`（便携/web 模式，`plugin-data/` 避开安装器管理的注册树）；③ 平台标准用户数据目录下 `dbx-plugin-data/io.dbx.ssh`（macOS `$HOME/Library/Application Support`、其他 unix `${XDG_DATA_HOME:-$HOME/.local/share}`、Windows `%APPDATA%`）；④ 全缺才回落 `std::env::temp_dir()/dbx-plugin-data/io.dbx.ssh`（临时兜底，永不失败）。当前宿主尚未注入 `DBX_PLUGIN_DATA_DIR`，实际生效的是 ③；切勿将持久数据依赖 ④ 的临时目录（重启即清空）。
 
 框架级连接测试挑战采用事件 `connection/challenge` 和固定响应方法 `connection/challenge/resolve`。原型未声明 `test`，因此暂不触发该流程。
 

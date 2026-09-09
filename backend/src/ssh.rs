@@ -1806,6 +1806,20 @@ impl SshRuntime {
             .ok_or("No active SSH session exists for this connection".to_string())
     }
 
+    /// `ssh/agent/mode/get`: connection-scoped agent terminal mode probe for
+    /// the MCP bridge — the DBX app asks this before forwarding a stdio tool
+    /// call so it can decide whether the workbench tab must exist for a
+    /// terminal-routed exec. No sessionId by design: the caller holds only
+    /// the connection id, and unknown ids degrade to `off` instead of
+    /// erroring (an old/stale reference must never break the silent path).
+    pub async fn agent_mode_get(&self, connection_id: &str) -> Result<Value, String> {
+        let has_terminal_session = self.session_id_for_connection(connection_id).await.is_ok();
+        Ok(json!({
+            "agentTerminalMode": self.agent_terminal_mode(connection_id).name(),
+            "hasTerminalSession": has_terminal_session,
+        }))
+    }
+
     /// Runs a command on the session's connection, optionally with Quick Sudo
     /// orchestration (password injection plus automatic 2FA/TOTP answers).
     pub async fn exec(
@@ -4400,6 +4414,27 @@ mod tests {
             runtime.agent_terminal_mode("conn-3"),
             AgentTerminalMode::Off
         );
+    }
+
+    #[tokio::test]
+    async fn agent_mode_get_reports_mode_and_live_session_presence() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+
+        // Unknown connection: degrades to off with no live session — the
+        // bridge caller treats this as "stay on the silent path" instead of
+        // erroring.
+        let probe = runtime.agent_mode_get("conn-ghost").await.expect("probe");
+        assert_eq!(probe["agentTerminalMode"], "off");
+        assert_eq!(probe["hasTerminalSession"], false);
+
+        // A mode set through the settings surface is reflected verbatim.
+        runtime.set_agent_terminal_mode("conn-1", AgentTerminalMode::Strict);
+        let probe = runtime.agent_mode_get("conn-1").await.expect("probe");
+        assert_eq!(probe["agentTerminalMode"], "strict");
+        // No session was opened in this test, so presence stays false even
+        // though the mode is on.
+        assert_eq!(probe["hasTerminalSession"], false);
     }
 
     #[test]
