@@ -1767,3 +1767,38 @@ windows APPDATA 分支按 `#[cfg]` 留对应平台）确认失败
 **剩余风险/后续**：已迁移历史数据在旧 `$TMPDIR` 路径且机器未重启的窗口期内
 不会自动搬家（一次迁移不做，避免与宿主方案 A 冲突）；宿主未来注入
 `DBX_PLUGIN_DATA_DIR`（方案 A）后 ① 自动生效，无插件侧改动。
+
+## 终端体验两连：细竖线光标 + 点击定位光标（2026-09-09）
+
+用户反馈两点：① 终端块状光标太粗，希望是细竖线；② 终端不能鼠标点击移动
+输入位置，只能键盘方向键，希望像普通输入框一样点击定位。
+
+**① 光标样式**：`App.vue::createTerminal` 的 xterm 配置
+`cursorStyle: "block"` → `"bar"`（细竖线，保留闪烁）。纯前端一行改动，
+无宿主/协议影响。
+
+**② 点击定位光标**：终端协议里 shell 光标由远端控制，term 无法直接"落点"，
+iTerm2/kitty 的通用做法是**同逻辑行内的点击换算成 N 次左右方向键**发给
+readline。新增 `frontend/src/lib/terminalClickCursor.ts`（纯计算，无 xterm
+依赖）：
+
+- `cellFromMouseEvent`：像素 → 视口 cell，量 `.xterm-screen` 的 rect
+  （恰为 cols×rows 格），滚动条宽度不影响列换算。
+- `logicalLineSpan`：沿 `isWrapped`（标在续行上）向两侧展开光标所在逻辑行。
+- `resolveClickCursorMove`：点击行不在逻辑行内 → 不动作（防止方向键把 shell
+  翻进历史命令）；行内则按**字符**（宽字符 2 格记 1，readline 按字符移动）
+  差值给方向键次数，上限 `CLICK_CURSOR_MAX_MOVES=1000`；备用屏
+  （`buffer.type === "alternate"`）不动作。
+- `clickCursorArrows`：展开为 CSI 左/右方向键序列。
+
+`App.vue` 接线：terminalHost 挂 `mousedown`/`mouseup`（左键原地点击，位移
+≤2px 且无选区才算点击，不干扰拖拽选择/双击选词）；守卫链：连接存活 →
+无选区 → `modes.mouseTrackingMode === "none"`（vim/htop 等鼠标上报应用
+点击语义归应用）→ normal buffer → 传输路由 `pty`（trzsz/zmodem 占流时
+不代发）→ 发送。卸载时同步 removeEventListener。无新增文案（无 i18n
+改动）、无新依赖、无协议/后端改动。
+
+**验证**：新增 `terminalClickCursor.spec.ts` 13 用例（含宽字符、折行跨行、
+回滚偏移、备用屏/上报守卫、像素换算），前端 `typecheck` + `vitest` 282
+全过，`build` 产出 ui/index.html。真机行为建议装包后在长命令行上点击
+回退/前进复核一次（macOS 拼音输入法组合窗口不受影响——点击不触发输入）。

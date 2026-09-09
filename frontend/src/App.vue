@@ -109,6 +109,7 @@ import { sanitizeSftpEntries } from "./lib/sftpEntries";
 import { resolveRemotePath } from "./lib/remotePathInput";
 import { shouldCommitRename } from "./lib/sftpRename";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
+import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from "./lib/terminalClickCursor";
 import { bridgeBinaryBytes } from "../../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
 import { workbenchMessage } from "./lib/i18n";
@@ -617,6 +618,10 @@ let fitAddon: FitAddon | undefined;
 let searchAddon: SearchAddon | undefined;
 let terminalPasteHandler: ((event: ClipboardEvent) => void) | undefined;
 let terminalWheelHandler: ((event: WheelEvent) => void) | undefined;
+// 点击定位光标（iTerm2 风格）：按下位置记忆 + 松开时判定“原地点击”。
+let terminalMouseDownHandler: ((event: MouseEvent) => void) | undefined;
+let terminalMouseUpHandler: ((event: MouseEvent) => void) | undefined;
+let terminalMouseDownAt: { clientX: number; clientY: number } | undefined;
 let pasteConfirmResolver: ((accepted: boolean) => void) | undefined;
 let zoomNoticeTimer = 0;
 let resizeObserver: ResizeObserver | undefined;
@@ -920,7 +925,8 @@ function createTerminal() {
   terminal = new Terminal({
     convertEol: false,
     cursorBlink: true,
-    cursorStyle: "block",
+    // 细竖线光标（bar）：块状光标在宽字距下显得笨重，竖线更接近常规输入框观感。
+    cursorStyle: "bar",
     fontFamily: appearance.value.terminal.fontFamily,
     fontSize: terminalFontSize.value,
     lineHeight: 1.15,
@@ -968,6 +974,10 @@ function createTerminal() {
   terminalHost.value.addEventListener("paste", terminalPasteHandler, true);
   terminalWheelHandler = (event) => handleTerminalWheel(event);
   terminalHost.value.addEventListener("wheel", terminalWheelHandler, { passive: false, capture: true });
+  terminalMouseDownHandler = (event) => handleTerminalMouseDown(event);
+  terminalHost.value.addEventListener("mousedown", terminalMouseDownHandler);
+  terminalMouseUpHandler = (event) => handleTerminalMouseUp(event);
+  terminalHost.value.addEventListener("mouseup", terminalMouseUpHandler);
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value);
   scheduleFit();
@@ -1007,6 +1017,32 @@ function handleTerminalWheel(event: WheelEvent) {
   if (!(event.ctrlKey || event.metaKey)) return;
   event.preventDefault();
   adjustTerminalZoom(event.deltaY < 0 ? 1 : -1);
+}
+
+// 点击定位光标（iTerm2/kitty 风格）：readline 只认按键，所以在光标所在逻辑行内
+// 的“原地点击”（无拖拽成选区）换算成 N 次左右方向键发给远端；行外点击不动作，
+// 避免方向键把 shell 翻进历史命令。鼠标上报（vim/htop）与备用屏（TUI 全屏应用）
+// 时点击属于应用自身语义，一律不代发。
+function handleTerminalMouseDown(event: MouseEvent) {
+  terminalMouseDownAt = event.button === 0 ? { clientX: event.clientX, clientY: event.clientY } : undefined;
+}
+
+function handleTerminalMouseUp(event: MouseEvent) {
+  const down = terminalMouseDownAt;
+  terminalMouseDownAt = undefined;
+  if (!down || !terminal || !terminalHost.value || !session.value) return;
+  if (terminal.hasSelection()) return;
+  if (Math.abs(event.clientX - down.clientX) > 2 || Math.abs(event.clientY - down.clientY) > 2) return;
+  if (terminal.modes.mouseTrackingMode !== "none") return;
+  const buffer = terminal.buffer.active;
+  if (buffer.type !== "normal") return;
+  const click = cellFromMouseEvent(terminalHost.value, { cols: terminal.cols, rows: terminal.rows }, event.clientX, event.clientY);
+  if (!click) return;
+  const move = resolveClickCursorMove({ buffer, cols: terminal.cols, click });
+  if (!move) return;
+  const route = resolveTerminalInputRoute({ zmodemBusy: zmodemBusy.value, trzszBusy: trzszBusy.value });
+  if (route !== "pty") return;
+  sendTerminalBytes(new TextEncoder().encode(clickCursorArrows(move)));
 }
 
 function adjustTerminalZoom(delta: number) {
@@ -4641,6 +4677,8 @@ onBeforeUnmount(() => {
   if (terminalHost.value) {
     if (terminalPasteHandler) terminalHost.value.removeEventListener("paste", terminalPasteHandler, true);
     if (terminalWheelHandler) terminalHost.value.removeEventListener("wheel", terminalWheelHandler, true);
+    if (terminalMouseDownHandler) terminalHost.value.removeEventListener("mousedown", terminalMouseDownHandler);
+    if (terminalMouseUpHandler) terminalHost.value.removeEventListener("mouseup", terminalMouseUpHandler);
   }
   document.removeEventListener("click", closeMenus);
   document.removeEventListener("click", onDocumentClickCapture, true);
