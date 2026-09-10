@@ -331,6 +331,16 @@ def main() -> None:
         # Strict MCP hosts drop undeclared arguments, so connectionId must be
         # part of the advertised schema or runInTerminal is unreachable there.
         assert "connectionId" in exec_schema, "ssh_exec lacks connectionId"
+        # Saved-connection addressing: connectionName plus the selector anyOf
+        # (id | name | endpoint) must be advertised on connection-bound tools.
+        assert "connectionName" in exec_schema, "ssh_exec lacks connectionName"
+        exec_input = next(tool["inputSchema"] for tool in tools if tool["name"] == "ssh_exec")
+        selector_variants = exec_input.get("anyOf") or []
+        assert any(
+            "connectionName" in variant.get("required", []) for variant in selector_variants
+        ), "ssh_exec inputSchema lacks the selector anyOf"
+        metrics_input = next(tool["inputSchema"] for tool in tools if tool["name"] == "ssh_metrics")
+        assert metrics_input.get("anyOf"), "ssh_metrics inputSchema lacks the selector anyOf"
         send(proc, {
             "jsonrpc": "2.0", "id": 20, "method": "tools/call",
             "params": {"name": "ssh_exec", "arguments": {

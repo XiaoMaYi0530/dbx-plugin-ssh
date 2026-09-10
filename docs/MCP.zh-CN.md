@@ -68,7 +68,7 @@ stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec
 按以下顺序发现，凭据暴露面逐级增大：
 
 1. **`ssh_list_connections`**（首选，无参数）：列出已保存连接元数据（id / name / host / port / username / authentication / readOnly），**只出元数据、任何密钥只出布尔标志位，绝不出值**；`source` 字段标明数据来源（`dbx-app-bridge` 应用桥 / `session-registry` 本会话注册表），降级时附 `note` 说明。
-2. **`connectionName`**：连接类工具可用连接名代替 `connectionId`，stdio 下按名解析出 id 后同样走桥接转发；重名报错并列出候选。
+2. **`connectionName` 或 endpoint**：连接类工具可用连接名代替 `connectionId`；若名称重复，同时传 `host`、`port`、`username` 可缩小到唯一连接。也可以不传 id/name，直接用完整 endpoint（`host` + `username`，`port` 默认 22）唯一复用已注册连接。只匹配到多个候选时拒绝执行并列出候选，绝不猜选；stdio 下相同规则先从 DBX bridge 列表解析出 id 后再转发。
 3. **内联凭据（最后兜底）**：桥不可用时才考虑。凭据所在位置为 DBX 应用数据 `com.dbx.app/dbx.db` 的 `connections` 与 `connection_secrets` 表——凭据会进工具参数与 LLM 上下文（暴露面），仅限本机可信会话使用。
 
 ### 接入 ZCode（stdio 客户端）
@@ -134,7 +134,7 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 | `sftp_disk_usage` | 路径所在挂载的磁盘用量 |
 | `sftp_copy` / `sftp_move` | 服务器内复制 / 剪切（`from` 单值或数组 → `toDir`，逐项返回成败） |
 
-**连接寻址（connectionId / connectionName 二选一）**：上表除 `ssh_list_connections`、known_hosts 管理与本地工具外的连接类工具，都可用 `connectionId` 或 `connectionName` 定位连接。`connectionName` 传连接名，注册表按名匹配，重名直接报错并列出候选 id（要求改用 `connectionId` 精确定位）；stdio 模式下按名解析出 id 后同样走桥接转发。两者都缺省时回落内联凭据拨号。
+**连接寻址（保存连接优先，内联凭据兜底）**：上表除 `ssh_list_connections`、known_hosts 管理与本地工具外的连接类工具，都可用 `connectionId` 精确定位；也可用 `connectionName`，重名时补充 `host` / `port` / `username` 做唯一筛选。若不传 id/name，提供完整 endpoint（`host` + `username`，`port` 默认 22）也会唯一复用已注册连接，因此不需要重复传密码。候选为零时才回落内联凭据/stdio bridge 兜底；候选超过一个时拒绝并列出候选 id，避免静默连错主机或账户。`connectionId` 与其它 selector 同时出现但不一致也会拒绝。
 
 ## 生产环境误操作防范
 

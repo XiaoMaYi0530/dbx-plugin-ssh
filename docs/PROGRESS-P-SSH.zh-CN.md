@@ -1802,3 +1802,36 @@ readline。新增 `frontend/src/lib/terminalClickCursor.ts`（纯计算，无 xt
 回滚偏移、备用屏/上报守卫、像素换算），前端 `typecheck` + `vitest` 282
 全过，`build` 产出 ui/index.html。真机行为建议装包后在长命令行上点击
 回退/前进复核一次（macOS 拼音输入法组合窗口不受影响——点击不触发输入）。
+
+## MCP 连接寻址升级：connectionName/endpoint 唯一匹配免 id（0.4.47 后续轮，2026-09-10）
+
+**痛点**：§8.16 之后连接寻址仍要 agent 先查 `ssh_list_connections` 拿不透明 id
+（或名称完全唯一才行），LLM 明明已从上下文知道「主机 + 用户名」却还要多一轮
+id 映射；同名连接（多环境双胞胎）只能整体报歧义拒绝。
+
+**改动**（纯后端 mcp.rs，协议面不变）：
+1. **统一引用解析**（`registered_connection_by_ref` 重写）：`connectionId` 精确
+   命中 > `connectionName` 精确匹配 > 完整 endpoint（host + username，port 默认
+   22）唯一匹配；endpoint 字段可收窄同名候选。唯一命中即在 `call_tool` 入口
+   归一化为 `connectionId`——池 key、只读门、sudo 白名单、终端路由全部一致。
+2. **零猜测原则**：候选 0 个回落内联凭据 / stdio 桥接兜底（行为不变）；>1 个
+   报歧义并列全部候选 id + host；`connectionId` 与其余 selector 共存且矛盾时
+   直接拒绝（防错连）。
+3. **stdio 桥列表同规则**（`resolve_connection_in_bridge_list` 替代 name-only
+   辅助）：桥列表支持 connectionName / endpoint 解析出 id 后转发，语义与注册表
+   一致。
+4. **inputSchema anyOf**：全部 22 个连接类工具 schema 由 `required: host+username`
+   改为 `anyOf: [connectionId | connectionName | host+username]`（业务字段
+   required 保持独立），严格 MCP 客户端不再因「只传 connectionName」被客户端侧
+   schema 校验拒绝。
+5. **描述文案**：`connectionName` / `ssh_list_connections` 描述同步 endpoint
+   复用语义。
+
+**验证**：新增单测 4（endpoint 唯一复用、name+endpoint 消歧、selector 矛盾拒绝、
+桥列表 name/endpoint 解析）+ schema anyOf 断言扩展；cargo test 239 全绿；
+smoke_mcp.py 增加 connectionName/anyOf schema 断言；改动文件 mcp.rs +
+docs/MCP.zh-CN.md（连接寻址节）。
+
+**边界**：runInTerminal stdio 转发仍要求显式 `connectionId`（桥转发路径不解析
+名称/endpoint，与 §8.16 一致）；仅传 host 不传 username 不做匹配（防同机多账户
+误选）。

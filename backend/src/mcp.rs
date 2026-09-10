@@ -148,9 +148,7 @@ fn validated_transfer_root(value: &Value) -> Result<String, String> {
         .trim()
         .to_string();
     if !root.is_empty() && !Path::new(&root).is_absolute() {
-        return Err(
-            "localTransferRoot must be an absolute path (or empty to reset)".to_string(),
-        );
+        return Err("localTransferRoot must be an absolute path (or empty to reset)".to_string());
     }
     Ok(root)
 }
@@ -216,16 +214,11 @@ pub fn run_mcp_stdio(data_dir: PathBuf) -> io::Result<()> {
             let _ = handle.await;
         }
     };
-    let _ = runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(300), drain).await
-    });
+    let _ = runtime.block_on(async { tokio::time::timeout(Duration::from_secs(300), drain).await });
     Ok(())
 }
 
-fn write_response(
-    stdout: &std::sync::Mutex<io::Stdout>,
-    response: Value,
-) -> io::Result<()> {
+fn write_response(stdout: &std::sync::Mutex<io::Stdout>, response: Value) -> io::Result<()> {
     let mut guard = stdout
         .lock()
         .map_err(|poisoned| io::Error::other(poisoned.to_string()))?;
@@ -422,10 +415,21 @@ impl McpState {
         arguments: &Value,
         emitter: Option<&PluginEmitter>,
     ) -> Result<Value, String> {
-        // Registry reference validation first: an ambiguous connectionName
-        // reports its candidates (id + host) here, before any coarser gate
-        // can mask the disambiguation error.
-        self.registered_connection_by_ref(arguments).await?;
+        // Normalize a saved-connection reference before any gate or tool sees
+        // it. This makes connectionName and unique host/port/username matches
+        // equivalent to an explicit connectionId, including pool keys and
+        // visible-terminal routing, while still rejecting ambiguity.
+        let normalized_arguments = match self.registered_connection_by_ref(arguments).await? {
+            Some(connection) => {
+                let mut normalized = arguments.clone();
+                if let Some(map) = normalized.as_object_mut() {
+                    map.insert("connectionId".to_string(), json!(connection.id));
+                }
+                Some(normalized)
+            }
+            None => None,
+        };
+        let arguments = normalized_arguments.as_ref().unwrap_or(arguments);
         // Safety gates, ordered cheapest-first and all evaluated before any
         // network I/O:
         // 1. Read-only gate: write-class tools are rejected when the DBX
@@ -548,51 +552,57 @@ impl McpState {
         self.global_read_only || self.registered_connection_is_read_only(arguments).await
     }
 
-    /// Unified lifecycle-registry lookup for a call's connection reference:
-    /// `connectionId` wins (exact registry id); `connectionName` is the
-    /// fallback (exact, trimmed — same convention as the Quick Sudo profile
-    /// reference). `Ok(None)` = no reference resolved (the callers keep
-    /// their existing inline fallbacks); `Err` = ambiguous name, listing
-    /// every candidate id + host so the caller can disambiguate by id.
+    /// Resolves a saved connection reference without making the caller carry
+    /// an opaque id. Exact `connectionId` wins, then an exact display name,
+    /// then a unique endpoint (`host` + `username`, with port defaulting to
+    /// 22). Endpoint fields narrow a name match when both are supplied. Any
+    /// ambiguity is an error; a miss returns `None` so inline credentials and
+    /// the stdio bridge fallback retain their existing behavior.
     async fn registered_connection_by_ref(
         &self,
         arguments: &Value,
     ) -> Result<Option<StoredConnection>, String> {
-        let id = arguments
-            .get("connectionId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty());
-        let name = arguments
-            .get("connectionName")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+        let id = non_empty_argument(arguments, "connectionId");
+        let name = non_empty_argument(arguments, "connectionName");
+        let endpoint = endpoint_selector(arguments);
+        if id.is_none() && name.is_none() && endpoint.is_none() {
+            return Ok(None);
+        }
         let registry = self.dbx_connections.read().await;
+
         if let Some(id) = id {
             if let Some(connection) = registry.get(id) {
+                if !connection_matches_selectors(connection, name, endpoint.as_ref()) {
+                    return Err(format!(
+                        "connectionId '{id}' does not match the supplied connectionName/host/port/username"
+                    ));
+                }
                 return Ok(Some(connection.clone()));
             }
-            // A stale id alongside a usable name falls through to the name
-            // match; without a name the miss stays a miss (unchanged
-            // behavior — the caller raises its own guidance error).
-            if name.is_none() {
+            // Preserve the existing self-heal behavior for a stale id when a
+            // second selector can still identify the saved connection.
+            if name.is_none() && endpoint.is_none() {
                 return Ok(None);
             }
         }
-        let Some(name) = name else {
-            return Ok(None);
-        };
+
         let candidates: Vec<&StoredConnection> = registry
             .values()
-            .filter(|connection| connection.name.as_deref() == Some(name))
+            .filter(|connection| connection_matches_selectors(connection, name, endpoint.as_ref()))
             .collect();
         match candidates.len() {
-            1 => Ok(Some(candidates[0].clone())),
             0 => Ok(None),
-            _ => Err(format!(
-                "Connection name '{name}' is ambiguous: {}; pass connectionId instead",
-                render_connection_candidates(&candidates)
-            )),
+            1 => Ok(Some(candidates[0].clone())),
+            _ => {
+                let selector = name
+                    .map(|value| format!("connection name '{value}'"))
+                    .or_else(|| endpoint.as_ref().map(endpoint_selector_label))
+                    .unwrap_or_else(|| "connection selectors".to_string());
+                Err(format!(
+                    "{selector} is ambiguous: {}; pass connectionId instead",
+                    render_connection_candidates(&candidates)
+                ))
+            }
         }
     }
 
@@ -613,7 +623,6 @@ impl McpState {
             Ok(None) => self.inline_dial_is_registered_read_only(arguments).await,
         }
     }
-
     /// True when the inline dial arguments (host/port/username) identify the
     /// same endpoint as a DBX-registered read-only connection.
     async fn inline_dial_is_registered_read_only(&self, arguments: &Value) -> bool {
@@ -712,44 +721,37 @@ impl McpState {
             // whitelist, and answers with its own MCP envelope.
             return Ok((!registered).then(|| (id.to_string(), arguments.clone())));
         }
-        let Some(name_ref) = arguments
-            .get("connectionName")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
+        if arguments.get("connectionName").is_none() && endpoint_selector(arguments).is_none() {
             return Ok(None);
-        };
-        // connectionName without connectionId: a registry hit (unique or
-        // ambiguous) stays local — `connection()` resolves it through the
-        // same registry and reports ambiguity itself. Only a stdio session
-        // with no registry entry needs the bridge list to resolve
-        // name → id before forwarding.
+        }
+        // A registry hit (unique or ambiguous) stays local — the same
+        // resolver reports ambiguity with all candidates. Only a stdio
+        // session with no registry entry needs the bridge list to resolve
+        // the selector to an id before forwarding.
         match self.registered_connection_by_ref(arguments).await {
             Ok(Some(_)) | Err(_) => Ok(None),
-            Ok(None) => match self.resolve_connection_name_via_bridge(name_ref).await {
+            Ok(None) => match self.resolve_connection_via_bridge(arguments).await {
                 Ok(id) => {
                     let mut forwarded = arguments.clone();
                     if let Some(map) = forwarded.as_object_mut() {
-                        map.insert("connectionId".to_string(), json!(id));
+                        map.insert("connectionId".to_string(), json!(id.clone()));
                     }
                     Ok(Some((id, forwarded)))
                 }
-                // Bridge list unavailable or the name is not in it: fall
-                // through so the inline path reports (for an unavailable
-                // bridge) or the resolution error above already did (for a
-                // bad name).
+                // Bridge list unavailable or selector not found: fall
+                // through so the inline path reports the normal guidance.
                 Err(_) => Ok(None),
             },
         }
     }
 
-    /// stdio connectionName resolution: reads the bridge list (no app
-    /// wake-up — a down bridge simply fails the resolution and the call
-    /// degrades) and matches by exact trimmed name.
-    async fn resolve_connection_name_via_bridge(&self, name: &str) -> Result<String, String> {
+    /// stdio connection resolution: reads the bridge list (no app wake-up —
+    /// a down bridge simply fails the resolution and the call degrades) and
+    /// applies the same exact-name / unique-endpoint rules as the lifecycle
+    /// registry.
+    async fn resolve_connection_via_bridge(&self, arguments: &Value) -> Result<String, String> {
         let entries = app_bridge::list_plugin_connections().await?;
-        resolve_name_in_bridge_list(&entries, name)
+        resolve_connection_in_bridge_list(&entries, arguments)
     }
 
     /// Forwards one connection-bound tool call through the DBX app bridge
@@ -960,9 +962,7 @@ impl McpState {
         // Agent terminal routing (agent terminal mode plan §1): only the DBX
         // embedded bridge carries an emitter plus a lifecycle connectionId;
         // every other caller stays on the hidden exec channel below.
-        let run_in_terminal = arguments
-            .get("runInTerminal")
-            .and_then(Value::as_bool);
+        let run_in_terminal = arguments.get("runInTerminal").and_then(Value::as_bool);
         let connection_id = arguments
             .get("connectionId")
             .and_then(Value::as_str)
@@ -975,13 +975,7 @@ impl McpState {
                 let route = run_in_terminal.unwrap_or(mode != AgentTerminalMode::Off);
                 if route {
                     return self
-                        .ssh_exec_terminal_tool(
-                            name,
-                            command,
-                            connection_id,
-                            timeout_secs,
-                            emitter,
-                        )
+                        .ssh_exec_terminal_tool(name, command, connection_id, timeout_secs, emitter)
                         .await;
                 }
             }
@@ -1011,8 +1005,8 @@ impl McpState {
         // Saved DBX connections declare their Quick Sudo source (form field
         // sudo_source); the hidden exec channel honors it exactly like the
         // workbench instead of requiring inline credentials on every call.
-        // The unified lookup also honors connectionName; an ambiguous name
-        // degrades to None here (the dial below reports it).
+        // The unified lookup also honors connectionName and endpoint
+        // selectors; an ambiguous reference is rejected before dialing.
         let stored = self
             .registered_connection_by_ref(arguments)
             .await
@@ -1229,9 +1223,7 @@ impl McpState {
             agent_terminal::CommandRisk::Elevated
         } else {
             match mcp_safety::assess_command(command) {
-                mcp_safety::CommandRisk::Destructive(_) => {
-                    agent_terminal::CommandRisk::Elevated
-                }
+                mcp_safety::CommandRisk::Destructive(_) => agent_terminal::CommandRisk::Elevated,
                 _ => agent_terminal::CommandRisk::Low,
             }
         };
@@ -1559,8 +1551,9 @@ impl McpState {
         let local_source = std::fs::canonicalize(&local_path)
             .map_err(|error| format!("Cannot read local file {local_path}: {error}"))?;
         self.ensure_local_transfer_allowed(&local_source)?;
-        let data = std::fs::read(&local_source)
-            .map_err(|error| format!("Cannot read local file {}: {error}", local_source.display()))?;
+        let data = std::fs::read(&local_source).map_err(|error| {
+            format!("Cannot read local file {}: {error}", local_source.display())
+        })?;
         let upload_limit = self.size_limits().max_upload_bytes;
         if data.len() as u64 > upload_limit {
             return Err(format!(
@@ -1597,7 +1590,12 @@ impl McpState {
                 "Remote path already exists: {remote_path} (pass overwrite=true to replace)"
             ));
         }
-        let mut file = sftp.lock().await.create(remote_path).await.map_err(sftp_error)?;
+        let mut file = sftp
+            .lock()
+            .await
+            .create(remote_path)
+            .await
+            .map_err(sftp_error)?;
         tokio::io::AsyncWriteExt::write_all(&mut file, data)
             .await
             .map_err(|error| format!("SFTP write failed: {error}"))?;
@@ -1639,16 +1637,25 @@ impl McpState {
             .filter(|parent| !parent.as_os_str().is_empty())
         {
             std::fs::create_dir_all(parent).map_err(|error| {
-                format!("Cannot create local directory {}: {error}", parent.display())
+                format!(
+                    "Cannot create local directory {}: {error}",
+                    parent.display()
+                )
             })?;
         }
         // Write through the canonical parent (symlinks and `..` resolved by
         // the OS) re-joined with the requested file name, so the target is
         // exactly the requested path and never a traversal artifact.
-        let local_target = match local.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        let local_target = match local
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             Some(parent) => std::fs::canonicalize(parent)
                 .map_err(|error| {
-                    format!("Cannot resolve local directory {}: {error}", parent.display())
+                    format!(
+                        "Cannot resolve local directory {}: {error}",
+                        parent.display()
+                    )
                 })?
                 .join(file_name),
             None => PathBuf::from(file_name),
@@ -1698,7 +1705,12 @@ impl McpState {
                 ));
             }
         }
-        let file = sftp.lock().await.open(remote_path).await.map_err(sftp_error)?;
+        let file = sftp
+            .lock()
+            .await
+            .open(remote_path)
+            .await
+            .map_err(sftp_error)?;
         // `take` is the hard cap for files that reported no size (or grew
         // between stat and open); the stat check above is only the fast path.
         let mut data = Vec::new();
@@ -1712,8 +1724,12 @@ impl McpState {
                  bytes (adjust maxDownloadBytes via mcp/settings/set)"
             ));
         }
-        std::fs::write(local_target, &data)
-            .map_err(|error| format!("Cannot write local file {}: {error}", local_target.display()))?;
+        std::fs::write(local_target, &data).map_err(|error| {
+            format!(
+                "Cannot write local file {}: {error}",
+                local_target.display()
+            )
+        })?;
         Ok(json!({ "remotePath": remote_path, "localPath": local_path, "bytes": data.len() }))
     }
 
@@ -2017,29 +2033,101 @@ fn connection_list_result(
     }
 }
 
-/// Pure name→id resolution over a bridge connection list: exactly one
-/// trimmed-name hit yields its id; zero hits and multiple hits are errors,
-/// the latter listing every candidate id + host for disambiguation.
-fn resolve_name_in_bridge_list(entries: &[Value], name: &str) -> Result<String, String> {
-    let wanted = name.trim();
+#[derive(Debug, Clone, Copy)]
+struct EndpointSelector<'a> {
+    host: &'a str,
+    port: u16,
+    username: &'a str,
+}
+
+fn non_empty_argument<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// A host selector is intentionally complete: host plus username, with port
+/// defaulting to 22. Matching only on host would silently choose the wrong
+/// saved account when a machine has multiple SSH users.
+fn endpoint_selector(arguments: &Value) -> Option<EndpointSelector<'_>> {
+    let host = non_empty_argument(arguments, "host")?;
+    let username = non_empty_argument(arguments, "username")?;
+    let port = arguments
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(22);
+    Some(EndpointSelector {
+        host,
+        port,
+        username,
+    })
+}
+
+fn connection_matches_selectors(
+    connection: &StoredConnection,
+    name: Option<&str>,
+    endpoint: Option<&EndpointSelector<'_>>,
+) -> bool {
+    name.is_none_or(|wanted| connection.name.as_deref() == Some(wanted))
+        && endpoint.is_none_or(|selector| {
+            connection.host.trim().eq_ignore_ascii_case(selector.host)
+                && connection.port == selector.port
+                && connection.username == selector.username
+        })
+}
+
+fn endpoint_selector_label(selector: &EndpointSelector<'_>) -> String {
+    format!(
+        "endpoint {}@{}:{}",
+        selector.username, selector.host, selector.port
+    )
+}
+
+/// Pure selector→id resolution over a bridge connection list: exact name
+/// and/or complete endpoint selectors filter candidates, exactly one hit
+/// yields its id, and ambiguity lists every candidate id + host.
+fn resolve_connection_in_bridge_list(
+    entries: &[Value],
+    arguments: &Value,
+) -> Result<String, String> {
+    let name = non_empty_argument(arguments, "connectionName");
+    let endpoint = endpoint_selector(arguments);
     let mut hits: Vec<(&str, &str)> = Vec::new();
     for entry in entries {
         let entry_name = entry.get("name").and_then(Value::as_str).map(str::trim);
-        if entry_name != Some(wanted) {
-            continue;
-        }
-        if let Some(id) = entry.get("id").and_then(Value::as_str) {
-            let host = entry.get("host").and_then(Value::as_str).unwrap_or("");
-            hits.push((id, host));
+        let entry_host = entry.get("host").and_then(Value::as_str).unwrap_or("");
+        let entry_port = entry
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(22);
+        let entry_username = entry.get("username").and_then(Value::as_str).unwrap_or("");
+        let name_matches = name.is_none_or(|wanted| entry_name == Some(wanted));
+        let endpoint_matches = endpoint.is_none_or(|selector| {
+            entry_host.trim().eq_ignore_ascii_case(selector.host)
+                && entry_port == selector.port
+                && entry_username == selector.username
+        });
+        if name_matches && endpoint_matches {
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                hits.push((id, entry_host));
+            }
         }
     }
+    let selector = name
+        .map(|value| format!("connection name '{value}'"))
+        .or_else(|| endpoint.as_ref().map(endpoint_selector_label))
+        .unwrap_or_else(|| "connection selectors".to_string());
     match hits.len() {
         1 => Ok(hits[0].0.to_string()),
-        0 => Err(format!(
-            "No connection named '{wanted}' in the DBX app's saved-connection list"
-        )),
+        0 => Err(format!("No saved connection matched {selector}")),
         _ => Err(format!(
-            "Connection name '{wanted}' is ambiguous: {}; pass connectionId instead",
+            "{selector} is ambiguous: {}; pass connectionId instead",
             hits.iter()
                 .map(|(id, host)| format!("{id} (host {host})"))
                 .collect::<Vec<_>>()
@@ -2098,15 +2186,13 @@ fn sensitive_read_path(name: &str, arguments: &Value) -> Option<String> {
     ) {
         return None;
     }
-    ["path", "remotePath", "logPath"]
-        .iter()
-        .find_map(|key| {
-            arguments
-                .get(*key)
-                .and_then(Value::as_str)
-                .filter(|value| mcp_safety::is_sensitive_path(value))
-                .map(str::to_string)
-        })
+    ["path", "remotePath", "logPath"].iter().find_map(|key| {
+        arguments
+            .get(*key)
+            .and_then(Value::as_str)
+            .filter(|value| mcp_safety::is_sensitive_path(value))
+            .map(str::to_string)
+    })
 }
 
 /// Local write targets that must never receive downloaded content through
@@ -2146,9 +2232,20 @@ fn is_sensitive_local_path(path: &str) -> bool {
         .unwrap_or("");
     matches!(
         file_name,
-        ".bashrc" | ".zshrc" | ".profile" | ".bash_profile" | ".zprofile" | ".zshenv"
-            | ".zlogin" | ".cshrc" | ".tcshrc" | "authorized_keys" | ".netrc"
-            | ".git-credentials" | ".npmrc" | ".htpasswd"
+        ".bashrc"
+            | ".zshrc"
+            | ".profile"
+            | ".bash_profile"
+            | ".zprofile"
+            | ".zshenv"
+            | ".zlogin"
+            | ".cshrc"
+            | ".tcshrc"
+            | "authorized_keys"
+            | ".netrc"
+            | ".git-credentials"
+            | ".npmrc"
+            | ".htpasswd"
     )
 }
 
@@ -2316,7 +2413,10 @@ fn sudo_auth(arguments: &Value) -> SudoAuth {
             .get("username")
             .and_then(Value::as_str)
             .unwrap_or_default(),
-        arguments.get("host").and_then(Value::as_str).unwrap_or_default(),
+        arguments
+            .get("host")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
         arguments.get("port").and_then(Value::as_u64).unwrap_or(22) as u16,
     );
     auth
@@ -2524,7 +2624,7 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
         // resolution, and an undeclared argument is dropped by schema
         // validation before the sidecar ever sees the call.
         "connectionId": { "type": "string", "description": "Saved DBX connection id (list ids with ssh_list_connections, or in the DBX app). With runInTerminal: true, a stdio-mode call is forwarded through the DBX app bridge to the connection's visible workbench terminal; on the embedded bridge it also resolves the stored connection's Quick Sudo source and read-only flag. In stdio mode an id unknown to this session is forwarded to the running DBX app, so no inline credentials are needed" },
-        "connectionName": { "type": "string", "description": "Saved DBX connection name, an alternative to connectionId: resolved against this session's registry first, then through ssh_list_connections in stdio mode. Ambiguous names are refused with their candidate ids" },
+        "connectionName": { "type": "string", "description": "Saved DBX connection name. It may replace connectionId; if names repeat, also provide host, port, and username to narrow to one connection. Ambiguous matches are refused with candidate ids." },
         "host": { "type": "string", "description": "Remote SSH host" },
         "port": { "type": "integer", "description": "SSH port (default 22)" },
         "username": { "type": "string", "description": "Login user" },
@@ -2552,12 +2652,16 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
     properties
 }
 
-fn required_connection() -> Vec<String> {
-    vec!["host".to_string(), "username".to_string()]
+fn connection_selector_requirements() -> Value {
+    json!([
+        { "required": ["connectionId"] },
+        { "required": ["connectionName"] },
+        { "required": ["host", "username"] },
+    ])
 }
 
 pub fn tool_definitions() -> Value {
-    json!([
+    let mut tools = json!([
         {
             "name": "ssh_exec",
             "description": "Run a non-interactive remote shell command over SSH. Quick Sudo orchestration is NOT applied; use ssh_exec_sudo for privileged commands. Commands matching catastrophic patterns (disk formatting, recursive system deletes, shutdown, raw device writes, SQL DROP) require confirmDestructive: true; on read-only connections only whitelisted inspection commands (ls, cat, df, ps, systemctl status, journalctl, docker ps, ...) are allowed. Hosts commonly give up waiting after ~15s regardless of timeoutSecs while the command keeps running remotely (and further calls to this server stall until it finishes) - for anything that may exceed ~10s use ssh_run_bg + ssh_task_status instead. After a timeout the command may STILL be running: verify before rerunning.",
@@ -2570,6 +2674,7 @@ pub fn tool_definitions() -> Value {
                     ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app). When omitted, the connection's terminal MCP mode — toggled in the DBX terminal toolbar — decides: modes other than off route every exec through the visible terminal, off keeps the silent hidden channel"),
                 ]),
                 "required": ["command"],
+                "anyOf": connection_selector_requirements(),
             },
         },
         {
@@ -2585,6 +2690,7 @@ pub fn tool_definitions() -> Value {
                     ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app). When omitted, the connection's terminal MCP mode — toggled in the DBX terminal toolbar — decides: modes other than off route every exec through the visible terminal, off keeps the silent hidden channel"),
                 ]),
                 "required": ["command"],
+                "anyOf": connection_selector_requirements(),
             },
         },
         {
@@ -2597,6 +2703,7 @@ pub fn tool_definitions() -> Value {
                     ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
                 ]),
                 "required": ["command"],
+                "anyOf": connection_selector_requirements(),
             },
         },
         {
@@ -2609,6 +2716,7 @@ pub fn tool_definitions() -> Value {
                     ("tailBytes", "integer", "Trailing bytes of output to return (200-16000, default 4000)"),
                 ]),
                 "required": ["logPath"],
+                "anyOf": connection_selector_requirements(),
             },
         },
         {
@@ -2617,7 +2725,7 @@ pub fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[]),
-                "required": required_connection(),
+                "anyOf": connection_selector_requirements(),
             },
         },
         {
@@ -2626,13 +2734,13 @@ pub fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[]),
-                "required": required_connection(),
+                "anyOf": connection_selector_requirements(),
             },
         },
         {
             "name": "ssh_test_connection",
             "description": "Verify connectivity and authentication for inline SSH settings (including the jump chain) without running commands.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[]), "required": required_connection() },
+            "inputSchema": { "type": "object", "properties": connection_properties(&[]), "anyOf": connection_selector_requirements() },
         },
         {
             "name": "ssh_list_known_hosts",
@@ -2641,7 +2749,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_list_connections",
-            "description": "List the DBX app's saved SSH connections for this plugin (id, name, host, port, username, authentication method, read-only flag) merged with connections registered in this MCP session. Metadata only: credentials are never included. Use an entry's id as connectionId, or its name as connectionName, on the connection-bound tools.",
+            "description": "List the DBX app's saved SSH connections for this plugin (id, name, host, port, username, authentication method, read-only flag) merged with connections registered in this MCP session. Metadata only: credentials are never included. Use an entry's id as connectionId, its name as connectionName, or its host+port+username as an endpoint reference on the connection-bound tools; a unique endpoint match reuses the saved connection without inline credentials.",
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
@@ -2695,22 +2803,22 @@ pub fn tool_definitions() -> Value {
         {
             "name": "sftp_list_dir",
             "description": "List a remote directory over SFTP.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"] },
+            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_stat",
             "description": "Inspect a remote path over SFTP (size, permissions, timestamps).",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"] },
+            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_exists",
             "description": "Check whether a remote path exists.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"] },
+            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_pwd",
             "description": "Return the remote login user's home directory (canonicalized absolute path over SFTP).",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[]), "required": required_connection() },
+            "inputSchema": { "type": "object", "properties": connection_properties(&[]), "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_upload",
@@ -2738,7 +2846,7 @@ pub fn tool_definitions() -> Value {
                 ("maxBytes", "integer", "Maximum bytes to read; clamped to the configured maxDownloadBytes (base64 field ignored)"),
                 ("offset", "integer", "Byte offset to start reading from (default 0)"),
                 ("base64", "boolean", "Set true to return base64 instead of UTF-8 text"),
-            ]), "required": ["path"] },
+            ]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_write_file",
@@ -2752,7 +2860,7 @@ pub fn tool_definitions() -> Value {
         {
             "name": "sftp_mkdir",
             "description": "Create a remote directory.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"] },
+            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_remove",
@@ -2760,7 +2868,7 @@ pub fn tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": connection_properties(&[
                 ("path", "string", "Remote path"),
                 ("recursive", "boolean", "Set true to remove directories recursively"),
-            ]), "required": ["path"] },
+            ]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_rename",
@@ -2799,9 +2907,41 @@ pub fn tool_definitions() -> Value {
         {
             "name": "sftp_disk_usage",
             "description": "Report filesystem usage for the mount containing a remote path.",
-            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"] },
+            "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
-    ])
+    ]);
+    // Connection-bound tools share the selector alternatives; add them here
+    // after the compact JSON declarations so path/command required fields
+    // stay independent from connection addressing.
+    if let Some(tool_list) = tools.as_array_mut() {
+        for tool in tool_list {
+            let is_connection_bound = matches!(
+                tool.get("name").and_then(Value::as_str).unwrap_or(""),
+                "sftp_list_dir"
+                    | "sftp_stat"
+                    | "sftp_exists"
+                    | "sftp_pwd"
+                    | "sftp_upload"
+                    | "sftp_download"
+                    | "sftp_read_file"
+                    | "sftp_write_file"
+                    | "sftp_mkdir"
+                    | "sftp_remove"
+                    | "sftp_rename"
+                    | "sftp_chmod"
+                    | "sftp_copy"
+                    | "sftp_move"
+                    | "sftp_disk_usage"
+            );
+            if !is_connection_bound {
+                continue;
+            }
+            if let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) {
+                schema.insert("anyOf".to_string(), connection_selector_requirements());
+            }
+        }
+    }
+    tools
 }
 
 #[cfg(test)]
@@ -2838,15 +2978,13 @@ mod tests {
         assert_eq!(alive, Some(true));
         assert_eq!(tail, "step 1 done\nstep 2 running\n");
 
-        let (state, code, alive, _tail) = parse_task_status_output(
-            "STATE=DONE\nCODE=EXIT_3\nPID_ALIVE=no\n===TAIL===\nEXIT_3\n",
-        );
+        let (state, code, alive, _tail) =
+            parse_task_status_output("STATE=DONE\nCODE=EXIT_3\nPID_ALIVE=no\n===TAIL===\nEXIT_3\n");
         assert_eq!(state, "done");
         assert_eq!(code, Some(3));
         assert_eq!(alive, Some(false));
 
-        let (state, code, alive, tail) =
-            parse_task_status_output("STATE=MISSING\n===TAIL===\n");
+        let (state, code, alive, tail) = parse_task_status_output("STATE=MISSING\n===TAIL===\n");
         assert_eq!(state, "missing");
         assert_eq!(code, None);
         assert_eq!(alive, None);
@@ -3175,10 +3313,9 @@ mod tests {
     #[test]
     fn connection_tools_declare_connection_id() {
         // Strict MCP hosts drop arguments the input schema does not declare,
-        // so a missing connectionId makes runInTerminal unreachable from
-        // stdio mode before the dispatcher ever reads it. connectionName is
-        // declared for the same reason (the L3 registry-name lookup reads
-        // it, and strict hosts would silently drop it otherwise).
+        // so connection selectors must be advertised for both stdio routing
+        // and saved-connection reuse. The selector anyOf is checked below so
+        // strict clients can call with id, name, or endpoint fields.
         let tools = tool_definitions();
         let array = tools.as_array().unwrap();
         for name in [
@@ -3194,8 +3331,8 @@ mod tests {
             let properties = array
                 .iter()
                 .find(|tool| tool["name"] == name)
-                .unwrap_or_else(|| panic!("tool {name} missing from definitions"))
-                ["inputSchema"]["properties"]
+                .unwrap_or_else(|| panic!("tool {name} missing from definitions"))["inputSchema"]
+                ["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("tool {name} schema has no properties object"));
             for key in ["connectionId", "connectionName"] {
@@ -3204,6 +3341,12 @@ mod tests {
                     .unwrap_or_else(|| panic!("tool {name} schema does not declare {key}"));
                 assert_eq!(schema["type"], "string", "tool {name} {key} type");
             }
+            assert!(
+                array.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"]["anyOf"]
+                    .as_array()
+                    .is_some(),
+                "tool {name} must accept a saved id/name or endpoint"
+            );
         }
     }
 
@@ -3335,9 +3478,18 @@ mod tests {
         for tool_name in ["sftp_upload", "sftp_download"] {
             let tool = tools.iter().find(|t| t["name"] == tool_name).unwrap();
             let props = tool["inputSchema"]["properties"].as_object().unwrap();
-            assert!(props.contains_key("localPath"), "{tool_name} lacks localPath");
-            assert!(props.contains_key("remotePath"), "{tool_name} lacks remotePath");
-            assert!(props.contains_key("overwrite"), "{tool_name} lacks overwrite");
+            assert!(
+                props.contains_key("localPath"),
+                "{tool_name} lacks localPath"
+            );
+            assert!(
+                props.contains_key("remotePath"),
+                "{tool_name} lacks remotePath"
+            );
+            assert!(
+                props.contains_key("overwrite"),
+                "{tool_name} lacks overwrite"
+            );
         }
         let sudo = tools.iter().find(|t| t["name"] == "ssh_exec_sudo").unwrap();
         let sudo_props = sudo["inputSchema"]["properties"].as_object().unwrap();
@@ -3429,9 +3581,7 @@ mod tests {
         // The upload cap follows the configured maxUploadBytes.
         let local_file = directory.path().join("payload.bin");
         std::fs::write(&local_file, vec![0u8; 64]).unwrap();
-        state
-            .settings_set(&json!({ "maxUploadBytes": 8 }))
-            .unwrap();
+        state.settings_set(&json!({ "maxUploadBytes": 8 })).unwrap();
         let too_big = state
             .run_tool(
                 "sftp_upload",
@@ -3475,10 +3625,7 @@ mod tests {
 
     #[tokio::test]
     async fn quick_sudo_profiles_roundtrip_without_echoing_secrets() {
-        let dir = std::env::temp_dir().join(format!(
-            "dbx-mcp-profiles-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("dbx-mcp-profiles-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let state = McpState::new(dir.clone());
         // Test-only secret assembled at runtime (never a real credential).
@@ -3512,7 +3659,11 @@ mod tests {
 
         // Duplicate names are rejected, unknown references report clearly.
         let duplicate = state
-            .run_tool("ssh_quick_sudo_profiles_save", &json!({ "name": "OPS" }), None)
+            .run_tool(
+                "ssh_quick_sudo_profiles_save",
+                &json!({ "name": "OPS" }),
+                None,
+            )
             .await;
         assert!(duplicate.unwrap_err().contains("already in use"));
         let missing = resolve_profile_reference(
@@ -3560,10 +3711,7 @@ mod tests {
 
     #[tokio::test]
     async fn sudo_auth_resolution_follows_declared_source() {
-        let dir = std::env::temp_dir().join(format!(
-            "dbx-mcp-sudo-src-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("dbx-mcp-sudo-src-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let state = McpState::new(dir.clone());
         let profile_secret = format!("profile-{}", uuid::Uuid::new_v4());
@@ -3596,11 +3744,7 @@ mod tests {
         // Explicit per-call arguments win over the declared source.
         let (stored, _) = source_connection("global", "src-ops");
         let auth = state
-            .resolve_sudo_auth(
-                &json!({ "sudoPassword": call_secret }),
-                None,
-                Some(stored),
-            )
+            .resolve_sudo_auth(&json!({ "sudoPassword": call_secret }), None, Some(stored))
             .await
             .unwrap();
         assert_eq!(auth.password, call_secret);
@@ -3650,11 +3794,7 @@ mod tests {
         assert!(refused.unwrap_err().contains("Quick Sudo is disabled"));
         let (stored, _) = source_connection("off", "");
         let auth = state
-            .resolve_sudo_auth(
-                &json!({ "sudoPassword": call_secret }),
-                None,
-                Some(stored),
-            )
+            .resolve_sudo_auth(&json!({ "sudoPassword": call_secret }), None, Some(stored))
             .await
             .unwrap();
         assert_eq!(auth.password, call_secret);
@@ -3796,7 +3936,10 @@ mod tests {
         // …and the default-roots message names the setting to widen.
         let empty_roots: Vec<PathBuf> = vec![];
         let error = ensure_local_transfer_allowed_in(&empty_roots, "", &inside).unwrap_err();
-        assert!(error.contains("outside the allowed transfer roots"), "{error}");
+        assert!(
+            error.contains("outside the allowed transfer roots"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -3953,8 +4096,14 @@ mod tests {
             .await
             .unwrap();
         let message = refused["error"]["message"].as_str().unwrap();
-        assert!(message.contains("confirmDestructive"), "unexpected: {message}");
-        assert!(!message.contains("password"), "gate must fire first: {message}");
+        assert!(
+            message.contains("confirmDestructive"),
+            "unexpected: {message}"
+        );
+        assert!(
+            !message.contains("password"),
+            "gate must fire first: {message}"
+        );
 
         // With the flag the gate passes and the call proceeds to parameter
         // validation (missing password), proving it was not blocked.
@@ -3986,7 +4135,10 @@ mod tests {
                 .await
                 .unwrap();
             let message = chained["error"]["message"].as_str().unwrap();
-            assert!(message.contains("confirmDestructive"), "unexpected: {message}");
+            assert!(
+                message.contains("confirmDestructive"),
+                "unexpected: {message}"
+            );
         }
     }
 
@@ -4236,18 +4388,25 @@ mod tests {
         assert_eq!(entries[1]["id"], "conn-extra");
     }
 
-    /// L3 stdio name resolution over the bridge list: unique hit, ambiguous
-    /// (both candidates listed with host), and missing.
+    /// stdio selector→id resolution over the bridge list: unique hit,
+    /// ambiguous (both candidates listed with host), and missing. The
+    /// endpoint selector disambiguates a duplicate name.
     #[test]
-    fn resolve_name_in_bridge_list_disambiguates() {
+    fn resolve_connection_in_bridge_list_matches_name_and_endpoint() {
         let entries = vec![
-            json!({ "id": "a", "name": "Web", "host": "h1" }),
+            json!({ "id": "a", "name": "Web", "host": "h1", "port": 22, "username": "ops" }),
             // Trailing space in the payload name still matches after trim.
-            json!({ "id": "b", "name": "Web ", "host": "h2" }),
-            json!({ "id": "c", "name": "DB", "host": "h3" }),
+            json!({ "id": "b", "name": "Web ", "host": "h2", "port": 2222, "username": "deploy" }),
+            json!({ "id": "c", "name": "DB", "host": "h3", "port": 22, "username": "ops" }),
         ];
-        assert_eq!(resolve_name_in_bridge_list(&entries, "DB").unwrap(), "c");
-        let error = resolve_name_in_bridge_list(&entries, "Web").unwrap_err();
+        assert_eq!(
+            resolve_connection_in_bridge_list(&entries, &json!({ "connectionName": "DB" }))
+                .unwrap(),
+            "c"
+        );
+        let error =
+            resolve_connection_in_bridge_list(&entries, &json!({ "connectionName": "Web" }))
+                .unwrap_err();
         assert!(
             error.contains("ambiguous")
                 && error.contains("a")
@@ -4256,11 +4415,29 @@ mod tests {
                 && error.contains("h2"),
             "expected candidates in the error: {error}"
         );
+        // Endpoint narrows the duplicate name to exactly one candidate.
+        assert_eq!(
+            resolve_connection_in_bridge_list(
+                &entries,
+                &json!({ "connectionName": "Web", "host": "h2", "port": 2222, "username": "deploy" })
+            )
+            .unwrap(),
+            "b"
+        );
+        // A complete endpoint alone reuses the saved connection.
+        assert_eq!(
+            resolve_connection_in_bridge_list(
+                &entries,
+                &json!({ "host": "H2", "port": 2222, "username": "deploy" })
+            )
+            .unwrap(),
+            "b"
+        );
         assert!(
-            resolve_name_in_bridge_list(&entries, "ghost")
+            resolve_connection_in_bridge_list(&entries, &json!({ "connectionName": "ghost" }))
                 .unwrap_err()
-                .contains("No connection named"),
-            "missing name must be a clear error"
+                .contains("No saved connection matched"),
+            "missing selector must be a clear error"
         );
     }
 
@@ -4298,7 +4475,11 @@ mod tests {
                 }
             }))
             .unwrap();
-            state.dbx_connections.write().await.insert(id.to_string(), stored);
+            state
+                .dbx_connections
+                .write()
+                .await
+                .insert(id.to_string(), stored);
         }
         let error = state
             .call_tool("ssh_metrics", &json!({ "connectionName": "Twin" }), None)
@@ -4315,7 +4496,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_connection_gates_writes_and_unknown_commands() {        let state = McpState::shared(Arc::new(SshRuntime::new(
+    async fn endpoint_identity_resolves_a_unique_saved_connection_without_id() {
+        let state = state();
+        let stored = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-endpoint",
+                "name": "Prod bastion",
+                "host": "prod.example.test",
+                "port": 2222,
+                "username": "deploy",
+                "password": format!("pw-{}", uuid::Uuid::new_v4()),
+            }
+        }))
+        .unwrap();
+        state
+            .dbx_connections
+            .write()
+            .await
+            .insert(stored.id.clone(), stored);
+
+        let resolved = state
+            .registered_connection_by_ref(&json!({
+                "host": "PROD.example.test",
+                "port": 2222,
+                "username": "deploy",
+            }))
+            .await
+            .unwrap()
+            .expect("endpoint should resolve the saved connection");
+        assert_eq!(resolved.id, "conn-endpoint");
+    }
+
+    #[tokio::test]
+    async fn connection_name_uses_endpoint_to_disambiguate_candidates() {
+        let state = state();
+        for (id, host) in [("conn-x", "10.0.0.1"), ("conn-y", "10.0.0.2")] {
+            let stored = StoredConnection::from_lifecycle_params(&json!({
+                "connection": {
+                    "id": id,
+                    "name": "Twin",
+                    "host": host,
+                    "port": 22,
+                    "username": "ops",
+                    "password": format!("pw-{}", uuid::Uuid::new_v4()),
+                }
+            }))
+            .unwrap();
+            state
+                .dbx_connections
+                .write()
+                .await
+                .insert(id.to_string(), stored);
+        }
+
+        let resolved = state
+            .registered_connection_by_ref(&json!({
+                "connectionName": "Twin",
+                "host": "10.0.0.2",
+                "port": 22,
+                "username": "ops",
+            }))
+            .await
+            .unwrap()
+            .expect("name plus endpoint should resolve one candidate");
+        assert_eq!(resolved.id, "conn-y");
+    }
+
+    #[tokio::test]
+    async fn conflicting_connection_selectors_are_rejected() {
+        let state = state();
+        let stored = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-prod",
+                "name": "Prod",
+                "host": "prod.example.test",
+                "port": 22,
+                "username": "ops",
+                "password": format!("pw-{}", uuid::Uuid::new_v4()),
+            }
+        }))
+        .unwrap();
+        state
+            .dbx_connections
+            .write()
+            .await
+            .insert(stored.id.clone(), stored);
+
+        let error = state
+            .registered_connection_by_ref(&json!({
+                "connectionId": "conn-prod",
+                "host": "other.example.test",
+                "username": "ops",
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("does not match"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_connection_gates_writes_and_unknown_commands() {
+        let state = McpState::shared(Arc::new(SshRuntime::new(
             std::env::temp_dir().join("dbx-mcp-readonly-test"),
         )));
         let lifecycle = json!({
@@ -4378,7 +4661,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(destructive.contains("Refused on read-only"), "unexpected: {destructive}");
+        assert!(
+            destructive.contains("Refused on read-only"),
+            "unexpected: {destructive}"
+        );
 
         // confirmDestructive cannot override a read-only connection.
         let confirmed = state
@@ -4393,7 +4679,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(confirmed.contains("Refused on read-only"), "unexpected: {confirmed}");
+        assert!(
+            confirmed.contains("Refused on read-only"),
+            "unexpected: {confirmed}"
+        );
     }
 }
 
@@ -4494,7 +4783,10 @@ mod dbx_bridge_tests {
             )
             .await
             .unwrap();
-        assert!(listed["content"][0]["text"].as_str().unwrap().contains("knownHosts"));
+        assert!(listed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("knownHosts"));
 
         // connectionName (exact, as stored) reaches the tool's own parameter
         // validation: the registry lookup passed.
