@@ -13,6 +13,7 @@
     "@codemirror/language-data": "^6.5.1",
     "@codemirror/state": "^6.5.2",
     "@codemirror/view": "^6.38.1",
+    "@lezer/highlight": "^1.2.3",
     "@lucide/vue": "1.17.0",
     "@xterm/addon-fit": "0.10.0",
     "@xterm/addon-search": "^0.16.0",

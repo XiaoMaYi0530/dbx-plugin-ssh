@@ -1835,3 +1835,452 @@ docs/MCP.zh-CN.md（连接寻址节）。
 **边界**：runInTerminal stdio 转发仍要求显式 `connectionId`（桥转发路径不解析
 名称/endpoint，与 §8.16 一致）；仅传 host 不传 username 不做匹配（防同机多账户
 误选）。
+
+## 前端 UX 三项：一键 sudo -v、全局配置扁平化、批量目标弹层外点关闭（2026-09-10）
+
+1. **一键 sudo -v 工具栏按钮**：新增 `sendSudoRefresh()`，复用 `sendQuickCommand`
+   的 PTY 写入路径（`trackPendingInput("sudo -v\r")` + `sendTerminalBytes`，回车
+   语义 `\r` 与现有代码一致），向当前交互终端立即执行 `sudo -v` 刷新 sudo 凭据
+   缓存；RefreshCw 图标按钮放 ShieldCheck（toggleQuickSudo 开关）旁，title 走新
+   七语 key `sudoRefresh.title`；与开关按钮互不相干。
+2. **全局配置编辑扁平化**：设置弹窗内联 quick sudo 配置档管理（`profilesInlineOpen`
+   section，与工具栏 KeyRound 独立 profiles 弹窗共用同一份 sudoProfiles/草稿状态）；
+   「管理」链接改为展开/收起 section，不再跳第二层弹窗。底部主「保存」改串行链：
+   ① 未保存的 profile 编辑（`saveProfileDraft`）→ ② 连接设置（ssh/settings/set）
+   → ③ MCP 限速（`saveMcpSettings`），各步独立容错（错误分别落
+   sudoProfilesError/mcpError，单步失败不阻断其余）；MCP 区独立「保存」链接移除。
+   `openSettings` 每次打开重置内联态并 `cancelProfileEdit()`，防陈旧草稿被主保存
+   静默提交；Esc 链在设置弹窗内按「关编辑表单 → 收 section → 关弹窗」逐层退出。
+3. **批量目标弹层点空白关闭**：`onDocumentMouseDownCapture` 判 target 不在
+   `.batch-targets-popover` 且不在触发按钮 `.batch-bar-targets` 内即收起——capture
+   阶段先于 `.batch-bar` 的 `@mousedown.stop` 生效，条内空白/终端区/工具栏任意
+   mousedown 都能关；popover 内部与触发按钮（toggle 语义）不处理，避免抖动。
+
+验证：`pnpm typecheck` 0 错；`pnpm test` 31 文件 289 用例全绿（workbench.spec 的
+七语 key 一致性覆盖新 `sudoRefresh.title`）；`pnpm build` 通过。真机流（sudo -v
+回显、设置弹窗保存链、批量条外点关闭）留宿主复验。
+
+## 终端可视模式失效修复：模式持久化 + agent 自主 runInTerminal 全量放行（0.4.49，2026-09-11）
+
+**症状**：用户在工作台把「终端 MCP 模式」切到 auto/strict 后，MCP 命令不自动打开
+终端、不写入命令，仍走静默隐藏通道。
+
+**根因（真机取证）**：
+1. **模式是纯内存态**：`agent_modes` HashMap 随 sidecar 存活，DBX.app 重启即清零
+   （安装 0.4.48 当晚 app 至少重启三次，次晨模式已回 `off`）——宿主桥探针
+   `ssh/agent/mode/get` 返回 off → 判定隐藏通道，一切符合设计但用户视角即"无效"。
+2. **agent 自主决定的 `runInTerminal: true` 在提权命令上是死路**：`off` + elevated
+   直接 Deny，错误文案引导去开 UI 开关——agent 无法操作该开关，引导不可执行。
+
+**改动**（backend only，协议面不变、新增持久化文件）：
+1. `agent_terminal.rs`：新增 `load_modes` / `save_modes`（`<data_dir>/agent-modes.json`，
+   版本化 JSON，原子写，损坏按空表处理，无敏感字段不设 0600）；
+   `decide(mode, risk, explicit)` 增加显式 opt-in 维度——`off` + elevated + 显式
+   `runInTerminal: true` 改为 **Prompt**（工作台人工审批，超时即拒绝），隐式路由
+   在 `off` 下维持 Deny 不变；Deny 文案改为指向 `runInTerminal: true`。
+2. `ssh.rs`：`SshRuntime::new` 构造时加载持久化模式；`set_agent_terminal_mode`
+   改为返回 Result（内存更新后写盘，`off` 移除条目防文件膨胀），`ssh/settings/set`
+   传播持久化失败。
+3. `mcp.rs`：`ssh_exec_terminal_tool` 增加 `explicit` 入参；`ssh_exec` /
+   `ssh_exec_sudo` 的 `runInTerminal` schema 文案改为「agent 可自主决定 + 审批语义
+   + 模式持久化」。
+
+**验证**：cargo test 240 全绿（新增 `modes_round_trip_through_the_data_dir`；
+decide 矩阵单测扩展 explicit 维度）。真机复验（0.4.48 现场取证）：桥转发
+`/call-plugin-tool` 200 正常；`runInTerminal: true` 经桥全链路通过——工作台自动
+开出新 PTY、命令写入可视终端、返回 `{mode: "terminal"}`（4.3s 含开标签+dial）；
+连接级模式路由待安装 0.4.49 后由用户切换一次即可长期生效（持久化后重启不丢）。
+
+**边界**：stdio 桥转发仍要求显式 `connectionId`（名称/endpoint 不参与转发路径）；
+`off` + 提权 + 隐式调用不弹审批，避免静默路径升级为打扰路径。
+
+## 面板简化：工具栏 sudo 按钮二合一 + icon 语义修正（2026-09-11）
+
+1. **Quick sudo 不再从工作台开关**：其启用态由连接设置决定（设置弹窗
+   `settingsQuickSudo`，默认开启），工作台此前并排的「ShieldCheck 开关 +
+   RefreshCw 一键 sudo -v」合并为单个 ShieldCheck 动作按钮——点击即
+   `sendSudoRefresh()` 向当前 PTY 写入 `sudo -v`；终端右键菜单原
+   「Quick Sudo · 开/关」项同步改为「刷新 sudo 凭据（sudo -v）」动作。
+2. **脚本层清理**：删除 `quickSudo`/`quickSudoSubmitting` ref、
+   `toggleQuickSudo()`、`refreshQuickSudoSetting()`、`quickSudoTitle` 及
+   afterSessionConnected/closeSession 中的状态同步调用（`ssh/settings/get|set`
+   仍由设置弹窗使用）；i18n `messages` 中 7 语废弃键
+   `quickSudo.label/hint/on/off` 全部移除（`supplemental` 顶层
+   `quickSudo`/`quickSudoHint` 仍服务命令对话框 sudo 开关，`sudoRefresh.title`
+   七语保留）。
+3. **icon 语义 review**：传输面板按钮原用 `ListChecks` 与「批量发送」同栏撞图标，
+   改为 `ArrowUpDown`（⇅ 双向传输）；其余工具栏图标过一遍——
+   ArrowLeftRight（面板互换）/FolderOpen+PanelRightClose（SFTP 面板）/PlugZap（重连）/
+   KeyRound（sudo 配置档）/SquareTerminal（命令对话框）/Zap（快捷命令）/Bot（AI 终端）/
+   Gauge（指标）/Info/Settings/Columns3 语义均成立，RefreshCw 删除 sudo 项后仅剩
+   刷新语义（目录刷新两处），无其他改动。
+
+验证：`pnpm typecheck` 0 错；`pnpm test` 31 文件 289 用例全绿。纯前端改动、
+协议面不变；工具栏/右键菜单真机流留宿主复验。
+
+## 审批记忆 + 执行审计 + 告警分诊（2026-09-11，0.4.51 → 0.4.52）
+
+openocta 对比评审后的两个学习点落地（实施计划
+`docs/IMPL_PLAN_SSH_APPROVAL_AUDIT_ALERT.zh-CN.md`；纯插件侧，无宿主改动、无新依赖）。
+并发四 agent 实施（WP-A/B/C 后端新模块 + WP-D 前端 lib/七语，热点文件接线主会话统一）：
+
+1. **审批记忆（4a）**：审批弹窗「记住此命令」（`ssh/agent/resolve` 增可选 `remember`，
+   向后兼容）→ 批准文本入连接级免审批清单（新模块 `agent_approvals.rs`，
+   `agent-approved-commands.json` 照 agent-modes.json 存储模式）；`decide_with_memory`
+   把 Prompt 降为 Run（Deny 不覆盖，D1）；匹配完整复用 sudo_allowlist token 语义
+   （D3）；破坏性命令拒绝入库 + 命中重检无效（D2 双重锁）。`ssh/settings/get|set`
+   增 `rememberedCommands`（全量替换、行 ≤500、≤50 行、破坏性行拒绝带行号），
+   设置弹窗「AI 终端」区块可查看/删除/手工泛化通配。
+2. **执行审计（4b）**：新模块 `audit_log.rs`（JSONL append-only，5 MiB 轮转 `.1`，
+   open-append 单行写支持 embedded/stdio 双进程共享数据目录）；`call_tool` 每次调用
+   一条（gate 枚举 = 既有门序各拒绝分支归纳 + 执行结果/exitCode/耗时，宿主桥转发由
+   执行方记账不双计）+ ssh.rs 审批生命周期一条（approved/denied/timeout/remembered）；
+   `ssh/audit/list {limit?, beforeTs?}` 只读回放（`entries` + `truncated`）。
+3. **告警分诊（5）**：新模块 `alert_triage.rs`（纯函数）：异构告警 JSON/纯文本 →
+   标准化（openocta /hooks/alert 兼容语义：解析失败整包当 message）+ 双语关键词分类
+   （cpu/memory/disk/inode/network/oom/service/generic，同分固定序 Oom>Memory）+ 只读
+   诊断命令清单（14 个稳定 purposeKey）。硬约束 D6 单测钉死：每条 playbook 命令
+   `assess_command == ReadOnly`（初稿 `top -b -n 1` 不在白名单被剔除）；`svc` 提取带
+   敏感路径守卫。`ssh/alert/triage` RPC（无需连接）+ MCP 工具 `ssh_alert_triage`
+   （28→29，非写工具）；工作台工具栏「告警排查」（Siren）弹窗：粘贴 → 分析 → 逐条
+   发送到终端 / 全部复制。
+
+**契约**：PROTOCOL 新增「审批记忆」「执行审计」「告警分诊」三节 + RPC 表 3 行 +
+settings/agent-resolve 字段；MCP.zh-CN.md 工具一览 29 + 「告警 → 排查（组合用法）」
+新节 + 审批记忆要点；FEATURE_PARITY 新增 openocta 对标节（5 行）。七语 41 key ×7
+（`approval.remember`、`settingsRemembered.*`、`alertTriage.*`）。
+
+**验证**：`cargo test` **286 passed / 0 failed / 0 warning**（agent_approvals 8 +
+decide_with_memory 矩阵 + audit_log 10 + alert_triage 26 + remember 持久化 2，基线
+240）；`pnpm typecheck` 0 错；`pnpm test` **307/307**（agentTerminal +10、
+alertTriage +9，七语 key/占位符对齐保持）；`smoke_mcp.py` all green（29 工具 +
+triage 离线回环）；`smoke_fs_test.py` **PASS 52 / SKIP 0 / FAIL 0**（真机容器，新增
+4 用例：remember 后同命令零弹窗直跑、设置清单管理 + 破坏性行拒绝、triage 正反例、
+audit 台账 gate/approval 全字段与 remembered 审批线）。
+
+**边界与遗留**：① token 精确匹配对参数漂移的命中率低，属保守取舍，泛化靠设置面板
+手工编辑；② 审计不含工作台人工操作（既定信任模型），Web 查看器未做（RPC 已备）；
+③ 分诊分类为关键词启发式、generic 兜底；④ 本轮未出包（安装生效需重新打包发版）；
+⑤ 宿主侧 `tools/list` 计数类断言（若有）需同步 28→29。
+
+**UI 浏览器验证（同日）**：mockDbxHost 补 `ssh/alert/triage` fixture 与
+settings `agentTerminalMode`/`rememberedCommands` 镜像（规约第 7 条）。聚焦走查
+（playwright-core 仓外 /tmp，项目零新依赖）**12/12 全绿**：工具栏 Siren 按钮 →
+弹窗粘贴 CPU 告警 JSON → Analyze → category="CPU"/severity 徽标 Critical/3 条
+建议行/发送按钮随会话启用；纯文本回退分类 Disk；弹窗关闭；设置弹窗「已记住命令」
+区块与空态提示渲染；零 page error。截图
+`docs/screenshots-ui-mock/triage-round92-{alert-dialog,settings-remembered}.png`。
+**既有 `scripts/smoke_ui_mock.mjs` 失效为先在问题**：其批量发送段断言
+`.batch-modal`/`.batch-quick-pick` 旧弹窗 UI，而批量交互已于 2026-09-08 改版为
+终端底部常驻命令条（见上 §批量发送轮），脚本未跟随改版——非本轮回归，待该脚本
+所有权方按新 UI 重写走查段。
+
+## 凭据静态加密 + 传输历史落盘 + SFTP 书签（2026-09-11，0.4.52）
+
+sshbool 对比评审后的学习点落地（实施计划
+`docs/IMPL_PLAN_SSH_VAULT_TRANSFER_HISTORY.zh-CN.md`；纯插件侧，无宿主改动；
+新依赖 4 个：`aes-gcm`/`keyring`/`zeroize`/`rand`）。并发三 agent 实施
+（WP-A vault / WP-B 历史+书签后端 / WP-C 前端，文件所有权互不重叠；`main.rs`
+mod 声明由主会话预置消除冲突）：
+
+1. **凭据静态加密（vault）**：新模块 `vault.rs`（`KeyProvider` trait：
+   `KeychainProvider` keyring 服务 `io.dbx.ssh` 账户 `vault-dek-v1` +
+   `KeyfileProvider` `<data_dir>/vault.key` 0600 回落；AES-256-GCM 字段级信封，
+   AAD 绑定 `字段|档案id`，DEK `Zeroizing`）；`quick-sudo-profiles.json` 升
+   `version:2` + `crypto` 头，`sudoPassword`/`totpSecret` 改
+   `sudoPasswordEnc`/`totpSecretEnc`（空值不加密），元数据明文；v1 加载后
+   best-effort 迁移重写；解密失败按空降级（元数据保留）。`load_store`/`save_store`
+   签名不变，新增 `*_with` 注入变体（单测全走 Keyfile+tempdir，不触真实
+   keychain）；`profile_view`/`reveal`/MCP 布尔面不变。
+2. **传输历史落盘**：新模块 `transfer_history.rs`（`transfer-history.json`
+   环形 200 条、tmp+rename 0600、仅状态跃迁写盘）；ssh.rs 跃迁点挂钩
+   （upload/download start 与统一收口点 `record_transfer`，补齐两个此前不落账的
+   incomplete 错误路径，session 关闭中止任务写 failed）；遗留 `running` 加载时
+   **呈现层**标 failed 不回写（保跨进程 last-writer-wins 正确性）；新 RPC
+   `sftp/transfer/history {sessionId?, limit?}` 持久化+live 合并（live 覆盖并
+   继承 startedAt/connectionId）。
+3. **SFTP 书签**：新模块 `sftp_bookmarks.rs`（镜像 quick_commands：全局 20 条、
+   label 1–64 唯一大小写不敏感、path 非空 ≤1024 不验存在性）；新 RPC
+   `sftp/bookmarks/list|save|delete`；前端 `lib/sftpBookmarks.ts`（校验/排序纯
+   函数 + RPC 封装，20 用例）+ 路径栏星标收藏弹层 + 历史弹层书签区 + 传输面板
+   历史区（无活动任务时展示、failed 显 error、活动清零自动刷新）。
+
+**契约**：PROTOCOL 新增 `sftp/transfer/history`、`sftp/bookmarks/*` 三方法
+（表 2 行 + 明细 2 段）+ sudo/profiles 节「凭据静态加密」说明；FEATURE_PARITY
+新增 sshbool 对标节（8 行）；三个新方法均不进 MCP 工具面（29 工具不变）。七语
+`i18n.ts` 新增 `sftpBookmark.*`（15 键）+ `transfersHistory.*`（3 键）。
+
+**验证**：后端 `cargo test` 全量 315 passed / 0 failed（/tmp 快照隔离验证：
+同工作区另一批次（审批记忆/审计/告警）收尾过程中 mcp_safety 测试短暂处于半成品
+态，快照仅桩替其 `mod tests` 后全量运行；含 vault 9 + sudo_profiles 19（新增 6）
++ transfer_history 5 + sftp_bookmarks 8 + live 合并 1）；ssh.rs 既有
+`profile_options_*` 测试改走 `save_store_with`+Keyfile（防测试触真实 keychain）。
+`pnpm typecheck` 0 错；`pnpm test` 37 文件 363/363。一次性探针（/tmp，17/17）：
+书签 CRUD+校验拒绝矩阵+排序、history 空态/limit、**真机 vault 链路**——
+`sudo/profiles/save` 落盘文件含 v2 头且无明文密钥、keychain 实建
+`io.dbx.ssh/vault-dek-v1` 条目、list 布尔面、`reveal` 回读原值；
+`smoke_mcp.py` all green（29 工具，sudo profiles roundtrip 复验）。
+
+**边界与遗留**：① keyring Linux 后端依赖 Secret Service（dbus），web Docker 等
+无 keychain 环境自动落 keyfile 档（弱保证：防拷贝/备份外泄，文档已声明）；
+② keychain 条目被删 → 密钥字段按空处理（可重填）；③ 传输历史跨进程
+last-writer-wins、逐块进度不落盘、断点续传不在范围；④ 书签全局共享不按连接
+分组；⑤ 无容器 smokes（smoke_test/fs/batch3）未在收口环境运行（docker 测试容器
+未起），新方法已由探针覆盖注册与语义，容器轮次回归时自然并入；⑥ 本轮未出包
+（安装生效需重新打包发版）；⑦ 前端 label/path 按 UTF-16 计数与后端 char 计数在
+多字节边界可能差 1–2 字符（前端 maxlength 已限）。
+
+## Netcatty 对标批次（部分落地 + mcp.rs 事故通报）（2026-09-11 晚）
+
+依据 `docs/IMPL_PLAN_NETCATTY_PARITY.zh-CN.md`（对标 binaricat/Netcatty，用户选定
+①MCP 权限档+作用域 ②multi_exec/terminal_input ③关键词高亮 ④审计 ⑤metrics 增强），
+并发双 agent 实施（A 后端 / B 前端）。**与同日并行批次「审批记忆+执行审计+
+告警分诊」「凭据静态加密+传输历史+SFTP 书签」存在范围交叠，收口前需主会话协调。**
+
+### ⚠️ mcp.rs 事故通报（两批次都受影响）
+
+后端 agent A 在修复插入点时批量替换脚本锚定错误，误删 mcp.rs 约 2800 行；外部
+恢复渠道（VS Code 本地历史/APFS 快照/git dangling blob）无快照，已用 git HEAD
+恢复文件骨架。**净损失两笔**：
+
+1. **事故前工作区的未提交 mcp.rs 改动**（0.4.49 轮的 `explicit` 传参线程化 +
+   runInTerminal schema 文案）——主会话已按 PROGRESS 0.4.49 记录**手工恢复**
+   （`ssh_exec_terminal_tool` 六参签名带 `explicit`，`decide(mode, risk, explicit)`，
+   schema 描述补 agent 自主决定/审批语义/持久化文案），cargo 327 全绿复验通过。
+   **后续任何 mcp.rs 重写必须保留该行为**。
+2. **并行批次 16:15 对 mcp.rs 的改动**（内容不明，推测为 `decide_with_memory` +
+   remember 参数在 MCP 终端路由的接线）——无法恢复。当前状态：`agent_approvals.rs`
+   与 `agent_terminal.rs::decide_with_memory` 在树上、main.rs `ssh/agent/resolve`
+   已带 `remember` 透传，但 **mcp.rs 终端路由仍走裸 `decide`，审批记忆在 MCP 面
+   未生效**。请并行批次会话对照其 PROGRESS 记录重放该接线（重放时保留上述
+   explicit 行为）。事故残骸备份：`/tmp/mcp.rs.damaged.*.bak`、
+   `/tmp/mcp.rs.residue.final.bak`。
+
+### 本批已落地（工作树，未提交，未出包）
+
+- **A3 关键词高亮（后端）**：`highlight_rules.rs` 新模块（照 quick_commands 模式，
+  上限 30、regex 合法性由前端校验）+ `ssh/highlightRules/list|save|delete` 三臂；
+- **A5 metrics 发行版识别**：`parse_os_release` + METRICS_SCRIPT `--os--` 哨兵段，
+  payload 可选 `osId`/`osPretty`（缺文件整体省略）；
+- **B1–B4（前端全量）**：`lib/keywordHighlight.ts`（compileRules/matchesInLine/
+  sanitize，17 spec）+ 工具栏管理弹层 + xterm decoration 视口扫描引擎（rAF 节流、
+  上限 400、localStorage 总开关 `ssh-keyword-highlight`；xterm 5.5 DOM renderer
+  不吃 decoration backgroundColor，改为 onRender 自绘着色）；`lib/metricsSparkline.ts`
+  （环形 60 点 SVG，rx/tx 双曲线）+ `lib/distroBadge.ts`（14 发行版 monogram，
+  纯 CSS 零图片资产）；设置弹窗 MCP 区权限档/作用域控件（B3，后端 A1 未落地前
+  对真机 set 会报错、经 mcpError 容错）；审计查看区（B4）；
+- **B4 双形状兼容（主会话补）**：发现并行批次 `ssh/audit/list` 契约与本批 §1.1
+  不同（`tsMs` 毫秒/`tool` 代 kind/`connectionId`/无 command/limit 1–500 缺省 100/
+  文件序/无 clear），`lib/auditLog.ts` 改为双形状容忍（ts 归一为秒、kind←tool、
+  newest-first 客户端排序、kind 过滤客户端做、clear 对无该方法后端静默降级）；
+  mockDbxHost fixture 改镜像真实形状（末条保留旧形状样例）。
+
+### 本批未落地（材料在案，待协调后收口）
+
+- **A1（MCP 权限档 confirm + 连接作用域）/ A2（ssh_multi_exec + ssh_terminal_input）**：
+  曾全部实现并 326 测试全绿，随事故回退。全部实现文本已转存
+  `~/.dbx-mcp-recovery/`（A1/A2 两个 .md + 被删文件 :1-3219 原文四段，合计约
+  220KB，仓库外持久保存；/tmp/mcp-recovery 为同内容副本；已知缺口——part3 的
+  StoredConnection 字面量缺六字段勘误在 part4 头部、tool_definitions 描述为
+  要点压缩，重建时以 HEAD 为底仅追加 A2 新工具），**重放前需
+  与并行批次协调 mcp.rs 的 edit 权**（其审批记忆接线与本批 confirm 门改同一
+  路由区域）；`mcp_safety.rs` 的 `normalize_terminal_input`/
+  `is_control_only_input`/`assess_terminal_input` 三函数仍在树上可直接复用。
+- **A4（审计）已撤销**：与并行批次「执行审计」（`audit_log.rs`，MCP exec 维度、
+  gate/approval 轨迹）完全重叠，以并行批次实现为准；本批计划 §1.1 审计契约作废，
+  前端 B4 已按上节适配。`ssh/audit/clear` 后端无此方法，前端静默降级，待并行
+  批次决定是否补充。
+
+### 验证基线（本批当前树）
+
+cargo test **327 passed / 0 failed**（含并行批次用例）；`vue-tsc` 0 错；
+vitest **37 文件 364 用例全绿**；`pnpm build` 过（ui/index.html 产出）。
+
+## vault 密钥托管优化：默认档反转为 keyfile（2026-09-11，用户反馈）
+
+sshbool 批次上线当天用户真机反馈"每次启动都要反复输入几次密码"。根因：macOS
+keychain 对访问方二进制做 ACL 校验——插件每次更新二进制变化即重弹授权对话框，
+而旧实现首写探测（`resolve_provider(None)` 读 keychain 探测档位）+ 每次读写重新
+解析 DEK 放大了弹窗频率；工作台与 stdio `--mcp` 双进程各弹一轮。修正（实施计划
+IMPL_PLAN_SSH_VAULT_TRANSFER_HISTORY 决策修订 D2a，纯后端 `vault.rs`/
+`sudo_profiles.rs`，协议面不变）：
+
+1. `resolve_provider(None)` **不再探测 keychain**：默认档直接为
+   `<data_dir>/vault.key`（0600）；keychain 仅在 env
+   `DBX_SSH_VAULT_STORAGE=keychain` 显式选入或读取遗留 keychain 档信封时使用。
+2. keychain DEK 解析**进程级缓存**（`OnceLock<Mutex<…>>`，成功与失败均缓存）：
+   每进程至多一次授权弹窗，被拒后进程内不重试。
+3. **自动迁移**：`load_from_value` 检测 keychain 档文件且密文成功解密时重封为
+   keyfile 档、更新 `crypto.storage` 头，并 best-effort 删除 keychain 条目
+   （`vault::delete_keychain_dek`）；解密失败（被拒/丢钥）时保持原文件不动——
+   `recovered_secret` 门禁保证绝不以空密文覆盖真实档案。
+4. 测试 +2（keychain 档恢复加载后迁移为 keyfile 且保持静态加密；不可恢复的
+   keychain 档文件原样保留、不铸造 keyfile）；`resolve_provider` 既有测试改为
+   断言默认 keyfile。
+
+验证：`cargo test` 全量 **330 passed / 0 failed**（共享树含并行批次用例整体
+全绿）。真机两个数据目录（`dbx-plugin-data` 与 `com.dbx.app/plugin-data`）均为
+keychain 档 v2 文件——装上本修订后：首次加载弹一次授权，点允许即自动迁移到
+keyfile 档并清理 keychain 条目，此后启动/重连/插件更新零弹窗；点拒绝则该进程
+内 sudo 档案密钥视为空、下次启动再给一次机会。本轮未出包（生效需重新打包发版）。
+未跑 smoke/打包；版本 0.4.52 已被并行批次占用，本批收口时 bump **0.4.53**。
+smoke 扩展（highlightRules CRUD + metrics osId + multi_exec/terminal_input
+schema）、PROTOCOL/MCP/FEATURE_PARITY 文档同步、PROGRESS 收尾报告随收口轮补。
+
+## 新增功能 UI 打磨轮（2026-09-11 晚）
+
+> 背景：UI_SCAN_FINDINGS 六轮收敛（09-06）之后落地的功能（关键词高亮、告警分诊、
+> 审批记忆、审计查看区）未经过 UI 走查；本轮按用户反馈 + mock.html 浏览器实测
+> （playwright-core + Chrome headless，截图复验）做一轮针对性打磨。
+
+1. **关键词高亮弹层零外间距（用户反馈）**：`.popover` 基类无 padding，其他弹层
+   （transfer/columns/batch-targets/quick-commands/connection-info/agent-mode 等）
+   均各自补了 padding，唯独 `.highlight-rules-popover` 漏配，内容贴边。修复：
+   `style.css` 补 `padding: 8px` + `h3` 对齐兄弟弹层（`margin: 0; font-size: 12px`，
+   原先吃 UA 默认 1em 上下边距）。浏览器实测：内容四边 9px（8px padding +
+   1px border），与 quick-commands 等弹层观感一致。
+2. **告警排查弹窗补功能说明（用户反馈「是什么功能」引出的可发现性问题）**：
+   弹窗原先只有 title + placeholder，无一句说明。补 `alertTriage.hint` 七语文案
+   （粘贴告警 → 自动归类 → 只读诊断清单 → 一键发送语义），模板在 header 下加
+   `.alert-triage-hint` 段落。定位本身不变（见 IMPL_PLAN_SSH_APPROVAL_AUDIT_ALERT
+   §#5：刻意不做 LLM，分诊 = 结构化 + 分类 + 白名单级命令建议）。
+3. **设置弹窗「已记住命令」补区块标题**：`settingsRemembered.section` 七语键早已
+   定义但模板从未使用，导致 label/empty/hint 三行文字悬空与前节提示粘连。在
+   `.settings-remembered` 首行补 `<h4 class="settings-section-title">`（带分隔线，
+   与 Terminal interaction 等区块一致）。
+
+实测范围：高亮弹层、告警排查弹窗（含分析结果区）、连接信息、设置弹窗（顶部 +
+底部审计区）、指标浮层；其余新增面（agent 审批弹窗、终端 MCP 模式弹出层）源码
+复核样式在位（scoped padding/间距均有定义），未逐一浏览器走查。
+验证：`vue-tsc` 0 错；vitest **37 文件 364 用例全绿**（七语 key/占位符对齐断言
+自动覆盖新键）。未跑 smoke/打包（纯前端 CSS/模板/i18n，无协议改动）。
+
+## 关键词高亮默认规则播种 + 弹层 Esc 链补漏（2026-09-11 晚，续）
+
+> 用户需求「关键词高亮加一些必须要用的规则」；顺带修复浏览器实测中发现的两个
+> 收敛后新增弹层 Esc 缺口。
+
+1. **首启默认规则播种（后端）**：新装数据目录下第一次 `ssh/highlightRules/list`
+   （或 save）时，`highlight_rules::load_or_seed_store` 以固定 id 写入 6 条
+   默认规则并持久化——`ERROR`/`FATAL` #ef4444、`FAIL`/`denied` #f59e0b、
+   `WARN` #facc15、`SUCCESS` #22c55e，全部字面匹配、不分大小写、默认启用。
+   语义边界：仅存储**文件不存在**时播种；坏文件降级空库与用户删空后均**不重播**
+   （文件存在即视为用户已有库）；seed 写失败时本次仍返回默认、下次重试。
+   新增单测 `first_load_seeds_defaults_and_persists_them`（播种/持久化/清空
+   不重播/确定性 id）。契约同步：IMPL_PLAN_NETCATTY §1.1 list 行 + 存储表注。
+2. **mock 镜像**：mockDbxHost 高亮夹具从单条 ERROR 换成同一组 6 条默认规则
+   （固定 id 对齐后端）；回放终端追加 3 行 deploy.log 演示输出（WARN/ERROR
+   Permission denied/SUCCESS），mock 页挂载即可见默认规则着色。
+3. **弹层 Esc 链补漏（浏览器实测发现）**：`onDocumentKeydown` 工具栏弹出层
+   Esc 分支的**条件**漏了 `highlightMenuOpen`（只在执行体，单独打开时 Esc
+   无效），`agentModeOpen`（终端 MCP 模式弹出层）条件与执行体均缺失——两者
+   均为 UI 扫描六轮收敛（09-06）之后新增的弹层，属 R5-P2-1 同类问题。已把
+   两个状态补进条件与执行体。浏览器复验：高亮弹层、agent-mode 弹层单独
+   打开后 Esc 均即时关闭，无残留。
+
+验证：cargo test **328 passed**（+1）；`vue-tsc` 0 错；vitest **364/364**；
+浏览器（mock.html）截图复验默认规则列表（6 / 30 rules）与终端四色着色。
+未跑 smoke/打包（后端为纯函数级改动，协议形状无变化）。
+
+### 默认规则集扩充为 22 条（同日续，用户需求「设计好用有效的规则」）
+
+按严重度分色的实战规则集替换首批 6 条（`DEFAULT_RULE_SPECS` 22 条，列表
+预算 22/30，仍留 8 槽给用户自建）：
+
+- **红（硬错误）**：ERROR、FATAL、Permission denied（权限不足）、No such
+  file or directory（文件不存在）、command not found、Connection refused、
+  No space left on device（磁盘满）、Failed to（systemd 操作失败）、cannot、
+  Exception、Traceback (most recent call last)（Python 栈头）；
+- **琥珀（命令失败/受限）**：FAIL、denied、timed out；
+- **黄（警告）**：WARN、deprecated；
+- **绿（成功/健康）**：SUCCESS、active (running)（systemd 健康）、done、✓、
+  PASSED（唯一区分大小写，避免散文 "passed"/"bypassed" 误报）；
+- **蓝（可提取信息）**：IPv4 正则 `\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`
+  （唯一 regex 规则）。
+
+分层设计：匹配按 pattern 长度降序先到先得——长短语精确红优先于同线词干
+（"Permission denied" 整段红时内部 "denied" 不再叠琥珀；"Access denied"
+孤立出现仍琥珀）。前端为 22 条列表补滚动容器 `.highlight-rule-list`
+（max-height 320/视口自适应，标题与编辑器固定可见）。mock 镜像同步 22 条 +
+回放演示扩充（No such file/command not found/timed out/IPv4）。
+验证：cargo test 328；vitest 364；`vue-tsc` 0 错；浏览器截图复验 22/30
+列表滚动 + 终端五色着色 + 分层优先级。
+
+#### 高亮遮字修复（同日，用户反馈「背景色遮挡文本内容」）
+
+xterm decoration 元素绘制在文字层**上方**，`onRender` 原来把规则色设为
+**不透明** `backgroundColor`——命中区域变成实色块，字形整个被盖住（用户截图
+证实 22 条默认规则全中）。修复：新增纯函数 `keywordHighlight.ts::
+highlightFillStyle(color)`（`#rrggbb` → `rgba(r,g,b,0.35)`，非法形状回退默认
+色，2 条单测），`onRender` 改设半透明填充，原文字透出、色相保留（编辑器式
+高亮）。浏览器复验：五色底透字全部可读（dark 主题），分层优先级不受影响。
+`vue-tsc` 0 错、vitest **366/366**（+2）。
+
+## review + 持续优化第 1 轮（2026-09-11，review+optimize agent）
+
+> UI 扫描六轮收敛（09-06）之后的新增面（告警排查、审批记忆、高亮、agent mode、
+> 传输历史、书签）未经专项复审；本轮对工作区未提交改动做 review + 小修。
+> 详情见 `.goal-state/report-ssh-round1.md`。
+
+发现：P0=0、P1=1、P2=3（全部当场修复，均在前端 `App.vue`）+ 后端新增面零缺陷。
+后端 review（agent_approvals/alert_triage/audit_log/highlight_rules/
+sftp_bookmarks/transfer_history/vault + ssh/mcp/mcp_safety/metrics/main 的 diff）
+未发现需修问题，纯函数单测覆盖与敏感路径（8KiB 截断、os-release 容错、vault
+恢复门禁）实现严谨。
+
+1. **告警排查弹窗接入焦点与 Esc 链（P1-1）**：`alertTriageOpen` 此前不在
+   `modalOpenStates` 也不在 Esc 对话框分支——打开不聚焦、Esc 关不掉，是
+   R5/R6（highlight/agentMode Esc 缺口）同族的"收敛后新增弹层漏接入"第三次复发。
+   修复：入 `modalOpenStates`（settingsOpen 之后）+ Esc 独立分支 + textarea 补
+   `autofocus` 定位标记（modalFocus 以该属性选首聚焦控件）。
+2. **审批「记住」放开风险档限制（P2-1）**：勾选框原 `v-if="risk === 'elevated'"`，
+   但 `decide_with_memory` 对低危 Prompt 同样生效且设置面板 rememberedCommands
+   无手动添加输入——strict 模式低危命令永远无法免审，与 IMPL_PLAN
+   （审批审计告警）"strict/auto approve+remember 二次零弹窗"预期不符。去掉
+   v-if；后端 D2 灾难门兜底不动。
+3. **高亮弹层互斥补漏（P2-2）**：`toggleHighlightMenu` 漏关 `agentModeOpen`
+   （agentMode 不在 mousedown-capture 收起清单，正向点击即两层叠开），补一行。
+4. **连接信息发行版徽标数据源补拉（P2-3）**：徽标取 `ssh/metrics` 的
+   `osId/osPretty`，但快照只在指标浮层轮询时拉取——从未开过指标的会话永远
+   看不到徽标。`toggleConnectionInfo` 打开时无快照则 `refreshMetrics()` 一次
+   （自带未连接守卫）。
+
+验证：`pnpm typecheck` 0 错；`pnpm test` **366/366 全绿**（与改动前基线一致，
+无新增文案键）。smoke SKIP（纯前端交互改动，无协议面变化）。浏览器级复核点
+（弹窗焦点/Esc、低危 remember 勾选、弹层不叠开、徽标显示）留人工，见报告。
+遗留：toggleBookmarkSave 互斥清单、互斥/Esc 接入的 spec 防线、告警排查 mock
+夹具等 5 项，见 `.goal-state/report-ssh-round1.md` 遗留节。
+
+## review + 持续优化第 2 轮（2026-09-11，review+optimize agent）
+
+> 以上一轮遗留项为主线（互斥收口、互斥/Esc 接入 spec 防线、告警排查 mock
+> 夹具、onLocaleChange 夹具）。详情见 `.goal-state/report-ssh-round2.md`。
+
+发现：P0=0、P1=0、P2=2（均当场修复，纯前端）+ 现状澄清 ×2。
+
+1. **工具栏弹出层互斥收敛为 closeToolbarPopovers() 单助手（P2-1）**：round1
+   P2-2 只修了高亮→agentMode 单方向；实际上 agentMode 弹层无 mousedown
+   capture 兜底，点快速命令/连接信息/星标/列配置/传输/路径历史触发钮均会
+   叠开，closeMenus（document click 全局收起）也漏 agentModeOpen（agent-mode
+   弹层点外不收，仅 Esc 可关）。五处 toggle 手抄清单 + 三处模板内联表达式
+   （columns/transfer/pathHistory 收敛为具名 toggle）+ closeMenus +
+   openTransferPanel 全部改走单助手；metrics 浮层与批量保存态语义不同不入族
+   （Esc 链单独收口）。
+2. **mock ssh/alert/triage 对齐后端（P2-2）**：该夹具已由并行批次补进工作区，
+   本轮修两处语义偏差——JSON 告警 message 缺失应回退整段 payload（openocta
+   兼容，与有无 title 无关）、source 应像后端一样小写化；并补单测锁定契约
+   形状（JSON/纯文本双路径 + disk playbook 逐字清单）。
+3. **弹层互斥回归防线（round1 遗留 2）**：workbench.spec.ts 新增 4 用例，
+   从 App.vue 源码反向提取模板全部 modal/popover 守卫 ref，断言接入
+   modalOpenStates / Esc 链 / closeToolbarPopovers 之一 + modal 全进焦点表 +
+   8 个 toggle 必须走助手；带非空锚点防空转。变异校验：模拟 P1-1 复发
+   （alertTriageOpen 出焦点表）防线准确报出。
+4. **onLocaleChange 夹具补齐（round1 遗留 5，可选顺手项）**：mock `locale`
+   改 getter + `?locale=` 定初值 + 新增 onLocaleChange（订阅即回调，与
+   onAppearanceChange/onContextChange 同构）+ `__dbxMockSetLocale` 调试入口
+   （镜像宿主桥 updateLocale 语义）；mockDbxHost.spec 补 i18n 切换链用例。
+
+验证：`pnpm typecheck` 0 错；`pnpm test` **37 文件 372/372 全绿**（基线 366
++ 新增 6）。后端零改动未跑 cargo test。smoke SKIP（纯前端交互/夹具，无协议面
+变化）。浏览器级复核（弹窗焦点/Esc、弹层两两不叠开、__dbxMockSetLocale 切语）
+与 0.4.53 smoke/打包留人工，见报告遗留节。R5-P2-2 维持豁免。

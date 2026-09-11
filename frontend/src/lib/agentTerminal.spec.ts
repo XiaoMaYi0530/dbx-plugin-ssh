@@ -2,9 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   AGENT_MODES,
   approvalRemainingSecs,
+  buildAgentResolveBody,
   dropAgentPrompt,
   enqueueAgentPrompt,
   findAgentPrompt,
+  REMEMBERED_COMMAND_LINE_LIMIT,
+  REMEMBERED_COMMAND_LIST_LIMIT,
+  sanitizeRememberedCommands,
   type AgentPromptPayload,
 } from "./agentTerminal";
 
@@ -79,5 +83,82 @@ describe("agent prompt queue helpers", () => {
     const queue = [first, second];
     expect(findAgentPrompt(queue, "c2")).toBe(second);
     expect(findAgentPrompt(queue, "missing")).toBeUndefined();
+  });
+});
+
+describe("agent resolve body", () => {
+  it("deny sends only challengeId and decision", () => {
+    expect(buildAgentResolveBody({ challengeId: "c1", decision: "deny" })).toEqual({
+      challengeId: "c1",
+      decision: "deny",
+    });
+  });
+
+  it("approve without a command sends only challengeId and decision", () => {
+    expect(buildAgentResolveBody({ challengeId: "c1", decision: "approve" })).toEqual({
+      challengeId: "c1",
+      decision: "approve",
+    });
+  });
+
+  it("approve with a command carries the edited command text but no remember key", () => {
+    expect(buildAgentResolveBody({ challengeId: "c1", decision: "approve", command: "systemctl restart nginx" })).toEqual({
+      challengeId: "c1",
+      decision: "approve",
+      command: "systemctl restart nginx",
+    });
+    // 空串视为未提供命令。
+    expect(buildAgentResolveBody({ challengeId: "c1", decision: "approve", command: "" })).toEqual({
+      challengeId: "c1",
+      decision: "approve",
+    });
+  });
+
+  it("approve + command + remember sends remember:true only when explicitly true", () => {
+    expect(buildAgentResolveBody({ challengeId: "c1", decision: "approve", command: "df -h", remember: true })).toEqual({
+      challengeId: "c1",
+      decision: "approve",
+      command: "df -h",
+      remember: true,
+    });
+    // 缺省 / 显式 false 都不发送 remember（协议省缺语义即 false）。
+    expect("remember" in buildAgentResolveBody({ challengeId: "c1", decision: "approve", command: "df -h" })).toBe(false);
+    expect("remember" in buildAgentResolveBody({ challengeId: "c1", decision: "approve", command: "df -h", remember: false })).toBe(false);
+    // deny 即使误带 command/remember 也不发送。
+    const denyBody = buildAgentResolveBody({ challengeId: "c1", decision: "deny", command: "df -h", remember: true });
+    expect(denyBody).toEqual({ challengeId: "c1", decision: "deny" });
+  });
+});
+
+describe("remembered command list sanitization", () => {
+  it("trims lines and drops empties", () => {
+    expect(sanitizeRememberedCommands(["  df -h  ", "", "   ", "uptime"])).toEqual(["df -h", "uptime"]);
+  });
+
+  it("dedupes by trimmed line text and preserves first-seen order", () => {
+    expect(sanitizeRememberedCommands(["df -h", "  df -h", "uptime", "df -h"])).toEqual(["df -h", "uptime"]);
+  });
+
+  it("clamps each line to 500 characters instead of rejecting it", () => {
+    const long = "x".repeat(REMEMBERED_COMMAND_LINE_LIMIT + 50);
+    const [line] = sanitizeRememberedCommands([long]);
+    expect(line).toHaveLength(REMEMBERED_COMMAND_LINE_LIMIT);
+  });
+
+  it("truncates the list to 50 entries", () => {
+    const many = Array.from({ length: REMEMBERED_COMMAND_LIST_LIMIT + 10 }, (_, i) => `cmd-${i}`);
+    const lines = sanitizeRememberedCommands(many);
+    expect(lines).toHaveLength(REMEMBERED_COMMAND_LIST_LIMIT);
+    expect(lines[0]).toBe("cmd-0");
+    expect(lines.at(-1)).toBe(`cmd-${REMEMBERED_COMMAND_LIST_LIMIT - 1}`);
+  });
+
+  it("returns an empty list for non-array input and skips junk items", () => {
+    expect(sanitizeRememberedCommands("df -h")).toEqual([]);
+    expect(sanitizeRememberedCommands(null)).toEqual([]);
+    expect(sanitizeRememberedCommands(undefined)).toEqual([]);
+    expect(sanitizeRememberedCommands({ commands: ["df -h"] })).toEqual([]);
+    // 非字符串项按原语 coercion 处理，对象/数组项直接跳过。
+    expect(sanitizeRememberedCommands([42, true, { x: 1 }, ["df"], "uptime"])).toEqual(["42", "true", "uptime"]);
   });
 });

@@ -15,6 +15,11 @@ let disconnectEmitted = false;
 // ?err=authfail 让 ssh/session/open 抛出真实 sidecar 风格的认证失败错误串，
 // 供连接失败错误提示友好化（connectError.*）的浏览器 UI 验证。
 const failSessionOpen = fixtureParams.get("err") === "authfail";
+// 初始 locale 支持 ?locale= 覆盖（镜像真实桥 api.locale）；运行时经
+// __dbxMockSetLocale 切换（镜像宿主桥 updateLocale 的"改字段 + 推监听"语义），
+// 供 i18n 切换链（onLocaleChange）的浏览器与单测验证。
+let currentLocale = fixtureParams.get("locale") || "en";
+const localeListeners = new Set<(locale: string) => void>();
 // 与 DBX globals.css 的 :root（pearl 浅色）和 .dark 规范块保持一致。
 const light = fixtureParams.get("theme") === "light";
 
@@ -164,7 +169,62 @@ const fixtureUploadCount = { value: 0 };
 // mock 状态：镜像真实 sidecar 的响应形状与上限/错误语义，防可视化夹具脱节。
 const QUICK_COMMANDS_LIMIT = 20;
 const quickCommandsState: { id: string; name: string; command: string; createdAt: number; updatedAt: number }[] = [];
-const settingsState = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "" };
+const settingsState = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "", agentTerminalMode: "off", rememberedCommands: [] as string[] };
+
+// 关键词高亮规则（ssh/highlightRules/*）mock 状态：镜像 sidecar 存储
+// （highlight-rules.json，0600）的响应形状/上限/默认值语义，并镜像后端
+// 首次初始化播种的 22 条默认规则（highlight_rules::DEFAULT_RULE_SPECS：
+// 严重度分色，长短语精确、词干兜底），防可视化夹具脱节。
+const HIGHLIGHT_RULES_LIMIT = 30;
+const HIGHLIGHT_PATTERN_MAX = 200;
+const HIGHLIGHT_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const HIGHLIGHT_DEFAULT_SEEDS: Array<{ id: string; pattern: string; color: string; caseSensitive?: boolean; isRegex?: boolean }> = [
+  { id: "default-error", pattern: "ERROR", color: "#ef4444" },
+  { id: "default-fatal", pattern: "FATAL", color: "#ef4444" },
+  { id: "default-permission-denied", pattern: "Permission denied", color: "#ef4444" },
+  { id: "default-no-such-file", pattern: "No such file or directory", color: "#ef4444" },
+  { id: "default-command-not-found", pattern: "command not found", color: "#ef4444" },
+  { id: "default-connection-refused", pattern: "Connection refused", color: "#ef4444" },
+  { id: "default-no-space-left", pattern: "No space left on device", color: "#ef4444" },
+  { id: "default-failed-to", pattern: "Failed to", color: "#ef4444" },
+  { id: "default-cannot", pattern: "cannot", color: "#ef4444" },
+  { id: "default-exception", pattern: "Exception", color: "#ef4444" },
+  { id: "default-traceback", pattern: "Traceback (most recent call last)", color: "#ef4444" },
+  { id: "default-fail", pattern: "FAIL", color: "#f59e0b" },
+  { id: "default-denied", pattern: "denied", color: "#f59e0b" },
+  { id: "default-timed-out", pattern: "timed out", color: "#f59e0b" },
+  { id: "default-warn", pattern: "WARN", color: "#facc15" },
+  { id: "default-deprecated", pattern: "deprecated", color: "#facc15" },
+  { id: "default-success", pattern: "SUCCESS", color: "#22c55e" },
+  { id: "default-active-running", pattern: "active (running)", color: "#22c55e" },
+  { id: "default-done", pattern: "done", color: "#22c55e" },
+  { id: "default-check", pattern: "✓", color: "#22c55e" },
+  { id: "default-passed", pattern: "PASSED", color: "#22c55e", caseSensitive: true },
+  { id: "default-ipv4", pattern: "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b", color: "#3b82f6", isRegex: true },
+];
+let highlightRuleSeq = 0;
+let metricsRefreshTick = 0;
+interface MockHighlightRule { id: string; pattern: string; isRegex: boolean; color: string; caseSensitive: boolean; enabled: boolean; createdAt: number; updatedAt: number }
+const highlightRulesState: MockHighlightRule[] = HIGHLIGHT_DEFAULT_SEEDS.map(({ id, pattern, color, caseSensitive = false, isRegex = false }) => ({
+  id, pattern, isRegex, color, caseSensitive, enabled: true, createdAt: 1786262400, updatedAt: 1786262400,
+}));
+const highlightRuleViews = () => [...highlightRulesState].sort((a, b) => a.createdAt - b.createdAt);
+
+// MCP 设置（mcp/settings/get|set）新字段（IMPL_PLAN_NETCATTY_PARITY §1.3）：
+// 权限档与连接作用域，镜像持久化 + 校验语义。
+const mcpSettingsState = { execPermissionMode: "autonomous", connectionScope: [] as string[] };
+// 镜像并行批次 ssh/audit/list 的真实形状（AuditEntry：tsMs/tool/connectionId/
+// gate/approval/outcome/exitCode/durationMs/mode/error，无 command 原文）；
+// 末条保留计划 §1.1 旧形状（ts 秒 + kind + command）验证前端双形状容忍。
+const AUDIT_FIXTURE: Array<Record<string, unknown>> = [
+  { tsMs: 1786262400000, tool: "ssh_exec", connectionId: "Production SSH", gate: "pass", approval: "none", outcome: "ok", exitCode: 0, durationMs: 812, mode: "stdio" },
+  { tsMs: 1786262460000, tool: "ssh_exec_sudo", connectionId: "Production SSH", gate: "pass", approval: "prompt", outcome: "ok", exitCode: 0, durationMs: 2310, mode: "terminal" },
+  { tsMs: 1786262520000, tool: "ssh_exec", connectionId: "Production SSH", gate: "destructive-unconfirmed", approval: "none", outcome: "error", error: "destructive command requires confirmDestructive: true", durationMs: 3, mode: "stdio" },
+  { tsMs: 1786262580000, tool: "ssh_terminal_input", connectionId: "Production SSH", gate: "write-denied", approval: "none", outcome: "error", durationMs: 1, mode: "embedded" },
+  { ts: 1786262640, kind: "agent.challenge", sessionId: "visual-session", command: "rm -rf /tmp/scratch", decision: "approved", risk: "elevated" },
+];
+let auditEntriesState: Array<Record<string, unknown>> = AUDIT_FIXTURE.map((entry) => ({ ...entry }));
+
 
 // 模拟 VS Code 风格 shell-integration 周期（OSC 633），让 command-marker 条
 // 在 open 与 reattach 两条启动路径下都有内容可渲染（P2-2）。
@@ -178,6 +238,18 @@ const shellIntegrationCycle = [
   `${OSC_633}C${BEL}`,
   "● nginx.service - A high performance web server\r\n   Active: active (running)\r\n",
   `${OSC_633}D;0${BEL}`,
+  // 默认高亮规则的演示输出：挂载即可见红（ERROR/No such file/command not
+  // found）、黄（WARN）、琥珀（denied/timed out）、绿（SUCCESS/active running）、
+  // 蓝（IPv4）五类着色。
+  "user@server:~$ tail -n 3 /var/log/deploy.log\r\n",
+  "2026-09-11 10:00:01 WARN disk usage 87%\r\n",
+  "2026-09-11 10:00:04 ERROR Permission denied: /var/backup\r\n",
+  "2026-09-11 10:00:09 deploy finished SUCCESS\r\n",
+  "user@server:~$ cat /etc/nope; bash xyz\r\n",
+  "cat: /etc/nope: No such file or directory\r\n",
+  "bash: xyz: command not found\r\n",
+  "user@server:~$ curl -m 3 http://10.0.0.12:8080/health\r\n",
+  "curl: (28) Connection timed out\r\n",
   `${OSC_633}A${BEL}`,
   "user@server:~$ ",
 ].join("");
@@ -325,10 +397,16 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   else if (method === "ssh/metrics") {
     const totalBytes = 16_573_006_848;
     const availableBytes = 11_012_874_240;
+    // 网络速率随刷新次数变化（正弦扰动），让 sparkline 曲线肉眼可见地滚动；
+    // processes/osId 镜像 §1.5 与既有扩展字段，供 B2 视觉验证。
+    metricsRefreshTick += 1;
+    const wave = (base: number, amplitude: number) => Math.max(0, Math.round(base + amplitude * Math.sin(metricsRefreshTick / 2)));
     result = {
       hostname: "web-01.demo.internal",
       kernel: "6.1.0-18-amd64",
       uptimeSeconds: 1_234_567,
+      osId: "ubuntu",
+      osPretty: "Ubuntu 22.04.5 LTS",
       cpu: { cores: 8, percent: 23.4, load1: 0.42, load5: 0.51, load15: 0.48 },
       memory: { totalBytes, availableBytes, usedBytes: totalBytes - availableBytes, swapTotalBytes: 2_147_483_648, swapUsedBytes: 0 },
       disks: [
@@ -336,6 +414,15 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
         // /data 固定给 87%（>=85 警戒阈值），让 disk-warn 红色进度条始终可被视觉验证。
         { filesystem: "/dev/sdb1", mount: "/data", totalBytes: 105_550_471_168, usedBytes: 91_828_909_916, availableBytes: 13_721_561_252, percentUsed: 87 },
         { filesystem: "tmpfs", mount: "/dev/shm", totalBytes: 8_146_615_296, usedBytes: 0, availableBytes: 8_146_615_296, percentUsed: 0 },
+      ],
+      network: [
+        { name: "eth0", rxRate: wave(48_000, 40_000), txRate: wave(12_000, 9_000), rxTotal: 123_456_789_012, txTotal: 9_876_543_210 },
+        { name: "lo", rxRate: wave(1_200, 800), txRate: wave(1_200, 800), rxTotal: 5_555_555, txTotal: 5_555_555 },
+      ],
+      processes: [
+        { pid: 1, user: "root", cpuPercent: 0.1, memPercent: 0.4, command: "systemd" },
+        { pid: 812, user: "www-data", cpuPercent: 12.6, memPercent: 3.1, command: "nginx: worker process" },
+        { pid: 1042, user: "demo", cpuPercent: 2.4, memPercent: 1.2, command: "htop" },
       ],
     };
   }
@@ -349,7 +436,7 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { success: true };
   }
   else if (method === "ssh/settings/get") {
-    const base = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "" };
+    const base = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "", agentTerminalMode: settingsState.agentTerminalMode, rememberedCommands: [...settingsState.rememberedCommands] };
     // revealSecrets: true 时镜像真实桥的回显形状（mock 不存原值，回空串）。
     result = (params as Record<string, unknown>).revealSecrets === true
       ? { ...base, sudoPassword: "", totpSecret: "" }
@@ -363,6 +450,11 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     settingsState.totpPromptHint = typeof input.totpPromptHint === "string" ? input.totpPromptHint : settingsState.totpPromptHint;
     settingsState.sudoPasswordSet = typeof input.sudoPassword === "string" ? input.sudoPassword.length > 0 : settingsState.sudoPasswordSet;
     settingsState.totpConfigured = typeof input.totpSecret === "string" ? input.totpSecret.trim().length > 0 : settingsState.totpConfigured;
+    if (typeof input.agentTerminalMode === "string") settingsState.agentTerminalMode = input.agentTerminalMode;
+    if (Array.isArray(input.rememberedCommands)) {
+      settingsState.rememberedCommands = (input.rememberedCommands as unknown[])
+        .map((line) => String(line).trim()).filter((line) => line.length > 0).slice(0, 50);
+    }
     result = { ...settingsState };
   }
   else if (method === "ssh/quickCommands/list") result = { commands: quickCommandsState };
@@ -391,6 +483,95 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     if (index >= 0) quickCommandsState.splice(index, 1);
     result = { removed: index >= 0, commands: [...quickCommandsState] };
   }
+  else if (method === "ssh/highlightRules/list") result = { rules: highlightRuleViews() };
+  else if (method === "ssh/highlightRules/save") {
+    const input = params as Record<string, unknown>;
+    const pattern = String(input.pattern || "").trim();
+    if (!pattern) throw new Error("Missing pattern");
+    if (pattern.length > HIGHLIGHT_PATTERN_MAX) throw new Error(`Pattern is limited to ${HIGHLIGHT_PATTERN_MAX} characters`);
+    const color = typeof input.color === "string" && HIGHLIGHT_COLOR_RE.test(input.color) ? input.color : "#f59e0b";
+    const id = String(input.id || "").trim();
+    const now = Math.floor(Date.now() / 1000);
+    const existing = highlightRulesState.findIndex((entry) => entry.id === id);
+    if (existing >= 0) {
+      highlightRulesState[existing] = {
+        ...highlightRulesState[existing],
+        pattern,
+        isRegex: input.isRegex === true,
+        color,
+        caseSensitive: input.caseSensitive === true,
+        enabled: input.enabled !== false,
+        updatedAt: now,
+      };
+      result = { rule: highlightRulesState[existing], created: false, rules: highlightRuleViews() };
+    } else {
+      if (highlightRulesState.length >= HIGHLIGHT_RULES_LIMIT) throw new Error(`At most ${HIGHLIGHT_RULES_LIMIT} highlight rules are supported`);
+      const entry: MockHighlightRule = {
+        id: `mock-hr-${++highlightRuleSeq}-${now}`,
+        pattern,
+        isRegex: input.isRegex === true,
+        color,
+        caseSensitive: input.caseSensitive === true,
+        enabled: input.enabled !== false,
+        createdAt: now,
+        updatedAt: now,
+      };
+      highlightRulesState.push(entry);
+      result = { rule: entry, created: true, rules: highlightRuleViews() };
+    }
+  }
+  else if (method === "ssh/highlightRules/delete") {
+    const id = String((params as Record<string, unknown>)?.id || "");
+    const index = highlightRulesState.findIndex((entry) => entry.id === id);
+    if (index >= 0) highlightRulesState.splice(index, 1);
+    // 未知 id 不报错（幂等），镜像真实 sidecar 的 removed:false 语义。
+    result = { removed: index >= 0, rules: highlightRuleViews() };
+  }
+  else if (method === "ssh/audit/list") {
+    // 镜像并行批次契约：limit ∈ [1,500] 缺省 100；行序保持文件序（旧→新）取
+    // 最新 limit 条；`kind` 参数后端不识别（过滤由前端客户端做）。
+    const input = (params || {}) as Record<string, unknown>;
+    const limitRaw = Number(input.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(500, Math.floor(limitRaw)) : 100;
+    const truncated = auditEntriesState.length > limit;
+    result = { entries: auditEntriesState.slice(-limit), truncated };
+  }
+  else if (method === "ssh/audit/clear") {
+    auditEntriesState = [];
+    result = { cleared: true };
+  }
+  else if (method === "ssh/alert/triage") {
+    // 镜像真实 sidecar 契约形状（normalized/category/suggestions + purposeKey），
+    // 简化分类：关键词命中哪个组回哪组，兜底 generic；命令清单为只读诊断面。
+    const payload = String((params as Record<string, unknown>)?.payload || "").trim();
+    let parsed: Record<string, unknown> = {};
+    try { parsed = JSON.parse(payload) as Record<string, unknown>; } catch { /* 纯文本回退 */ }
+    const text = [parsed.title, parsed.message, payload].filter(Boolean).join(" ").toLowerCase();
+    const category =
+      text.includes("oom") || text.includes("out of memory") ? "oom" :
+      text.includes("inode") ? "inode" :
+      text.includes("cpu") || text.includes("负载") ? "cpu" :
+      text.includes("memory") || text.includes("内存") ? "memory" :
+      text.includes("disk") || text.includes("磁盘") || text.includes("空间") ? "disk" :
+      text.includes("network") || text.includes("丢包") ? "network" :
+      text.includes("service") || text.includes("systemd") ? "service" : "generic";
+    const severityRaw = String(parsed.severity || "unknown").toLowerCase();
+    // severity/source 均小写化，镜像后端 normalize（alert_triage::normalize）。
+    result = {
+      normalized: {
+        alertId: String(parsed.alertId || ""),
+        title: String(parsed.title || ""),
+        message: String(parsed.message || payload),
+        severity: severityRaw,
+        source: String(parsed.source || "").toLowerCase(),
+        dataJson: parsed.data && typeof parsed.data === "object" ? JSON.stringify(parsed.data, null, 2) : "",
+      },
+      category,
+      suggestions: category === "disk"
+        ? [{ command: "df -h", purposeKey: "diskUsage" }, { command: "du -x -d 1 / | sort -rh | head -15", purposeKey: "diskDu" }]
+        : [{ command: "uptime", purposeKey: "loadSnapshot" }, { command: "free -m", purposeKey: "memFree" }, { command: "df -h", purposeKey: "diskUsage" }],
+    };
+  }
   else if (method === "ssh/terminal/batchInput") {
     const input = params as Record<string, unknown>;
     const sessionIds = Array.isArray(input.sessionIds) ? (input.sessionIds as string[]) : [];
@@ -410,7 +591,21 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   else if (method === "sudo/profiles/save" || method === "sudo/profiles/delete") result = { success: true };
   else if (method === "ssh/knownHosts/list") result = { entries: [] };
   else if (method === "keys/discover") result = { keys: [] };
-  else if (method === "mcp/settings/get") result = { maxReadBytes: 8 * 1024 * 1024, maxUploadBytes: 64 * 1024 * 1024, maxDownloadBytes: 256 * 1024 * 1024 };
+  else if (method === "mcp/settings/get") result = { maxReadBytes: 8 * 1024 * 1024, maxUploadBytes: 64 * 1024 * 1024, maxDownloadBytes: 256 * 1024 * 1024, execPermissionMode: mcpSettingsState.execPermissionMode, connectionScope: [...mcpSettingsState.connectionScope] };
+  else if (method === "mcp/settings/set") {
+    const input = (params || {}) as Record<string, unknown>;
+    if (typeof input.execPermissionMode === "string") {
+      if (input.execPermissionMode !== "autonomous" && input.execPermissionMode !== "confirm") throw new Error("Invalid execPermissionMode: expected autonomous or confirm");
+      mcpSettingsState.execPermissionMode = input.execPermissionMode;
+    }
+    if (Array.isArray(input.connectionScope)) {
+      mcpSettingsState.connectionScope = input.connectionScope
+        .map((entry) => String(entry).trim())
+        .filter((entry) => entry.length > 0)
+        .slice(0, 20);
+    }
+    result = { maxReadBytes: 8 * 1024 * 1024, maxUploadBytes: 64 * 1024 * 1024, maxDownloadBytes: 256 * 1024 * 1024, execPermissionMode: mcpSettingsState.execPermissionMode, connectionScope: [...mcpSettingsState.connectionScope] };
+  }
   else result = { success: true };
   return result as T;
 };
@@ -420,7 +615,9 @@ window.dbxPlugin = {
   context,
   appearance,
   theme,
-  locale: "en",
+  get locale() {
+    return currentLocale;
+  },
   request,
   invoke,
   notify: async () => undefined,
@@ -440,6 +637,9 @@ window.dbxPlugin = {
   onEvent: (listener) => { eventListeners.add(listener); return () => eventListeners.delete(listener); },
   onBinary: (listener) => { binaryListeners.add(listener); return () => binaryListeners.delete(listener); },
   onAppearanceChange: (listener) => { appearanceListeners.add(listener); listener(appearance); return () => appearanceListeners.delete(listener); },
+  // 镜像 env.d.ts 声明的宿主 1.1 形状（(listener) => unsubscribe）；立即回调
+  // 当前 locale 与 mock 的 onAppearanceChange/onContextChange 同构。
+  onLocaleChange: (listener) => { localeListeners.add(listener); listener(currentLocale); return () => localeListeners.delete(listener); },
   onContextChange: (listener) => { contextListeners.add(listener); listener(context); return () => contextListeners.delete(listener); },
   decodeBase64: (value) => Uint8Array.from(atob(value), (character) => character.charCodeAt(0)),
   encodeBase64: base64,
@@ -455,6 +655,14 @@ window.dbxPlugin = {
     onDragState: () => () => undefined,
     onDrop: () => () => undefined,
   },
+};
+
+// mock 专有调试入口（真实桥无此字段）：切换 locale 并推送 onLocaleChange
+// 监听，供 mock.html 控制台 / 单测走查 i18n 切换链（瞬态 notice 不随切语
+// 重译的 R5-P2-2 维持豁免，不在本夹具模拟范围）。
+(window as unknown as { __dbxMockSetLocale?: (next: string) => void }).__dbxMockSetLocale = (next: string) => {
+  currentLocale = next || "en";
+  for (const listener of localeListeners) listener(currentLocale);
 };
 
 // 供单元测试（mockDbxHost.spec.ts）以模块形式动态导入并重置状态。

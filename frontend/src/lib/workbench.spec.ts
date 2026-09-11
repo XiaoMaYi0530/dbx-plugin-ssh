@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import appVueSource from "../App.vue?raw";
 import { Osc7DirectoryParser, parseOsc7Path } from "./terminalDirectoryTracking";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay } from "./terminalReconnect";
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress } from "./sftpBatchProgress";
@@ -648,5 +649,79 @@ describe("connection info auth method label", () => {
     expect(formatAuthMethodLabel("", translate)).toBe("–");
     expect(formatAuthMethodLabel(null, translate)).toBe("–");
     expect(formatAuthMethodLabel(undefined, translate, "n/a")).toBe("n/a");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// App.vue 弹层接入结构防线（round2）：UI 扫描六轮收敛后新增弹层已三次漏接入
+// 收口机制（highlight/agentMode 漏 Esc 链、alertTriage 漏焦点表 + Esc 链）。
+// 本组用例从 App.vue 源码反向提取模板中所有 modal/popover 的守卫状态 ref，
+// 断言每个 ref 至少被 modalOpenStates（焦点管理）/ onDocumentKeydown（Esc
+// 关闭链）/ closeToolbarPopovers（互斥族）之一覆盖，防"新增弹层漏接入"复发。
+// ---------------------------------------------------------------------------
+
+// App.vue 的 SFC 块序为 script → template → style（对两种块序都稳健地按块
+// 边界切分，而非假定顺序）：模板 = <template> 起点至 <style> 前最后一个
+// </template>（嵌套 template 元素的闭合符在行内，不会命中行首最后一个）。
+const appStyleIndex = appVueSource.indexOf("<style");
+const appTemplate = appVueSource.slice(appVueSource.indexOf("<template>"), appVueSource.lastIndexOf("</template>", appStyleIndex));
+const appScript = appVueSource.slice(appVueSource.indexOf("<script"), appVueSource.indexOf("</script>"));
+
+/** 模板中 class 含 marker 且由 v-if 守卫的元素 → 守卫表达式的状态 ref 基名。 */
+function templateGuardRefs(classMarker: string): string[] {
+  const refs = new Set<string>();
+  const marker = new RegExp(`class="[^"]*${classMarker}`, "g");
+  for (let hit = marker.exec(appTemplate); hit; hit = marker.exec(appTemplate)) {
+    const guard = appTemplate.slice(appTemplate.lastIndexOf("<", hit.index), hit.index).match(/v-if="([A-Za-z_$][\w$]*)/);
+    if (guard) refs.add(guard[1]);
+  }
+  return [...refs];
+}
+
+/** 脚本中 startMarker 起到 endMarker 止的代码块内出现过的 `.value` 状态名。 */
+function scriptBlockRefs(startMarker: string, endMarker: string): Set<string> {
+  const start = appScript.indexOf(startMarker);
+  const body = start >= 0 ? appScript.slice(start, appScript.indexOf(endMarker, start)) : "";
+  return new Set([...body.matchAll(/([A-Za-z_$][\w$]*)\.value/g)].map((match) => match[1]));
+}
+
+describe("App.vue popover/modal wiring structural guard", () => {
+  const popoverRefs = templateGuardRefs("popover");
+  const modalRefs = templateGuardRefs("modal-backdrop");
+  const focusTableRefs = scriptBlockRefs("const modalOpenStates = computed(() => [", "]);");
+  const escChainRefs = scriptBlockRefs("function onDocumentKeydown(event: KeyboardEvent)", "\nfunction ");
+  const familyRefs = scriptBlockRefs("function closeToolbarPopovers()", "\nfunction ");
+
+  it("extracts a non-empty template inventory (guards against vacuous regex passes)", () => {
+    // 提取逻辑本身失效（模板改写导致 regex 不再匹配）时先在这里暴露，
+    // 避免后续断言因空集合而静默通过。
+    for (const ref of ["quickMenuOpen", "connectionInfoOpen", "agentModeOpen", "highlightMenuOpen", "bookmarkSaveOpen", "columnsOpen", "transferPanelOpen", "batchTargetsOpen", "pathHistoryOpen"]) {
+      expect(popoverRefs, `popover 提取丢失 ${ref}`).toContain(ref);
+    }
+    for (const ref of ["settingsOpen", "alertTriageOpen", "hostKeyPrompt"]) {
+      expect(modalRefs, `modal 提取丢失 ${ref}`).toContain(ref);
+    }
+  });
+
+  it("wires every modal/popover state ref into at least one close mechanism", () => {
+    const covered = (ref: string) => focusTableRefs.has(ref) || escChainRefs.has(ref) || familyRefs.has(ref);
+    const missing = [...popoverRefs, ...modalRefs].filter((ref) => !covered(ref));
+    expect(missing, `状态 ref 未接入任何收口机制（modalOpenStates / Esc 链 / closeToolbarPopovers）: ${missing.join(", ")}`).toEqual([]);
+  });
+
+  it("keeps every .modal-backdrop ref inside modalOpenStates (focus trap table)", () => {
+    // modalOpenStates 驱动弹层焦点进入 / Tab 陷阱 / 触发元素归还（R3-P1-2）；
+    // alertTriage 曾因不在表内导致打开不聚焦、Esc 关不掉（round1 P1-1）。
+    const missing = modalRefs.filter((ref) => !focusTableRefs.has(ref));
+    expect(missing, `modal 未进 modalOpenStates（焦点管理失效）: ${missing.join(", ")}`).toEqual([]);
+  });
+
+  it("routes every toolbar popover toggle through closeToolbarPopovers", () => {
+    for (const name of ["toggleQuickMenu", "toggleConnectionInfo", "toggleAgentModeMenu", "toggleHighlightMenu", "toggleBookmarkSave", "toggleColumnsMenu", "toggleTransferPanel", "togglePathHistoryMenu"]) {
+      const start = appScript.indexOf(`function ${name}(`);
+      expect(start, `缺少 toggle 函数 ${name}()`).toBeGreaterThanOrEqual(0);
+      const body = appScript.slice(start, appScript.indexOf("\n}", start));
+      expect(body, `${name}() 未走 closeToolbarPopovers 统一收口`).toContain("closeToolbarPopovers()");
+    }
   });
 });

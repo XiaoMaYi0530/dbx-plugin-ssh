@@ -4,13 +4,14 @@
 //! everything is unit-testable without a connection (see the M1/M2 sections
 //! of `docs/IMPL_PLAN_AGENT_TERMINAL.zh-CN.md`).
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::exec;
 
-/// Connection-level agent terminal mode (`agentTerminalMode`). Kept
-/// in-memory per connection like the Quick Sudo field overrides: a sidecar
-/// restart falls back to [`AgentTerminalMode::Off`].
+/// Connection-level agent terminal mode (`agentTerminalMode`). Persisted per
+/// connection in `<data_dir>/agent-modes.json` so the toggle in the terminal
+/// toolbar survives sidecar/app restarts; unknown connections read `off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentTerminalMode {
     #[default]
@@ -88,25 +89,112 @@ pub enum RoutingDecision {
 ///
 /// `Off` only reaches here when `runInTerminal: true` forced the terminal
 /// path (otherwise the routing never leaves the hidden channel): low-risk
-/// commands may still run because they are plain visibility, but elevated
-/// ones are denied — the user never opted into agent approvals, and the
-/// audited hidden channel (with its `confirmDestructive` gate) stays the
-/// path for privileged work.
-pub fn decide(mode: AgentTerminalMode, risk: CommandRisk) -> RoutingDecision {
+/// commands still run because they are plain visibility, and elevated ones
+/// raise the in-app approval prompt — the agent explicitly opted into the
+/// visible terminal, the human still approves each command, and an
+/// unanswered prompt times out to a refusal. Without that explicit opt-in
+/// an elevated command under `off` is denied outright.
+pub fn decide(
+    mode: AgentTerminalMode,
+    risk: CommandRisk,
+    explicit_run_in_terminal: bool,
+) -> RoutingDecision {
     match (mode, risk) {
         (AgentTerminalMode::Off, CommandRisk::Low) => RoutingDecision::Run,
+        (AgentTerminalMode::Off, CommandRisk::Elevated) if explicit_run_in_terminal => {
+            RoutingDecision::Prompt
+        }
         (
             AgentTerminalMode::Off,
             CommandRisk::Elevated,
         ) => RoutingDecision::Deny(
-            "Agent terminal mode is off; enable agentTerminalMode (auto or strict) to run \
-             elevated commands in the terminal",
+            "Agent terminal mode is off; retry with runInTerminal: true to ask the user to \
+             approve this command in the terminal, or keep it on the hidden channel",
         ),
         (AgentTerminalMode::Auto, CommandRisk::Low) => RoutingDecision::Run,
         (AgentTerminalMode::Auto, CommandRisk::Elevated) => RoutingDecision::Prompt,
         (AgentTerminalMode::Strict, CommandRisk::Low) => RoutingDecision::Prompt,
         (AgentTerminalMode::Strict, CommandRisk::Elevated) => RoutingDecision::Prompt,
     }
+}
+
+/// §IMPL_PLAN D1: a remembered approval downgrades `Prompt` to `Run`;
+/// `Deny` is never overridden (mode-level semantics stay intact).
+///
+/// The remember list is a single-command exemption: a command the user
+/// already approved (possibly hand-generalized into a wildcard) skips the
+/// approval prompt, but it cannot widen what a mode allows — `off` without
+/// an explicit `runInTerminal` still refuses elevated commands outright, so
+/// remembering can never turn a silent denial into a silent run. Callers
+/// must additionally exclude `Destructive` commands before treating
+/// `remembered` as true (decision D2: the disaster gate stays last).
+pub fn decide_with_memory(
+    mode: AgentTerminalMode,
+    risk: CommandRisk,
+    explicit_run_in_terminal: bool,
+    remembered: bool,
+) -> RoutingDecision {
+    match decide(mode, risk, explicit_run_in_terminal) {
+        RoutingDecision::Prompt if remembered => RoutingDecision::Run,
+        other => other,
+    }
+}
+
+/// File the per-connection mode map persists to, relative to the plugin data
+/// directory. Plain `{ "version": 1, "modes": { "<connectionId>": "auto" } }`
+/// JSON — no credential material, so the sudo-profile 0600 dance is skipped.
+const MODES_FILE_NAME: &str = "agent-modes.json";
+
+/// Per-connection persisted store path.
+pub fn modes_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(MODES_FILE_NAME)
+}
+
+/// Loads the persisted mode map; a missing or corrupted file yields an empty
+/// map so a bad file can never break connecting (same policy as
+/// mcp-settings.json and the Quick Sudo store).
+pub fn load_modes(data_dir: &std::path::Path) -> HashMap<String, AgentTerminalMode> {
+    let text = std::fs::read_to_string(modes_path(data_dir)).unwrap_or_default();
+    let Some(value) = serde_json::from_str::<serde_json::Value>(&text).ok() else {
+        return HashMap::new();
+    };
+    value
+        .get("modes")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter(|(_, mode)| mode.is_string())
+                .map(|(connection, mode)| {
+                    (connection.clone(), AgentTerminalMode::parse(mode.as_str().unwrap_or("")))
+                })
+                .filter(|(_, mode)| *mode != AgentTerminalMode::Off)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persists the mode map atomically (tmp + rename). Failures surface to the
+/// caller: the persistence is the feature (the in-memory toggle already
+/// worked), so a silent loss would quietly resurrect the restart bug.
+pub fn save_modes(
+    data_dir: &std::path::Path,
+    modes: &HashMap<String, AgentTerminalMode>,
+) -> Result<(), String> {
+    let path = modes_path(data_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entries: serde_json::Map<String, serde_json::Value> = modes
+        .iter()
+        .map(|(connection, mode)| (connection.clone(), serde_json::Value::from(mode.name())))
+        .collect();
+    let value = serde_json::json!({ "version": 1, "modes": entries });
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("Failed to encode agent terminal modes: {error}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)
+        .map_err(|error| format!("Failed to write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|error| format!("Failed to write {}: {error}", path.display()))
 }
 
 /// Decision delivered through an approval challenge's oneshot channel.
@@ -395,33 +483,174 @@ mod tests {
 
     #[test]
     fn decide_covers_the_full_policy_matrix() {
-        // off: only forced low-risk runs; elevated is refused outright.
+        // off: only forced low-risk runs; explicit runInTerminal still gets
+        // the human approval prompt, implicit routing is refused outright.
         assert_eq!(
-            decide(AgentTerminalMode::Off, CommandRisk::Low),
+            decide(AgentTerminalMode::Off, CommandRisk::Low, false),
             RoutingDecision::Run
         );
+        assert_eq!(
+            decide(AgentTerminalMode::Off, CommandRisk::Low, true),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide(AgentTerminalMode::Off, CommandRisk::Elevated, true),
+            RoutingDecision::Prompt
+        );
         assert!(matches!(
-            decide(AgentTerminalMode::Off, CommandRisk::Elevated),
+            decide(AgentTerminalMode::Off, CommandRisk::Elevated, false),
             RoutingDecision::Deny(_)
         ));
         // auto: low runs, elevated needs approval.
         assert_eq!(
-            decide(AgentTerminalMode::Auto, CommandRisk::Low),
+            decide(AgentTerminalMode::Auto, CommandRisk::Low, false),
             RoutingDecision::Run
         );
         assert_eq!(
-            decide(AgentTerminalMode::Auto, CommandRisk::Elevated),
+            decide(AgentTerminalMode::Auto, CommandRisk::Elevated, false),
             RoutingDecision::Prompt
         );
         // strict: everything needs approval.
         assert_eq!(
-            decide(AgentTerminalMode::Strict, CommandRisk::Low),
+            decide(AgentTerminalMode::Strict, CommandRisk::Low, false),
             RoutingDecision::Prompt
         );
         assert_eq!(
-            decide(AgentTerminalMode::Strict, CommandRisk::Elevated),
+            decide(AgentTerminalMode::Strict, CommandRisk::Elevated, false),
             RoutingDecision::Prompt
         );
+    }
+
+    #[test]
+    fn decide_with_memory_downgrades_only_prompt_to_run() {
+        // Full matrix: 3 modes x 2 risks x explicit x remembered. A
+        // remembered approval only ever turns a `Prompt` into a `Run`
+        // (marked below); `Run` stays `Run` and `Deny` stays `Deny` (D1).
+        // off / low: already running, remembering changes nothing.
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Off, CommandRisk::Low, false, false),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Off, CommandRisk::Low, false, true),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Off, CommandRisk::Low, true, false),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Off, CommandRisk::Low, true, true),
+            RoutingDecision::Run
+        );
+        // off / elevated without explicit runInTerminal: mode-level denial is
+        // never overridden by a remembered approval.
+        assert!(matches!(
+            decide_with_memory(AgentTerminalMode::Off, CommandRisk::Elevated, false, false),
+            RoutingDecision::Deny(_)
+        ));
+        assert!(matches!(
+            decide_with_memory(AgentTerminalMode::Off, CommandRisk::Elevated, false, true),
+            RoutingDecision::Deny(_)
+        ));
+        // off / elevated with explicit runInTerminal: remembered approval
+        // replaces the per-command human prompt.
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Off, CommandRisk::Elevated, true, false),
+            RoutingDecision::Prompt
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Off, CommandRisk::Elevated, true, true),
+            RoutingDecision::Run
+        );
+        // auto / low: already running.
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Auto, CommandRisk::Low, false, false),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Auto, CommandRisk::Low, false, true),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Auto, CommandRisk::Low, true, false),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Auto, CommandRisk::Low, true, true),
+            RoutingDecision::Run
+        );
+        // auto / elevated: remembered approval skips the prompt.
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Auto, CommandRisk::Elevated, false, false),
+            RoutingDecision::Prompt
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Auto, CommandRisk::Elevated, false, true),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Auto, CommandRisk::Elevated, true, false),
+            RoutingDecision::Prompt
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Auto, CommandRisk::Elevated, true, true),
+            RoutingDecision::Run
+        );
+        // strict: every remembered command skips its approval prompt.
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Low, false, false),
+            RoutingDecision::Prompt
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Low, false, true),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Low, true, false),
+            RoutingDecision::Prompt
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Low, true, true),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Elevated, false, false),
+            RoutingDecision::Prompt
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Elevated, false, true),
+            RoutingDecision::Run
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Elevated, true, false),
+            RoutingDecision::Prompt
+        );
+        assert_eq!(
+            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Elevated, true, true),
+            RoutingDecision::Run
+        );
+    }
+
+    #[test]
+    fn modes_round_trip_through_the_data_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbx-agent-modes-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut modes = HashMap::new();
+        modes.insert("conn-a".to_string(), AgentTerminalMode::Auto);
+        modes.insert("conn-b".to_string(), AgentTerminalMode::Strict);
+        save_modes(&dir, &modes).expect("save");
+
+        let loaded = load_modes(&dir);
+        assert_eq!(loaded.get("conn-a"), Some(&AgentTerminalMode::Auto));
+        assert_eq!(loaded.get("conn-b"), Some(&AgentTerminalMode::Strict));
+
+        // A corrupted file degrades to an empty map instead of failing.
+        std::fs::write(modes_path(&dir), "{ not json").unwrap();
+        assert!(load_modes(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

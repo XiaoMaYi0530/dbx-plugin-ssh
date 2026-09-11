@@ -32,6 +32,7 @@ import {
   Loader2,
   Lock,
   PackageOpen,
+  Palette,
   PanelRightClose,
   Pencil,
   PlugZap,
@@ -42,7 +43,9 @@ import {
   Send,
   Settings,
   ShieldCheck,
+  Siren,
   SquareTerminal,
+  Star,
   TextSelect,
   Trash2,
   TriangleAlert,
@@ -86,6 +89,17 @@ import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpe
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
 import { expandSelection, filterSftpEntries, type SftpTypeFilter } from "./lib/sftpFileFilters";
 import { pushPathHistory, sanitizePathHistories } from "./lib/sftpPathHistory";
+import {
+  defaultBookmarkLabel,
+  deleteBookmark,
+  listBookmarks,
+  SFTP_BOOKMARKS_LIMIT,
+  SFTP_BOOKMARK_LABEL_MAX_LENGTH,
+  saveBookmark,
+  sortBookmarksByLabel,
+  validateBookmarkInput,
+  type SftpBookmark,
+} from "./lib/sftpBookmarks";
 import { browseCommandHistory, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
 import { normalizeQuickCommands, QUICK_COMMANDS_LIMIT, type QuickCommand } from "./lib/quickCommands";
 import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
@@ -99,7 +113,21 @@ import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI, type DbxPluginAppearanceInput } from "./lib/appearance";
 import { isDbxPluginTheme, onHostThemeChange, themeToAppearance } from "./lib/hostTheme";
-import { AGENT_MODES, approvalRemainingSecs, dropAgentPrompt, enqueueAgentPrompt, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload, type AgentTerminalMode } from "./lib/agentTerminal";
+import { AGENT_MODES, approvalRemainingSecs, buildAgentResolveBody, dropAgentPrompt, enqueueAgentPrompt, sanitizeRememberedCommands, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload, type AgentTerminalMode } from "./lib/agentTerminal";
+import { purposeKeyLabel, sanitizeTriagePayload, severityClass, type TriageResult } from "./lib/alertTriage";
+import {
+  compileRules,
+  highlightFillStyle,
+  matchesInLine,
+  normalizeHighlightRules,
+  sanitizeHighlightRuleInput,
+  HIGHLIGHT_COLOR_DEFAULT,
+  HIGHLIGHT_RULES_LIMIT,
+  type HighlightRuleView,
+} from "./lib/keywordHighlight";
+import { pushSample, sparklinePath, METRICS_SAMPLE_CAPACITY } from "./lib/metricsSparkline";
+import { distroBadge, type DistroBadge } from "./lib/distroBadge";
+import { auditKindLabel, auditKindOptions, auditOutcomeLabel, sanitizeAuditEntries, type AuditEntry } from "./lib/auditLog";
 import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
 import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRestore";
 import { toolbarTintStyle } from "./lib/toolbarTint";
@@ -182,6 +210,21 @@ interface TransferTask {
   error?: string;
 }
 
+// sftp/transfer/history 行（落盘历史 + 内存 live 合并视图）：status 沿用现有枚举、无 queued。
+interface TransferHistoryEntry {
+  taskId: string;
+  sessionId?: string;
+  connectionId?: string;
+  direction: "upload" | "download";
+  fileName: string;
+  size: number;
+  transferred: number;
+  status: "running" | "completed" | "cancelled" | "failed";
+  startedAt?: number;
+  finishedAt?: number;
+  error?: string;
+}
+
 interface WorkbenchState {
   sessionId?: string;
   terminalSequence?: number;
@@ -226,6 +269,10 @@ interface ServerMetrics {
   // process sections simply stay hidden instead of erroring.
   network?: Array<{ name: string; rxRate: number; txRate: number; rxTotal: number; txTotal: number }>;
   processes?: Array<{ pid: number; user: string; cpuPercent: number; memPercent: number; command: string }>;
+  // §1.5 发行版识别（/etc/os-release）：读不到时两字段整体缺省，
+  // 旧 sidecar 自然缺失，前端不渲染徽标（optional 降级）。
+  osId?: string;
+  osPretty?: string;
 }
 
 interface SshSettings {
@@ -244,6 +291,8 @@ interface SshSettings {
   quickSudoProfileName?: string;
   // AI 终端同步执行模式（连接级；off 默认 / auto 分级 / strict 全审）。
   agentTerminalMode?: string;
+  // 已记住的免审批命令（连接级原始行，sudoers 式 token 语义）。
+  rememberedCommands?: string[];
 }
 
 // 全局 quick sudo 配置视图：密钥永不回显，只有已设置布尔位。
@@ -290,6 +339,9 @@ interface McpSizeSettings {
   maxReadBytes?: number;
   maxUploadBytes?: number;
   maxDownloadBytes?: number;
+  // §1.3 MCP 权限档与连接作用域（新字段，旧 sidecar 不回即用默认值）。
+  execPermissionMode?: string;
+  connectionScope?: string[];
 }
 
 type SftpColumn = "size" | "modified" | "permissions";
@@ -312,6 +364,8 @@ const PASTE_CONFIRM_CHAR_THRESHOLD = 200;
 // SFTP 路径历史：每连接最多保留 10 条，存 localStorage（对齐 tiny-rdm pathHistory）。
 const SFTP_PATH_HISTORY_KEY = "sftp-path-history";
 const SFTP_PATH_HISTORY_LIMIT = 10;
+// 传输历史查询上限（sftp/transfer/history，后端环形 200，面板一次取 50）。
+const TRANSFER_HISTORY_LIMIT = 50;
 // Upper bound for out-of-order terminal frames held while waiting for the
 // missing sequence; the replay path re-delivers anything dropped beyond it.
 const TERMINAL_PENDING_FRAME_LIMIT = 1024;
@@ -328,6 +382,15 @@ const SFTP_SIDE_TAB_KEY = "ssh-sftp-side-tab";
 const SFTP_SIDE_COLLAPSED_KEY = "ssh-sftp-side-collapsed";
 // 终端交互：选中复制 + 右键粘贴（localStorage 全局偏好，默认开，"false" 关闭）。
 const SELECT_COPY_KEY = "ssh-terminal-select-copy";
+// 关键词高亮总开关（IMPL_PLAN_NETCATTY_PARITY §3-B1）：localStorage 全局持久化，
+// 默认开、仅显式 "false" 关（对齐 sanitizeSelectCopyEnabled 模式）；关闭时零挂钩子。
+const HIGHLIGHT_ENABLED_KEY = "ssh-keyword-highlight";
+// decoration 引擎护栏：全局在档 decoration 上限（超限停止本帧注册）。
+const HIGHLIGHT_DECORATION_LIMIT = 400;
+// rAF 节流目标：≤30fps（约 33ms 一帧）。
+const HIGHLIGHT_SCAN_MIN_INTERVAL_MS = 33;
+// 8 色板（新增规则默认色板；自定义 hex 输入并行提供）。
+const HIGHLIGHT_PALETTE = ["#ef4444", "#f59e0b", "#facc15", "#22c55e", "#3b82f6", "#8b5cf6", "#ec4899", "#6b7280"];
 
 type TerminalSearchMatchState = "idle" | "match" | "no-match";
 
@@ -356,6 +419,9 @@ const agentPromptQueue = ref<AgentPromptPayload[]>([]);
 const agentPromptCommand = ref("");
 const agentPromptRemaining = ref(0);
 const agentPromptExpired = ref(false);
+// 「记住此命令」勾选态：批准时随 resolve 提交，把命令写入连接级免审批清单
+// （后端 D2 兜底：破坏性命令自动忽略记住标记）。
+const agentPromptRemember = ref(false);
 const agentRunning = ref<AgentNoticePayload>();
 const splitRatio = ref(58);
 const paneOrder = ref<SshWorkbenchPaneOrder>("terminal-left");
@@ -378,6 +444,11 @@ const visibleColumns = ref<SftpColumn[]>(["size", "modified"]);
 const sort = ref<{ column: SftpSortColumn; direction: "asc" | "desc" }>({ column: "name", direction: "asc" });
 const transferTasks = reactive<Record<string, TransferTask>>({});
 const transferPanelOpen = ref(false);
+// 传输历史（sftp/transfer/history，落盘+内存合并）：面板打开或活动任务清零时刷新；
+// 历史区仅无进行中任务时展示。后端未升级/读取失败仅提示加载失败（optional 特性降级）。
+const transferHistory = ref<TransferHistoryEntry[]>([]);
+const transferHistoryLoading = ref(false);
+const transferHistoryFailed = ref(false);
 const columnsOpen = ref(false);
 const transferSpeeds = reactive<Record<string, number>>({});
 const previewOpen = ref(false);
@@ -398,8 +469,6 @@ const previewBaseline = ref("");
 // 仅加载了文件头部（大文件确认预览）时置位：预览只读，禁止保存以免整文件覆盖。
 const previewTruncated = ref(false);
 const sudoMode = ref(false);
-const quickSudo = ref(false);
-const quickSudoSubmitting = ref(false);
 const archiveBusy = ref(false);
 const operationDialog = ref<"mkdir" | null>(null);
 const operationDraft = ref("");
@@ -519,12 +588,16 @@ const settingsDraft = reactive({
   totpPromptHint: "",
   quickSudoProfileId: "",
   agentTerminalMode: "off",
+  rememberedCommands: [] as string[],
 });
 // 全局 quick sudo 配置集中管理：列表与编辑弹窗状态（密钥只在提交时发送）。
 const sudoProfiles = ref<SudoProfileView[]>([]);
 const sudoProfilesLoading = ref(false);
 const sudoProfilesError = ref("");
 const profilesOpen = ref(false);
+// 设置弹窗内联的 quick sudo 配置档管理 section（展开/收起；独立 profiles 弹窗
+// 仍是工具栏 KeyRound 的入口，两者共存复用同一份 sudoProfiles/草稿状态）。
+const profilesInlineOpen = ref(false);
 const profileEditing = ref(false);
 const profileSaving = ref(false);
 const profileDraftHadPassword = ref(false);
@@ -552,7 +625,7 @@ const knownHostsError = ref("");
 const localKeys = ref<DiscoveredKey[]>([]);
 const localKeysLoading = ref(false);
 const localKeysError = ref("");
-const mcpDraft = reactive({ readMiB: "", uploadMiB: "", downloadMiB: "" });
+const mcpDraft = reactive({ readMiB: "", uploadMiB: "", downloadMiB: "", permissionMode: "autonomous", connectionScope: "" });
 const mcpLoading = ref(false);
 const mcpError = ref("");
 const mcpSaving = ref(false);
@@ -599,6 +672,11 @@ const sftpClipboard = ref<SftpClipboard>();
 const pasteBusy = ref(false);
 const pathHistoryOpen = ref(false);
 const pathHistories = reactive<Record<string, string[]>>(loadPathHistories());
+// SFTP 路径书签（全局清单，sftp-bookmarks.json）：路径栏星标收藏 + 路径弹层内跳转/删除。
+const sftpBookmarks = ref<SftpBookmark[]>([]);
+const bookmarkSaveOpen = ref(false);
+const bookmarkSaving = ref(false);
+const bookmarkLabelDraft = ref("");
 const newFileDialog = ref(false);
 const newFileDraft = ref("");
 const newFileSubmitting = ref(false);
@@ -738,7 +816,6 @@ watch(reconnectPending, (pending) => {
   reconnectCountdownTimer = window.setInterval(update, 250);
 });
 const commandOutputText = computed(() => (commandResult.value ? sanitizeCommandOutput(commandResult.value.output) : ""));
-const quickSudoTitle = computed(() => `${t("quickSudo.label")}: ${quickSudo.value ? t("quickSudo.on") : t("quickSudo.off")}\n${t("quickSudo.hint")}`);
 // AI 终端同步模式下拉随档位变化的说明文案（off/auto/strict 三键 hint）。
 const agentTerminalModeHint = computed(() => t(
   settingsDraft.agentTerminalMode === "auto" ? "agentTerminalAutoHint"
@@ -980,6 +1057,7 @@ function createTerminal() {
   terminalHost.value.addEventListener("mouseup", terminalMouseUpHandler);
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value);
+  if (highlightEnabled.value) attachHighlightRender();
   scheduleFit();
 }
 
@@ -1883,7 +1961,6 @@ async function afterSessionConnected() {
   scheduleFit();
   await writeWorkbenchState();
   if (followDirectory.value) await setDirectoryTracking(true);
-  void refreshQuickSudoSetting();
   void refreshSftpHomePath();
   await Promise.all([loadDirectory(currentPath.value), restoreTransfers()]);
   // 侧栏 tree tab 可见时补拉根节点（首连/重连后缓存仍为空的场景）。
@@ -1901,7 +1978,6 @@ async function closeSession(updateStatus = true) {
   const sessionId = session.value?.sessionId;
   session.value = undefined;
   activeTerminalSessionId = "";
-  quickSudo.value = false;
   clearAgentPrompts();
   agentRunning.value = undefined;
   // Closing mid-ZMODEM aborts the transfer silently instead of leaving the
@@ -1950,6 +2026,61 @@ async function restoreTransfers() {
   for (const task of result.tasks) transferTasks[task.taskId] = task;
 }
 
+// ---------------------------------------------------------------------------
+// 传输历史（sftp/transfer/history，落盘+内存合并视图，只读）
+// ---------------------------------------------------------------------------
+
+async function refreshTransferHistory() {
+  transferHistoryLoading.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ tasks: unknown }>("sftp/transfer/history", { limit: TRANSFER_HISTORY_LIMIT });
+    transferHistory.value = sanitizeTransferHistoryTasks(result?.tasks);
+    transferHistoryFailed.value = false;
+  } catch {
+    // 历史是 best-effort UX 数据：后端未升级/读取失败仅显示加载失败提示，不阻塞面板。
+    transferHistory.value = [];
+    transferHistoryFailed.value = true;
+  } finally {
+    transferHistoryLoading.value = false;
+  }
+}
+
+/** 收敛 sftp/transfer/history 响应：丢畸形行，方向/状态收敛到已知枚举（镜像 normalizeTransferStatus）。 */
+function sanitizeTransferHistoryTasks(raw: unknown): TransferHistoryEntry[] {
+  if (!Array.isArray(raw)) return [];
+  const out: TransferHistoryEntry[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const taskId = typeof record.taskId === "string" ? record.taskId : "";
+    if (!taskId) continue;
+    // 历史枚举无 queued；异常遗留 queued 行按 running 展示（保守降级，不丢条目）。
+    const status = normalizeTransferStatus(record.status, "completed");
+    out.push({
+      taskId,
+      sessionId: typeof record.sessionId === "string" ? record.sessionId : undefined,
+      connectionId: typeof record.connectionId === "string" ? record.connectionId : undefined,
+      direction: record.direction === "download" ? "download" : "upload",
+      fileName: typeof record.fileName === "string" ? record.fileName : "",
+      size: Number(record.size ?? 0) || 0,
+      transferred: Number(record.transferred ?? 0) || 0,
+      status: status === "queued" ? "running" : status,
+      startedAt: typeof record.startedAt === "number" ? record.startedAt : undefined,
+      finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : undefined,
+      error: typeof record.error === "string" && record.error ? record.error : undefined,
+    });
+  }
+  return out;
+}
+
+// 打开传输面板或最后一个活动任务结束（进行中清零）时拉取历史：历史区仅在无进行中任务时展示。
+watch(transferPanelOpen, (open) => {
+  if (open) void refreshTransferHistory();
+});
+watch(activeTransfers, (count, previous) => {
+  if (count === 0 && previous > 0 && transferPanelOpen.value) void refreshTransferHistory();
+});
+
 async function resolveHostKey(accept: boolean) {
   const prompt = hostKeyPrompt.value;
   if (!prompt) return;
@@ -1985,6 +2116,7 @@ watch(agentPromptHead, (head) => {
   }
   agentPromptCommand.value = head.command;
   agentPromptExpired.value = false;
+  agentPromptRemember.value = false;
   const tick = () => {
     const current = agentPromptHead.value;
     if (!current) return;
@@ -2021,15 +2153,15 @@ function clearAgentPrompts() {
 }
 
 // 审批语义对齐 host-key 挑战：先出队再 resolve（挑战一次性，重复 resolve 报错）；
-// 批准时提交编辑后的命令（所见即所执行）。
+// 批准时提交编辑后的命令（所见即所执行）；勾选「记住」时携带 remember 标记。
 async function resolveAgentPrompt(decision: "approve" | "deny") {
   const prompt = agentPromptHead.value;
   if (!prompt) return;
   const command = agentPromptCommand.value;
+  const remember = agentPromptRemember.value;
   dismissAgentPrompt();
   try {
-    const payload: Record<string, unknown> = { challengeId: prompt.challengeId, decision };
-    if (decision === "approve") payload.command = command;
+    const payload = buildAgentResolveBody({ challengeId: prompt.challengeId, decision, command, remember });
     await window.dbxPlugin.invoke("ssh/agent/resolve", payload);
   } catch (cause) {
     showError(cause, "terminal");
@@ -2039,6 +2171,382 @@ async function resolveAgentPrompt(decision: "approve" | "deny") {
 // 中断 AI 正在终端执行的命令：复用 PTY 输入通道发送 Ctrl+C（0x03，对齐快速命令写入语义）。
 function interruptAgentRun() {
   sendTerminalBytes(new Uint8Array([3]));
+}
+
+// ---------------------------------------------------------------------------
+// 告警排查（IMPL_PLAN_SSH_APPROVAL_AUDIT_ALERT §2.4）：粘贴异构告警 → 后端
+// ssh/alert/triage 分诊（结构化 + 分类 + 只读命令清单）；建议命令一键发送到
+// 当前终端（复用 PTY 键盘写入链路），分诊本身不需要活动连接。
+const alertTriageOpen = ref(false);
+const alertTriageBusy = ref(false);
+const alertTriageError = ref("");
+const alertTriagePayload = ref("");
+const alertTriageResult = ref<TriageResult>();
+
+function openAlertTriage() {
+  alertTriageOpen.value = true;
+  alertTriageError.value = "";
+}
+
+async function runAlertTriage() {
+  if (alertTriageBusy.value) return;
+  const payload = sanitizeTriagePayload(alertTriagePayload.value);
+  if (!payload) {
+    alertTriageError.value = t("alertTriage.invalidPayload");
+    return;
+  }
+  alertTriageBusy.value = true;
+  alertTriageError.value = "";
+  try {
+    alertTriageResult.value = await window.dbxPlugin.invoke<TriageResult>("ssh/alert/triage", { payload });
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    alertTriageBusy.value = false;
+  }
+}
+
+function sendSuggestionToTerminal(command: string) {
+  if (!session.value) return;
+  trackPendingInput(`${command}\r`);
+  sendTerminalBytes(new TextEncoder().encode(`${command}\r`));
+  terminal?.focus();
+}
+
+async function copySuggestions() {
+  const result = alertTriageResult.value;
+  if (!result?.suggestions?.length) return;
+  try {
+    await window.dbxPlugin.clipboard?.writeText(result.suggestions.map((item) => item.command).join("\n"));
+    showNotice(t("terminalCopied"));
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 关键词高亮（IMPL_PLAN_NETCATTY_PARITY §3-B1）：规则管理 + xterm decorations。
+// 数据面走 ssh/highlightRules/*（后端不可用静默空表）；渲染面用 onRender 触发
+// rAF 节流（≤30fps）视口行扫描，per-row Map 维护 decoration，全局上限 400。
+// ---------------------------------------------------------------------------
+const highlightRules = ref<HighlightRuleView[]>([]);
+const highlightMenuOpen = ref(false);
+const highlightSaving = ref(false);
+const highlightDraftError = ref("");
+const highlightDraft = reactive({ id: undefined as string | undefined, pattern: "", color: HIGHLIGHT_COLOR_DEFAULT, isRegex: false, caseSensitive: false });
+const compiledHighlightRules = computed(() => compileRules(highlightRules.value));
+
+function loadHighlightEnabled(): boolean {
+  try {
+    return window.localStorage.getItem(HIGHLIGHT_ENABLED_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+// 总开关：关闭时摘掉 onRender 挂子并全量清理 decoration（零挂钩子语义）。
+const highlightEnabled = ref(loadHighlightEnabled());
+
+function toggleHighlightEnabled() {
+  highlightEnabled.value = !highlightEnabled.value;
+  try {
+    window.localStorage.setItem(HIGHLIGHT_ENABLED_KEY, highlightEnabled.value ? "true" : "false");
+  } catch {
+    // 存储不可用时仅当前会话生效。
+  }
+  if (highlightEnabled.value) {
+    attachHighlightRender();
+    rescanHighlightViewport();
+  } else {
+    detachHighlightRender();
+  }
+}
+
+async function hydrateHighlightRules() {
+  try {
+    const response = await window.dbxPlugin.invoke<{ rules: unknown }>("ssh/highlightRules/list", {});
+    highlightRules.value = normalizeHighlightRules(response.rules);
+  } catch {
+    // 后端不可用（如旧版 sidecar）：静默降级空表，高亮功能整体退场。
+    highlightRules.value = [];
+  }
+}
+
+function resetHighlightDraft() {
+  highlightDraft.id = undefined;
+  highlightDraft.pattern = "";
+  highlightDraft.color = HIGHLIGHT_COLOR_DEFAULT;
+  highlightDraft.isRegex = false;
+  highlightDraft.caseSensitive = false;
+  highlightDraftError.value = "";
+}
+
+async function saveHighlightRule() {
+  if (highlightSaving.value) return;
+  const sanitized = sanitizeHighlightRuleInput({ pattern: highlightDraft.pattern, color: highlightDraft.color, isRegex: highlightDraft.isRegex, caseSensitive: highlightDraft.caseSensitive });
+  if (sanitized.error || !sanitized.value) {
+    highlightDraftError.value = t(sanitized.error ?? "highlightRules.invalidPattern");
+    return;
+  }
+  if (!highlightDraft.id && highlightRules.value.length >= HIGHLIGHT_RULES_LIMIT) return;
+  highlightSaving.value = true;
+  highlightDraftError.value = "";
+  try {
+    const response = await window.dbxPlugin.invoke<{ rules: unknown }>("ssh/highlightRules/save", {
+      id: highlightDraft.id ?? "",
+      pattern: sanitized.value.pattern,
+      isRegex: sanitized.value.isRegex,
+      color: sanitized.value.color,
+      caseSensitive: sanitized.value.caseSensitive,
+    });
+    highlightRules.value = normalizeHighlightRules(response.rules);
+    resetHighlightDraft();
+  } catch (cause) {
+    highlightDraftError.value = settingsErrorOf(cause);
+  } finally {
+    highlightSaving.value = false;
+  }
+}
+
+function editHighlightRule(item: HighlightRuleView) {
+  highlightDraft.id = item.id;
+  highlightDraft.pattern = item.pattern;
+  highlightDraft.color = item.color;
+  highlightDraft.isRegex = item.isRegex;
+  highlightDraft.caseSensitive = item.caseSensitive;
+  highlightDraftError.value = "";
+}
+
+async function toggleHighlightRule(item: HighlightRuleView) {
+  try {
+    const response = await window.dbxPlugin.invoke<{ rules: unknown }>("ssh/highlightRules/save", {
+      id: item.id,
+      pattern: item.pattern,
+      isRegex: item.isRegex,
+      color: item.color,
+      caseSensitive: item.caseSensitive,
+      enabled: !item.enabled,
+    });
+    highlightRules.value = normalizeHighlightRules(response.rules);
+  } catch (cause) {
+    showError(cause, "terminal");
+  }
+}
+
+async function deleteHighlightRule(id: string) {
+  try {
+    const response = await window.dbxPlugin.invoke<{ rules: unknown }>("ssh/highlightRules/delete", { id });
+    highlightRules.value = normalizeHighlightRules(response.rules);
+    if (highlightDraft.id === id) resetHighlightDraft();
+  } catch (cause) {
+    showError(cause, "terminal");
+  }
+}
+
+// 规则弹层开关（互斥族统一走 closeToolbarPopovers 收口）。
+function toggleHighlightMenu() {
+  const next = !highlightMenuOpen.value;
+  closeToolbarPopovers();
+  highlightMenuOpen.value = next;
+  if (next) resetHighlightDraft();
+}
+
+// ---- decoration 引擎 ----
+// onRender({start,end}) 只给重渲染的视口行区间：合并进 pending 区间，经
+// setTimeout 节流（≤30fps）后统一扫描。alt buffer 与 normal buffer 走同一
+// 路径（buffer.active 直接扫描）。
+let highlightRenderDisposable: { dispose(): void } | undefined;
+// 每行一个组（marker + decorations）；行滚出视口整组 dispose。
+const highlightDecorationsByRow = new Map<number, { dispose(): void }>();
+let highlightDecorationCount = 0;
+let highlightScanScheduled = false;
+let highlightLastScanAt = 0;
+let highlightPendingRange: { start: number; end: number } | undefined;
+
+function clearHighlightDecorations() {
+  for (const entry of highlightDecorationsByRow.values()) entry.dispose();
+  highlightDecorationsByRow.clear();
+  highlightDecorationCount = 0;
+}
+
+function attachHighlightRender() {
+  if (!terminal || highlightRenderDisposable || !highlightEnabled.value) return;
+  highlightRenderDisposable = terminal.onRender(({ start, end }) => scheduleHighlightScan(start, end));
+  rescanHighlightViewport();
+}
+
+function detachHighlightRender() {
+  highlightRenderDisposable?.dispose();
+  highlightRenderDisposable = undefined;
+  clearHighlightDecorations();
+}
+
+function rescanHighlightViewport() {
+  if (!terminal || !highlightEnabled.value) return;
+  scheduleHighlightScan(0, terminal.rows - 1);
+}
+
+function scheduleHighlightScan(start: number, end: number) {
+  if (!terminal || !highlightEnabled.value || !compiledHighlightRules.value.length) return;
+  highlightPendingRange = highlightPendingRange
+    ? { start: Math.min(highlightPendingRange.start, start), end: Math.max(highlightPendingRange.end, end) }
+    : { start, end };
+  if (highlightScanScheduled) return;
+  highlightScanScheduled = true;
+  const wait = Math.max(0, HIGHLIGHT_SCAN_MIN_INTERVAL_MS - (performance.now() - highlightLastScanAt));
+  window.setTimeout(runHighlightScan, wait);
+}
+
+function runHighlightScan() {
+  highlightScanScheduled = false;
+  highlightLastScanAt = performance.now();
+  const range = highlightPendingRange;
+  highlightPendingRange = undefined;
+  if (!range || !terminal || !highlightEnabled.value) return;
+  scanHighlightRange(range.start, range.end);
+}
+
+function scanHighlightRange(start: number, end: number) {
+  const term = terminal;
+  if (!term) return;
+  const buffer = term.buffer.active;
+  const from = Math.max(0, Math.min(start, buffer.length - 1));
+  const to = Math.max(from, Math.min(end, buffer.length - 1));
+  // 行滚出本帧视口：整组 dispose（Map 不同步收缩会拖着全局上限走）。
+  for (const [row, entry] of highlightDecorationsByRow) {
+    if (row < from || row > to) {
+      entry.dispose();
+      highlightDecorationsByRow.delete(row);
+    }
+  }
+  const compiled = compiledHighlightRules.value;
+  if (!compiled.length) return;
+  // registerMarker 的 offset 相对光标绝对行（baseY + cursorY）；marker dispose 时
+  // xterm 会连带 dispose 挂在其上的 decoration。
+  const base = buffer.baseY + buffer.cursorY;
+  for (let row = from; row <= to; row++) {
+    if (highlightDecorationsByRow.has(row)) continue;
+    if (highlightDecorationCount >= HIGHLIGHT_DECORATION_LIMIT) return;
+    const lineText = buffer.getLine(row)?.translateToString(true) ?? "";
+    if (!lineText) continue;
+    const matches = matchesInLine(lineText, compiled);
+    if (!matches.length) continue;
+    const marker = term.registerMarker(row - base);
+    if (!marker) continue;
+    const disposables: Array<{ dispose(): void }> = [marker];
+    const entry = {
+      dispose() {
+        for (const disposable of disposables.splice(0)) disposable.dispose();
+      },
+    };
+    for (const match of matches) {
+      if (highlightDecorationCount >= HIGHLIGHT_DECORATION_LIMIT) break;
+      const decoration = term.registerDecoration({ marker, x: match.start, width: match.end - match.start });
+      if (decoration) {
+        // xterm 5 的 DOM renderer 不应用 registerDecoration 的 backgroundColor
+        // 选项（与 @xterm/addon-search 同因），着色走 onRender 自绘元素样式。
+        // 装饰层在文字层上方，必须用半透明填充——纯色会把字形整个盖住。
+        decoration.onRender((element) => {
+          element.style.backgroundColor = highlightFillStyle(match.color);
+        });
+        disposables.push(decoration);
+        highlightDecorationCount++;
+      }
+    }
+    highlightDecorationsByRow.set(row, entry);
+  }
+}
+
+// 规则/开关变化：全量清理后重扫当前视口（即时生效语义）。
+watch(compiledHighlightRules, () => {
+  clearHighlightDecorations();
+  rescanHighlightViewport();
+});
+
+// ---------------------------------------------------------------------------
+// metrics sparkline + 发行版徽标（IMPL_PLAN_NETCATTY_PARITY §3-B2）
+// ---------------------------------------------------------------------------
+
+// 每方向环形采样（60 帧 × 5s 轮询 ≈ 5 分钟）；跨重连（新 session）清空。
+const metricSamples = reactive({ rx: [] as number[], tx: [] as number[] });
+
+function recordMetricSamples() {
+  let rx = 0;
+  let tx = 0;
+  for (const net of metrics.value?.network ?? []) {
+    rx += Math.max(0, net.rxRate || 0);
+    tx += Math.max(0, net.txRate || 0);
+  }
+  metricSamples.rx = pushSample(metricSamples.rx, rx, METRICS_SAMPLE_CAPACITY);
+  metricSamples.tx = pushSample(metricSamples.tx, tx, METRICS_SAMPLE_CAPACITY);
+}
+
+const metricsRxSparkline = computed(() => sparklinePath(metricSamples.rx, 60, 18));
+const metricsTxSparkline = computed(() => sparklinePath(metricSamples.tx, 60, 18));
+// 旧 sidecar 无 osId/osPretty 时整体缺徽标（optional 降级，§6.6）。
+const metricsDistroBadge = computed<DistroBadge | null>(() => (metrics.value ? distroBadge(metrics.value.osId, metrics.value.osPretty) : null));
+
+watch(() => session.value?.sessionId, (next, previous) => {
+  if (next !== previous) {
+    metricSamples.rx = [];
+    metricSamples.tx = [];
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 审计日志查看（IMPL_PLAN_NETCATTY_PARITY §3-B4）：设置弹窗折叠 section，
+// 只读最近 200 条；打开/过滤变化/刷新时拉取，失败静默空态。
+// ---------------------------------------------------------------------------
+const auditInlineOpen = ref(false);
+const auditEntries = ref<AuditEntry[]>([]);
+const auditLoading = ref(false);
+const auditTruncated = ref(false);
+const auditKindFilter = ref("");
+
+async function loadAuditEntries() {
+  auditLoading.value = true;
+  try {
+    // kind 过滤在客户端做（sanitizeAuditEntries 统一 newest-first；后端可能
+    // 不认 `kind` 参数，见 lib/auditLog.ts 双形状容忍说明）。
+    const result = await window.dbxPlugin.invoke<{ entries: unknown; truncated?: boolean }>("ssh/audit/list", { limit: 200 });
+    auditEntries.value = sanitizeAuditEntries(result.entries, 200);
+    auditTruncated.value = result.truncated === true;
+  } catch {
+    // 失败静默空态（§3-B4-T1）：旧 sidecar 无该方法时不打断设置弹窗。
+    auditEntries.value = [];
+    auditTruncated.value = false;
+  } finally {
+    auditLoading.value = false;
+  }
+}
+
+function toggleAuditInline() {
+  auditInlineOpen.value = !auditInlineOpen.value;
+  if (auditInlineOpen.value) void loadAuditEntries();
+}
+
+const visibleAuditEntries = computed(() => {
+  if (!auditKindFilter.value) return auditEntries.value;
+  return auditEntries.value.filter((entry) => entry.kind === auditKindFilter.value);
+});
+
+async function clearAuditLog() {
+  if (!window.confirm(t("auditLog.clearConfirm"))) return;
+  try {
+    await window.dbxPlugin.invoke("ssh/audit/clear", {});
+  } catch {
+    // 清空失败静默：保留现列表，用户可再次尝试或刷新。
+  }
+  await loadAuditEntries();
+}
+
+function auditTime(ts: number) {
+  if (!ts) return "";
+  return new Intl.DateTimeFormat(locale.value, { dateStyle: "short", timeStyle: "medium" }).format(new Date(ts * 1000));
+}
+
+function auditRowKindClass(kind: string) {
+  return `k-${kind.replace(/\./g, "-")}`;
 }
 
 async function loadHome() {
@@ -2228,39 +2736,6 @@ function toggleSudoMode() {
   sudoMode.value = !sudoMode.value;
   persistState();
   void loadDirectory();
-}
-
-async function refreshQuickSudoSetting() {
-  const sessionId = session.value?.sessionId;
-  if (!sessionId) {
-    quickSudo.value = false;
-    return;
-  }
-  try {
-    const meta = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/get", { sessionId });
-    quickSudo.value = meta.quickSudo === true;
-  } catch {
-    quickSudo.value = false;
-  }
-}
-
-async function toggleQuickSudo() {
-  if (!connected.value || quickSudoSubmitting.value) return;
-  const sessionId = session.value?.sessionId;
-  if (!sessionId) return;
-  terminalMenu.value = undefined;
-  const previous = quickSudo.value;
-  const next = !previous;
-  quickSudo.value = next;
-  quickSudoSubmitting.value = true;
-  try {
-    await window.dbxPlugin.invoke<SshSettings>("ssh/settings/set", { sessionId, quickSudo: next });
-  } catch (cause) {
-    quickSudo.value = previous;
-    showError(cause, "terminal");
-  } finally {
-    quickSudoSubmitting.value = false;
-  }
 }
 
 function goParent() {
@@ -2797,6 +3272,72 @@ function rememberPathHistory(path: string) {
   for (const connection of Object.keys(next)) pathHistories[connection] = next[connection];
   persistPathHistories();
 }
+
+// ---------------------------------------------------------------------------
+// SFTP 路径书签（全局清单）：星标收藏 + 路径弹层跳转/删除（sftp/bookmarks/*）
+// ---------------------------------------------------------------------------
+
+async function refreshBookmarks() {
+  try {
+    sftpBookmarks.value = sortBookmarksByLabel(await listBookmarks());
+  } catch {
+    // 后端未升级/读取失败时保留既有列表（optional 特性静默降级，不阻塞路径栏）。
+  }
+}
+
+function toggleBookmarkSave() {
+  if (!connected.value) return;
+  if (bookmarkSaveOpen.value) {
+    bookmarkSaveOpen.value = false;
+    return;
+  }
+  closeToolbarPopovers();
+  bookmarkLabelDraft.value = defaultBookmarkLabel(currentPath.value);
+  bookmarkSaveOpen.value = true;
+}
+
+async function confirmBookmarkSave() {
+  if (!connected.value || bookmarkSaving.value) return;
+  const input = { label: bookmarkLabelDraft.value, path: currentPath.value };
+  // 前端先行校验（与后端同规则）：label 空/超长/重复、path 空/超长、超上限。
+  const localError = validateBookmarkInput(input, sftpBookmarks.value);
+  if (localError) {
+    showNotice(t(`sftpBookmark.error.${localError}`, localError === "limitReached" ? { limit: SFTP_BOOKMARKS_LIMIT } : {}));
+    return;
+  }
+  bookmarkSaving.value = true;
+  try {
+    const result = await saveBookmark(input);
+    sftpBookmarks.value = sortBookmarksByLabel([
+      ...sftpBookmarks.value.filter((item) => item.id !== result.bookmark.id),
+      result.bookmark,
+    ]);
+    bookmarkSaveOpen.value = false;
+    showNotice(t("sftpBookmark.saved", { label: result.bookmark.label }));
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    bookmarkSaving.value = false;
+  }
+}
+
+async function removeBookmark(bookmark: SftpBookmark) {
+  try {
+    await deleteBookmark(bookmark.id);
+    sftpBookmarks.value = sftpBookmarks.value.filter((item) => item.id !== bookmark.id);
+    showNotice(t("sftpBookmark.deleted"));
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
+// 连接建立后拉取书签（全局共享，不随会话清空）；打开路径弹层时刷新兜底。
+watch(connected, (value) => {
+  if (value) void refreshBookmarks();
+});
+watch(pathHistoryOpen, (open) => {
+  if (open) void refreshBookmarks();
+});
 
 function clearRowSelection() {
   selectedUris.value = [];
@@ -3566,6 +4107,15 @@ function sendQuickCommand(item: QuickCommand) {
   terminal?.focus();
 }
 
+// 一键 sudo -v：向当前交互终端按键盘语义写入 `sudo -v` + 回车（等价手敲执行），
+// 立即刷新远端 sudo 凭据缓存；输出回显在终端，密码提示由用户/Quick Sudo 应答。
+function sendSudoRefresh() {
+  if (!session.value || terminalTransferBusy.value) return;
+  trackPendingInput("sudo -v\r");
+  sendTerminalBytes(new TextEncoder().encode("sudo -v\r"));
+  terminal?.focus();
+}
+
 // ---------------------------------------------------------------------------
 // 批量发送：跨连接把命令写入多个已打开会话的交互终端（tiny-rdm batch send）
 // ---------------------------------------------------------------------------
@@ -3780,41 +4330,48 @@ watch(connected, (value) => {
 
 function toggleQuickMenu() {
   const next = !quickMenuOpen.value;
-  fileMenu.value = undefined;
-  terminalMenu.value = undefined;
-  transferPanelOpen.value = false;
-  columnsOpen.value = false;
-  pathHistoryOpen.value = false;
-  connectionInfoOpen.value = false;
+  closeToolbarPopovers();
   quickMenuOpen.value = next;
 }
 
 function toggleConnectionInfo() {
   const next = !connectionInfoOpen.value;
-  fileMenu.value = undefined;
-  terminalMenu.value = undefined;
-  transferPanelOpen.value = false;
-  columnsOpen.value = false;
-  pathHistoryOpen.value = false;
-  quickMenuOpen.value = false;
+  closeToolbarPopovers();
   connectionInfoOpen.value = next;
   if (next) {
     void measureLatency();
     void refreshConnectionAuthMethod();
+    // 发行版徽标数据源是 metrics 快照：未拉过时补拉一次（一次 exec，约 0.4s），
+    // 否则从未开过指标浮层的会话在连接信息里永远看不到徽标。
+    if (!metrics.value) void refreshMetrics();
   }
 }
 
 function toggleAgentModeMenu() {
   const next = !agentModeOpen.value;
-  fileMenu.value = undefined;
-  terminalMenu.value = undefined;
-  transferPanelOpen.value = false;
-  columnsOpen.value = false;
-  pathHistoryOpen.value = false;
-  connectionInfoOpen.value = false;
-  quickMenuOpen.value = false;
+  closeToolbarPopovers();
   agentModeOpen.value = next;
   if (next) void refreshAgentMode();
+}
+
+// ---- 模板内联互斥清单收敛为具名 toggle（round2），与五个函数 toggle 同族 ----
+
+function toggleColumnsMenu() {
+  const next = !columnsOpen.value;
+  closeToolbarPopovers();
+  columnsOpen.value = next;
+}
+
+function toggleTransferPanel() {
+  const next = !transferPanelOpen.value;
+  closeToolbarPopovers();
+  transferPanelOpen.value = next;
+}
+
+function togglePathHistoryMenu() {
+  const next = !pathHistoryOpen.value;
+  closeToolbarPopovers();
+  pathHistoryOpen.value = next;
 }
 
 /// 读取当前连接的 agentTerminalMode（与设置弹窗同一 ssh/settings/get 视图）；
@@ -3898,6 +4455,7 @@ async function refreshMetrics() {
   try {
     metrics.value = await window.dbxPlugin.invoke<ServerMetrics>("ssh/metrics", { sessionId: session.value.sessionId }, { timeoutMs: 30_000 });
     metricsError.value = "";
+    recordMetricSamples();
   } catch (cause) {
     metricsError.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
@@ -3956,6 +4514,11 @@ function beginChmod(entry: SftpEntry) {
 async function openSettings() {
   settingsOpen.value = true;
   settingsLoading.value = true;
+  // 每次打开都回到收起态，并丢弃上次遗留的内联编辑草稿：
+  // 主「保存」会串行提交未保存的 profile 编辑，不能把陈旧草稿静默入库。
+  profilesInlineOpen.value = false;
+  cancelProfileEdit();
+  auditInlineOpen.value = false;
   void loadKnownHosts();
   void loadLocalKeys();
   void loadMcpSettings();
@@ -3972,6 +4535,7 @@ async function openSettings() {
     settingsDraft.quickSudoProfileId = meta.quickSudoProfileId || "";
     const agentMode = meta.agentTerminalMode;
     settingsDraft.agentTerminalMode = agentMode && (AGENT_MODES as readonly string[]).includes(agentMode) ? agentMode : "off";
+    settingsDraft.rememberedCommands = sanitizeRememberedCommands(meta.rememberedCommands);
     settingsDraft.sudoPassword = meta.sudoPassword || "";
     settingsDraft.totpSecret = meta.totpSecret || "";
   } catch (cause) {
@@ -4107,6 +4671,14 @@ async function removeProfile(profile: SudoProfileView) {
   }
 }
 
+/// 取消内联 profile 编辑：关表单并清空草稿/错误（独立 profiles 弹窗、
+/// 设置弹窗内联 section 与 Esc 关闭链共用同一语义）。
+function cancelProfileEdit() {
+  profileEditing.value = false;
+  resetProfileDraft();
+  sudoProfilesError.value = "";
+}
+
 /// 全局配置或其绑定变化后，刷新设置弹窗的只读摘要（会话内即时生效）。
 async function refreshSettingsMeta() {
   if (!settingsOpen.value || !session.value) return;
@@ -4169,6 +4741,9 @@ async function loadMcpSettings() {
     mcpDraft.readMiB = mibField(result.maxReadBytes);
     mcpDraft.uploadMiB = mibField(result.maxUploadBytes);
     mcpDraft.downloadMiB = mibField(result.maxDownloadBytes);
+    // §1.3 新字段：旧 sidecar 不回时用默认（autonomous / 空=不限）。
+    mcpDraft.permissionMode = result.execPermissionMode === "confirm" ? "confirm" : "autonomous";
+    mcpDraft.connectionScope = Array.isArray(result.connectionScope) ? result.connectionScope.join("\n") : "";
   } catch (cause) {
     mcpError.value = settingsErrorOf(cause);
   } finally {
@@ -4189,6 +4764,10 @@ async function saveMcpSettings() {
       maxReadBytes: Number.parseInt(mcpDraft.readMiB.trim(), 10) * MIB,
       maxUploadBytes: Number.parseInt(mcpDraft.uploadMiB.trim(), 10) * MIB,
       maxDownloadBytes: Number.parseInt(mcpDraft.downloadMiB.trim(), 10) * MIB,
+      // §1.3 MCP 权限档 + 连接作用域（每行一条，trim 去空后提交；旧 sidecar
+      // 不识别新字段时整体报错，经 mcpError 容错展示）。
+      execPermissionMode: mcpDraft.permissionMode === "confirm" ? "confirm" : "autonomous",
+      connectionScope: mcpDraft.connectionScope.split("\n").map((line) => line.trim()).filter(Boolean),
     });
     showNotice(t("mcpLimits.saved"));
   } catch (cause) {
@@ -4198,10 +4777,17 @@ async function saveMcpSettings() {
   }
 }
 
+/**
+ * 一次保存链（设置弹窗主按钮）：① 未保存的 profile 编辑 → ② 连接设置 →
+ * ③ MCP 限速。各步独立容错——saveProfileDraft/saveMcpSettings 内部已把失败
+ * 写入 sudoProfilesError/mcpError 并展示，单步失败不阻断其余步骤；
+ * MCP 表单非法时保持现有校验提示、静默跳过提交。
+ */
 async function saveSettings() {
   if (!session.value || settingsSaving.value) return;
   settingsSaving.value = true;
   try {
+    if (profileEditing.value) await saveProfileDraft();
     const updates: Record<string, unknown> = {
       quickSudo: settingsDraft.quickSudo,
       sudoUsePty: settingsDraft.sudoUsePty,
@@ -4210,6 +4796,7 @@ async function saveSettings() {
       totpPromptHint: settingsDraft.totpPromptHint,
       quickSudoProfileId: settingsDraft.quickSudoProfileId,
       agentTerminalMode: settingsDraft.agentTerminalMode,
+      rememberedCommands: sanitizeRememberedCommands(settingsDraft.rememberedCommands),
     };
     if (settingsDraft.sudoPassword) updates.sudoPassword = settingsDraft.sudoPassword;
     if (settingsDraft.totpSecret.trim()) updates.totpSecret = settingsDraft.totpSecret;
@@ -4217,6 +4804,7 @@ async function saveSettings() {
     settingsMeta.value = meta;
     settingsDraft.sudoPassword = "";
     settingsDraft.totpSecret = "";
+    await saveMcpSettings();
     showNotice(t("settingsSaved"));
   } catch (cause) {
     showError(cause);
@@ -4313,16 +4901,36 @@ function showFileMenu(event: MouseEvent, entry: SftpEntry) {
   sideMenu.value = undefined;
 }
 
-function closeMenus() {
-  terminalMenu.value = undefined;
+/**
+ * 工具栏弹出层互斥族统一收口（round2：收敛五处 + 三处模板内联的手抄互斥清单）。
+ * 打开任一同族弹出层前调用，先关掉全部兄弟弹出层与右键菜单，再由各 toggle
+ * 设定自身状态。族成员 = 模板 class="popover" 的九个弹出层（quick-commands /
+ * agent-mode / highlight-rules / connection-info / columns / transfer /
+ * batch-targets / bookmark-save / path-history）。语义差异说明：metrics 浮层
+ * （.metrics-float，closeMetrics 自带轮询清理）与批量保存态（batchSaveMode，
+ * cancelBatchBarSave 带草稿清理）不属于本族，仍由 Esc 链单独收口；
+ * batch-targets 弹层另有 mousedown-capture 点空白收起，此处再关一次幂等无害。
+ */
+function closeToolbarPopovers() {
   fileMenu.value = undefined;
-  blankMenu.value = undefined;
-  sideMenu.value = undefined;
+  terminalMenu.value = undefined;
   transferPanelOpen.value = false;
   columnsOpen.value = false;
   pathHistoryOpen.value = false;
   quickMenuOpen.value = false;
   connectionInfoOpen.value = false;
+  agentModeOpen.value = false;
+  highlightMenuOpen.value = false;
+  bookmarkSaveOpen.value = false;
+  batchTargetsOpen.value = false;
+}
+
+function closeMenus() {
+  terminalMenu.value = undefined;
+  fileMenu.value = undefined;
+  blankMenu.value = undefined;
+  sideMenu.value = undefined;
+  closeToolbarPopovers();
 }
 
 /** 多选批量：复制所选路径（换行拼接写入剪贴板）。 */
@@ -4350,8 +4958,25 @@ let lastStableFocus: HTMLElement | null = null;
 // 幽灵点击守卫（R3-P1-1）：焦点归还后短窗内拦截无 mousedown 前驱的合成
 // click；决策逻辑走 ghostClickGuard 纯模块（有单测），真实鼠标点击放行。
 const ghostClickGuard = createGhostClickGuard();
-function onDocumentMouseDownCapture() {
+function onDocumentMouseDownCapture(event: MouseEvent) {
   ghostClickGuard.noteMouseDown();
+  // 批量目标弹层点空白收起：capture 阶段先于 batch-bar 的 @mousedown.stop 生效，
+  // 条内空白/终端区/工具栏任意 mousedown 都能关；popover 内部与触发按钮
+  // （触发按钮自身是 toggle 语义）不处理，避免关了又开的抖动。
+  if (batchTargetsOpen.value) {
+    const target = event.target;
+    if (target instanceof HTMLElement && !target.closest(".batch-targets-popover") && !target.closest(".batch-bar-targets")) {
+      batchTargetsOpen.value = false;
+    }
+  }
+  // 关键词高亮管理弹层点空白收起：capture 阶段先于 popover 内部处理；
+  // popover 内部与触发按钮（toggle 语义）不处理，避免关了又开的抖动。
+  if (highlightMenuOpen.value) {
+    const target = event.target;
+    if (target instanceof HTMLElement && !target.closest(".highlight-rules-popover") && !target.closest(".highlight-rules-trigger")) {
+      highlightMenuOpen.value = false;
+    }
+  }
 }
 function onDocumentClickCapture(event: MouseEvent) {
   if (!ghostClickGuard.shouldSuppress()) return;
@@ -4379,6 +5004,7 @@ const modalOpenStates = computed(() => [
   commandOpen.value,
   profilesOpen.value,
   settingsOpen.value,
+  alertTriageOpen.value,
   hostKeyPrompt.value,
   agentPromptHead.value,
 ]);
@@ -4481,11 +5107,29 @@ function onDocumentKeydown(event: KeyboardEvent) {
     commandOpen.value = false;
     return;
   }
+  if (alertTriageOpen.value) {
+    alertTriageOpen.value = false;
+    return;
+  }
   if (profilesOpen.value) {
     profilesOpen.value = false;
     return;
   }
   if (settingsOpen.value) {
+    // 内联 profile 管理（设置弹窗内）沿用 profilesOpen→settingsOpen 的逐层
+    // 退出语义：先关编辑表单，再收起配置档 section，最后关弹窗。
+    if (profilesInlineOpen.value && profileEditing.value) {
+      cancelProfileEdit();
+      return;
+    }
+    if (profilesInlineOpen.value) {
+      profilesInlineOpen.value = false;
+      return;
+    }
+    if (auditInlineOpen.value) {
+      auditInlineOpen.value = false;
+      return;
+    }
     settingsOpen.value = false;
     return;
   }
@@ -4497,13 +5141,17 @@ function onDocumentKeydown(event: KeyboardEvent) {
     blankMenu.value = undefined;
     return;
   }
-  // ---- 工具栏弹出层（含指标浮层，R5-P2-1：同列 popover 一并进 Esc 链）----
-  if (quickMenuOpen.value || pathHistoryOpen.value || columnsOpen.value || transferPanelOpen.value || connectionInfoOpen.value || metricsOpen.value || batchTargetsOpen.value || batchSaveMode.value) {
+  // ---- 工具栏弹出层（含指标浮层，R5-P2-1：同列 popover 一并进 Esc 链；
+  //      高亮规则/终端 MCP 模式为收敛后新增弹层，同列收口）----
+  if (quickMenuOpen.value || pathHistoryOpen.value || columnsOpen.value || transferPanelOpen.value || connectionInfoOpen.value || metricsOpen.value || batchTargetsOpen.value || batchSaveMode.value || bookmarkSaveOpen.value || highlightMenuOpen.value || agentModeOpen.value) {
     quickMenuOpen.value = false;
+    highlightMenuOpen.value = false;
+    agentModeOpen.value = false;
     pathHistoryOpen.value = false;
     columnsOpen.value = false;
     transferPanelOpen.value = false;
     connectionInfoOpen.value = false;
+    bookmarkSaveOpen.value = false;
     batchTargetsOpen.value = false;
     if (batchSaveMode.value) cancelBatchBarSave();
     if (metricsOpen.value) closeMetrics();
@@ -4511,9 +5159,8 @@ function onDocumentKeydown(event: KeyboardEvent) {
 }
 
 function openTransferPanel() {
-  terminalMenu.value = undefined;
-  fileMenu.value = undefined;
-  columnsOpen.value = false;
+  // 右键菜单项打开：菜单项自身随后卸载，互斥族统一收口后再开面板。
+  closeToolbarPopovers();
   transferPanelOpen.value = true;
 }
 
@@ -4648,6 +5295,7 @@ onMounted(() => {
   document.addEventListener("keydown", onDocumentKeydown);
   document.addEventListener("focusin", trackStableFocus);
   void hydrateQuickCommands();
+  void hydrateHighlightRules();
   void initialize().catch((cause) => {
     terminalState.value = "error";
     showError(cause, "terminal");
@@ -4697,6 +5345,7 @@ onBeforeUnmount(() => {
   disposeInput?.dispose();
   disposeSelectionCopy?.dispose();
   terminalWriteThrottle.dispose();
+  detachHighlightRender();
   terminal?.dispose();
   for (const waiter of uploadAckWaiters.values()) {
     window.clearTimeout(waiter.timer);
@@ -4728,8 +5377,11 @@ onBeforeUnmount(() => {
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
         <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting' && !reconnectPending" @click="reconnectNow"><PlugZap /></button>
-        <button class="icon-button icon-emerald" :class="{ 'is-active': quickSudo }" :title="quickSudoTitle" :aria-pressed="quickSudo" :disabled="!connected" @click="toggleQuickSudo"><ShieldCheck /></button>
+        <!-- 一键 sudo -v：向当前 PTY 写入命令刷新 sudo 凭据缓存；quick sudo 自动应答
+             是否启用由连接设置决定（设置弹窗），工作台不再提供开关。 -->
+        <button class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
         <button class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
+        <button class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
         <label class="follow-directory-control" :title="t('followTerminal')">
           <button class="switch-control" type="button" role="switch" :aria-checked="followDirectory" :disabled="!connected" @click="setDirectoryTracking(!followDirectory)"><span /></button>
           <span>{{ t("followTerminal") }}</span>
@@ -4773,13 +5425,56 @@ onBeforeUnmount(() => {
             <p class="muted agent-mode-note">{{ agentModeHint }}</p>
           </section>
         </div>
+        <div class="menu-anchor">
+          <button class="icon-button icon-violet highlight-rules-trigger" :class="{ 'is-active': highlightMenuOpen }" :title="t('highlightRules.title')" @click.stop="toggleHighlightMenu"><Palette /></button>
+          <section v-if="highlightMenuOpen" class="popover highlight-rules-popover" @click.stop>
+            <h3>{{ t("highlightRules.title") }}</h3>
+            <div v-if="!highlightRules.length" class="empty compact">{{ t("highlightRules.empty") }}</div>
+            <div v-else class="highlight-rule-list">
+              <div v-for="item in highlightRules" :key="item.id" class="highlight-rule-row">
+              <span class="highlight-color-dot" :style="{ backgroundColor: item.color }" />
+              <div class="highlight-rule-main">
+                <span class="highlight-rule-pattern mono" :class="{ disabled: !item.enabled }" :title="item.pattern">{{ item.pattern }}</span>
+                <span class="highlight-rule-badges">
+                  <span v-if="item.isRegex">regex</span>
+                  <span v-if="item.caseSensitive">Aa</span>
+                </span>
+              </div>
+              <span class="highlight-rule-actions">
+                <label class="highlight-switch-control" :title="t('highlightRules.enabled')">
+                  <input type="checkbox" :checked="item.enabled" @change="toggleHighlightRule(item)" />
+                </label>
+                <button class="icon-button" :title="t('quickCommandsEdit')" @click="editHighlightRule(item)"><Pencil /></button>
+                <button class="icon-button" :title="t('delete')" @click="deleteHighlightRule(item.id)"><Trash2 /></button>
+              </span>
+            </div>
+            </div>
+            <footer class="highlight-editor">
+              <div class="highlight-editor-inputs">
+                <input v-model="highlightDraft.pattern" :placeholder="t('highlightRules.patternPlaceholder')" :maxlength="200" spellcheck="false" @keydown.enter="saveHighlightRule" />
+                <label class="highlight-editor-flag" :title="t('highlightRules.regex')"><input v-model="highlightDraft.isRegex" type="checkbox" />.*</label>
+                <label class="highlight-editor-flag" :title="t('highlightRules.caseSensitive')"><input v-model="highlightDraft.caseSensitive" type="checkbox" />Aa</label>
+              </div>
+              <div class="highlight-palette">
+                <button v-for="swatch in HIGHLIGHT_PALETTE" :key="swatch" type="button" class="highlight-palette-swatch" :class="{ selected: highlightDraft.color.toLowerCase() === swatch }" :style="{ backgroundColor: swatch }" :aria-label="swatch" @click="highlightDraft.color = swatch" />
+                <input v-model="highlightDraft.color" class="highlight-hex-input mono" :title="t('highlightRules.color')" :maxlength="7" spellcheck="false" />
+              </div>
+              <div class="highlight-editor-actions">
+                <span class="highlight-rule-limit">{{ t("highlightRules.limit", { count: highlightRules.length, limit: HIGHLIGHT_RULES_LIMIT }) }}</span>
+                <button v-if="highlightDraft.id" @click="resetHighlightDraft">{{ t("cancel") }}</button>
+                <button class="primary-button" :disabled="highlightSaving || !highlightDraft.pattern.trim() || (!highlightDraft.id && highlightRules.length >= HIGHLIGHT_RULES_LIMIT)" @click="saveHighlightRule">{{ highlightDraft.id ? t("save") : t("highlightRules.add") }}</button>
+              </div>
+              <p v-if="highlightDraftError" class="task-error">{{ highlightDraftError }}</p>
+            </footer>
+          </section>
+        </div>
         <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-neutral" :title="t('connectionInfo')" @click.stop="toggleConnectionInfo"><Info /></button>
           <section v-if="connectionInfoOpen" class="popover connection-info-popover" @click.stop>
             <h3>{{ t("connectionInfo") }}</h3>
             <dl class="connection-info-grid">
-              <dt>{{ t("connectionInfoHost") }}</dt><dd class="mono">{{ connection.host || connection.name || "–" }}</dd>
+              <dt>{{ t("connectionInfoHost") }}</dt><dd class="mono"><span v-if="metricsDistroBadge" class="distro-badge" :style="{ backgroundColor: metricsDistroBadge.color }" :title="metricsDistroBadge.name">{{ metricsDistroBadge.label }}</span> {{ connection.host || connection.name || "–" }}</dd>
               <dt>{{ t("connectionInfoPort") }}</dt><dd class="mono">{{ connection.port || 22 }}</dd>
               <dt>{{ t("connectionInfoUser") }}</dt><dd class="mono">{{ connection.username || "–" }}</dd>
               <dt>{{ t("connectionInfoAuth") }}</dt><dd>{{ connectionAuthMethodLabel }}</dd>
@@ -4795,7 +5490,7 @@ onBeforeUnmount(() => {
         </div>
         <button class="icon-button icon-violet" :title="t('settings')" :disabled="!connected" @click="openSettings"><Settings /></button>
         <div class="menu-anchor">
-          <button class="icon-button icon-violet" :title="t('customizeColumns')" @click.stop="fileMenu = undefined; terminalMenu = undefined; transferPanelOpen = false; columnsOpen = !columnsOpen"><Columns3 /></button>
+          <button class="icon-button icon-violet" :title="t('customizeColumns')" @click.stop="toggleColumnsMenu"><Columns3 /></button>
           <div v-if="columnsOpen" class="popover columns-popover" @click.stop>
             <label v-for="column in (['size', 'modified', 'permissions'] as SftpColumn[])" :key="column"><input type="checkbox" :checked="visibleColumns.includes(column)" @change="toggleColumn(column)" />{{ t(column) }}</label>
             <hr class="columns-popover-separator" />
@@ -4803,7 +5498,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="menu-anchor">
-          <button class="icon-button icon-blue" :title="t('transfers')" @click.stop="transferPanelOpen = !transferPanelOpen"><ListChecks /><span v-if="activeTransfers" class="activity-dot" /></button>
+          <button class="icon-button icon-blue" :title="t('transfers')" @click.stop="toggleTransferPanel"><ArrowUpDown /><span v-if="activeTransfers" class="activity-dot" /></button>
           <section v-if="transferPanelOpen" class="popover transfer-popover" @click.stop>
             <h3>{{ t("transfers") }}</h3>
             <div v-if="!transferList.length" class="empty compact">{{ t("noTransfers") }}</div>
@@ -4814,6 +5509,21 @@ onBeforeUnmount(() => {
               <button v-if="task.status === 'queued' || task.status === 'running'" class="link-button" @click="cancelTransfer(task)">{{ t("cancel") }}</button>
               <p v-if="task.error" class="task-error">{{ task.error }}</p>
             </article>
+            <!-- 历史区：无进行中任务时展示（落盘历史跨重启可查，failed 显示原因） -->
+            <template v-if="!activeTransfers">
+              <h3 class="transfer-history-title">{{ t("transfersHistory.title") }}</h3>
+              <div v-if="transferHistoryFailed" class="empty compact">
+                <span>{{ t("transfersHistory.loadFailed") }}</span>
+                <button class="link-button" @click="refreshTransferHistory">{{ t("refresh") }}</button>
+              </div>
+              <div v-else-if="transferHistoryLoading && !transferHistory.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+              <div v-else-if="!transferHistory.length" class="empty compact">{{ t("transfersHistory.empty") }}</div>
+              <article v-for="entry in transferHistory" :key="entry.taskId" class="transfer-card transfer-history-card">
+                <div class="transfer-title"><FileUp v-if="entry.direction === 'upload'" /><Download v-else /><span :title="entry.fileName">{{ entry.fileName || entry.taskId }}</span><strong>{{ formatBytes(entry.size) }}</strong></div>
+                <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span v-if="entry.transferred">{{ formatBytes(entry.transferred) }}</span></div>
+                <p v-if="entry.error" class="task-error">{{ entry.error }}</p>
+              </article>
+            </template>
           </section>
         </div>
       </div>
@@ -4890,7 +5600,7 @@ onBeforeUnmount(() => {
         </div>
         <section v-if="metricsOpen" class="metrics-float">
           <header>
-            <h2>{{ t("metrics") }}<span v-if="metrics?.hostname" class="metrics-host"> · {{ metrics.hostname }}</span></h2>
+            <h2>{{ t("metrics") }}<span v-if="metricsDistroBadge" class="distro-badge" :style="{ backgroundColor: metricsDistroBadge.color }" :title="metricsDistroBadge.name">{{ metricsDistroBadge.label }}</span><span v-if="metrics?.hostname" class="metrics-host"> · {{ metrics.hostname }}</span></h2>
             <button class="icon-button" @click="closeMetrics"><X /></button>
           </header>
           <div class="metrics-float-body">
@@ -4922,7 +5632,13 @@ onBeforeUnmount(() => {
                 </div>
               </div>
               <div v-if="metrics.network?.length">
-                <h3 class="settings-section-title">{{ t("metricsNetwork") }}</h3>
+                <h3 class="settings-section-title metrics-net-title">
+                  <span>{{ t("metricsNetwork") }}</span>
+                  <span v-if="metricsRxSparkline || metricsTxSparkline" class="metrics-sparkline-group">
+                    <svg class="metrics-sparkline" width="60" height="18" viewBox="0 0 60 18" role="img" aria-label="rx"><polyline :points="metricsRxSparkline" fill="none" style="stroke: var(--primary)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg>
+                    <svg class="metrics-sparkline" width="60" height="18" viewBox="0 0 60 18" role="img" aria-label="tx"><polyline :points="metricsTxSparkline" fill="none" style="stroke: var(--success)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg>
+                  </span>
+                </h3>
                 <div class="metrics-disks">
                   <div
                     v-for="net in metrics.network"
@@ -5053,11 +5769,33 @@ onBeforeUnmount(() => {
           <button class="icon-button icon-cyan" :title="t('refresh')" :disabled="!connected || loadingFiles" @click="loadDirectory()"><RefreshCw :class="{ spinning: loadingFiles }" /></button>
           <input v-model="currentPath" spellcheck="false" @keydown.enter="submitPathInput" />
           <div class="menu-anchor">
-            <button class="icon-button" :title="t('sftpPathHistory.title')" :disabled="!connected" @click.stop="fileMenu = undefined; terminalMenu = undefined; transferPanelOpen = false; columnsOpen = false; pathHistoryOpen = !pathHistoryOpen"><History /></button>
+            <button class="icon-button icon-amber" :title="t('sftpBookmark.add')" :disabled="!connected" @click.stop="toggleBookmarkSave"><Star /></button>
+            <!-- 星标收藏弹层：label 默认取路径末段，可编辑后保存（前端先行校验 + 后端错误回显） -->
+            <div v-if="bookmarkSaveOpen" class="popover bookmark-save-popover" @click.stop>
+              <strong class="path-history-title">{{ t("sftpBookmark.add") }}</strong>
+              <span class="bookmark-save-path mono" :title="currentPath">{{ currentPath }}</span>
+              <input v-model="bookmarkLabelDraft" class="bookmark-label-input mono" :maxlength="SFTP_BOOKMARK_LABEL_MAX_LENGTH" spellcheck="false" :placeholder="t('sftpBookmark.namePlaceholder')" :disabled="bookmarkSaving" autofocus @keydown.enter="confirmBookmarkSave" />
+              <div class="bookmark-save-actions">
+                <button class="icon-button icon-emerald" :title="t('save')" :disabled="bookmarkSaving" @click="confirmBookmarkSave"><Save /></button>
+                <button class="icon-button" :title="t('cancel')" :disabled="bookmarkSaving" @click="bookmarkSaveOpen = false"><X /></button>
+              </div>
+            </div>
+          </div>
+          <div class="menu-anchor">
+            <button class="icon-button" :title="t('sftpPathHistory.title')" :disabled="!connected" @click.stop="togglePathHistoryMenu"><History /></button>
             <div v-if="pathHistoryOpen" class="popover path-history-popover" @click.stop>
               <strong class="path-history-title">{{ t("sftpPathHistory.title") }}</strong>
               <button v-for="item in currentPathHistory" :key="item" class="path-item mono" :title="item" @click="goToPath(item)">{{ item }}</button>
               <div v-if="!currentPathHistory.length" class="empty compact">{{ t("sftpPathHistory.empty") }}</div>
+              <!-- 书签区：点击跳转，行尾悬浮删除；全局清单（跨连接共享） -->
+              <strong class="path-history-title">{{ t("sftpBookmark.title") }}</strong>
+              <template v-if="sftpBookmarks.length">
+                <div v-for="bookmark in sftpBookmarks" :key="bookmark.id" class="bookmark-row">
+                  <button class="path-item mono" :title="`${bookmark.label} · ${bookmark.path}`" @click="goToPath(bookmark.path)">{{ bookmark.label }}</button>
+                  <button class="bookmark-delete" :title="t('delete')" @click.stop="removeBookmark(bookmark)"><Trash2 /></button>
+                </div>
+              </template>
+              <div v-else class="empty compact">{{ t("sftpBookmark.empty") }}</div>
               <strong class="path-history-title">{{ t("sftpQuickPath.title") }}</strong>
               <button v-for="item in SFTP_QUICK_PATHS" :key="item" class="path-item mono" :title="item" @click="goToPath(item)">{{ item }}</button>
             </div>
@@ -5169,7 +5907,7 @@ onBeforeUnmount(() => {
       <button @click="selectAllTerminal"><TextSelect />{{ t("terminalSelectAll") }}</button>
       <button @click="openTerminalSearch"><Search />{{ t("terminalSearch.open") }}</button>
       <button @click="clearTerminal"><Eraser />{{ t("terminalClear") }}</button>
-      <button :disabled="!connected" @click="toggleQuickSudo()"><ShieldCheck />{{ t("quickSudo.label") }} · {{ quickSudo ? t("quickSudo.on") : t("quickSudo.off") }}</button>
+      <button :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck />{{ t("sudoRefresh.title") }}</button>
       <hr />
       <button :disabled="!connected || terminalTransferBusy || !canWrite" @click="chooseZmodem"><FileUp />{{ t("zmodemUpload") }}</button>
       <button :disabled="!connected || terminalTransferBusy || !canWrite" @click="chooseTrzszUpload"><FileUp />{{ t("trzszUpload") }}</button>
@@ -5373,10 +6111,73 @@ onBeforeUnmount(() => {
                   <option value="">{{ t("profileSourceConnection") }}</option>
                   <option v-for="profile in sudoProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}</option>
                 </select>
-                <button class="link-button" @click="openProfilesManager">{{ t("profilesManage") }}</button>
+                <!-- 内联管理入口：展开/收起下方配置档 section，不再跳独立弹窗（工具栏 KeyRound 仍保留独立弹窗）。 -->
+                <button class="link-button" :aria-expanded="profilesInlineOpen" @click="profilesInlineOpen = !profilesInlineOpen">{{ t("profilesManage") }}</button>
               </span>
             </label>
             <p v-if="boundProfile" class="muted settings-note">{{ t("profilesBoundSummary", { name: boundProfile.name }) }} · {{ profileSummary(boundProfile) }}</p>
+            <!-- 内联 quick sudo 配置档管理：列表 + 新增/编辑同表单状态
+                 （sudoProfiles/profileDraft/... 与独立 profiles 弹窗共用），主「保存」串行提交。 -->
+            <section v-if="profilesInlineOpen" class="profiles-inline">
+              <h3 class="settings-section-title">{{ t("profilesTitle") }}</h3>
+              <p class="muted">{{ t("profilesHint") }}</p>
+              <div v-if="sudoProfilesLoading && !sudoProfiles.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+              <div v-else-if="!sudoProfiles.length" class="empty compact">{{ t("profilesEmpty") }}</div>
+              <ul v-else class="settings-list">
+                <li v-for="profile in sudoProfiles" :key="profile.id">
+                  <div class="settings-list-main">
+                    <strong>{{ profile.name }}</strong>
+                    <span class="muted">{{ profileSummary(profile) }}</span>
+                  </div>
+                  <span class="settings-list-actions">
+                    <button class="icon-button" :title="t('profilesEdit')" @click="startProfileEdit(profile)"><Pencil /></button>
+                    <button class="icon-button" :title="t('profilesDelete')" @click="removeProfile(profile)"><Trash2 /></button>
+                  </span>
+                </li>
+              </ul>
+              <p class="muted">{{ t("profilesLimit", { count: sudoProfiles.length, limit: 20 }) }}</p>
+              <button v-if="!profileEditing" class="link-button" @click="startProfileCreate">{{ t("profilesAdd") }}</button>
+              <template v-if="profileEditing">
+                <h4 class="settings-section-title">{{ profileDraft.id ? t("profilesEdit") : t("profilesAdd") }}</h4>
+                <label class="settings-field">
+                  <span>{{ t("profilesName") }}</span>
+                  <input v-model="profileDraft.name" spellcheck="false" :placeholder="t('profilesNamePlaceholder')" />
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("profilesPassword") }}</span>
+                  <input v-model="profileDraft.sudoPassword" type="password" autocomplete="off" :placeholder="profileDraftHadPassword ? t('profilesPasswordKeep') : t('settingsSudoPasswordPlaceholder')" />
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("profilesTotp") }}</span>
+                  <textarea v-model="profileDraft.totpSecret" rows="2" spellcheck="false" :placeholder="profileDraftHadTotp ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("settingsFlowMode") }}</span>
+                  <select v-model="profileDraft.authFlowMode">
+                    <option value="password_then_otp">{{ t("flowThenOtp") }}</option>
+                    <option value="password_plus_otp">{{ t("flowPlusOtp") }}</option>
+                    <option value="password_only">{{ t("flowOnly") }}</option>
+                  </select>
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("settingsPasswordHint") }}</span>
+                  <input v-model="profileDraft.passwordPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("settingsTotpHint") }}</span>
+                  <input v-model="profileDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+                </label>
+                <label class="quick-sudo-control">
+                  <button class="switch-control" type="button" role="switch" :aria-checked="profileDraft.sudoUsePty" @click="profileDraft.sudoUsePty = !profileDraft.sudoUsePty"><span /></button>
+                  <span>{{ t("settingsUsePty") }}</span>
+                </label>
+                <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
+                <footer class="profiles-form-actions">
+                  <button @click="cancelProfileEdit">{{ t("cancel") }}</button>
+                  <button class="primary-button" :disabled="profileSaving || !profileDraft.name.trim()" @click="saveProfileDraft"><Loader2 v-if="profileSaving" class="spinning" />{{ t("save") }}</button>
+                </footer>
+              </template>
+            </section>
             <label class="quick-sudo-control">
               <button class="switch-control" type="button" role="switch" :aria-checked="settingsDraft.quickSudo" @click="settingsDraft.quickSudo = !settingsDraft.quickSudo"><span /></button>
               <span>{{ t("settingsQuickSudo") }}</span>
@@ -5422,6 +6223,18 @@ onBeforeUnmount(() => {
               </select>
             </label>
             <p class="muted settings-note">{{ agentTerminalModeHint }}</p>
+            <div class="settings-remembered">
+              <h4 class="settings-section-title">{{ t("settingsRemembered.section") }}</h4>
+              <label class="settings-field"><span>{{ t("settingsRemembered.label") }}</span></label>
+              <p v-if="!settingsDraft.rememberedCommands.length" class="muted settings-note">{{ t("settingsRemembered.empty") }}</p>
+              <ul v-else class="remembered-list">
+                <li v-for="(line, index) in settingsDraft.rememberedCommands" :key="`${index}-${line}`" class="remembered-row">
+                  <code class="mono remembered-line">{{ line }}</code>
+                  <button class="link-button" type="button" @click="settingsDraft.rememberedCommands.splice(index, 1)">{{ t("settingsRemembered.remove") }}</button>
+                </li>
+              </ul>
+              <p class="muted settings-note">{{ t("settingsRemembered.hint") }}</p>
+            </div>
 
             <h3 class="settings-section-title">{{ t("terminalSelectCopy.section") }}</h3>
             <label class="quick-sudo-control">
@@ -5477,10 +6290,56 @@ onBeforeUnmount(() => {
                 <input v-model="mcpDraft.downloadMiB" type="number" min="1" step="1" inputmode="numeric" />
               </label>
             </div>
+            <label class="settings-field">
+              <span>{{ t("mcpSettings.permissionMode") }}</span>
+              <select v-model="mcpDraft.permissionMode">
+                <option value="autonomous">autonomous</option>
+                <option value="confirm">confirm</option>
+              </select>
+            </label>
+            <p v-if="mcpDraft.permissionMode === 'confirm'" class="muted settings-note">{{ t("mcpSettings.permissionModeConfirmHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("mcpSettings.connectionScope") }}</span>
+              <textarea v-model="mcpDraft.connectionScope" rows="3" class="mono" spellcheck="false" :placeholder="t('mcpSettings.connectionScopeHint')" />
+            </label>
             <p v-if="!mcpInputsValid" class="task-error">{{ t("mcpLimits.invalid") }}</p>
             <p v-if="mcpError" class="task-error">{{ mcpError }} <button class="link-button" @click="loadMcpSettings">{{ t("refresh") }}</button></p>
-            <button class="link-button" :disabled="!mcpInputsValid || mcpSaving" @click="saveMcpSettings"><Loader2 v-if="mcpSaving" class="spinning" />{{ t("save") }}</button>
+            <!-- 独立「保存」链接已并入底部主「保存」串行链（saveSettings）。 -->
           </template>
+
+          <div class="audit-section-head">
+            <h3 class="settings-section-title">{{ t("auditLog.title") }}</h3>
+            <button class="link-button" :aria-expanded="auditInlineOpen" @click="toggleAuditInline">{{ t("auditLog.toggle") }}</button>
+          </div>
+          <section v-if="auditInlineOpen">
+            <div class="audit-toolbar">
+              <label class="highlight-editor-flag">
+                <span>{{ t("auditLog.kindFilter") }}</span>
+                <select v-model="auditKindFilter">
+                  <option value="">{{ t("auditLog.kindAll") }}</option>
+                  <option v-for="kind in auditKindOptions(auditEntries)" :key="kind" :value="kind">{{ auditKindLabel(kind, t) }}</option>
+                </select>
+              </label>
+              <button class="icon-button" :title="t('refresh')" :disabled="auditLoading" @click="loadAuditEntries"><RefreshCw :class="{ spinning: auditLoading }" /></button>
+              <button class="icon-button" :title="t('auditLog.clear')" @click="clearAuditLog"><Trash2 /></button>
+            </div>
+            <div v-if="auditLoading && !auditEntries.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+            <div v-else-if="!visibleAuditEntries.length" class="empty compact">{{ t("auditLog.empty") }}</div>
+            <template v-else>
+              <ul class="audit-list">
+                <li v-for="(entry, index) in visibleAuditEntries" :key="`${entry.ts}-${entry.kind}-${index}`" class="audit-row">
+                  <span class="audit-time mono">{{ auditTime(entry.ts) }}</span>
+                  <span class="audit-kind-badge" :class="auditRowKindClass(entry.kind)">{{ auditKindLabel(entry.kind, t) }}</span>
+                  <span v-if="entry.connection || entry.sessionId" class="audit-connection mono" :title="entry.connection || entry.sessionId">{{ entry.connection || entry.sessionId }}</span>
+                  <span v-if="entry.command" class="audit-command mono" :title="entry.command">{{ entry.command }}</span>
+                  <span v-if="entry.gate" class="audit-gate mono">{{ entry.gate }}</span>
+                  <span v-if="auditOutcomeLabel(entry, t)" class="audit-outcome" :class="{ error: entry.outcome === 'error' || entry.decision === 'denied' || entry.decision === 'timeout', ok: entry.outcome === 'ok' || entry.decision === 'approved' }">{{ auditOutcomeLabel(entry, t) }}</span>
+                  <span v-if="entry.exitCode != null" class="audit-time">{{ t("auditLog.exitCode", { code: entry.exitCode }) }}</span>
+                </li>
+              </ul>
+              <p v-if="auditTruncated" class="muted audit-truncated">{{ t("auditLog.truncated") }}</p>
+            </template>
+          </section>
         </div>
         <footer>
           <button :disabled="!settingsMeta?.sudoPasswordSet && !settingsMeta?.totpConfigured" @click="clearStoredSecrets"><Trash2 />{{ t("settingsClearSecrets") }}</button>
@@ -5548,7 +6407,7 @@ onBeforeUnmount(() => {
             </label>
             <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
             <footer class="profiles-form-actions">
-              <button @click="profileEditing = false; resetProfileDraft(); sudoProfilesError = ''">{{ t("cancel") }}</button>
+              <button @click="cancelProfileEdit">{{ t("cancel") }}</button>
               <button class="primary-button" :disabled="profileSaving || !profileDraft.name.trim()" @click="saveProfileDraft"><Loader2 v-if="profileSaving" class="spinning" />{{ t("save") }}</button>
             </footer>
           </template>
@@ -5568,7 +6427,7 @@ onBeforeUnmount(() => {
 
     <section v-if="agentPromptHead" class="modal-backdrop">
       <article class="modal agent-prompt-modal">
-        <header><h2>{{ t("agentPromptTitle") }}</h2></header>
+        <header><h2>{{ agentPromptHead.source === "mcp" ? t("agentPrompt.mcpSource", { tool: agentPromptHead.tool }) : t("agentPromptTitle") }}</h2></header>
         <div class="agent-prompt-meta">
           <span>{{ t("agentPromptSource") }} <code class="mono">{{ agentPromptHead.tool }}</code></span>
           <span class="agent-risk-badge" :class="agentPromptHead.risk === 'elevated' ? 'elevated' : 'low'">{{ agentPromptHead.risk === "elevated" ? t("agentPromptRiskElevated") : t("agentPromptRiskLow") }}</span>
@@ -5577,8 +6436,50 @@ onBeforeUnmount(() => {
           <span>{{ t("agentPromptCommandLabel") }}</span>
           <textarea v-model="agentPromptCommand" class="mono" rows="3" spellcheck="false" />
         </label>
+        <!-- 记住不限风险档：strict 模式下低危命令同样每次弹审、同样需要免审
+             记忆（IMPL_PLAN 预期 strict/auto 下 approve+remember 二次零弹窗）；
+             破坏性命令由后端 D2 兜底忽略 remember。 -->
+        <label class="agent-prompt-remember">
+          <input v-model="agentPromptRemember" type="checkbox" />
+          <span>{{ t("approval.remember") }}</span>
+        </label>
         <p class="muted agent-prompt-countdown">{{ t("agentPromptTimeoutHint", { seconds: Math.ceil(agentPromptRemaining) }) }}</p>
         <footer><button @click="resolveAgentPrompt('deny')">{{ t("agentPromptDeny") }}</button><button class="primary-button" @click="resolveAgentPrompt('approve')">{{ t("agentPromptApprove") }}</button></footer>
+      </article>
+    </section>
+
+    <!-- 告警排查：异构告警 → 结构化 + 分类 + 只读诊断命令清单 -->
+    <section v-if="alertTriageOpen" class="modal-backdrop" @mousedown.self="alertTriageOpen = false">
+      <article class="modal alert-triage-modal">
+        <header>
+          <h2>{{ t("alertTriage.title") }}</h2>
+          <button class="icon-button" @click="alertTriageOpen = false"><X /></button>
+        </header>
+        <p class="muted alert-triage-hint">{{ t("alertTriage.hint") }}</p>
+        <textarea v-model="alertTriagePayload" class="mono alert-triage-payload" rows="6" :placeholder="t('alertTriage.placeholder')" spellcheck="false" autofocus />
+        <p v-if="alertTriageError" class="task-error">{{ alertTriageError }}</p>
+        <footer class="alert-triage-actions">
+          <button class="primary-button" :disabled="alertTriageBusy || !sanitizeTriagePayload(alertTriagePayload)" @click="runAlertTriage">{{ t("alertTriage.analyze") }}</button>
+        </footer>
+        <div v-if="alertTriageResult" class="alert-triage-result">
+          <div class="alert-triage-summary">
+            <span class="alert-severity-badge" :class="severityClass(alertTriageResult.normalized.severity)">{{ t(`alertTriage.severity.${severityClass(alertTriageResult.normalized.severity)}`) }}</span>
+            <span class="alert-category">{{ t(`alertTriage.category.${alertTriageResult.category}`) }}</span>
+            <strong v-if="alertTriageResult.normalized.title" class="alert-title">{{ alertTriageResult.normalized.title }}</strong>
+          </div>
+          <p v-if="alertTriageResult.normalized.message" class="muted alert-message mono">{{ alertTriageResult.normalized.message }}</p>
+          <p v-if="!alertTriageResult.suggestions.length" class="muted">{{ t("alertTriage.emptyResult") }}</p>
+          <ul v-else class="alert-suggestion-list">
+            <li v-for="suggestion in alertTriageResult.suggestions" :key="suggestion.command" class="alert-suggestion-row">
+              <code class="mono alert-suggestion-command">{{ suggestion.command }}</code>
+              <span class="alert-purpose muted">{{ purposeKeyLabel(suggestion.purposeKey, t) }}</span>
+              <button :disabled="!session" :title="!session ? t('alertTriage.noSession') : ''" @click="sendSuggestionToTerminal(suggestion.command)">{{ t("alertTriage.sendToTerminal") }}</button>
+            </li>
+          </ul>
+          <footer v-if="alertTriageResult.suggestions.length" class="alert-triage-actions">
+            <button @click="copySuggestions">{{ t("alertTriage.copyAll") }}</button>
+          </footer>
+        </div>
       </article>
     </section>
 
@@ -5637,6 +6538,21 @@ onBeforeUnmount(() => {
 .path-history-title { margin: 4px; color: var(--muted-foreground); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; }
 .path-history-popover .path-item { display: block; width: 100%; height: 26px; overflow: hidden; border: 0; border-radius: 4px; padding: 0 7px; background: transparent; color: var(--foreground); font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .path-history-popover .path-item:hover { background: var(--accent); }
+/* 书签行：label 跳转 + 行尾悬浮删除（对齐 path-item 观感） */
+.bookmark-row { display: flex; align-items: center; gap: 2px; }
+.bookmark-row .path-item { flex: 1 1 auto; min-width: 0; }
+.bookmark-row .bookmark-delete { display: flex; width: 22px; height: 22px; flex: 0 0 22px; align-items: center; justify-content: center; border: 0; border-radius: 4px; background: transparent; color: var(--muted-foreground); cursor: pointer; opacity: 0; }
+.bookmark-row:hover .bookmark-delete, .bookmark-row .bookmark-delete:focus-visible { opacity: 1; }
+.bookmark-row .bookmark-delete:hover { color: var(--destructive); background: var(--accent); }
+.bookmark-row .bookmark-delete svg { width: 12px; height: 12px; }
+/* 星标收藏弹层：路径预览 + 可编辑 label + 保存/取消 */
+.bookmark-save-popover { display: flex; width: 250px; flex-direction: column; gap: 6px; padding: 8px; }
+.bookmark-save-path { overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.bookmark-label-input { width: 100%; border: 1px solid var(--border); border-radius: 4px; padding: 4px 7px; background: var(--background); color: var(--foreground); font-size: 11px; }
+.bookmark-save-actions { display: flex; justify-content: flex-end; gap: 4px; }
+.bookmark-save-actions .icon-button { width: 26px; height: 26px; flex: 0 0 26px; }
+/* 传输历史区标题：与任务卡片间的分隔线 */
+.transfer-history-title { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
 .attrs-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 12px; }
 .attrs-grid dt { color: var(--muted-foreground); white-space: nowrap; }
 .attrs-grid dd { margin: 0; overflow-wrap: anywhere; }

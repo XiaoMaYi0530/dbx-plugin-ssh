@@ -69,6 +69,7 @@ EXPECTED_TOOLS = [
     "sftp_disk_usage",
     "sftp_upload",
     "sftp_download",
+    "ssh_alert_triage",
 ]
 
 
@@ -264,6 +265,28 @@ def main() -> None:
         parsed = json.loads(result["content"][0]["text"])
         assert isinstance(parsed["knownHosts"], list)
         print("tools/call round-trip ok")
+
+        # Alert triage (IMPL_PLAN_SSH_APPROVAL_AUDIT_ALERT §2.4): offline,
+        # connection-free — normalize + classify + whitelisted-only playbook.
+        send(proc, {
+            "jsonrpc": "2.0", "id": 95, "method": "tools/call",
+            "params": {"name": "ssh_alert_triage", "arguments": {
+                "payload": json.dumps({
+                    "alertId": "smoke-1", "title": "CPU 使用率过高",
+                    "severity": "critical", "source": "prometheus",
+                    "message": "node-1 cpu_usage above 0.9",
+                }),
+            }},
+        })
+        result = recv(proc, 95)["result"]
+        assert not result.get("isError", False), f"triage failed: {result}"
+        triage = json.loads(result["content"][0]["text"])
+        assert triage["normalized"]["alertId"] == "smoke-1", triage
+        assert triage["category"] == "cpu", triage
+        assert triage["suggestions"], triage
+        assert all("sudo" not in item["command"] for item in triage["suggestions"]), triage
+        assert all(item["purposeKey"] for item in triage["suggestions"]), triage
+        print("ssh_alert_triage offline round-trip ok")
 
         # Global Quick Sudo profiles: save/list/delete round-trip with a
         # runtime-assembled test secret; responses must never echo it.

@@ -127,3 +127,36 @@ deferred（本批不做）：多会话分屏、端口转发、SecretRef/审计�
 | Agent 转发（ForwardAgent/-A） | ❌ 不做 | **2026-09-07 用户决策**：转发类特性不做（认证侧 ssh-agent 已支持：SSH_AUTH_SOCK/自定义 socket/Pageant/agent 内证书身份，见 `ssh.rs authenticate_agent`） |
 | mosh/UDP 漫游、X11、GSSAPI、ControlMaster、SSH console | ❌ 不做 | 需自研服务端组件/大额自研、或宿主已承担（连接管理/凭据）、或 GUI 客户端不适用；理由见 review 结论 |
 | 批量登录、登录选择器/分组、记住密码、自动重连 | ✅ 已有（等价） | 分别对应批量发送（跨连接活跃会话）、DBX 连接管理、宿主 secret binding、断线自动重连 |
+
+## openocta 对标补充（2026-09-11，0.4.52）
+
+以 [openocta/openocta](https://github.com/openocta/openocta)（AIOps 运维智能体平台，
+Go Gateway + Agent Runtime + Skills + MCP 客户端）为参照的运维闭环能力借鉴
+（实施计划 `docs/IMPL_PLAN_SSH_APPROVAL_AUDIT_ALERT.zh-CN.md`；SSH 传输层不对标
+——对方依赖系统 openssh-clients，本插件自研 russh 深度领先）：
+
+| openocta 能力 | 插件状态 | 说明 |
+| --- | --- | --- |
+| 审批队列持久化（`src/pkg/security/approval_queue.go` 按 storePath 单例 + 持久化批准存储） | ✅ 已有（等价增强） | 审批弹窗「记住此命令」（`ssh/agent/resolve remember`）→ 连接级免审批清单 `agent-approved-commands.json`，匹配复用 sudoers 式 token 语义、可手工泛化通配；破坏性命令拒绝入库且命中重检无效（灾难门永不绕过） |
+| 执行可追溯（事件总线 + 审批中间件） | ✅ 已有（SSH 域内） | 执行审计 JSONL（`audit-log.jsonl`，5 MiB 轮转）：MCP/AI 执行面每调用一条（gate/outcome/exitCode/耗时）+ 审批生命周期一条（approved/denied/timeout/remembered）；`ssh/audit/list` 只读回放；工作台人工操作按既定信任模型不记 |
+| 告警标准化 + 固定分析 Prompt（`/hooks/alert`） | ✅ 已有（插件侧形态） | `ssh_alert_triage` 工具 + `ssh/alert/triage` RPC：异构告警 JSON/纯文本 → 结构化（相同兼容语义：解析失败整包当 message）+ 双语关键词分类 + 白名单级只读诊断命令清单；分析与执行分离（分诊在插件、推理在外部 Agent），不接收 webhook（宿主契约之外） |
+| 主机巡检场景（`deploy/scenarios/host-inspection`） | ⏸ 未做（另有对标项） | 一键巡检报告（复用 `ssh/metrics` + `ssh/exec` 的配方化组织）列为后续候选，见对比评审结论 #1 |
+| 定时调度（`src/pkg/cron`）、IM 渠道指挥（channels）、数字员工（employees） | ❌ 不做 | 宿主/生态层职责（sidecar 生命周期受宿主管理，长期定时任务不合适；IM 渠道超出插件契约）；角色预设包（快速命令组 + sudo 白名单模板组合）列为后续候选 |
+
+## sshbool 对标补充（2026-09-11，0.4.52）
+
+以 [omarsenusi/sshbool](https://github.com/omarsenusi/sshbool)（Tauri v2 + russh +
+React 19 独立桌面 SSH 工作台）为参照的能力借鉴（实施计划
+`docs/IMPL_PLAN_SSH_VAULT_TRANSFER_HISTORY.zh-CN.md`；SSH 传输层双方同级单连接
+多路复用，其每次操作新开 SFTP channel 的做法劣于本插件会话级复用）：
+
+| sshbool 能力 | 插件状态 | 说明 |
+| --- | --- | --- |
+| 本地凭据静态加密（SQLCipher 库 + Argon2id KEK + AES-256-GCM DEK 信封） | ✅ 已有（keyfile 默认档） | `quick-sudo-profiles.json` 升 v2：密钥字段 AES-256-GCM 信封（AAD 绑定字段+档案 id）、DEK 默认存同目录 0600 keyfile，OS keychain 仅显式选入（`DBX_SSH_VAULT_STORAGE=keychain`；macOS 每次更新都会重弹授权框，见 IMPL_PLAN D2a）、遗留 keychain 档自动迁移；v1 自动迁移、解密失败按空降级；实施计划特性 A |
+| 传输任务持久化（`transfer_jobs`/`transfer_items` 表） | ✅ 已有（轻量形态） | `transfer-history.json` 环形 200 条 + `sftp/transfer/history` 持久化/live 合并查询，仅状态跃迁落盘；断点续传/逐文件 resume 不做（登记后续候选）；实施计划特性 B1 |
+| SFTP 书签（`sftp_bookmarks` 表 + 双栏书签） | ✅ 已有 | `sftp-bookmarks.json` + `sftp/bookmarks/list` / `save` / `delete` + 路径栏星标收藏/下拉跳转（七语）；实施计划特性 B2 |
+| 主密码 Vault（解锁屏 / 自动锁定 / 生物识别 / FIDO2） | ❌ 不做 | 宿主插件形态下无人值守 sudo 自动应答要求重启免解锁；keychain 托管已覆盖“防拷贝/备份外泄”目标，主密码模型收益不成立 |
+| 端口转发（`channel_open_direct_tcpip` ProxyJump/本地转发，数据库面板经隧道连 DB） | ❌ 不做 | 沿 2026-09-07 用户决策（宿主已有 ssh 隧道实现，见 tssh 节）；sshbool 的 russh direct-tcpip 用法留作未来宿主侧通用转发 API 的参考 |
+| 监控历史趋势（`host_snapshots` + 分桶 `metric_series` 落盘 + 趋势图） | ⏸ 未做（候选） | 现有 `ssh/metrics` 单快照维度更全（inode/Top 进程/每接口速率）；快照环形落盘 + sparkline 趋势列为后续候选 |
+| 终端 BiDi/阿拉伯语变形（`arabic-xterm.ts` 词级 reshape 保词序 + shell UTF-8 locale） | ⏸ 未做（候选） | xterm.js 原生无 BiDi/shaping；本插件 UI 七语无阿拉伯语，但终端输出内容可能含 RTL 文本，shaping 管线可放 `shared/frontend/` 公共层单点实现 |
+| 审计账 + 审计面板（`audit_log` 表 + audit-panel） | ✅ 已有（SSH 域内） | MCP/AI 执行面 JSONL 审计 + `ssh/audit/list`，见上节 openocta 对标（本批前已落地） |

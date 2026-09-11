@@ -612,6 +612,106 @@ def main() -> None:
             finally:
                 req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "off"})
 
+        # -- 审批记忆 + 审计 + 告警分诊 group ------------------------------------
+        # （docs/IMPL_PLAN_SSH_APPROVAL_AUDIT_ALERT.zh-CN.md §2）
+
+        def remember_agent_prompt(event: dict) -> dict | None:
+            # 批准并记住：把弹窗命令原样提交 + remember 标记。
+            if event.get("method") != "ssh/agent/prompt":
+                return None
+            params = event.get("params", {})
+            print(f"    agent approval (remember): risk={params.get('risk')} "
+                  f"command={str(params.get('command'))[:60]!r}")
+            return {"method": "ssh/agent/resolve",
+                    "params": {"challengeId": params["challengeId"],
+                               "decision": "approve",
+                               "command": params.get("command"),
+                               "remember": True}}
+
+        def case_agent_remember_approval():
+            # strict 模式 approve+remember：第一次弹审批并记住；同一命令第二次
+            # 调用命中免审批清单 → 不带审批回调直接执行（若仍弹审批，调用会
+            # 撞 90s 超时即失败）。
+            marker_cmd = "echo smoke-remember-ok"
+            req("ssh/settings/set", {"sessionId": session_id, "rememberedCommands": []})
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "strict"})
+            first = call_tool_embedded("ssh_exec", {"command": marker_cmd},
+                                       on_event=remember_agent_prompt)
+            if "smoke-remember-ok" not in str(first.get("output", "")):
+                raise AssertionError(f"first approved exec missing marker: "
+                                     f"{str(first.get('output'))[:200]}")
+            second = call_tool_embedded("ssh_exec", {"command": marker_cmd})
+            if "smoke-remember-ok" not in str(second.get("output", "")):
+                raise AssertionError(f"remembered exec missing marker: "
+                                     f"{str(second.get('output'))[:200]}")
+            print("    remembered command re-ran without an approval prompt")
+
+        def case_agent_remember_listing_and_cleanup():
+            got = req("ssh/settings/get", {"sessionId": session_id}).get("rememberedCommands")
+            if not isinstance(got, list) or "echo smoke-remember-ok" not in got:
+                raise AssertionError(f"rememberedCommands={got!r} missing remembered entry")
+            # 全量替换语义：换一批通配形态的行。
+            req("ssh/settings/set", {"sessionId": session_id,
+                                     "rememberedCommands": ["echo a *", "echo b"]})
+            got = req("ssh/settings/get", {"sessionId": session_id}).get("rememberedCommands")
+            if got != ["echo a *", "echo b"]:
+                raise AssertionError(f"rememberedCommands after replace={got!r}")
+            # 破坏性行拒绝（IMPL_PLAN D2，错误信息带行号）。
+            try:
+                req("ssh/settings/set", {"sessionId": session_id,
+                                         "rememberedCommands": ["echo ok", "rm -rf /"]})
+            except SidecarError as error:
+                if "destructive" not in str(error).lower():
+                    raise AssertionError(f"unexpected destructive-line error: {error}")
+                print(f"    destructive line refused: {str(error)[:90]}")
+            else:
+                raise AssertionError("destructive rememberedCommands line unexpectedly accepted")
+            req("ssh/settings/set", {"sessionId": session_id, "rememberedCommands": []})
+
+        def case_alert_triage():
+            payload = json.dumps({
+                "alertId": "smoke-1", "title": "CPU 使用率过高", "severity": "CRITICAL",
+                "source": "prometheus", "message": "node-1 cpu_usage above 0.9",
+                "data": {"instance": "node-1"},
+            })
+            result = req("ssh/alert/triage", {"payload": payload})
+            normalized = result.get("normalized") or {}
+            if normalized.get("alertId") != "smoke-1" or normalized.get("severity") != "critical":
+                raise AssertionError(f"normalized={normalized!r}")
+            if result.get("category") != "cpu":
+                raise AssertionError(f"category={result.get('category')!r}, want 'cpu'")
+            suggestions = result.get("suggestions") or []
+            if not suggestions or not all(item.get("command") for item in suggestions):
+                raise AssertionError(f"suggestions={suggestions!r}")
+            if any("sudo" in str(item.get("command", "")) for item in suggestions):
+                raise AssertionError(f"sudo leaked into playbook: {suggestions!r}")
+            # 非 JSON 纯文本回退（整包作为 message）+ 双语分类。
+            fallback = req("ssh/alert/triage", {"payload": "磁盘空间不足 disk full"})
+            if fallback.get("category") != "disk":
+                raise AssertionError(f"fallback category={fallback.get('category')!r}")
+            if (fallback.get("normalized") or {}).get("message") != "磁盘空间不足 disk full":
+                raise AssertionError(f"fallback normalized={fallback.get('normalized')!r}")
+            print(f"    cpu suggestions={len(suggestions)}, fallback category=disk")
+
+        def case_audit_list():
+            result = req("ssh/audit/list", {"limit": 100})
+            entries = result.get("entries") or []
+            if not entries:
+                raise AssertionError("audit ledger empty after prior tool calls")
+            sample = entries[-1]
+            for field in ("tsMs", "tool", "connectionId", "gate", "approval",
+                          "outcome", "exitCode", "durationMs", "mode", "error"):
+                if field not in sample:
+                    raise AssertionError(f"audit entry missing {field}: {sample!r}")
+            gates = {entry.get("gate") for entry in entries}
+            approvals = {entry.get("approval") for entry in entries}
+            if "pass" not in gates:
+                raise AssertionError(f"no pass gate recorded: {gates!r}")
+            if "remembered" not in approvals:
+                raise AssertionError(f"remembered approval not audited: {approvals!r}")
+            print(f"    {len(entries)} audit entries; gates={sorted(g for g in gates if g)}; "
+                  f"approvals={sorted(a for a in approvals if a)}")
+
         # -- agent terminal extension group --------------------------------------
         # All routed commands below rely on agentTerminalMode=auto, re-armed by
         # case_agent_shell_state_reuse right after the deny case turned it off.
@@ -909,8 +1009,14 @@ def main() -> None:
                    needs="agent terminal exec routes to PTY")
         report.run("agent strict approval deny", "mcp/call", case_agent_deny,
                    needs="agent strict approval approve")
+        report.run("agent approval remembered skips later prompts", "mcp/call",
+                   case_agent_remember_approval, needs="agent strict approval deny")
+        report.run("agent remembered list settings + destructive refused", "ssh/settings/set",
+                   case_agent_remember_listing_and_cleanup,
+                   needs="agent approval remembered skips later prompts")
         report.run("agent mode re-armed + shell state reused", "ssh/settings/set",
-                   case_agent_shell_state_reuse, needs="agent strict approval deny")
+                   case_agent_shell_state_reuse,
+                   needs="agent remembered list settings + destructive refused")
         report.run("agent cwd reused across calls", "mcp/call", case_agent_cwd_reuse,
                    needs="agent mode re-armed + shell state reused")
         report.run("agent same-session concurrency serialized", "mcp/call",
@@ -944,6 +1050,13 @@ def main() -> None:
         report.run("agent settings restored (off + sudo password cleared)", "ssh/settings/set",
                    case_agent_settings_restored,
                    needs="agent mode re-armed + shell state reused")
+
+        print("\n--- alert triage + audit group ---")
+        report.run("ssh/alert/triage normalize+classify+playbook", "ssh/alert/triage",
+                   case_alert_triage)
+        report.run("ssh/audit/list returns approval trail", "ssh/audit/list",
+                   case_audit_list,
+                   needs="agent remembered list settings + destructive refused")
 
         step("cleanup leftovers")
         # Best-effort mode/secret restore even when a late case failed: the

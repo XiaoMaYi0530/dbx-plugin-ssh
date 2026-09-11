@@ -2,7 +2,8 @@
 // TextPreview 组件测试：CodeMirror 以内联最小假实现替换（vi.mock 全部内联在本
 // spec，不动生产代码）。覆盖：编辑器挂载与 doc 播种、readOnly/editable 派生、
 // 编辑 → change 事件、外部 text 推送与同值短路、editable/appearance 变更重建
-// （活编辑保留）、语言扩展命中/未命中/加载失败吞错、卸载销毁。
+// （活编辑保留）、语言扩展命中/未命中/加载失败吞错、shared editorTheme 语法
+// 高亮扩展注入（暗色提亮取值）、卸载销毁。
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import TextPreview from "./TextPreview.vue";
@@ -101,7 +102,13 @@ vi.mock("@codemirror/state", () => ({
 vi.mock("@codemirror/view", () => ({ EditorView: cm.FakeEditorView }));
 
 // .js 命中语言 → 加载成功；.md 命中但加载失败（吞错路径）；其余不命中。
+// HighlightStyle/syntaxHighlighting 为 shared editorTheme 高亮注入的运行时，
+// 假实现保留 spec 数据供扩展注入断言。
 vi.mock("@codemirror/language", () => ({
+  HighlightStyle: {
+    define: (specs: readonly { tag: unknown; color?: string }[]) => ({ kind: "highlightStyle", specs }),
+  },
+  syntaxHighlighting: (style: unknown) => ({ kind: "syntaxHighlighting", style }),
   LanguageDescription: {
     matchFilename: (_languages: unknown, filename: string) => {
       if (filename.endsWith(".js")) return { load: async () => ({ kind: "languageSupport" }) };
@@ -118,6 +125,11 @@ vi.mock("@codemirror/language", () => ({
 }));
 
 vi.mock("@codemirror/language-data", () => ({ languages: [{ name: "JavaScript" }] }));
+
+// tags 仅作成员占位（shared editorTheme 按成员名解析，名称即可命中断言）。
+vi.mock("@lezer/highlight", () => ({
+  tags: new Proxy({}, { get: (_target, name) => ({ name: String(name) }) }),
+}));
 
 // ---- fixtures ----
 function appearance(scheme: "light" | "dark" = "light"): DbxPluginAppearance {
@@ -213,6 +225,28 @@ describe("TextPreview", () => {
     await flushPromises();
     expect(cm.views).toHaveLength(2);
     expect(cm.views[0].destroyed).toBe(true);
+  });
+
+  it("injects the shared editorTheme highlight extension with brightened dark tokens", async () => {
+    // 暗色挂载：basicSetup 之后必须追加 syntaxHighlighting 扩展（覆盖内置浅色
+    // defaultHighlightStyle），且关键字取提亮后的调色板值。
+    await mountPreview({ fileName: "script.js", appearance: appearance("dark") });
+    const highlight = cm.views[0].extensions.find((ext) => ext.kind === "syntaxHighlighting") as
+      | { style: { specs: Array<{ tag: { name: string }; color?: string }> } }
+      | undefined;
+    expect(highlight).toBeDefined();
+    const keywordSpec = highlight!.style.specs.find((spec) => spec.tag.name === "keyword");
+    expect(keywordSpec?.color).toBe("#4fc1ff");
+    // 修饰器组合 tag（函数调用名）同样解析注入
+    const functionSpec = highlight!.style.specs.find((spec) => spec.tag.name === "function(variableName)");
+    expect(functionSpec?.color).toBe("#d2a8ff");
+
+    // 浅色挂载：关键字回到 Light+ 同源取值
+    await mountPreview({ fileName: "script.js" });
+    const lightHighlight = cm.views[1].extensions.find((ext) => ext.kind === "syntaxHighlighting") as
+      | { style: { specs: Array<{ tag: { name: string }; color?: string }> } }
+      | undefined;
+    expect(lightHighlight?.style.specs.find((spec) => spec.tag.name === "keyword")?.color).toBe("#0000ff");
   });
 
   it("adds language support for matched files, swallows loader failures and skips unmatched files", async () => {

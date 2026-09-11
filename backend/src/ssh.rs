@@ -20,13 +20,16 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::agent_approvals;
 use crate::agent_terminal::{
     self, AgentDecision, AgentTerminalMode, CommandRisk, TerminalRecorder,
 };
+use crate::audit_log;
 use crate::exec::{
     self, AuthFlowMode, ExecOutcome, Hints, SudoAuth, PLAIN_EXEC_TIMEOUT, SUDO_EXEC_TIMEOUT,
 };
 use crate::host_key::{HostKeyState, HostKeyVerifier};
+use crate::highlight_rules;
 use crate::model::{
     normalize_remote_path, path_from_sftp_uri, sftp_uri, AuthenticationMethod, SftpEntry,
     StoredConnection, SudoSource, TerminalFrame, TerminalStream, MAX_TRANSFER_SIZE,
@@ -34,6 +37,7 @@ use crate::model::{
 };
 use crate::quick_commands;
 use crate::sudo_profiles;
+use crate::transfer_history;
 
 /// Resolves the Quick Sudo / 2FA orchestration settings for a connection.
 fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
@@ -118,6 +122,9 @@ pub(crate) const NO_TERMINAL_SESSION_MESSAGE: &str =
 const AGENT_APPROVAL_DEFAULT_SECS: u64 = 120;
 const AGENT_APPROVAL_MIN_SECS: u64 = 10;
 const AGENT_APPROVAL_MAX_SECS: u64 = 300;
+/// Fixed wait for the MCP confirm permission gate (IMPL_PLAN §1.3: 120s,
+/// clamped 10–300 by design for any future configurability).
+const MCP_CONFIRM_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PromptDecision {
@@ -654,6 +661,14 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Unix milliseconds for audit-ledger timestamps and approval durations.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Builds the response served from the snapshot cache: the stored fields plus
 /// a `cachedAt` marker (Unix seconds) so callers can show the age of the data.
 /// The stored snapshot itself is never mutated.
@@ -727,18 +742,33 @@ pub struct SshRuntime {
     metrics_cache: Mutex<HashMap<String, CachedMetrics>>,
     /// In-flight remote command executions, cancellable by exec id.
     exec_tasks: Mutex<HashMap<String, tokio::task::AbortHandle>>,
-    /// Per-connection AI terminal mode (`agentTerminalMode`), in-memory like
-    /// the Quick Sudo field overrides: a sidecar restart resets it to `off`.
+    /// Per-connection AI terminal mode (`agentTerminalMode`), persisted in
+    /// `<data_dir>/agent-modes.json` so the toolbar toggle survives sidecar
+    /// restarts (an app restart must not silently drop the user's choice
+    /// back to `off`).
     agent_modes: Mutex<HashMap<String, AgentTerminalMode>>,
     /// One-shot approval challenges for terminal-routed agent commands;
-    /// each entry is removed as soon as it is resolved.
-    agent_challenges: Mutex<HashMap<String, oneshot::Sender<AgentDecision>>>,
+    /// each entry is removed as soon as it is resolved. The payload carries
+    /// the context the resolver needs for the remembered-approval store and
+    /// the audit ledger (the resolver only knows the challenge id).
+    agent_challenges: Mutex<HashMap<String, PendingChallenge>>,
     /// Trust-on-first-use for unknown host keys (MCP stdio mode).
     auto_trust: bool,
     pub prompts: PromptBroker,
     data_dir: PathBuf,
     known_hosts_path: PathBuf,
     transfer_dir: PathBuf,
+}
+
+/// A raised approval challenge: the decision channel plus the command
+/// context its resolution needs (remembered-approval persistence and the
+/// audit ledger).
+struct PendingChallenge {
+    sender: oneshot::Sender<AgentDecision>,
+    connection_id: String,
+    tool: String,
+    command: String,
+    raised_at_ms: u64,
 }
 
 impl SshRuntime {
@@ -756,7 +786,7 @@ impl SshRuntime {
             sudo_keepalive: Arc::new(Mutex::new(HashMap::new())),
             metrics_cache: Mutex::new(HashMap::new()),
             exec_tasks: Mutex::new(HashMap::new()),
-            agent_modes: Mutex::new(HashMap::new()),
+            agent_modes: Mutex::new(agent_terminal::load_modes(&data_dir)),
             agent_challenges: Mutex::new(HashMap::new()),
             auto_trust: false,
             prompts: PromptBroker::default(),
@@ -1948,7 +1978,7 @@ impl SshRuntime {
         })
     }
 
-    /// Agent terminal mode for a connection; unknown connections read `off`.
+    /// Per-connection AI terminal mode; unknown connections read `off`.
     pub fn agent_terminal_mode(&self, connection_id: &str) -> AgentTerminalMode {
         self.agent_modes
             .lock()
@@ -1957,10 +1987,26 @@ impl SshRuntime {
             .unwrap_or(AgentTerminalMode::Off)
     }
 
-    fn set_agent_terminal_mode(&self, connection_id: &str, mode: AgentTerminalMode) {
-        if let Ok(mut modes) = self.agent_modes.lock() {
-            modes.insert(connection_id.to_string(), mode);
-        }
+    fn set_agent_terminal_mode(
+        &self,
+        connection_id: &str,
+        mode: AgentTerminalMode,
+    ) -> Result<(), String> {
+        let snapshot = {
+            let mut modes = self
+                .agent_modes
+                .lock()
+                .map_err(|_| "Agent mode registry is poisoned".to_string())?;
+            if mode == AgentTerminalMode::Off {
+                // Persisted off is the default: dropping the entry keeps the
+                // file bounded by connections the user actually opted in.
+                modes.remove(connection_id);
+            } else {
+                modes.insert(connection_id.to_string(), mode);
+            }
+            modes.clone()
+        };
+        agent_terminal::save_modes(&self.data_dir, &snapshot)
     }
 
     /// Acquires the session's agent-execution lock for the caller. The owned
@@ -2134,6 +2180,106 @@ impl SshRuntime {
         }))
     }
 
+    /// Pure builder for the MCP confirm challenge payload (IMPL_PLAN §1.3):
+    /// the shared `ssh/agent/prompt` event with `kind: "mcp-confirm"` and
+    /// `source: "mcp"` (legacy terminal approvals never carry `source`, so
+    /// the workbench can tell the two apart; older frontends fall back to
+    /// their existing rendering). Unit-tested shape.
+    pub(crate) fn mcp_confirm_challenge_payload(
+        challenge_id: &str,
+        tool: &str,
+        command: &str,
+        connection_id: Option<&str>,
+        timeout_secs: u64,
+    ) -> Value {
+        let mut payload = json!({
+            "challengeId": challenge_id,
+            "kind": "mcp-confirm",
+            "source": "mcp",
+            "tool": tool,
+            "command": command,
+            "requestedAt": unix_now_secs(),
+            "timeoutSecs": timeout_secs,
+        });
+        if let Some(id) = connection_id.filter(|id| !id.is_empty()) {
+            payload["connectionId"] = json!(id);
+        }
+        payload
+    }
+
+    /// MCP confirm permission gate (IMPL_PLAN §1.3): raises a
+    /// `ssh/agent/prompt` approval challenge (kind `mcp-confirm`,
+    /// source `mcp`) on the workbench and waits for `ssh/agent/resolve`.
+    /// Returns the (possibly user-edited) command on approval; denial or
+    /// the 120s timeout returns `Err`. One-shot challenge semantics are
+    /// shared with the terminal approval path (`resolve_agent_challenge`).
+    /// There is deliberately no session binding and no terminal follow-up
+    /// events — an MCP confirm never types into a terminal.
+    pub(crate) async fn request_mcp_confirm(
+        &self,
+        tool: &str,
+        command: &str,
+        connection_id: Option<&str>,
+        emitter: &PluginEmitter,
+    ) -> Result<String, String> {
+        let wait = Duration::from_secs(MCP_CONFIRM_TIMEOUT_SECS);
+        let challenge_id = Uuid::new_v4().to_string();
+        let connection_id = connection_id.unwrap_or_default().to_string();
+        let raised_at_ms = unix_now_ms();
+        let (sender, receiver) = oneshot::channel();
+        if let Ok(mut challenges) = self.agent_challenges.lock() {
+            challenges.insert(
+                challenge_id.clone(),
+                PendingChallenge {
+                    sender,
+                    connection_id: connection_id.clone(),
+                    tool: tool.to_string(),
+                    command: command.to_string(),
+                    raised_at_ms,
+                },
+            );
+        }
+        let raised = emitter.event(
+            "ssh/agent/prompt",
+            Self::mcp_confirm_challenge_payload(
+                &challenge_id,
+                tool,
+                command,
+                Some(&connection_id),
+                wait.as_secs(),
+            ),
+        );
+        if let Err(error) = raised {
+            // Nobody can approve without the prompt; fail fast instead of
+            // letting the challenge run into its timeout.
+            if let Ok(mut challenges) = self.agent_challenges.lock() {
+                challenges.remove(&challenge_id);
+            }
+            return Err(format!("Failed to raise the approval prompt: {}", error.message));
+        }
+        let decision = match tokio::time::timeout(wait, receiver).await {
+            Ok(Ok(decision)) => Some(decision),
+            // Timeout or dropped sender both mean "no user decision"; the
+            // challenge is expired so a late resolve reports not found.
+            Ok(Err(_)) | Err(_) => {
+                if let Ok(mut challenges) = self.agent_challenges.lock() {
+                    challenges.remove(&challenge_id);
+                }
+                None
+            }
+        };
+        match decision {
+            Some(AgentDecision::Approve { command: edited }) => {
+                let edited = edited.filter(|text| !text.trim().is_empty());
+                Ok(edited.unwrap_or_else(|| command.to_string()))
+            }
+            Some(AgentDecision::Deny) => {
+                Err("Command not run: user denied the execution".to_string())
+            }
+            None => Err("Command not run: approval timed out waiting for the user".to_string()),
+        }
+    }
+
     /// Raises an approval challenge for a terminal-routed agent command:
     /// emits `ssh/agent/prompt`, then waits for `ssh/agent/resolve`.
     /// Returns the (possibly user-edited) command on approval; denial or
@@ -2153,9 +2299,21 @@ impl SshRuntime {
                 .clamp(AGENT_APPROVAL_MIN_SECS, AGENT_APPROVAL_MAX_SECS),
         );
         let challenge_id = Uuid::new_v4().to_string();
+        let session = self.session(session_id).await?;
+        let connection_id = session.connection_id.clone();
+        let raised_at_ms = unix_now_ms();
         let (sender, receiver) = oneshot::channel();
         if let Ok(mut challenges) = self.agent_challenges.lock() {
-            challenges.insert(challenge_id.clone(), sender);
+            challenges.insert(
+                challenge_id.clone(),
+                PendingChallenge {
+                    sender,
+                    connection_id,
+                    tool: tool.to_string(),
+                    command: command.to_string(),
+                    raised_at_ms,
+                },
+            );
         }
         let raised = emitter.event(
             "ssh/agent/prompt",
@@ -2182,8 +2340,19 @@ impl SshRuntime {
             // Timeout or dropped sender both mean "no user decision".
             Ok(Err(_)) | Err(_) => {
                 // Expire the challenge so a late resolve reports not found.
-                if let Ok(mut challenges) = self.agent_challenges.lock() {
-                    challenges.remove(&challenge_id);
+                if let Some(pending) = self
+                    .agent_challenges
+                    .lock()
+                    .ok()
+                    .and_then(|mut challenges| challenges.remove(&challenge_id))
+                {
+                    self.audit_approval(
+                        &pending.tool,
+                        &pending.connection_id,
+                        audit_log::ApprovalTrail::Timeout,
+                        audit_log::EntryOutcome::Error,
+                        unix_now_ms().saturating_sub(pending.raised_at_ms),
+                    );
                 }
                 None
             }
@@ -2212,12 +2381,15 @@ impl SshRuntime {
     /// One-shot: the challenge is removed from the registry before the
     /// decision is delivered, so a repeat resolve reports not found.
     /// `decision` is "approve" or "deny"; `command` carries the edited
-    /// command text from the approval dialog (approve only).
+    /// command text from the approval dialog (approve only); `remember`
+    /// (approve only) persists the approved command on the connection's
+    /// remembered-approval list so later identical matches skip the prompt.
     pub fn resolve_agent_challenge(
         &self,
         challenge_id: &str,
         decision: &str,
         command: Option<&str>,
+        remember: bool,
     ) -> Result<(), String> {
         let approved = match decision {
             "approve" => true,
@@ -2228,7 +2400,7 @@ impl SshRuntime {
                 ))
             }
         };
-        let sender = self
+        let pending = self
             .agent_challenges
             .lock()
             .map_err(|_| "Agent challenge registry is poisoned".to_string())?
@@ -2241,9 +2413,77 @@ impl SshRuntime {
         } else {
             AgentDecision::Deny
         };
-        sender
+        let mut remembered = false;
+        if approved && remember {
+            // The remembered text is what the dialog showed the user — the
+            // edited command when one was sent, otherwise the original.
+            let text = command
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .unwrap_or(&pending.command);
+            // A destructive command is never rememberable (IMPL_PLAN D2):
+            // the flag is silently dropped and the approval stays one-shot.
+            let mut store = agent_approvals::load_store(&self.data_dir);
+            match agent_approvals::remember(&mut store, &pending.connection_id, text) {
+                Ok(newly_added) if newly_added => {
+                    match agent_approvals::save_store(&self.data_dir, &store) {
+                        Ok(()) => remembered = true,
+                        Err(error) => {
+                            eprintln!("[ssh] failed to persist remembered approval: {error}")
+                        }
+                    }
+                }
+                Ok(_) => remembered = true,
+                Err(error) => eprintln!("[ssh] approval not remembered: {error}"),
+            }
+        }
+        self.audit_approval(
+            &pending.tool,
+            &pending.connection_id,
+            match (approved, remembered) {
+                (true, true) => audit_log::ApprovalTrail::Remembered,
+                (true, false) => audit_log::ApprovalTrail::Approved,
+                (false, _) => audit_log::ApprovalTrail::Denied,
+            },
+            if approved {
+                audit_log::EntryOutcome::Ok
+            } else {
+                audit_log::EntryOutcome::Error
+            },
+            unix_now_ms().saturating_sub(pending.raised_at_ms),
+        );
+        pending
+            .sender
             .send(decision)
             .map_err(|_| "Agent challenge is no longer waiting".to_string())
+    }
+
+    /// Appends one approval-lifecycle line to the execution audit ledger.
+    /// Execution itself is audited by the MCP layer; these lines carry the
+    /// human-decision trail (`approval` field) for terminal-routed commands.
+    fn audit_approval(
+        &self,
+        tool: &str,
+        connection_id: &str,
+        approval: audit_log::ApprovalTrail,
+        outcome: audit_log::EntryOutcome,
+        duration_ms: u64,
+    ) {
+        let entry = audit_log::AuditEntry {
+            ts_ms: unix_now_ms(),
+            tool: tool.to_string(),
+            connection_id: connection_id.to_string(),
+            gate: audit_log::GateOutcome::Pass,
+            approval,
+            outcome,
+            exit_code: None,
+            duration_ms,
+            mode: audit_log::ExecMode::Terminal,
+            error: None,
+        };
+        if let Err(error) = audit_log::append(&self.data_dir, &entry) {
+            eprintln!("[ssh] audit append failed: {error}");
+        }
     }
 
     /// Starts a per-connection `sudo -nv` refresh loop after a successful
@@ -2610,6 +2850,13 @@ impl SshRuntime {
             "quickSudoProfileId": profile.as_ref().map(|p| p.id.clone()).unwrap_or_default(),
             "quickSudoProfileName": profile.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
             "agentTerminalMode": self.agent_terminal_mode(&session.connection_id).name(),
+            // Remembered approvals (IMPL_PLAN §2.2): raw pattern lines the
+            // user saved from the approval dialog; editable/wildcard-able in
+            // the settings panel, matched with the sudoers-style token rules.
+            "rememberedCommands": agent_approvals::list_lines(
+                &agent_approvals::load_store(&self.data_dir),
+                &session.connection_id,
+            ),
         });
         if reveal {
             if let Some(connection) = &connection {
@@ -2650,13 +2897,31 @@ impl SshRuntime {
             sudo_profiles::save_store(&self.data_dir, &store)?;
         }
         // AI terminal mode: validated strictly before anything else mutates,
-        // so an unknown value leaves the request without side effects.
+        // so an unknown value leaves the request without side effects. The
+        // set persists too — a failed write reports instead of silently
+        // dropping the toggle on the next restart.
         if let Some(raw) = updates.get("agentTerminalMode") {
             let text = raw
                 .as_str()
                 .ok_or("agentTerminalMode must be a string (off|auto|strict)")?;
             let mode = AgentTerminalMode::parse_exact(text)?;
-            self.set_agent_terminal_mode(&connection_id, mode);
+            self.set_agent_terminal_mode(&connection_id, mode)?;
+        }
+        // Remembered approvals: full-replacement list from the settings
+        // panel. Validated (caps / destructive-line rejection with line
+        // numbers) before anything else mutates, so a bad line leaves the
+        // request without side effects.
+        if let Some(raw) = updates.get("rememberedCommands") {
+            let values = raw
+                .as_array()
+                .ok_or("rememberedCommands must be an array of strings")?;
+            let lines: Vec<String> = values
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().trim().to_string())
+                .collect();
+            let mut store = agent_approvals::load_store(&self.data_dir);
+            agent_approvals::set_lines(&mut store, &connection_id, &lines)?;
+            agent_approvals::save_store(&self.data_dir, &store)?;
         }
         let login_password = {
             let connections = self
@@ -2852,6 +3117,44 @@ impl SshRuntime {
         }))
     }
 
+    /// `ssh/highlightRules/list`: terminal keyword highlight rules shared by
+    /// every workbench, `createdAt` ascending. A fresh data dir is seeded
+    /// with the first-run default rules (see `highlight_rules::load_or_seed_store`).
+    pub fn highlight_rules_list(&self) -> Value {
+        let store = highlight_rules::load_or_seed_store(&self.data_dir);
+        json!({ "rules": highlight_rules::list_views(&store) })
+    }
+
+    /// `ssh/highlightRules/save`: creates or updates one keyword rule.
+    /// Returns the saved rule, whether it was newly created, and the full
+    /// list so the workbench adopts the authoritative order in one call.
+    /// Seeds the first-run defaults when the store file does not exist yet,
+    /// so a first-save on a fresh install keeps them.
+    pub fn highlight_rules_save(&self, params: &Value) -> Result<Value, String> {
+        let mut store = highlight_rules::load_or_seed_store(&self.data_dir);
+        let (entry, created) = highlight_rules::save_entry(&mut store, params)?;
+        highlight_rules::save_store(&self.data_dir, &store)?;
+        Ok(json!({
+            "rule": highlight_rules::entry_view(&entry),
+            "created": created,
+            "rules": highlight_rules::list_views(&store),
+        }))
+    }
+
+    /// `ssh/highlightRules/delete`: removes one keyword rule; unknown ids
+    /// report `removed: false` without rewriting the file.
+    pub fn highlight_rules_delete(&self, id: &str) -> Result<Value, String> {
+        let mut store = highlight_rules::load_store(&self.data_dir);
+        let removed = highlight_rules::delete_entry(&mut store, id);
+        if removed {
+            highlight_rules::save_store(&self.data_dir, &store)?;
+        }
+        Ok(json!({
+            "removed": removed,
+            "rules": highlight_rules::list_views(&store),
+        }))
+    }
+
     /// `sudo/profiles/options`: secret-free select options for the host
     /// connection form (`sudo_profile` field declares this as its
     /// `options_action`). Value is the profile id (what `sudo_profile_ref`
@@ -3038,6 +3341,15 @@ impl SshRuntime {
                 json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": file_name, "transferred": 0, "size": size, "status": "queued" }),
             )
             .map_err(plugin_error)?;
+        let connection_id = self.session_connection_id(&session_id).await;
+        self.record_transfer_start(
+            &task_id,
+            &session_id,
+            &connection_id,
+            "upload",
+            file_name,
+            size,
+        );
         Ok(
             json!({ "taskId": task_id, "chunkSize": TRANSFER_CHUNK_SIZE, "maxBytes": MAX_TRANSFER_SIZE }),
         )
@@ -3109,10 +3421,15 @@ impl SshRuntime {
             .ok_or("Upload task was not found")?;
         if upload.received != upload.expected_size {
             let _ = std::fs::remove_file(&upload.local_path);
-            return Err(format!(
+            let error = format!(
                 "Upload is incomplete: expected {}, received {}",
                 upload.expected_size, upload.received
-            ));
+            );
+            // The task dies here without reaching the commit path, so the
+            // failure is recorded explicitly (same ledger entry a failed
+            // commit writes).
+            self.record_transfer(json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.expected_size, "transferred": upload.received, "status": "failed", "error": error }));
+            return Err(error);
         }
         let UploadState {
             session_id,
@@ -3265,6 +3582,15 @@ impl SshRuntime {
                 json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "transferred": 0, "size": size, "status": "queued" }),
             )
             .map_err(plugin_error)?;
+        let connection_id = self.session_connection_id(session_id).await;
+        self.record_transfer_start(
+            &task_id,
+            session_id,
+            &connection_id,
+            "download",
+            &file_name,
+            size,
+        );
         Ok(
             json!({ "taskId": task_id, "fileName": file_name, "size": size, "chunkSize": TRANSFER_CHUNK_SIZE }),
         )
@@ -3386,10 +3712,14 @@ impl SshRuntime {
             .remove(task_id)
             .ok_or("Download task was not found".to_string())?;
         if download.next_offset < download.size {
-            return Err(format!(
+            let error = format!(
                 "Download is incomplete: received {} of {} bytes",
                 download.next_offset, download.size
-            ));
+            );
+            // The task dies here without reaching the completed path, so
+            // the failure is recorded explicitly.
+            self.record_transfer(json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "failed", "error": error }));
+            return Err(error);
         }
         let task = json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.size, "status": "completed" });
         self.record_transfer(task.clone());
@@ -3490,17 +3820,186 @@ impl SshRuntime {
         Err("Transfer task was not found".to_string())
     }
 
+    /// `sftp/transfer/history`: merges the persisted history with the
+    /// in-memory live tasks, deduplicated by taskId (the live snapshot wins
+    /// because it carries fresh progress), newest first. Pure local data, so
+    /// it answers without any active connection.
+    pub async fn transfer_history_query(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Value, String> {
+        let sessions = self.sessions.read().await;
+        let connection_id_for = |sid: &str| {
+            sessions
+                .get(sid)
+                .map(|session| session.connection_id.clone())
+                .unwrap_or_default()
+        };
+        self.build_transfer_history(session_id, limit, &connection_id_for)
+    }
+
+    /// Synchronous core of `transfer_history_query`; `connection_id_for`
+    /// resolves the owning connection of a session (empty when unknown) so
+    /// tests can inject the lookup without live sessions.
+    fn build_transfer_history(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+        connection_id_for: &impl Fn(&str) -> String,
+    ) -> Result<Value, String> {
+        // Stale running/queued rows from a dead sidecar surface as failed
+        // here (they are never rewritten on disk, so another live process'
+        // in-flight transfers stay untouched).
+        let mut tasks = transfer_history::load_history(&self.data_dir);
+        for row in self.live_transfer_rows(connection_id_for) {
+            let task_id = row
+                .get("taskId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            // The live snapshot has no start context of its own; keep the
+            // persisted row's startedAt/connectionId when present.
+            let mut merged = row;
+            if let Some(persisted) = tasks
+                .iter()
+                .find(|task| task.get("taskId").and_then(Value::as_str) == Some(task_id.as_str()))
+            {
+                for key in ["startedAt", "connectionId"] {
+                    if let Some(value) = persisted.get(key) {
+                        merged[key] = value.clone();
+                    }
+                }
+            }
+            tasks.retain(|task| {
+                task.get("taskId").and_then(Value::as_str) != Some(task_id.as_str())
+            });
+            tasks.push(merged);
+        }
+        if let Some(filter) = session_id {
+            tasks.retain(|task| task.get("sessionId").and_then(Value::as_str) == Some(filter));
+        }
+        // Newest first by startedAt; rows without one sort last (stable).
+        tasks.sort_by(|a, b| {
+            let started = |task: &Value| task.get("startedAt").and_then(Value::as_u64).unwrap_or(0);
+            started(b).cmp(&started(a))
+        });
+        tasks.truncate(limit);
+        Ok(json!({ "tasks": tasks }))
+    }
+
+    /// Live snapshot rows from the in-memory transfer registries. These rows
+    /// carry fresh progress but no start context; `build_transfer_history`
+    /// merges them over the persisted rows. A poisoned registry is skipped:
+    /// the history query stays answerable from the persisted store.
+    fn live_transfer_rows(&self, connection_id_for: &impl Fn(&str) -> String) -> Vec<Value> {
+        let mut rows = Vec::new();
+        if let Ok(uploads) = self.uploads.lock() {
+            for (task_id, upload) in uploads.iter() {
+                rows.push(json!({
+                    "taskId": task_id,
+                    "sessionId": upload.session_id,
+                    "connectionId": connection_id_for(&upload.session_id),
+                    "direction": "upload",
+                    "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"),
+                    "size": upload.expected_size,
+                    "transferred": upload.received,
+                    "status": "running",
+                }));
+            }
+        }
+        if let Ok(finishing) = self.finishing_uploads.lock() {
+            for (task_id, upload) in finishing.iter() {
+                rows.push(json!({
+                    "taskId": task_id,
+                    "sessionId": upload.session_id,
+                    "connectionId": connection_id_for(&upload.session_id),
+                    "direction": "upload",
+                    "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"),
+                    "size": upload.size,
+                    "transferred": upload.transferred.load(Ordering::Acquire),
+                    "status": if upload.cancelled.load(Ordering::Acquire) { "cancelled" } else { "running" },
+                }));
+            }
+        }
+        if let Ok(downloads) = self.downloads.lock() {
+            for (task_id, download) in downloads.iter() {
+                rows.push(json!({
+                    "taskId": task_id,
+                    "sessionId": download.session_id,
+                    "connectionId": connection_id_for(&download.session_id),
+                    "direction": "download",
+                    "fileName": download.file_name,
+                    "size": download.size,
+                    "transferred": download.next_offset,
+                    "status": "running",
+                }));
+            }
+        }
+        rows
+    }
+
     fn record_transfer(&self, task: Value) {
         let Some(task_id) = task.get("taskId").and_then(Value::as_str) else {
             return;
         };
         if let Ok(mut history) = self.transfer_history.lock() {
             history.retain(|entry| entry.get("taskId").and_then(Value::as_str) != Some(task_id));
-            history.push_back(task);
+            history.push_back(task.clone());
             while history.len() > 64 {
                 history.pop_front();
             }
         }
+        // Terminal transitions also land in <data_dir>/transfer-history.json
+        // so the workbench keeps them across sidecar restarts. Cross-process
+        // semantics are last-writer-wins (see transfer_history.rs).
+        self.persist_transfer_record(&task);
+    }
+
+    /// Persists the start transition of a transfer job. Live tasks stay in
+    /// the in-memory registries; the persisted history only sees status
+    /// transitions, never per-chunk progress.
+    fn record_transfer_start(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        connection_id: &str,
+        direction: &str,
+        file_name: &str,
+        size: u64,
+    ) {
+        self.persist_transfer_record(&json!({
+            "taskId": task_id,
+            "sessionId": session_id,
+            "connectionId": connection_id,
+            "direction": direction,
+            "fileName": file_name,
+            "size": size,
+            "transferred": 0,
+            "status": "running",
+            "startedAt": unix_now_ms(),
+            "finishedAt": Value::Null,
+        }));
+    }
+
+    /// Best-effort persistence of one status transition; a failed write is
+    /// logged but never fails the transfer itself (history is UX data, not
+    /// an audit ledger).
+    fn persist_transfer_record(&self, task: &Value) {
+        if let Err(error) = transfer_history::record_transition(&self.data_dir, task) {
+            eprintln!("[ssh-trace] failed to persist transfer history: {error}");
+        }
+    }
+
+    /// Connection owning a session, or empty when the session is no longer
+    /// registered (sidecar restarted after the workbench attached).
+    async fn session_connection_id(&self, session_id: &str) -> String {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|session| session.connection_id.clone())
+            .unwrap_or_default()
     }
 
     fn active_transfer_count(&self, session_id: &str) -> Result<usize, String> {
@@ -3541,11 +4040,49 @@ impl SshRuntime {
                 .collect::<Vec<_>>();
             task_ids
                 .into_iter()
-                .filter_map(|task_id| uploads.remove(&task_id))
+                .filter_map(|task_id| uploads.remove_entry(&task_id))
                 .collect::<Vec<_>>()
         };
-        for upload in removed_uploads {
-            let _ = std::fs::remove_file(upload.local_path);
+        for (task_id, upload) in removed_uploads {
+            let _ = std::fs::remove_file(&upload.local_path);
+            // A session close aborts its unfinished uploads; record them as
+            // failed so the persisted history keeps no silent ghosts.
+            self.persist_transfer_record(&json!({
+                "taskId": task_id,
+                "sessionId": upload.session_id,
+                "direction": "upload",
+                "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"),
+                "size": upload.expected_size,
+                "transferred": upload.received,
+                "status": "failed",
+                "error": "Transfer was aborted because the session closed",
+            }));
+        }
+        {
+            let mut downloads = self
+                .downloads
+                .lock()
+                .map_err(|_| "Download registry is poisoned".to_string())?;
+            let task_ids = downloads
+                .iter()
+                .filter(|(_, download)| download.session_id == session_id)
+                .map(|(task_id, _)| task_id.clone())
+                .collect::<Vec<_>>();
+            for task_id in task_ids {
+                let Some((task_id, download)) = downloads.remove_entry(&task_id) else {
+                    continue;
+                };
+                self.persist_transfer_record(&json!({
+                    "taskId": task_id,
+                    "sessionId": download.session_id,
+                    "direction": "download",
+                    "fileName": download.file_name,
+                    "size": download.size,
+                    "transferred": download.next_offset,
+                    "status": "failed",
+                    "error": "Transfer was aborted because the session closed",
+                }));
+            }
         }
         for upload in self
             .finishing_uploads
@@ -3556,10 +4093,6 @@ impl SshRuntime {
         {
             upload.cancelled.store(true, Ordering::Release);
         }
-        self.downloads
-            .lock()
-            .map_err(|_| "Download registry is poisoned".to_string())?
-            .retain(|_, download| download.session_id != session_id);
         if let Ok(mut history) = self.transfer_history.lock() {
             history
                 .retain(|task| task.get("sessionId").and_then(Value::as_str) != Some(session_id));
@@ -4178,7 +4711,15 @@ mod tests {
             &json!({ "name": "alpha", "sudoPassword": "secret-a" }),
         )
         .unwrap();
-        sudo_profiles::save_store(&dir, &store).unwrap();
+        // Keyfile injection: the production save_store would probe the real
+        // macOS keychain from a test; the envelope then resolves reads to the
+        // same keyfile, so the runtime path below stays keychain-free too.
+        sudo_profiles::save_store_with(
+            &dir,
+            &store,
+            &crate::vault::KeyfileProvider::new(crate::vault::keyfile_path(&dir)),
+        )
+        .unwrap();
 
         let payload = runtime.profiles_options();
         let options = payload["options"].as_array().unwrap();
@@ -4400,8 +4941,12 @@ mod tests {
             runtime.agent_terminal_mode("conn-1"),
             AgentTerminalMode::Off
         );
-        runtime.set_agent_terminal_mode("conn-1", AgentTerminalMode::parse("auto"));
-        runtime.set_agent_terminal_mode("conn-2", AgentTerminalMode::Strict);
+        runtime
+            .set_agent_terminal_mode("conn-1", AgentTerminalMode::parse("auto"))
+            .expect("mode");
+        runtime
+            .set_agent_terminal_mode("conn-2", AgentTerminalMode::Strict)
+            .expect("mode");
         assert_eq!(
             runtime.agent_terminal_mode("conn-1"),
             AgentTerminalMode::Auto
@@ -4429,7 +4974,9 @@ mod tests {
         assert_eq!(probe["hasTerminalSession"], false);
 
         // A mode set through the settings surface is reflected verbatim.
-        runtime.set_agent_terminal_mode("conn-1", AgentTerminalMode::Strict);
+        runtime
+            .set_agent_terminal_mode("conn-1", AgentTerminalMode::Strict)
+            .expect("mode");
         let probe = runtime.agent_mode_get("conn-1").await.expect("probe");
         assert_eq!(probe["agentTerminalMode"], "strict");
         // No session was opened in this test, so presence stays false even
@@ -4443,7 +4990,7 @@ mod tests {
         let runtime = SshRuntime::new(data_dir.path().to_path_buf());
 
         // Unknown / already resolved challenges are refused.
-        assert!(runtime.resolve_agent_challenge("ghost", "approve", None).is_err());
+        assert!(runtime.resolve_agent_challenge("ghost", "approve", None, false).is_err());
 
         // Approve delivers the (possibly edited) command once, then the
         // challenge is gone. The registry guard is dropped before each
@@ -4453,9 +5000,18 @@ mod tests {
             .agent_challenges
             .lock()
             .expect("challenges")
-            .insert("c-1".to_string(), sender);
+            .insert(
+                "c-1".to_string(),
+                PendingChallenge {
+                    sender,
+                    connection_id: "conn-1".to_string(),
+                    tool: "ssh_exec".to_string(),
+                    command: "echo edited".to_string(),
+                    raised_at_ms: 0,
+                },
+            );
         runtime
-            .resolve_agent_challenge("c-1", "approve", Some("echo edited"))
+            .resolve_agent_challenge("c-1", "approve", Some("echo edited"), false)
             .expect("resolve");
         let decision = tokio::runtime::Runtime::new()
             .expect("tokio runtime")
@@ -4467,7 +5023,7 @@ mod tests {
                 command: Some("echo edited".to_string())
             }
         );
-        assert!(runtime.resolve_agent_challenge("c-1", "approve", None).is_err());
+        assert!(runtime.resolve_agent_challenge("c-1", "approve", None, false).is_err());
 
         // Deny decisions and unknown decision names are handled too.
         let (sender, receiver) = oneshot::channel();
@@ -4475,14 +5031,126 @@ mod tests {
             .agent_challenges
             .lock()
             .expect("challenges")
-            .insert("c-2".to_string(), sender);
-        runtime.resolve_agent_challenge("c-2", "deny", None).expect("resolve");
+            .insert(
+                "c-2".to_string(),
+                PendingChallenge {
+                    sender,
+                    connection_id: "conn-1".to_string(),
+                    tool: "ssh_exec".to_string(),
+                    command: "echo hi".to_string(),
+                    raised_at_ms: 0,
+                },
+            );
+        runtime.resolve_agent_challenge("c-2", "deny", None, false).expect("resolve");
         let decision = tokio::runtime::Runtime::new()
             .expect("tokio runtime")
             .block_on(receiver)
             .expect("decision");
         assert_eq!(decision, AgentDecision::Deny);
-        assert!(runtime.resolve_agent_challenge("c-2", "maybe", None).is_err());
+        assert!(runtime.resolve_agent_challenge("c-2", "maybe", None, false).is_err());
+    }
+
+    #[test]
+    fn mcp_confirm_challenge_payload_shape() {
+        let payload = SshRuntime::mcp_confirm_challenge_payload(
+            "ch-1",
+            "ssh_exec",
+            "echo hi",
+            Some("conn-9"),
+            120,
+        );
+        assert_eq!(payload["challengeId"], "ch-1");
+        assert_eq!(payload["kind"], "mcp-confirm");
+        assert_eq!(payload["source"], "mcp");
+        assert_eq!(payload["tool"], "ssh_exec");
+        assert_eq!(payload["command"], "echo hi");
+        assert_eq!(payload["connectionId"], "conn-9");
+        assert_eq!(payload["timeoutSecs"], 120);
+        assert!(payload["requestedAt"].is_u64());
+
+        // Without a connection reference the field is absent (optional —
+        // not null) so legacy frontends keep their fallback rendering.
+        let bare = SshRuntime::mcp_confirm_challenge_payload(
+            "ch-2",
+            "sftp_remove",
+            "path=/tmp/x",
+            None,
+            120,
+        );
+        assert!(bare.get("connectionId").is_none());
+        assert_eq!(bare["kind"], "mcp-confirm");
+        assert_eq!(bare["source"], "mcp");
+        // An empty reference is treated as absent too.
+        let blank =
+            SshRuntime::mcp_confirm_challenge_payload("ch-3", "ssh_exec", "ls", Some(""), 120);
+        assert!(blank.get("connectionId").is_none());
+    }
+
+    #[test]
+    fn agent_remember_persists_approved_and_skips_destructive() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+
+        // approve + remember persists the approved command on the
+        // connection's remembered list (IMPL_PLAN §2.1).
+        let (sender, _receiver) = oneshot::channel();
+        runtime
+            .agent_challenges
+            .lock()
+            .expect("challenges")
+            .insert(
+                "r-1".to_string(),
+                PendingChallenge {
+                    sender,
+                    connection_id: "conn-1".to_string(),
+                    tool: "ssh_exec".to_string(),
+                    command: "systemctl restart nginx".to_string(),
+                    raised_at_ms: 0,
+                },
+            );
+        runtime
+            .resolve_agent_challenge("r-1", "approve", Some("systemctl restart nginx"), true)
+            .expect("resolve");
+        assert_eq!(
+            agent_approvals::list_lines(&agent_approvals::load_store(data_dir.path()), "conn-1"),
+            ["systemctl restart nginx"]
+        );
+
+        // A destructive text is approved (the decision still delivers) but
+        // never remembered — the D2 double lock, second half.
+        let (sender, receiver) = oneshot::channel();
+        runtime
+            .agent_challenges
+            .lock()
+            .expect("challenges")
+            .insert(
+                "r-2".to_string(),
+                PendingChallenge {
+                    sender,
+                    connection_id: "conn-1".to_string(),
+                    tool: "ssh_exec".to_string(),
+                    command: "rm -rf /".to_string(),
+                    raised_at_ms: 0,
+                },
+            );
+        runtime
+            .resolve_agent_challenge("r-2", "approve", Some("rm -rf /"), true)
+            .expect("resolve");
+        let decision = tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(receiver)
+            .expect("decision");
+        assert_eq!(
+            decision,
+            AgentDecision::Approve {
+                command: Some("rm -rf /".to_string())
+            }
+        );
+        assert_eq!(
+            agent_approvals::list_lines(&agent_approvals::load_store(data_dir.path()), "conn-1"),
+            ["systemctl restart nginx"],
+            "destructive command must not join the remembered list"
+        );
     }
 
     #[test]
@@ -4547,5 +5215,88 @@ mod tests {
             error.contains("not found") || error.contains("expired"),
             "unexpected error: {error}"
         );
+    }
+
+    /// `sftp/transfer/history`: live registry rows win over the persisted
+    /// rows of the same task (fresh progress, inherited start context),
+    /// stale persisted `running` rows from a dead sidecar surface as
+    /// failed, and the result is newest-first with limit/session filtering.
+    #[test]
+    fn transfer_history_merges_live_rows_over_persisted_ones() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let root = data_dir.path();
+        transfer_history::record_transition(
+            root,
+            &json!({
+                "taskId": "t-done", "sessionId": "s1", "connectionId": "c1",
+                "direction": "download", "fileName": "done.bin", "size": 4,
+                "transferred": 4, "status": "completed",
+                "startedAt": 1_000, "finishedAt": 2_000,
+            }),
+        )
+        .unwrap();
+        transfer_history::record_transition(
+            root,
+            &json!({
+                "taskId": "t-live", "sessionId": "s1", "connectionId": "c1",
+                "direction": "download", "fileName": "live.bin", "size": 9,
+                "transferred": 0, "status": "running",
+                "startedAt": 3_000, "finishedAt": null,
+            }),
+        )
+        .unwrap();
+        transfer_history::record_transition(
+            root,
+            &json!({
+                "taskId": "t-stale", "sessionId": "s1", "connectionId": "c1",
+                "direction": "upload", "fileName": "stale.bin", "size": 2,
+                "transferred": 0, "status": "running",
+                "startedAt": 500, "finishedAt": null,
+            }),
+        )
+        .unwrap();
+        let runtime = SshRuntime::new(root.to_path_buf());
+        runtime.downloads.lock().unwrap().insert(
+            "t-live".to_string(),
+            DownloadState {
+                session_id: "s1".to_string(),
+                remote_path: "/live.bin".to_string(),
+                file_name: "live.bin".to_string(),
+                size: 9,
+                next_offset: 5,
+            },
+        );
+        let no_connection = |_: &str| String::new();
+        let tasks = runtime
+            .build_transfer_history(Some("s1"), 50, &no_connection)
+            .unwrap();
+        let tasks = tasks.get("tasks").and_then(Value::as_array).unwrap();
+        assert_eq!(tasks.len(), 3);
+        // Newest first: the live task (startedAt 3000) leads.
+        assert_eq!(tasks[0]["taskId"], "t-live");
+        assert_eq!(tasks[0]["transferred"], 5, "live progress wins");
+        assert_eq!(tasks[0]["status"], "running");
+        assert_eq!(tasks[0]["startedAt"], 3_000, "start context is inherited");
+        assert_eq!(tasks[1]["taskId"], "t-done");
+        assert_eq!(tasks[1]["status"], "completed");
+        // The stale row has no live counterpart: dead-sidecar downgrade (D7).
+        assert_eq!(tasks[2]["taskId"], "t-stale");
+        assert_eq!(tasks[2]["status"], "failed");
+        assert!(
+            tasks[2]["error"].as_str().unwrap().contains("sidecar restart"),
+            "unexpected error: {}",
+            tasks[2]["error"]
+        );
+        // Limit caps the merged list after sorting.
+        let limited = runtime
+            .build_transfer_history(Some("s1"), 1, &no_connection)
+            .unwrap();
+        assert_eq!(limited["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["tasks"][0]["taskId"], "t-live");
+        // Unknown sessions yield an empty list.
+        let other = runtime
+            .build_transfer_history(Some("s2"), 50, &no_connection)
+            .unwrap();
+        assert!(other["tasks"].as_array().unwrap().is_empty());
     }
 }

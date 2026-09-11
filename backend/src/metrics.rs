@@ -47,7 +47,11 @@ const METRICS_SCRIPT: &str = concat!(
     "df -iP 2>/dev/null | tail -n +2 | head -n 24; ",
     "echo '--mem--'; grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null; ",
     "echo '--cpu--'; head -n 1 /proc/stat; sleep 0.4; head -n 1 /proc/stat; ",
-    "echo '--df--'; df -kP 2>/dev/null | tail -n +2 | head -n 24",
+    "echo '--df--'; df -kP 2>/dev/null | tail -n +2 | head -n 24; ",
+    // Distribution identification (IMPL_PLAN §1.5): both standard paths,
+    // first present wins; neither existing (BSD, busybox minimal) leaves the
+    // section empty and the payload fields omitted entirely.
+    "echo '--os--'; cat /etc/os-release 2>/dev/null || cat /usr/lib/os-release 2>/dev/null"
 );
 
 /// Collects the extended metrics sample over a new exec channel. Read-only
@@ -77,9 +81,61 @@ pub fn parse_metrics_output(output: &str) -> serde_json::Value {
         let top_memory = serde_json::to_value(parse_process_lines(section_of(output, "--psm--")))
             .unwrap_or_default();
         object.insert("topMemory".to_string(), top_memory);
+        // Distribution identification (IMPL_PLAN §1.5): `osId` / `osPretty`
+        // are omitted entirely when the host has no readable os-release —
+        // old callers and the frontend treat absence as "no badge".
+        let (os_id, os_pretty) = parse_os_release(section_of(output, "--os--"));
+        if let Some(id) = os_id {
+            object.insert("osId".to_string(), serde_json::json!(id));
+        }
+        if let Some(pretty) = os_pretty {
+            object.insert("osPretty".to_string(), serde_json::json!(pretty));
+        }
     }
     merge_inode_usage(&mut root, section_of(output, "--dfi--"));
     root
+}
+
+/// Strips one optional layer of single or double quotes from an os-release
+/// value (shell-style quoting, per the os-release spec).
+fn unquote_os_release_value(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+/// Parses `ID=` and `PRETTY_NAME=` from an os-release style text into
+/// `(osId, osPretty)`. `ID_LIKE` never matches the `ID=` prefix; CRLF and
+/// quoted values are tolerated; blank or missing values yield `None` so the
+/// metrics payload omits the fields instead of writing empty strings.
+pub fn parse_os_release(text: &str) -> (Option<String>, Option<String>) {
+    let mut os_id: Option<String> = None;
+    let mut os_pretty: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("ID=") {
+            if os_id.is_none() {
+                let parsed = unquote_os_release_value(value);
+                if !parsed.is_empty() {
+                    os_id = Some(parsed.to_string());
+                }
+            }
+        } else if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+            if os_pretty.is_none() {
+                let parsed = unquote_os_release_value(value);
+                if !parsed.is_empty() {
+                    os_pretty = Some(parsed.to_string());
+                }
+            }
+        }
+    }
+    (os_id, os_pretty)
 }
 
 /// Merges per-mount inode usage into the base `disks` array as an additive
@@ -618,5 +674,52 @@ eth0: 100    1 0 0 0 0 0 0 50 1 0 0 0 0 0 0
             value,
             json!({"name": "en0", "rxRate": 1.5, "txRate": 2.5, "rxTotal": 10, "txTotal": 20})
         );
+    }
+
+    // —— A5: os-release identification ————————————————
+
+    #[test]
+    fn parses_os_release_id_and_pretty_name() {
+        let text = "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n\
+                    PRETTY_NAME=\"Ubuntu 22.04.3 LTS\"\nVERSION_ID=\"22.04\"\n";
+        let (id, pretty) = parse_os_release(text);
+        assert_eq!(id.as_deref(), Some("ubuntu"));
+        assert_eq!(pretty.as_deref(), Some("Ubuntu 22.04.3 LTS"));
+        // ID_LIKE must not be mistaken for ID.
+
+        // CRLF output is tolerated.
+        let (id, pretty) = parse_os_release("ID=\"centos\"\r\nPRETTY_NAME=\"CentOS Stream 9\"\r\n");
+        assert_eq!(id.as_deref(), Some("centos"));
+        assert_eq!(pretty.as_deref(), Some("CentOS Stream 9"));
+
+        // Unquoted values work.
+        let (id, _) = parse_os_release("ID=alpine\n");
+        assert_eq!(id.as_deref(), Some("alpine"));
+
+        // Missing keys, empty text, and blank values yield nothing.
+        assert_eq!(parse_os_release(""), (None, None));
+        assert_eq!(parse_os_release("NAME=\"BusyBox\"\n"), (None, None));
+        let (id, pretty) = parse_os_release("ID=\"\"\nPRETTY_NAME=\"\"\n");
+        assert_eq!(id, None);
+        assert_eq!(pretty, None);
+    }
+
+    #[test]
+    fn os_release_fields_land_in_the_payload_only_when_present() {
+        // The collector section parse: ID/PRETTY_NAME become optional top
+        // level fields; a missing --os-- section (BSD, busybox minimal)
+        // omits both entirely instead of writing nulls.
+        let with_os = parse_metrics_output("--os--\nID=ubuntu\nPRETTY_NAME=\"Ubuntu 22.04\"\n");
+        assert_eq!(with_os["osId"], "ubuntu");
+        assert_eq!(with_os["osPretty"], "Ubuntu 22.04");
+
+        let without_os = parse_metrics_output("--ps--\n");
+        assert!(without_os.get("osId").is_none(), "{without_os}");
+        assert!(without_os.get("osPretty").is_none(), "{without_os}");
+
+        // A section whose cat found nothing (both paths missing) stays out.
+        let empty_section = parse_metrics_output("--os--\n");
+        assert!(empty_section.get("osId").is_none());
+        assert!(empty_section.get("osPretty").is_none());
     }
 }

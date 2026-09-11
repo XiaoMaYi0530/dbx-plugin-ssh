@@ -8,7 +8,7 @@ DBX 的 MCP 服务器（`dbx mcp` 或桌面内置 MCP）内置两个通用插件
 
 | 工具 | 说明 |
 | --- | --- |
-| `dbx_list_plugin_tools` | 列出所有已装插件贡献的 MCP 工具（含本插件的 28 个 SSH/SFTP 工具及其 JSON Schema） |
+| `dbx_list_plugin_tools` | 列出所有已装插件贡献的 MCP 工具（含本插件的 29 个 SSH/SFTP 工具及其 JSON Schema） |
 | `dbx_call_plugin_tool` | 调用插件工具；传 `connectionId` 即引用 DBX 已保存的 SSH 连接，凭据由 DBX 解析转发，**工具参数里不出现任何密码** |
 
 典型调用流（MCP 客户端视角）：
@@ -90,7 +90,7 @@ stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec
 }
 ```
 
-- 会话启动时自动连接；`tools/list` 即 28 个工具，无需 DBX 在场。
+- 会话启动时自动连接；`tools/list` 即 29 个工具，无需 DBX 在场。
 - 凭据内联传参、带 `connectionId` / `connectionName` 时自动桥接转发（见上节），
   或在 DBX 桥模式可用时优先走方式一；数据目录默认
   `/tmp/dbx-plugin-data/io.dbx.ssh`，可用 `DBX_PLUGIN_DATA_DIR` 重定向
@@ -98,7 +98,7 @@ stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec
 - 真机回环验证：`DBX_SSH_SMOKE_PASSWORD=… python3 scripts/smoke_mcp.py
   --host <host> --port <port> --username <user>`（凭据走环境变量，不落盘）。
 
-## 工具一览（28 个，两种方式通用）
+## 工具一览（29 个，两种方式通用）
 
 ### 本地传输路径约束（sftp_upload / sftp_download）
 
@@ -133,6 +133,7 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 | `sftp_mkdir` / `sftp_remove` / `sftp_rename` / `sftp_chmod` | 目录与文件管理 |
 | `sftp_disk_usage` | 路径所在挂载的磁盘用量 |
 | `sftp_copy` / `sftp_move` | 服务器内复制 / 剪切（`from` 单值或数组 → `toDir`，逐项返回成败） |
+| `ssh_alert_triage` | 告警分诊（**无连接参数、从不执行**）：异构告警 JSON（任意 schema）或纯文本 → 结构化（对齐 openocta `/hooks/alert` 兼容语义）+ 双语关键词分类（`cpu/memory/disk/inode/network/oom/service/generic`）+ 只读诊断命令清单（每条带 `purposeKey`；playbook 逐条经 `mcp_safety` 白名单单测钉死，只读连接可直接执行）。执行由调用方经 `ssh_exec` 等门禁完成 |
 
 **连接寻址（保存连接优先，内联凭据兜底）**：上表除 `ssh_list_connections`、known_hosts 管理与本地工具外的连接类工具，都可用 `connectionId` 精确定位；也可用 `connectionName`，重名时补充 `host` / `port` / `username` 做唯一筛选。若不传 id/name，提供完整 endpoint（`host` + `username`，`port` 默认 22）也会唯一复用已注册连接，因此不需要重复传密码。候选为零时才回落内联凭据/stdio bridge 兜底；候选超过一个时拒绝并列出候选 id，避免静默连错主机或账户。`connectionId` 与其它 selector 同时出现但不一致也会拒绝。
 
@@ -243,19 +244,50 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
   `runInTerminal` 显式值优先于连接模式。**终端工具栏快速开关**：工作台按钮行
   新增「终端 MCP 模式」弹出层（`Bot` 图标，非 `off` 高亮），就地切换连接级模式——
   开启后 MCP exec 命令（即使不传 `runInTerminal`）都经该终端可见执行（审计/学习），
-  关闭则全部走静默隐藏通道。
+  关闭则全部走静默隐藏通道。**模式持久化（0.4.49）**：`agentTerminalMode` 落盘到
+  插件数据目录 `agent-modes.json`（按 connectionId 记录，off 移除条目），app/sidecar
+  重启后保持，不再静默回落 `off`——此前「设置过、重启后无效」即此原因。
+- **agent 可自主决定**：`runInTerminal` 是 agent 决策参数——工具 schema 引导 AI 在
+  任务需要可见性、人工监督或交互性时主动传 `true`，不必等用户开模式。`off` 连接上
+  显式 `runInTerminal: true` 的提权命令（sudo/灾难命中）不再死路拒绝，而是触发
+  工作台人工审批弹窗（超时即拒绝）；隐式路由（未传参）在 `off` 下维持隐藏通道不变。
 - **静默调用不打扰**：宿主桥转发前按「工具是否为 ssh_exec 族 + 显式 `runInTerminal`
   + 连接模式探针（`ssh/agent/mode/get`，任何失败回落 `off`）」判定是否需要打开
   工作台标签；静默调用（隐藏通道）不再自动开标签，事件监听也不再抢 macOS 窗口
   焦点——标签在后台就位、命令写入终端缓冲，用户回到 DBX 时可完整回看。
 - 审批：`auto` 下 elevated（sudo / 灾难命中）与 `strict` 下全部命令会触发工作台
   弹窗（完整命令原文 + 风险徽标 + 倒计时，默认 120s 超时即拒绝）；AI 侧表现为
-  明确的 denied/timed out 错误。
+  明确的 denied/timed out 错误。`off` 连接上 agent 显式 `runInTerminal: true` 的
+  提权命令走同一审批弹窗（0.4.49：此前直接拒绝且引导指向 agent 无法操作的 UI
+  开关，现按「agent 显式申请 + 人工批准」放行）。
+- **审批记忆（0.4.52）**：弹窗新增「记住此命令」勾选（resolve 请求 `remember: true`），
+  批准的命令写入连接级免审批清单（`agent-approved-commands.json`，匹配复用 sudo
+  白名单 token 语义，设置弹窗可查看/删除/手工泛化通配）；后续命中清单的命令在
+  任何模式下免审批直接执行。破坏性命令双重锁定：拒绝入库且命中重检无效——灾难
+  `confirmDestructive` 门永不绕过。
 - sudo + 终端路径不注入密码：`sudo …` 原文进用户 shell，密码/TOTP 由终端内
   auto-sudo 自动应答（已配置时）或人工输入。
 
 既有只读白名单（含敏感路径拒绝清单）、灾难 `confirmDestructive`、进程级只读
 开关先于路由判定生效，`runInTerminal` 不放宽任何安全门。
+
+## 告警 → 排查（组合用法）
+
+监控告警（Prometheus / Grafana / Zabbix / Sentry webhook 文本等）直接粘给
+`ssh_alert_triage`：工具把任意 schema 的告警体标准化（解析失败整包当 message，
+对齐 openocta `/hooks/alert` 兼容语义），按双语关键词分类（cpu / memory / disk /
+inode / network / oom / service / generic），返回一组**带 purposeKey 的只读诊断
+命令**（uptime / free / df / ps 排序 / journalctl -k / systemctl status 等静态
+playbook，逐条经 `mcp_safety` 白名单单测钉死——只读连接上可直接执行，普通连接
+不受限）。典型组合：
+
+1. `ssh_alert_triage {payload: <告警原文>}` → 拿到 `normalized` + `category` +
+   `suggestions`；
+2. 依次 `ssh_exec` 执行建议命令（门禁照常；超过 ~10s 的改用 `ssh_run_bg`）；
+3. 结合输出做根因判断；建议命令之外的排查动作沿用既有门禁语义。
+
+该工具只做结构化与清单，不做 LLM 分析；工作台侧等价入口为工具栏「告警排查」
+（Siren 图标）弹窗：粘贴 → 分析 → 逐条发送到当前终端 / 全部复制。
 
 ## MCP 工具命名与语义
 

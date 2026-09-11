@@ -16,7 +16,9 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/host-key/resolve` | 处理工作台内的主机密钥确认 |
 | `ssh/exec` | 在会话连接上执行远程命令，可选 Quick Sudo 提权 |
 | `ssh/exec/cancel` | 中止进行中的远程命令（按 `execId`） |
-| `ssh/agent/resolve` | 处理 AI 终端同步执行的命令审批（按 `challengeId`，一次性） |
+| `ssh/agent/resolve` | 处理 AI 终端同步执行的命令审批（按 `challengeId`，一次性；approve 可携 `command` 编辑后原文与 `remember: true` 记住标记，见「审批记忆」节） |
+| `ssh/alert/triage` | 告警分诊：异构告警 JSON/纯文本 → 结构化 + 分类 + 只读诊断命令清单（无需连接，从不执行；见「告警分诊」节） |
+| `ssh/audit/list` | 执行审计台账只读回放：`{limit?, beforeTs?}` → `{entries, truncated}`（见「执行审计」节） |
 | `ssh/agent/mode/get` | 连接级 AI 终端模式探针（供宿主 MCP 桥转发前判定路由）：`{connectionId}` → `{agentTerminalMode: "off"\|"auto"\|"strict", hasTerminalSession: bool}`；未知连接降级为 `off` + `false` 而非报错，宿主侧任何失败同样回落静默路径 |
 | `ssh/metrics` | 采集服务器指标（CPU/内存/负载/磁盘（含 inode 使用率）+ 网络接口速率 + Top CPU/内存进程，只读命令；`cached: true` 返回上次快照） |
 | `ssh/host-key/check` | 连接维度主机密钥预检（探针三态：已知 / 变更 / 未知，不发认证） |
@@ -32,8 +34,10 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/stat`、`sftp/exists`、`sftp/touch`、`sftp/write` | 扩展文件操作：元信息单查、存在性检查、空文件创建、小文件直写 |
 | `sftp/archive`、`sftp/extract` | 远端 tar.gz 打包与解压 |
 | `sftp/copy`、`sftp/move` | 服务器内复制 / 剪切（逐项执行，目标存在需 `overwrite`） |
+| `sftp/bookmarks/list`、`sftp/bookmarks/save`、`sftp/bookmarks/delete` | SFTP 路径书签管理（全局命名清单，插件数据目录持久化，见下文） |
 | `sftp/transfer/cancel` | 取消并清理临时状态 |
 | `sftp/transfer/list`、`sftp/transfer/status` | 查询会话传输任务列表 / 单任务状态（含历史，会话维度过滤） |
+| `sftp/transfer/history` | 跨重启传输历史查询（持久化 + 内存 live 合并，见下文） |
 | `sudo/stat`、`sudo/exists`、`sudo/touch` | sudo 元信息查询与空文件创建 |
 | `sudo/listDir`、`sudo/readFile`、`sudo/writeFile` | sudo 目录浏览与文件读写 |
 | `sudo/mkdir`、`sudo/remove`、`sudo/removeAll`、`sudo/chmod`、`sudo/rename` | sudo 写操作 |
@@ -49,7 +53,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 
 ## 运行时设置
 
-`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文；传 `revealSecrets: true` 时额外回显本连接配置的 `sudoPassword` / `totpSecret` 原始串（多密钥原文），供工作台设置弹窗预填已存原值——该参数仅工作台使用，MCP 通道不暴露，缺省响应与此前完全一致；另附 `quickSudoProfileId` / `quickSudoProfileName` 报告生效的全局配置绑定（`sudo_source=global` 时含连接表单引用解析结果），未绑定为空串，`sudoSource`（`custom` / `global` / `off`，生效来源），以及 `agentTerminalMode`（`off` / `auto` / `strict`，AI 终端同步模式，见下节））；`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`、可选 `agentTerminalMode`（非法值报错，缺省不改变），以及可选 `quickSudoProfileId`（非空须引用存在的全局配置并持久化绑定，空串解除绑定，缺省不改变；挑选配置会将连接的 `sudo_source` 切到 `global`，解除时 `global` 回落 `custom`）。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐每次输出动态 resolve 的语义）；终端侧监视器随每次设置/配置更新按当前连接状态**重新挂载**：连接时未配置凭据（如密钥认证连接）或 Quick Sudo 处于关闭的会话，在运行时配置密码/TOTP 或重新打开开关后立即开始自动应答，无需重连。`sudoPassword` 等字段级覆盖是 sidecar 本地值，sidecar 重启或重开连接后恢复宿主下发的配置，而 `quickSudoProfileId` 绑定持久化在插件数据目录、重启保留。`agentTerminalMode` 为连接级内存态（重启回默认 `off`）。工作台工具栏提供设置弹窗；宿主连接表单通过 manifest 字段提供持久化配置入口：`sudo_source`（三选一 `custom` 本连接 / `global` 全局配置 / `off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射）、`sudo_profile`（仅 `global` 时显示，声明 `options_action: sudo/profiles/options` 由宿主渲染为动态下拉，无该扩展能力的宿主保留文本回退）、`sudo_password`、`sudo_use_pty`（仅 `custom` 时显示）、2FA 编排四件套 `totp_secret`、`auth_flow_mode`、`password_prompt_hint`、`totp_prompt_hint`（`global` 时隐藏——凭据来源整体由全局配置接管；`custom`/`off` 时常显以服务登录期 keyboard-interactive）、超时与 keepalive、`jump_hosts`、`set_env`（会话环境变量）、`remote_command`（会话命令，两者详见「会话环境与会话命令（SetEnv / RemoteCommand）」）。
+`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文；传 `revealSecrets: true` 时额外回显本连接配置的 `sudoPassword` / `totpSecret` 原始串（多密钥原文），供工作台设置弹窗预填已存原值——该参数仅工作台使用，MCP 通道不暴露，缺省响应与此前完全一致；另附 `quickSudoProfileId` / `quickSudoProfileName` 报告生效的全局配置绑定（`sudo_source=global` 时含连接表单引用解析结果），未绑定为空串，`sudoSource`（`custom` / `global` / `off`，生效来源），以及 `agentTerminalMode`（`off` / `auto` / `strict`，AI 终端同步模式，见下节））；`ssh/settings/set` 另接受可选 `rememberedCommands`（字符串数组全量替换连接级免审批清单，校验规则见「审批记忆」节，破坏性行拒绝且错误信息带行号，缺省不改变）；`ssh/settings/get` 响应含 `rememberedCommands`。`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`、可选 `agentTerminalMode`（非法值报错，缺省不改变），以及可选 `quickSudoProfileId`（非空须引用存在的全局配置并持久化绑定，空串解除绑定，缺省不改变；挑选配置会将连接的 `sudo_source` 切到 `global`，解除时 `global` 回落 `custom`）。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐每次输出动态 resolve 的语义）；终端侧监视器随每次设置/配置更新按当前连接状态**重新挂载**：连接时未配置凭据（如密钥认证连接）或 Quick Sudo 处于关闭的会话，在运行时配置密码/TOTP 或重新打开开关后立即开始自动应答，无需重连。`sudoPassword` 等字段级覆盖是 sidecar 本地值，sidecar 重启或重开连接后恢复宿主下发的配置，而 `quickSudoProfileId` 绑定与 `agentTerminalMode` 持久化在插件数据目录、重启保留（0.4.49 起，见「AI 终端同步执行」）。工作台工具栏提供设置弹窗；宿主连接表单通过 manifest 字段提供持久化配置入口：`sudo_source`（三选一 `custom` 本连接 / `global` 全局配置 / `off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射）、`sudo_profile`（仅 `global` 时显示，声明 `options_action: sudo/profiles/options` 由宿主渲染为动态下拉，无该扩展能力的宿主保留文本回退）、`sudo_password`、`sudo_use_pty`（仅 `custom` 时显示）、2FA 编排四件套 `totp_secret`、`auth_flow_mode`、`password_prompt_hint`、`totp_prompt_hint`（`global` 时隐藏——凭据来源整体由全局配置接管；`custom`/`off` 时常显以服务登录期 keyboard-interactive）、超时与 keepalive、`jump_hosts`、`set_env`（会话环境变量）、`remote_command`（会话命令，两者详见「会话环境与会话命令（SetEnv / RemoteCommand）」）。
 
 ## AI 终端同步执行（agent terminal mode）
 
@@ -61,6 +65,7 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
 | `agentTerminalMode` | low 风险 | elevated（sudo / 灾难模式命中） |
 | --- | --- | --- |
 | `off`（默认） | 既有隐藏 exec 通道 | 既有隐藏 exec 通道 |
+| `off` + 显式 `runInTerminal: true` | 直接注入（发 `ssh/agent/notice`） | 审批后注入（0.4.49 起；此前为拒绝） |
 | `auto` | 直接注入（发 `ssh/agent/notice`） | 审批后注入 |
 | `strict` | 审批后注入 | 审批后注入 |
 
@@ -68,7 +73,11 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
   通道、缺省按连接模式）。stdio `--mcp` 模式的连接类调用自动经宿主桥转发到运行中的
   DBX 应用执行（embedded sidecar 按同一矩阵决策），因此连接级模式开关在 stdio 场景
   同样生效；宿主桥仅在显式 `runInTerminal: true` 或探针确认模式非 `off` 时才打开
-  工作台标签，静默调用不再开标签也不再抢窗口焦点。
+  工作台标签，静默调用不再开标签也不再抢窗口焦点。`runInTerminal` 是 agent 可自主
+  决定的参数（schema 引导：任务需要可见性/人工监督/交互性时主动置 `true`）。
+- 持久化：连接级 `agentTerminalMode` 落盘 `<plugin_data_dir>/agent-modes.json`
+  （版本化 JSON：`{version, modes: {connectionId: "auto"|"strict"}}`，原子写，
+  `off` 移除条目；损坏按空表处理），sidecar/app 重启后保持，不再回落 `off`。
 - 终端工具栏快速开关：工作台按钮行新增「终端 MCP 模式」弹出层（`Bot` 图标，非 `off`
   时高亮），就地读写连接级 `agentTerminalMode`（与设置弹窗共用 `ssh/settings/get` /
   `ssh/settings/set`）；开启后 MCP 命令在本终端可见执行（审计/学习），关闭走静默
@@ -76,8 +85,9 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
 - 无终端会话：报错 `No open terminal session for this connection; open the SSH
   workbench terminal first`（可见才执行的承诺）。
 - 审批：发 `ssh/agent/prompt` 事件并阻塞等待；`ssh/agent/resolve {challengeId,
-  decision: "approve"|"deny", command?}`（approve 可携带弹窗编辑后的命令原文）；
-  默认 120s（钳 10–300）超时即拒绝；挑战一次性。
+  decision: "approve"|"deny", command?, remember?}`（approve 可携带弹窗编辑后的
+  命令原文；`remember: true` 仅 approve 时有效，把该命令写入连接级免审批清单，见
+  「审批记忆」节）；默认 120s（钳 10–300）超时即拒绝；挑战一次性。
 - 收尾：发 `ssh/agent/finish {sessionId, status: "done"|"timeout"|"denied"}`。
 - 响应：终端路径返回 `{output, exitCode: null, mode: "terminal", incomplete,
   interrupted}`；超时返回已捕获输出且 `incomplete: true`，命令留在终端继续跑、
@@ -86,9 +96,64 @@ DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` 
   回显/尾提示符剥离为尽力而为。
 - 既有只读白名单与灾难 `confirmDestructive` 门禁先于路由判定生效，模式不放宽任何门。
 
+## 审批记忆（remembered approvals）
+
+AI 终端审批弹窗勾选「记住此命令」后，批准的命令（用户编辑后的最终文本）写入该
+连接的免审批清单（`<plugin_data_dir>/agent-approved-commands.json`，版本化 JSON
+`{version, connections: {connectionId: {commands: [原始行…]}}}`，tmp+rename 原子写，
+普通 JSON 无凭据不做 0600；损坏按空库处理）。后续同连接的终端路由命中清单即直接
+执行、不再弹审批：
+
+- 匹配完整复用 sudo 白名单的 token 语义（`backend/src/sudo_allowlist.rs`）：token
+  精确、`*` 匹配一个参数、尾 `*` 匹配剩余且须至少一个参数；记住时存精确形态，可在
+  设置面板手工泛化为通配。
+- 双重灾难锁（D2）：破坏性命令（`mcp_safety::assess_command == Destructive`）拒绝
+  入库（`remember`/`ssh/settings/set rememberedCommands` 均拒绝，后者错误信息带
+  行号），且命中清单前的重检对破坏性文本一律无效——灾难确认门永不绕过。
+- 生效范围：`decide_with_memory` 只把 `Prompt` 降为 `Run`，`Deny`（off 模式未显式
+  opt-in）不覆盖；off/auto/strict 三档下的已记住命令均可免审执行（用户显式动作
+  优先于模式默认）。
+- 管理：`ssh/settings/get` 返回 `rememberedCommands`（原始行数组）；`ssh/settings/set`
+  接受 `rememberedCommands` 全量替换（每行 ≤500 字符、每连接 ≤50 行、去重）。
+- 设置弹窗「AI 终端」区块提供清单展示与删除（保存随设置链全量提交）。
+
+## 执行审计（audit log）
+
+MCP/AI 执行面全量落本地 JSONL 审计账（`<plugin_data_dir>/audit-log.jsonl`，
+append-only；5 MiB 轮转保留一代 `.1`；open-append 单行写保证 embedded sidecar 与
+stdio `--mcp` 双进程共享数据目录时的行完整性；进程内 Mutex 串行）。审计面 =
+`call_tool` 每次工具调用一条（gate + outcome + exitCode + 耗时）+ 终端路由审批
+生命周期一条（`approval` 字段；工作台人工操作不记）。行结构（camelCase）：
+`{tsMs, tool, connectionId, gate, approval, outcome, exitCode, durationMs, mode, error}`，
+其中 `gate ∈ pass|write-denied|whitelist-denied|sensitive-path|destructive-unconfirmed|
+sudo-allowlist-denied|read-only-server`，`approval ∈ none|prompt|approved|denied|
+timeout|remembered`，`outcome ∈ ok|error`，`mode ∈ stdio|embedded|terminal`；
+`error` 钳制 1 KiB，凭据从不进入命令文本。宿主桥转发的调用由实际执行方（app 侧
+sidecar）记账，不双计。
+
+- `ssh/audit/list`：`{limit?: 1–500 缺省 100, beforeTs?: ms}` → `{entries: [行…],
+  truncated}`，文件序（旧→新）取末尾 limit 条，只读。
+
+## 告警分诊（alert triage）
+
+`ssh/alert/triage {payload: string}`：把异构告警体（JSON 文本任意 schema，或纯文本）
+标准化为固定结构并给出**只读诊断命令清单**。兼容语义对齐 openocta `/hooks/alert`：
+JSON 解析失败或 `message` 为空时整包文本作为 message；`data` 字段（object）原样
+序列化进 `dataJson`。分类为双语关键词计分（`cpu|memory|disk|inode|network|oom|
+service|generic`，同分按固定序、全零落 generic）。响应：
+`{normalized: {alertId, title, message, severity, source, dataJson}, category,
+suggestions: [{command, purposeKey}]}`（字段钳制：title/message ≤2 KiB、dataJson
+≤16 KiB）。硬约束：playbook 每条命令必须过 `mcp_safety` 只读白名单（单测钉死），
+无重定向/`$()`/`sudo`——建议命令在只读连接上可直接经既有 exec 门执行。该方法是
+纯分诊、无需连接、从不执行命令；执行由调用方经 `ssh_exec` 等门禁完成。MCP 通道
+同名工具 `ssh_alert_triage`（非写工具、无连接参数）。工作台工具栏「告警排查」
+（Siren 图标）弹窗提供粘贴→分析→逐条发送到终端/全部复制。
+
 ## Quick Sudo 全局配置
 
-`sudo/profiles/*` 管理跨连接复用的多套 Quick Sudo 配置（全局配置 + 连接级覆盖语义），持久化于 `<plugin_data_dir>/quick-sudo-profiles.json`（版本化 JSON：`profiles` + `bindings`，Unix 权限 0600，原子写；损坏按空库处理）。每套配置含：`name`（唯一，trim 后 1–64 字符）、`sudoPassword`、`totpSecret`、`authFlowMode`（`password_only` / `password_plus_otp` / `password_then_otp`）、`passwordPromptHint`、`totpPromptHint`、`sudoUsePty`。上限 20 套。
+`sudo/profiles/*` 管理跨连接复用的多套 Quick Sudo 配置（全局配置 + 连接级覆盖语义），持久化于 `<plugin_data_dir>/quick-sudo-profiles.json`（版本化 JSON：`profiles` + `bindings`，Unix 权限 0600，原子写；损坏按空库处理；0.4.52 起 `version: 2` 并静态加密，见下）。每套配置含：`name`（唯一，trim 后 1–64 字符）、`sudoPassword`、`totpSecret`、`authFlowMode`（`password_only` / `password_plus_otp` / `password_then_otp`）、`passwordPromptHint`、`totpPromptHint`、`sudoUsePty`。上限 20 套。
+
+**凭据静态加密（vault，0.4.52 起）**：文件内 `sudoPassword` / `totpSecret` 不再明文落盘，改为字段级 AES-256-GCM 信封（`sudoPasswordEnc` / `totpSecretEnc`，密文 `base64(nonce‖ct)`，AAD 绑定 `字段|档案id` 防密文挪用；空值不加密），name/提示词/模式等元数据保持明文。顶层 `crypto: {scheme:"aead-v1", storage:"keyfile"|"keychain"}` 声明 DEK 托管档位。**默认档为同目录 `vault.key`（0600）**：OS keychain 在 sidecar 二进制每次更新（macOS）或每进程首次访问时都会弹授权对话框，违背无人值守体验，故仅显式选入（环境变量 `DBX_SSH_VAULT_STORAGE=keychain`）时新建才走 keychain（服务 `io.dbx.ssh`、账户 `vault-dek-v1`；keyring，解析结果进程级缓存、至多弹一次）。遗留 keychain 档文件在首次成功解密时自动迁移为 keyfile 档并删除 keychain 条目；keychain 被拒绝时该进程内不再重试、文件保持原档位不被空密文覆盖。v1 明文文件加载后自动 best-effort 重写为 v2；解密失败按空处理、元数据保留。内存结构与全部方法视图不变（视图仍只出布尔位，`reveal` 仅工作台可用）。
 
 - `sudo/profiles/list`：返回 `{ profiles: [视图…] }`，按名称排序；视图含 `id`、`name`、`sudoPasswordSet`、`totpConfigured`、`authFlowMode`、提示词、`sudoUsePty`、`createdAt`、`updatedAt`，**永不携带密钥明文**。
 - `sudo/profiles/reveal`：参数 `id`；返回 `{ profile: 完整视图 }`（含 `sudoPassword` / `totpSecret` 原值），供工作台配置编辑器预填已存原值；未知 id 报错。**仅工作台方法，不进 MCP 工具面**——MCP 通道（list/save/工具 schema）只见布尔标记，密钥不进 agent 上下文。
@@ -371,6 +436,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 - `sftp/transfer/list`：参数 `sessionId`。返回 `{ tasks: [...] }`——该会话进行中的上传 / 下载与近期历史（每个会话独立记录），元素结构 `{ taskId, sessionId, direction, fileName, size, transferred, status }`，`status` 取 `running` / `completed` / `cancelled`。
 - `sftp/transfer/status`：参数 `taskId`。返回单个任务的同构状态对象；任务不存在时先查历史，仍无则报错。
+- `sftp/transfer/history`：参数 `sessionId?`（可选过滤）、`limit?`（默认 50，上限 200）。返回 `{ tasks: [...] }`——持久化传输历史（`transfer-history.json`，环形上限 200 条，跨 sidecar 重启保留）与内存 live 任务按 `taskId` 去重合并、新→旧排序，元素结构 `{ taskId, sessionId, connectionId, direction, fileName, size, transferred, status, startedAt, finishedAt, error? }`（时间戳 Unix 毫秒；`status` 同上并含 `failed`）。无活动连接也可查询；仅状态跃迁落盘，逐块进度不落盘；跨进程（embedded 与 stdio `--mcp`）last-writer-wins；重启后遗留 `running` 呈现为 `failed`（不回写文件）。不进 MCP 工具面。
 
 ## 主机密钥
 
@@ -455,6 +521,20 @@ localStorage 会因宿主 webview 存储分区表现为"绑连接"，已废弃�
 `ssh/quickCommands/save`：参数 `id?`（空/缺省=新建，非空=更新须存在）、`name?`（空/缺省取 `command` 截断兜底）、`command`（必填，trim 后非空）。返回 `{ quickCommand: {…}, created: bool, commands: [...] }`（完整清单随响应下发，工作台可直接采纳权威顺序）。错误：超限（"At most 20 quick commands…"）、字段超长、`command` 缺失。
 
 `ssh/quickCommands/delete`：参数 `id`。返回 `{ removed: bool, commands: [...] }`；id 不存在时 `removed: false` 不算错误（对齐 `ssh/knownHosts/remove` 语义），此时不重写存储文件。
+
+### sftp/bookmarks/list、sftp/bookmarks/save、sftp/bookmarks/delete
+
+SFTP 路径书签：用户收藏的命名远端路径（label + path），持久化在
+`DBX_PLUGIN_DATA_DIR/sftp-bookmarks.json`（原子写、Unix 0600、坏文件降级为空清单），
+**全局共享一份**（不按连接分组），模式与 `ssh/quickCommands/*` 同构。上限 20 条
+（仅约束新建）、`label` trim 后 1–64 字符且全库唯一（大小写不敏感）、`path` 非空
+≤ 1024（不做存在性校验，书签可指向未挂载路径）。
+
+`sftp/bookmarks/list`：参数无。返回 `{ bookmarks: [{ id, label, path, createdAt, updatedAt }] }`，按 `label` 排序。
+
+`sftp/bookmarks/save`：参数 `id?`（有=更新须存在，无=新建）、`label`、`path`。返回 `{ bookmark: {…}, created: bool }`。错误：`label` 为空/超长/重复（大小写不敏感）、`path` 为空/超长、`id` 不存在、超出上限。
+
+`sftp/bookmarks/delete`：参数 `id`。返回 `{ success, removed }`；未知 id 报错。工作台方法，不进 MCP 工具面。
 
 ### ssh/terminal/batchInput
 

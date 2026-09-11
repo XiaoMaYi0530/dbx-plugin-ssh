@@ -449,3 +449,89 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .terminal-command-marker .marker-cwd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40ch; opacity: 0.75; }
 .terminal-command-marker.active { color: var(--foreground); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
 .terminal-command-marker.failed { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
+
+/* AI 审批「记住此命令」勾选行 */
+.agent-prompt-remember { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--foreground); cursor: pointer; }
+.agent-prompt-remember input { accent-color: var(--primary); }
+
+/* 设置弹窗「已记住命令」列表 */
+.settings-remembered { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.remembered-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-height: 140px; overflow-y: auto; }
+.remembered-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.remembered-line { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; }
+
+/* 告警排查弹窗 */
+.alert-triage-modal { width: min(560px, calc(100vw - 32px)); }
+.alert-triage-hint { margin: -6px 0 0; font-size: 11px; line-height: 1.5; }
+.alert-triage-payload { width: 100%; resize: vertical; font-size: 11px; line-height: 1.5; }
+.alert-triage-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.alert-triage-result { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+.alert-triage-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.alert-severity-badge { border-radius: 999px; padding: 2px 10px; font-size: 10px; font-weight: 600; border: 1px solid var(--border); color: var(--muted-foreground); }
+.alert-severity-badge.critical { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
+.alert-severity-badge.warning { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.alert-severity-badge.info { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.alert-category { font-size: 11px; font-weight: 600; }
+.alert-title { font-size: 12px; }
+.alert-message { margin: 0; font-size: 10px; max-height: 60px; overflow-y: auto; overflow-wrap: anywhere; }
+.alert-suggestion-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+.alert-suggestion-row { display: flex; align-items: center; gap: 8px; }
+.alert-suggestion-command { flex: 1 1 auto; font-size: 10px; padding: 3px 6px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alert-purpose { flex: 0 0 auto; font-size: 10px; }
+
+/* ---- 关键词高亮（IMPL_PLAN_NETCATTY_PARITY §3-B1）---- */
+/* 管理弹层：规则列表 + 新增表单（工具栏 Palette 按钮，紧邻快捷命令） */
+.highlight-rules-popover { width: 300px; display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+.highlight-rules-popover h3 { margin: 0; font-size: 12px; }
+.highlight-rule-list { display: flex; flex-direction: column; gap: 8px; max-height: min(320px, calc(100vh - 260px)); overflow-y: auto; }
+.highlight-rule-row { display: flex; align-items: center; gap: 6px; }
+.highlight-color-dot { width: 10px; height: 10px; flex: 0 0 10px; border-radius: 3px; border: 1px solid rgb(255 255 255 / 22%); }
+.highlight-rule-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.highlight-rule-main .highlight-rule-pattern { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.highlight-rule-main .highlight-rule-pattern.disabled { opacity: 0.45; text-decoration: line-through; }
+.highlight-rule-badges { display: inline-flex; gap: 4px; font-size: 9px; color: var(--muted-foreground); }
+.highlight-rule-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+.highlight-rule-actions .icon-button svg { width: 12px; height: 12px; }
+.highlight-editor { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 8px; }
+.highlight-editor .highlight-editor-inputs { display: flex; align-items: center; gap: 6px; }
+.highlight-editor .highlight-editor-inputs input[type="text"], .highlight-editor .highlight-editor-inputs input:not([type]) { flex: 1 1 auto; min-width: 0; }
+.highlight-editor label.highlight-editor-flag { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--muted-foreground); cursor: pointer; white-space: nowrap; }
+.highlight-editor label.highlight-editor-flag input { accent-color: var(--primary); }
+.highlight-palette { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.highlight-palette-swatch { width: 18px; height: 18px; border-radius: 4px; border: 2px solid transparent; cursor: pointer; padding: 0; }
+.highlight-palette-swatch.selected { border-color: var(--foreground); }
+.highlight-editor input.highlight-hex-input { width: 90px; font-family: var(--terminal-font-family); font-size: 11px; }
+.highlight-editor-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.highlight-rule-limit { font-size: 10px; color: var(--muted-foreground); margin-right: auto; }
+.highlight-switch-control { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted-foreground); cursor: pointer; }
+.highlight-switch-control input { accent-color: var(--primary); }
+
+/* ---- metrics sparkline + 发行版徽标（IMPL_PLAN_NETCATTY_PARITY §3-B2）---- */
+/* 网络区头部两枚 60×18 SVG 曲线（rx=primary / tx=success），零资产纯内联。 */
+.metrics-net-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.metrics-sparkline-group { display: inline-flex; align-items: center; gap: 6px; }
+.metrics-sparkline { display: block; }
+/* 发行版 monogram 徽标：圆角方块 + 首字母，纯 CSS，无图片/SVG 资产。 */
+.distro-badge { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; flex: 0 0 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 700; line-height: 1; vertical-align: middle; }
+.metrics-float .distro-badge { width: 18px; height: 18px; flex-basis: 18px; font-size: 11px; }
+
+/* ---- 审计日志（IMPL_PLAN_NETCATTY_PARITY §3-B4，设置弹窗折叠区）---- */
+.audit-section-head { display: flex; align-items: center; gap: 8px; }
+.audit-section-head .settings-section-title { margin: 0; }
+.audit-toolbar { display: flex; align-items: center; gap: 8px; }
+.audit-toolbar select { min-width: 150px; }
+.audit-truncated { font-size: 10px; }
+.audit-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
+.audit-row { display: flex; align-items: baseline; gap: 8px; font-size: 10px; }
+.audit-time { flex: 0 0 auto; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.audit-kind-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; font-size: 9px; font-weight: 600; color: var(--muted-foreground); }
+.audit-kind-badge.k-exec { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.audit-kind-badge.k-agent-challenge { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.audit-kind-badge.k-terminal-auto_sudo { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.audit-kind-badge.k-mcp-tool, .audit-kind-badge.k-mcp-gate { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
+.audit-connection { flex: 0 1 auto; max-width: 20ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-command { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-outcome { flex: 0 0 auto; font-weight: 600; }
+.audit-outcome.error { color: var(--destructive); }
+.audit-outcome.ok { color: var(--success, var(--primary)); }
+.audit-gate { flex: 0 0 auto; color: var(--muted-foreground); }

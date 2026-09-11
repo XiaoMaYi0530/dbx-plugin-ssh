@@ -974,8 +974,19 @@ impl McpState {
                 // when it is absent. Off keeps the existing path untouched.
                 let route = run_in_terminal.unwrap_or(mode != AgentTerminalMode::Off);
                 if route {
+                    // Whether the agent explicitly opted into the visible
+                    // terminal decides the `off` + elevated matrix cell
+                    // (approve with explicit opt-in, deny without it).
+                    let explicit = run_in_terminal == Some(true);
                     return self
-                        .ssh_exec_terminal_tool(name, command, connection_id, timeout_secs, emitter)
+                        .ssh_exec_terminal_tool(
+                            name,
+                            command,
+                            connection_id,
+                            explicit,
+                            timeout_secs,
+                            emitter,
+                        )
                         .await;
                 }
             }
@@ -1209,6 +1220,7 @@ impl McpState {
         name: &str,
         command: &str,
         connection_id: &str,
+        explicit: bool,
         timeout_secs: Option<Duration>,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
@@ -1256,7 +1268,7 @@ impl McpState {
         // the shared PTY. The lock is per-session, so different connections
         // still execute in parallel (no global lock here on purpose).
         let _exec_guard = self.runtime.agent_exec_guard(&session_id).await?;
-        match agent_terminal::decide(mode, risk) {
+        match agent_terminal::decide(mode, risk, explicit) {
             agent_terminal::RoutingDecision::Run => {
                 self.runtime
                     .exec_in_terminal(&session_id, name, &command, risk, timeout, emitter)
@@ -2671,7 +2683,7 @@ pub fn tool_definitions() -> Value {
                     ("command", "string", "Shell command to execute"),
                     ("timeoutSecs", "integer", "Plugin-side wait cap in seconds (5-300, default 60). The MCP host may abandon the wait earlier (~15s); the command keeps running remotely either way"),
                     ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
-                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app). When omitted, the connection's terminal MCP mode — toggled in the DBX terminal toolbar — decides: modes other than off route every exec through the visible terminal, off keeps the silent hidden channel"),
+                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app). This is yours to decide as the agent: set true when the task needs visibility, human oversight, or interactivity. Elevated commands run only after the user approves them in the terminal; the connection-level terminal MCP mode (toggled in the DBX terminal toolbar, persisted across restarts) decides when the flag is omitted: modes other than off route every exec through the visible terminal, off keeps the silent hidden channel"),
                 ]),
                 "required": ["command"],
                 "anyOf": connection_selector_requirements(),
@@ -2687,7 +2699,7 @@ pub fn tool_definitions() -> Value {
                     ("timeoutSecs", "integer", "Plugin-side wait cap in seconds (5-300, default 90). The MCP host may abandon the wait earlier (~15s); the command keeps running remotely either way"),
                     ("quickSudoProfile", "string", "Global Quick Sudo profile id or exact name supplying sudo password/TOTP/prompt defaults"),
                     ("confirmDestructive", "boolean", "Set true to allow a command recognized as destructive (disk formatting, recursive system deletes, shutdown, ...) after human review"),
-                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app). When omitted, the connection's terminal MCP mode — toggled in the DBX terminal toolbar — decides: modes other than off route every exec through the visible terminal, off keeps the silent hidden channel"),
+                    ("runInTerminal", "boolean", "Run inside the user's visible DBX terminal so the command and its output are visible and interruptible. Through the DBX embedded bridge it routes to the open workbench terminal; in stdio mode it is forwarded to the DBX app bridge (requires a saved connectionId that exists in the DBX app). This is yours to decide as the agent: set true when the task needs visibility, human oversight, or interactivity. Elevated commands run only after the user approves them in the terminal; the connection-level terminal MCP mode (toggled in the DBX terminal toolbar, persisted across restarts) decides when the flag is omitted: modes other than off route every exec through the visible terminal, off keeps the silent hidden channel"),
                 ]),
                 "required": ["command"],
                 "anyOf": connection_selector_requirements(),

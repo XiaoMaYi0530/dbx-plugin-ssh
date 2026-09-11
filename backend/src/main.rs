@@ -1,6 +1,10 @@
+mod agent_approvals;
 mod agent_terminal;
+mod alert_triage;
 mod app_bridge;
+mod audit_log;
 mod exec;
+mod highlight_rules;
 mod host_key;
 mod keys;
 mod mcp;
@@ -8,12 +12,15 @@ mod mcp_safety;
 mod metrics;
 mod model;
 mod quick_commands;
+mod sftp_bookmarks;
 mod sftp_copy;
 mod sftp_ext;
 mod ssh;
 mod sudo_fs;
 mod sudo_allowlist;
 mod sudo_profiles;
+mod transfer_history;
+mod vault;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -394,9 +401,35 @@ impl Plugin {
                 let challenge_id = required_string(&params, "challengeId")?;
                 let decision = required_string(&params, "decision")?;
                 let command = params.get("command").and_then(Value::as_str);
+                let remember = params
+                    .get("remember")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 self.ssh
-                    .resolve_agent_challenge(challenge_id, decision, command)?;
+                    .resolve_agent_challenge(challenge_id, decision, command, remember)?;
                 Ok(json!({ "success": true }))
+            }
+            "ssh/alert/triage" => {
+                let payload = required_string(&params, "payload")?;
+                Ok(alert_triage::triage_view(&alert_triage::triage(&payload)))
+            }
+            "ssh/audit/list" => {
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100)
+                    .clamp(1, 500) as usize;
+                let before_ts = params.get("beforeTs").and_then(Value::as_u64);
+                // Fetch one extra entry to report truncation without a
+                // second full read.
+                let mut entries = audit_log::tail(&self.ssh.data_dir(), limit + 1, before_ts)?;
+                let truncated = entries.len() > limit;
+                entries.truncate(limit);
+                let items: Vec<Value> = entries
+                    .iter()
+                    .map(|entry| serde_json::to_value(entry).unwrap_or(Value::Null))
+                    .collect();
+                Ok(json!({ "entries": items, "truncated": truncated }))
             }
             "ssh/agent/mode/get" => {
                 let connection_id = required_string(&params, "connectionId")?;
@@ -515,6 +548,12 @@ impl Plugin {
                 let id = required_string(&params, "id")?;
                 self.ssh.quick_commands_delete(id)
             }
+            "ssh/highlightRules/list" => Ok(self.ssh.highlight_rules_list()),
+            "ssh/highlightRules/save" => self.ssh.highlight_rules_save(&params),
+            "ssh/highlightRules/delete" => {
+                let id = required_string(&params, "id")?;
+                self.ssh.highlight_rules_delete(id)
+            }
             "ssh/batchBar/state" => {
                 // 批量发送命令条的跨工作台状态同步：把调用方（source 标识的
                 // webview）的草稿/下拉选择/开关原样广播给所有插件 webview，
@@ -606,6 +645,25 @@ impl Plugin {
             "sftp/transfer/status" => self
                 .ssh
                 .transfer_status(required_string(&params, "taskId")?),
+            "sftp/transfer/history" => {
+                let session_id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(50)
+                    .clamp(1, 200) as usize;
+                self.runtime
+                    .block_on(self.ssh.transfer_history_query(session_id, limit))
+            }
+            "sftp/bookmarks/list" => sftp_bookmarks::list(&self.ssh.data_dir()),
+            "sftp/bookmarks/save" => sftp_bookmarks::save(&self.ssh.data_dir(), &params),
+            "sftp/bookmarks/delete" => {
+                let id = required_string(&params, "id")?;
+                sftp_bookmarks::delete(&self.ssh.data_dir(), id)
+            }
             "filesystem/list" => self.filesystem_list(params),
             "filesystem/read" => self.filesystem_read(params),
             "filesystem/write" => self.filesystem_write(params),

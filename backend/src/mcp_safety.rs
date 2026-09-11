@@ -57,6 +57,68 @@ pub fn runs_under_sudo(command: &str) -> bool {
         .any(|segment| effective_tokens(segment).first().map(String::as_str) == Some("sudo"))
 }
 
+/// Byte ceiling for one `ssh_terminal_input` payload after normalization.
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 8 * 1024;
+
+/// Normalizes terminal input for injection (IMPL_PLAN §1.2): `\r\n` and
+/// `\n` fold to `\r` (the Enter an interactive shell expects), NUL bytes
+/// are stripped, and the result is capped at 8 KiB on a char boundary.
+pub fn normalize_terminal_input(input: &str) -> String {
+    let mut normalized = String::with_capacity(input.len().min(MAX_TERMINAL_INPUT_BYTES + 4));
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                // Fold CRLF to a single CR.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                normalized.push('\r');
+            }
+            '\n' => normalized.push('\r'),
+            '\0' => {}
+            other => normalized.push(other),
+        }
+        if normalized.len() >= MAX_TERMINAL_INPUT_BYTES {
+            break;
+        }
+    }
+    if normalized.len() > MAX_TERMINAL_INPUT_BYTES {
+        let mut end = MAX_TERMINAL_INPUT_BYTES;
+        while !normalized.is_char_boundary(end) {
+            end -= 1;
+        }
+        normalized.truncate(end);
+    }
+    normalized
+}
+
+/// True when every character of the input is a control character: pure
+/// control sequences (Enter, Ctrl+C, escape runs) carry no shell-visible
+/// text, so they are the only input a read-only connection accepts
+/// (IMPL_PLAN §1.2 ①).
+pub fn is_control_only_input(input: &str) -> bool {
+    input.chars().all(char::is_control)
+}
+
+/// Assesses terminal input by its worst `\r`-delimited line: each line is
+/// classified like a shell command and the highest risk wins. Destructive
+/// short-circuits; an empty (pure-control) input is read-only.
+pub fn assess_terminal_input(input: &str) -> CommandRisk {
+    let mut overall = CommandRisk::ReadOnly;
+    for line in input.split('\r') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match assess_command(line) {
+            CommandRisk::Destructive(reason) => return CommandRisk::Destructive(reason),
+            CommandRisk::Unknown => overall = CommandRisk::Unknown,
+            CommandRisk::ReadOnly => {}
+        }
+    }
+    overall
+}
+
 /// Replaces fd duplications (`2>&1`, `1>&2`, ...) with a neutral token so
 /// the `&` splitter does not shred them; they duplicate fds, not files.
 fn neutralize_fd_dups(command: &str) -> String {
@@ -832,5 +894,56 @@ mod tests {
             assess_command("rm -rf /etc"),
             Destructive("recursive rm targets a system root")
         );
+    }
+
+    // —— A2: terminal input assessment ————————————————
+
+    #[test]
+    fn control_only_detection_matches_normalized_content() {
+        // Pure control sequences (Enter, Ctrl+C). Per the §1.2 contract the
+        // check is strictly per-character `is_control`, so CSI arrow runs
+        // ("\u{1b}[A") carry printable bytes and are refused (fail closed) —
+        // an operator can still send them through a writable connection.
+        assert!(is_control_only_input("\r"));
+        assert!(is_control_only_input("\u{3}"));
+        assert!(is_control_only_input(""));
+        assert!(!is_control_only_input("\u{1b}[A"));
+        // Any visible text is not control-only.
+        assert!(!is_control_only_input("y"));
+        assert!(!is_control_only_input("echo hi\r"));
+        assert!(!is_control_only_input("exit\n"));
+    }
+
+    #[test]
+    fn terminal_input_risk_takes_the_max_across_enter_lines() {
+        // Plain inspection text stays Low (read-only-ish: allowed on normal
+        // connections, still refused as visible text on read-only ones via
+        // the control-only rule).
+        assert_eq!(assess_terminal_input("echo hi\r"), CommandRisk::ReadOnly);
+        assert_eq!(assess_terminal_input("df -h\recho done\r"), CommandRisk::ReadOnly);
+        // A mutating line is Unknown...
+        assert_eq!(assess_terminal_input("systemctl restart nginx\r"), CommandRisk::Unknown);
+        // ...and a catastrophic line is Destructive regardless of position.
+        assert!(matches!(
+            assess_terminal_input("echo start\rrm -rf /data\r"),
+            CommandRisk::Destructive(_)
+        ));
+        // An empty input has no risk.
+        assert_eq!(assess_terminal_input(""), CommandRisk::ReadOnly);
+    }
+
+    #[test]
+    fn terminal_input_normalization_caps_at_8kib_and_strips_nul() {
+        // CRLF and LF both fold to CR; NUL bytes are stripped.
+        assert_eq!(normalize_terminal_input("a\r\nb\nc\u{0}d"), "a\rb\rcd");
+        // Oversized input truncates at 8 KiB on a char boundary.
+        let oversized = "x".repeat(9 * 1024);
+        let normalized = normalize_terminal_input(&oversized);
+        assert_eq!(normalized.len(), 8 * 1024);
+        // Multi-byte chars are never split mid-codepoint.
+        let multibyte = "é".repeat(5000); // 2 bytes each
+        let normalized = normalize_terminal_input(&multibyte);
+        assert!(normalized.len() <= 8 * 1024);
+        assert_eq!(normalized.chars().count(), 4096);
     }
 }
