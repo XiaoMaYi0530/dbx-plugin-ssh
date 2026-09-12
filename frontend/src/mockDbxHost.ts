@@ -165,6 +165,9 @@ function mockWriteEntry(path: string, node: MockNode): { success: true } {
 
 const fixtureDownloads = new Map<string, { fileName: string; size: number; offset: number }>();
 const fixtureUploadCount = { value: 0 };
+// 编辑器 sftp/write 落盘的内存副本（按路径）：sftp/read 优先回读，保证
+// "保存 → 重开预览" 在可视化夹具里闭环（真实 sidecar 写远端文件）。
+const mockFileContents = new Map<string, Uint8Array>();
 // 全局快速命令（ssh/quickCommands/*）与批量发送（ssh/terminal/batchInput）的
 // mock 状态：镜像真实 sidecar 的响应形状与上限/错误语义，防可视化夹具脱节。
 const QUICK_COMMANDS_LIMIT = 20;
@@ -305,7 +308,7 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   }
   else if (method === "sftp/list" || method === "sudo/listDir") result = { entries: mockList(String((params as Record<string, unknown>)?.path || "/")) };
   else if (method === "sftp/home") result = { path: "/home/demo" };
-  else if (method === "sftp/createDirectory") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockDir(String((params as Record<string, unknown>)?.path || "/").split("/").pop() || "folder"));
+  else if (method === "sftp/createDirectory" || method === "sudo/mkdir") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockDir(String((params as Record<string, unknown>)?.path || "/").split("/").pop() || "folder"));
   else if (method === "sftp/touch") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockFile(String((params as Record<string, unknown>)?.path || "").split("/").pop() || "file.txt", 0));
   else if (method === "sftp/archive") {
     const input = params as Record<string, unknown>;
@@ -318,7 +321,7 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     const destination = String(input.destinationPath || "");
     result = mockWriteEntry(destination, mockDir(destination.split("/").pop() || "extracted", [mockFile("README", 64)]));
   }
-  else if (method === "sftp/delete") {
+  else if (method === "sftp/delete" || method === "sudo/remove" || method === "sudo/removeAll") {
     const { parent, name } = mockParentAndName(String((params as Record<string, unknown>)?.path || ""));
     const index = parent?.children?.findIndex((child) => child.name === name) ?? -1;
     if (!parent || index < 0) throw new Error(`sftp: no such file: ${name}`);
@@ -350,10 +353,91 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { path: normalizeMockPath(String((params as Record<string, unknown>)?.path || "")), kind: node.kind, ...(node.kind === "file" ? { size: node.size } : {}), modifiedAt: node.modifiedAt, mode: node.permissions };
   }
   else if (method === "sftp/transfer/list") result = { tasks: [] };
+  else if (method === "sftp/transfer/history") {
+    // ?err=transferHistory 模拟历史查询失败，供面板 loadFailed+重试态走查。
+    if (fixtureParams.get("err") === "transferHistory") throw new Error("sftp: transfer history unavailable");
+    // 镜像真实 sidecar 契约（transfer-history.json 环形 200 + live 合并、
+    // 新→旧排序、status 枚举无 queued、时间戳 Unix 毫秒、failed 带 error）。
+    const input = (params || {}) as Record<string, unknown>;
+    const limitRaw = Number(input.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.floor(limitRaw)) : 50;
+    const now = Date.now();
+    const entries: Array<Record<string, unknown>> = [
+      { taskId: "visual-hist-4", connectionId: context.connectionId, direction: "upload", fileName: "deploy.sh", size: 2481, transferred: 2481, status: "completed", startedAt: now - 400_000, finishedAt: now - 396_000 },
+      { taskId: "visual-hist-3", connectionId: context.connectionId, direction: "download", fileName: "server.log", size: 741_248, transferred: 741_248, status: "completed", startedAt: now - 800_000, finishedAt: now - 790_000 },
+      { taskId: "visual-hist-2", connectionId: context.connectionId, direction: "download", fileName: "core.dump", size: 268_435_456, transferred: 268_435_456, status: "failed", startedAt: now - 1_600_000, finishedAt: now - 1_590_000, error: "disk quota exceeded" },
+      { taskId: "visual-hist-1", connectionId: context.connectionId, direction: "upload", fileName: "backup.tar.gz", size: 52_428_800, transferred: 0, status: "cancelled", startedAt: now - 3_200_000, finishedAt: now - 3_190_000 },
+    ];
+    result = { tasks: entries.slice(0, limit) };
+  }
   else if (method === "sftp/upload/start") result = { taskId: `visual-upload-${++fixtureUploadCount.value}`, chunkSize: 262144 };
   else if (method === "sftp/upload/finish") result = { success: true };
   else if (method === "sftp/transfer/cancel") result = { success: true };
-  else if (method === "sftp/read") result = { dataBase64: base64(new TextEncoder().encode("#!/usr/bin/env bash\nset -euo pipefail\n\necho deploy\n")), truncated: false };
+  else if (method === "sftp/write" || method === "sudo/writeFile") {
+    // 镜像真实契约：整文件覆写（sftp/write 用 remotePath、sudo/writeFile 用
+    // path）。节点必须已存在，内容驻留内存供读回，树节点 size 同步更新。
+    const input = params as Record<string, unknown>;
+    const writePath = normalizeMockPath(String(input.remotePath || input.path || ""));
+    const node = findMockNode(writePath);
+    if (!node || node.kind !== "file") throw new Error(`sftp: no such file: ${writePath}`);
+    const bytes = Uint8Array.from(atob(String(input.dataBase64 || "")), (value) => value.charCodeAt(0));
+    mockFileContents.set(writePath, bytes);
+    node.size = bytes.byteLength;
+    result = { success: true };
+  }
+  else if (method === "sftp/copy" || method === "sftp/move") {
+    // 镜像 sftp/copy | sftp/move 契约：`from`（单个或数组）逐项执行进 `toDir`、
+    // 保留基名；overwrite:false 时目标已存在按项失败；逐项回报
+    // { from, to, ok, error? }，任一失败 success=false。move 额外摘除源节点。
+    const input = params as Record<string, unknown>;
+    const sources = Array.isArray(input.from) ? input.from.map(String) : [String(input.from || "")];
+    const toDir = normalizeMockPath(String(input.toDir || ""));
+    const overwrite = input.overwrite === true;
+    const targetDir = findMockNode(toDir);
+    if (!targetDir || targetDir.kind !== "directory") throw new Error(`sftp: no such directory: ${toDir}`);
+    const rows = sources.map((source) => {
+      const fromPath = normalizeMockPath(source);
+      const name = fromPath.split("/").pop() || "";
+      const toPath = `${toDir === "/" ? "" : toDir}/${name}`;
+      try {
+        const node = findMockNode(fromPath);
+        if (!node || !name) throw new Error(`sftp: no such file: ${fromPath}`);
+        const targetNode = findMockNode(toPath);
+        if (targetNode && targetNode !== node && !overwrite) throw new Error(`sftp: target exists: ${toPath}`);
+        if (targetNode && targetNode !== node) {
+          const { parent } = mockParentAndName(toPath);
+          const targetIndex = parent?.children?.indexOf(targetNode) ?? -1;
+          if (!parent || targetIndex < 0) throw new Error(`sftp: cannot write ${toPath}`);
+          parent.children!.splice(targetIndex, 1);
+        }
+        if (method === "sftp/move") {
+          if (fromPath !== toPath) {
+            const { parent: sourceParent } = mockParentAndName(fromPath);
+            const sourceIndex = sourceParent?.children?.indexOf(node) ?? -1;
+            if (!sourceParent || sourceIndex < 0) throw new Error(`sftp: no such file: ${fromPath}`);
+            sourceParent.children!.splice(sourceIndex, 1);
+            node.name = name;
+            targetDir.children!.push(node);
+          }
+        } else if (!targetNode || targetNode !== node) {
+          const copy = structuredClone(node);
+          copy.name = name;
+          targetDir.children!.push(copy);
+        }
+        return { from: fromPath, to: toPath, ok: true };
+      } catch (cause) {
+        return { from: fromPath, to: toPath, ok: false, error: cause instanceof Error ? cause.message : String(cause) };
+      }
+    });
+    result = { success: rows.every((row) => row.ok), results: rows };
+  }
+  else if (method === "sftp/read" || method === "sudo/readFile") {
+    const readPath = normalizeMockPath(String((params as Record<string, unknown>)?.path || ""));
+    const stored = mockFileContents.get(readPath);
+    result = stored
+      ? { dataBase64: base64(stored), truncated: false }
+      : { dataBase64: base64(new TextEncoder().encode("#!/usr/bin/env bash\nset -euo pipefail\n\necho deploy\n")), truncated: false };
+  }
   else if (method === "sftp/download/start") {
     const remotePath = normalizeMockPath(String((params as Record<string, unknown>)?.remotePath || "download.bin"));
     const node = findMockNode(remotePath);
@@ -429,7 +513,7 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   else if (method === "sftp/diskUsage") {
     result = { filesystem: "/dev/sda1", mount: "/", totalBytes: 52_723_200_512, usedBytes: 24_023_981_056, availableBytes: 26_005_927_936, percentUsed: 48 };
   }
-  else if (method === "sftp/chmod") {
+  else if (method === "sftp/chmod" || method === "sudo/chmod") {
     const input = params as Record<string, unknown>;
     const node = findMockNode(String(input.path || ""));
     if (node) node.permissions = String(input.mode || node.permissions);
@@ -649,7 +733,11 @@ window.dbxPlugin = {
     pick: async () => ({ files: [] }),
     read: async () => ({ dataBase64: "", length: 0, eof: true }),
     beginSave: async () => ({ handleId: "visual-save-handle-0001", chunkBytes: 262144 }),
-    write: async (_handleId, offset, data) => ({ written: typeof data === "string" ? data.length : data.byteLength, nextOffset: offset + (typeof data === "string" ? data.length : data.byteLength) }),
+    write: async (_handleId, offset, data) => {
+      // 字符串载荷为 base64；确认的是解码后的字节数，与二进制载荷同义。
+      const written = typeof data === "string" ? atob(data).length : data.byteLength;
+      return { written, nextOffset: offset + written };
+    },
     finish: async () => undefined,
     cancel: async () => undefined,
     onDragState: () => () => undefined,

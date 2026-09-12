@@ -33,6 +33,17 @@ afterEach(() => {
 });
 
 describe("mockDbxHost fixture", () => {
+  it("fileTransfer.write acknowledges decoded bytes for base64, typed-array slices and ArrayBuffer", async () => {
+    const plugin = await loadMock("");
+    const bytes = new Uint8Array([99, 0, 128, 255, 98]).subarray(1, 4);
+    const payloads = [bytes, bytes.slice().buffer, plugin.encodeBase64(bytes)];
+    for (const data of payloads) {
+      expect(await plugin.fileTransfer!.write("fixture-save", 11, data)).toEqual({ written: 3, nextOffset: 14 });
+    }
+    expect(await plugin.fileTransfer!.write("fixture-save", 14, "AA==")).toEqual({ written: 1, nextOffset: 15 });
+    expect(await plugin.fileTransfer!.write("fixture-save", 15, "")).toEqual({ written: 0, nextOffset: 15 });
+  });
+
   it("replays Welcome + OSC 633 transcript on the default reattach startup path (P2-2)", async () => {
     vi.useFakeTimers();
     const plugin = await loadMock("");
@@ -151,6 +162,8 @@ describe("mockDbxHost fixture", () => {
 
   // round2：onLocaleChange 夹具补齐（env.d.ts 宿主 1.1 形状）：?locale= 定初值，
   // __dbxMockSetLocale 模拟宿主 updateLocale 推送，供 i18n 切换链走查。
+  // round2：onLocaleChange 夹具补齐（env.d.ts 宿主 1.1 形状）：?locale= 定初值，
+  // __dbxMockSetLocale 模拟宿主 updateLocale 推送，供 i18n 切换链走查。
   it("exposes onLocaleChange with ?locale= initial value and runtime switching", async () => {
     const plugin = await loadMock("?locale=ja");
     expect(plugin.locale).toBe("ja");
@@ -168,5 +181,77 @@ describe("mockDbxHost fixture", () => {
     setLocale!("en");
     expect(plugin.locale).toBe("en");
     expect(seen).toEqual(["ja", "zh-CN"]);
+  });
+
+  // round4：sftp/transfer/history 夹具补齐——此前落 catch-all（success:true 无
+  // tasks），面板在 mock.html 恒为空态，loadFailed+重试态与历史渲染无法走查。
+  it("sftp/transfer/history mirrors the sidecar contract (newest-first, failed rows, limit, err knob)", async () => {
+    const plugin = await loadMock("");
+    const ok = (await plugin.invoke("sftp/transfer/history", { limit: 50 })) as { tasks: Array<Record<string, unknown>> };
+    expect(ok.tasks.length).toBeGreaterThan(0);
+    // 新→旧排序；status 枚举无 queued；failed 行带 error。
+    const startedAts = ok.tasks.map((task) => task.startedAt as number);
+    expect([...startedAts].sort((a, b) => b - a)).toEqual(startedAts);
+    for (const task of ok.tasks) {
+      expect(["running", "completed", "cancelled", "failed"]).toContain(task.status);
+      expect(typeof task.taskId).toBe("string");
+    }
+    const failed = ok.tasks.find((task) => task.status === "failed");
+    expect(failed?.error).toBeTruthy();
+    // limit 收敛到实际条数。
+    const capped = (await plugin.invoke("sftp/transfer/history", { limit: 2 })) as { tasks: unknown[] };
+    expect(capped.tasks).toHaveLength(2);
+
+    const failing = await loadMock("?err=transferHistory");
+    await expect(failing.invoke("sftp/transfer/history", {})).rejects.toThrow(/transfer history/);
+  });
+
+  // round4：sftp/copy | sftp/move | sftp/write 夹具补齐——此前落 catch-all
+  // （静默 success 但树不变），粘贴/编辑保存流在 mock.html 无法闭环走查。
+  it("sftp/copy and sftp/move mutate the fixture tree per the sidecar contract", async () => {
+    const plugin = await loadMock("");
+    // copy：目标落位、源保留；撞名不覆盖时按项失败。
+    const copy = (await plugin.invoke("sftp/copy", { from: ["/home/demo/deploy.sh"], toDir: "/tmp", overwrite: false })) as {
+      success: boolean;
+      results: Array<{ from: string; to: string; ok: boolean; error?: string }>;
+    };
+    expect(copy.success).toBe(true);
+    expect(copy.results[0].ok).toBe(true);
+    const tmp1 = (await plugin.invoke("sftp/list", { path: "/tmp" })) as { entries: Array<{ name: string }> };
+    expect(tmp1.entries.map((entry) => entry.name)).toContain("deploy.sh");
+    const home1 = (await plugin.invoke("sftp/list", { path: "/home/demo" })) as { entries: Array<{ name: string }> };
+    expect(home1.entries.map((entry) => entry.name)).toContain("deploy.sh");
+
+    const conflict = (await plugin.invoke("sftp/copy", { from: ["/home/demo/deploy.sh"], toDir: "/tmp" })) as {
+      success: boolean;
+      results: Array<{ ok: boolean; error?: string }>;
+    };
+    expect(conflict.success).toBe(false);
+    expect(conflict.results[0].ok).toBe(false);
+    expect(conflict.results[0].error).toContain("target exists");
+
+    const overwrite = (await plugin.invoke("sftp/copy", { from: ["/home/demo/deploy.sh"], toDir: "/tmp", overwrite: true })) as { success: boolean };
+    expect(overwrite.success).toBe(true);
+    const tmp2 = (await plugin.invoke("sftp/list", { path: "/tmp" })) as { entries: Array<{ name: string }> };
+    expect(tmp2.entries.filter((entry) => entry.name === "deploy.sh")).toHaveLength(1);
+
+    // move：目标落位、源摘除。
+    const move = (await plugin.invoke("sftp/move", { from: ["/home/demo/server.log"], toDir: "/tmp" })) as { success: boolean };
+    expect(move.success).toBe(true);
+    const home2 = (await plugin.invoke("sftp/list", { path: "/home/demo" })) as { entries: Array<{ name: string }> };
+    const tmp3 = (await plugin.invoke("sftp/list", { path: "/tmp" })) as { entries: Array<{ name: string }> };
+    expect(home2.entries.map((entry) => entry.name)).not.toContain("server.log");
+    expect(tmp3.entries.map((entry) => entry.name)).toContain("server.log");
+  });
+
+  it("sftp/write persists content that sftp/read echoes back (editor save roundtrip)", async () => {
+    const plugin = await loadMock("");
+    const encoded = btoa("#!/usr/bin/env sh\necho edited\n");
+    await plugin.invoke("sftp/write", { remotePath: "/home/demo/deploy.sh", dataBase64: encoded });
+    const read = (await plugin.invoke("sftp/read", { path: "/home/demo/deploy.sh" })) as { dataBase64: string; truncated: boolean };
+    expect(read.truncated).toBe(false);
+    expect(atob(read.dataBase64)).toBe("#!/usr/bin/env sh\necho edited\n");
+    const stat = (await plugin.invoke("sftp/stat", { path: "/home/demo/deploy.sh" })) as { size: number };
+    expect(stat.size).toBe(30);
   });
 });

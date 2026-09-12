@@ -2,6 +2,8 @@ export type WorkbenchLocale = "en" | "es" | "it" | "ja" | "pt-BR" | "zh-CN" | "z
 
 const messages = {
   "en": {
+    settingsLoadFailed: "Could not load SSH settings. Retry before saving.",
+    alertTriageLoadFailed: "Could not analyze this alert: {error}",
     open: "Open",
     newSession: "New connection",
     connecting: "Connecting SSH...",
@@ -307,6 +309,7 @@ const messages = {
     auditLog: {
       title: "Audit log",
       empty: "No audit entries yet",
+      loadFailed: "Could not load audit entries",
       toggle: "View",
       kindFilter: "Entry type",
       kindAll: "All types",
@@ -325,6 +328,8 @@ const messages = {
     },
   },
   "es": {
+    settingsLoadFailed: "No se pudo cargar la configuración SSH. Vuelve a intentarlo antes de guardar.",
+    alertTriageLoadFailed: "No se pudo analizar esta alerta: {error}",
     open: "Abrir",
     newSession: "Nueva conexión",
     connecting: "Conectando SSH...",
@@ -624,6 +629,7 @@ const messages = {
     auditLog: {
       title: "Registro de auditoría",
       empty: "Aún no hay entradas de auditoría",
+      loadFailed: "No se pudieron cargar las entradas de auditoría",
       toggle: "Ver",
       kindFilter: "Tipo de entrada",
       kindAll: "Todos los tipos",
@@ -642,6 +648,8 @@ const messages = {
     },
   },
   "it": {
+    settingsLoadFailed: "Impossibile caricare le impostazioni SSH. Riprova prima di salvare.",
+    alertTriageLoadFailed: "Impossibile analizzare questo avviso: {error}",
     open: "Apri",
     newSession: "Nuova connessione",
     connecting: "Connessione SSH...",
@@ -941,6 +949,7 @@ const messages = {
     auditLog: {
       title: "Registro di controllo",
       empty: "Nessuna voce di controllo",
+      loadFailed: "Impossibile caricare le voci di controllo",
       toggle: "Vedi",
       kindFilter: "Tipo di voce",
       kindAll: "Tutti i tipi",
@@ -959,6 +968,8 @@ const messages = {
     },
   },
   "ja": {
+    settingsLoadFailed: "SSH 設定を読み込めませんでした。保存する前に再試行してください。",
+    alertTriageLoadFailed: "このアラートを分析できませんでした：{error}",
     open: "開く",
     newSession: "新しい接続",
     connecting: "SSH に接続中...",
@@ -1258,6 +1269,7 @@ const messages = {
     auditLog: {
       title: "監査ログ",
       empty: "監査エントリはまだありません",
+      loadFailed: "監査エントリを読み込めませんでした",
       toggle: "表示",
       kindFilter: "エントリ種別",
       kindAll: "すべての種別",
@@ -1276,6 +1288,8 @@ const messages = {
     },
   },
   "pt-BR": {
+    settingsLoadFailed: "Não foi possível carregar as configurações SSH. Tente novamente antes de salvar.",
+    alertTriageLoadFailed: "Não foi possível analisar este alerta: {error}",
     open: "Abrir",
     newSession: "Nova conexão",
     connecting: "Conectando ao SSH...",
@@ -1575,6 +1589,7 @@ const messages = {
     auditLog: {
       title: "Registro de auditoria",
       empty: "Nenhuma entrada de auditoria ainda",
+      loadFailed: "Não foi possível carregar as entradas de auditoria",
       toggle: "Ver",
       kindFilter: "Tipo de entrada",
       kindAll: "Todos os tipos",
@@ -1593,6 +1608,8 @@ const messages = {
     },
   },
   "zh-CN": {
+    settingsLoadFailed: "SSH 设置加载失败，请重试后再保存。",
+    alertTriageLoadFailed: "告警分析失败：{error}",
     open: "打开",
     newSession: "新建连接",
     connecting: "正在连接 SSH...",
@@ -1898,6 +1915,7 @@ const messages = {
     auditLog: {
       title: "审计日志",
       empty: "还没有审计记录",
+      loadFailed: "审计记录加载失败",
       toggle: "查看",
       kindFilter: "条目类型",
       kindAll: "全部类型",
@@ -1916,6 +1934,8 @@ const messages = {
     },
   },
   "zh-TW": {
+    settingsLoadFailed: "SSH 設定載入失敗，請重試後再儲存。",
+    alertTriageLoadFailed: "告警分析失敗：{error}",
     open: "開啟",
     newSession: "新建連線",
     connecting: "正在連線 SSH...",
@@ -2221,6 +2241,7 @@ const messages = {
     auditLog: {
       title: "稽核日誌",
       empty: "還沒有稽核記錄",
+      loadFailed: "稽核記錄載入失敗",
       toggle: "檢視",
       kindFilter: "條目類型",
       kindAll: "全部類型",

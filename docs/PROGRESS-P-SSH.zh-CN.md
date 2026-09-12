@@ -2284,3 +2284,62 @@ sftp_bookmarks/transfer_history/vault + ssh/mcp/mcp_safety/metrics/main 的 diff
 + 新增 6）。后端零改动未跑 cargo test。smoke SKIP（纯前端交互/夹具，无协议面
 变化）。浏览器级复核（弹窗焦点/Esc、弹层两两不叠开、__dbxMockSetLocale 切语）
 与 0.4.53 smoke/打包留人工，见报告遗留节。R5-P2-2 维持豁免。
+
+## review + 持续优化第 4 轮（2026-09-12，review+optimize agent，换视角 fresh review）
+
+> 扫五个从未系统查过的面：①空态/加载态/错误态一致性 ②表单与输入校验
+> ③键盘覆盖与冲突 ④长列表性能 ⑤mock↔真实桥契约抽查。不重复 round1-2
+> 已修项。详情见 `.goal-state/report-ssh-round4.md`。
+
+发现：P0=0、P1=0、P2=3（均当场修复，纯前端）+ 无缺陷结论 ×3（面 1/2/3
+除审计外均达标）+ 风险记录 ×1（面 4）。
+
+1. **审计日志加载失败静默空态（P2-1）**：`loadAuditEntries` 失败 catch 清空
+   列表且无标记，与"确无记录"不可区分；同弹窗其余五 section 均为
+   "错误+刷新"风格。修复：`auditLoadFailed` 失败态 + i18n 提示 + 重试按钮
+   （新键 `auditLog.loadFailed`，七语同步）；"旧 sidecar 无方法不打断设置
+   弹窗"的原意不变。
+2. **mock 缺 sftp/transfer/history（P2-2）**：落 catch-all 致传输历史面板在
+   mock.html 恒空态，loadFailed+重试与历史渲染无法走查。补 handler（新→旧
+   fixture、failed 带 error、limit 收敛）+ `?err=transferHistory` 失败注入。
+3. **mock 缺 sftp/copy|move|write 与 sudo 写族（P2-3）**：catch-all 静默
+   success 但内存树不变——粘贴流"提示成功但无变化"、编辑器保存后重开仍是
+   旧内容，夹具闭环断裂。按协议契约补齐（from 数组逐项、overwrite 撞名按项
+   失败、move 摘源、write 内容驻留供 read 回读 + size 同步），并把
+   sudo/mkdir|remove|removeAll|chmod|readFile|writeFile 别名到对应 sftp
+   handler，sudo 模式在夹具内可用。
+4. **面 4 风险记录（不实施）**：文件列表全量渲染无虚拟滚动，数千条目目录有
+   卡顿风险（审计封顶 200、历史 50 无风险）；真机确认卡顿再立项。
+5. **面 2/3 无发现**：表单校验（高亮 regex 试编译、限频计数+禁用、书签
+   前置校验、MCP 行内提示）无静默失败；全局键仅 Tab（弹层在场才拦截）与
+   Escape（分层链），终端聚焦态 Cmd+F/0/滚轮/V/Shift+V/Shift+C 均
+   preventDefault，无宿主/浏览器冲突组合键。
+
+验证：`pnpm typecheck` 0 错；`pnpm test` **37 文件 375/375 全绿**（基线 372
++ 新增 3 条 mock 契约锁定用例：transfer/history 契约、copy/move 树变更、
+write→read 闭环）。后端零改动未跑 cargo test。smoke SKIP（前端失败态 +
+可视化夹具，无协议面变化）。mock.html 四点浏览器走查与 0.4.53 smoke/打包
+留人工，见报告遗留节。
+
+
+### 第 4 轮独立复核补充（2026-09-12，本次执行）
+
+启动时上节 round4 改动及报告已存在，按 375 用例起始基线保留；原报告快照见
+`.goal-state/ssh-round4-baseline/.goal-state/report-ssh-round4.md`。本次用失败
+注入与浏览器事件重新验证五个面，修订此前“即时校验 / 已消费快捷键 / 已收敛”
+结论，详细矩阵与证据见 `.goal-state/report-ssh-round4.md`。
+
+新增修复四项：P1 设置读取未成功时阻止默认 / 陈旧草稿保存，补错误与重试；
+P2 告警分诊补就地失败 / 加载反馈并清理旧结果；P2 xterm 已处理快捷键显式
+preventDefault + stopPropagation；P2 mock fileTransfer.write 按解码字节确认。
+两条新提示七语齐全。无后端、shared/、host/、其他插件、版本或依赖改动。
+
+验证：typecheck 通过；37 文件 **376/376**；新增浏览器 smoke 三场景通过
+（外部 Vite 与独立启动模式，pageerror=0），Ctrl+C / Tab 仍到 PTY；连接表单
+只读检查 90 组通过；diff --check 通过。首次 smoke 及两次观察探针的选择器
+错误已修正，失败经过如实写入报告。未跑 cargo / sidecar smoke / 打包全套。
+
+收敛：**否**。剩三类 P2：书签 / 高亮 / 快速命令静默加载失败、高亮校验反馈
+滞后、mock 设置写入后读取仍返回默认值。500 条文件 / 会话全量渲染、审计限
+200 的粗测已记录，未做性能重构。原弹层人工走查、off 真机、0.4.53 smoke /
+打包及 R5-P2-2 豁免维持不动。

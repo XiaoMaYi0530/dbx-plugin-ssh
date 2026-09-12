@@ -571,6 +571,7 @@ const metricsLoading = ref(false);
 const metricsError = ref("");
 const settingsOpen = ref(false);
 const settingsLoading = ref(false);
+const settingsLoadFailed = ref(false);
 const settingsSaving = ref(false);
 const settingsMeta = ref<SshSettings>();
 // 终端 MCP 模式快速开关（工具栏弹出层）：连接级 agentTerminalMode 的就地入口，
@@ -1064,29 +1065,35 @@ function createTerminal() {
 function handleTerminalKey(event: KeyboardEvent) {
   const mod = event.ctrlKey || event.metaKey;
   if (event.type !== "keydown") return true;
+  // xterm 的 false 只跳过终端处理，不会取消浏览器默认动作或冒泡。
+  const consume = () => {
+    event.preventDefault();
+    event.stopPropagation();
+    return false;
+  };
   if (mod && (event.key === "f" || event.key === "F")) {
     openTerminalSearch();
-    return false;
+    return consume();
   }
   if (mod && event.key === "0") {
     resetTerminalZoom();
-    return false;
+    return consume();
   }
   if (event.key === "Escape" && searchOpen.value) {
     closeTerminalSearch();
-    return false;
+    return consume();
   }
   // iTerm2/XShell 风格组合键：Ctrl/Cmd+V 与 Ctrl/Cmd+Shift+V 粘贴（走同一风险
   // 确认流程），Ctrl/Cmd+Shift+C 复制选区；普通 Ctrl+C 保持发给远端（SIGINT）。
   const keyAction = resolveTerminalKeyAction({ mod, shiftKey: event.shiftKey, key: event.key, hasSelection: terminal?.hasSelection() ?? false });
   if (keyAction === "paste") {
-    // 返回 false 会阻止默认行为与原生 paste 事件，避免与确认流程重复写入。
+    // 同时取消原生 paste，避免浏览器与插件各粘贴一次。
     void pasteFromClipboardToTerminal();
-    return false;
+    return consume();
   }
   if (keyAction === "copy") {
     void copyTerminalSelection();
-    return false;
+    return consume();
   }
   return true;
 }
@@ -2183,6 +2190,11 @@ const alertTriageError = ref("");
 const alertTriagePayload = ref("");
 const alertTriageResult = ref<TriageResult>();
 
+watch(alertTriagePayload, () => {
+  alertTriageResult.value = undefined;
+  alertTriageError.value = "";
+});
+
 function openAlertTriage() {
   alertTriageOpen.value = true;
   alertTriageError.value = "";
@@ -2197,10 +2209,11 @@ async function runAlertTriage() {
   }
   alertTriageBusy.value = true;
   alertTriageError.value = "";
+  alertTriageResult.value = undefined;
   try {
     alertTriageResult.value = await window.dbxPlugin.invoke<TriageResult>("ssh/alert/triage", { payload });
   } catch (cause) {
-    showError(cause);
+    alertTriageError.value = t("alertTriageLoadFailed", { error: settingsErrorOf(cause) });
   } finally {
     alertTriageBusy.value = false;
   }
@@ -2500,6 +2513,7 @@ watch(() => session.value?.sessionId, (next, previous) => {
 const auditInlineOpen = ref(false);
 const auditEntries = ref<AuditEntry[]>([]);
 const auditLoading = ref(false);
+const auditLoadFailed = ref(false);
 const auditTruncated = ref(false);
 const auditKindFilter = ref("");
 
@@ -2511,10 +2525,13 @@ async function loadAuditEntries() {
     const result = await window.dbxPlugin.invoke<{ entries: unknown; truncated?: boolean }>("ssh/audit/list", { limit: 200 });
     auditEntries.value = sanitizeAuditEntries(result.entries, 200);
     auditTruncated.value = result.truncated === true;
+    auditLoadFailed.value = false;
   } catch {
-    // 失败静默空态（§3-B4-T1）：旧 sidecar 无该方法时不打断设置弹窗。
+    // 失败不打断设置弹窗（§3-B4-T1），但与"确无记录"区分开：显示加载失败
+    // 提示 + 重试入口（与其他设置 section 的 error+refresh 一致）。
     auditEntries.value = [];
     auditTruncated.value = false;
+    auditLoadFailed.value = true;
   } finally {
     auditLoading.value = false;
   }
@@ -4513,7 +4530,10 @@ function beginChmod(entry: SftpEntry) {
 
 async function openSettings() {
   settingsOpen.value = true;
+  if (settingsLoading.value || settingsSaving.value) return;
   settingsLoading.value = true;
+  settingsLoadFailed.value = false;
+  settingsMeta.value = undefined;
   // 每次打开都回到收起态，并丢弃上次遗留的内联编辑草稿：
   // 主「保存」会串行提交未保存的 profile 编辑，不能把陈旧草稿静默入库。
   profilesInlineOpen.value = false;
@@ -4538,8 +4558,8 @@ async function openSettings() {
     settingsDraft.rememberedCommands = sanitizeRememberedCommands(meta.rememberedCommands);
     settingsDraft.sudoPassword = meta.sudoPassword || "";
     settingsDraft.totpSecret = meta.totpSecret || "";
-  } catch (cause) {
-    showError(cause);
+  } catch {
+    settingsLoadFailed.value = true;
   } finally {
     settingsLoading.value = false;
   }
@@ -4784,7 +4804,7 @@ async function saveMcpSettings() {
  * MCP 表单非法时保持现有校验提示、静默跳过提交。
  */
 async function saveSettings() {
-  if (!session.value || settingsSaving.value) return;
+  if (!session.value || settingsSaving.value || settingsLoading.value || settingsLoadFailed.value || !settingsMeta.value) return;
   settingsSaving.value = true;
   try {
     if (profileEditing.value) await saveProfileDraft();
@@ -4814,7 +4834,7 @@ async function saveSettings() {
 }
 
 async function clearStoredSecrets() {
-  if (!session.value) return;
+  if (!session.value || settingsSaving.value || settingsLoading.value || settingsLoadFailed.value || !settingsMeta.value) return;
   try {
     const meta = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/set", {
       sessionId: session.value.sessionId,
@@ -6103,6 +6123,10 @@ onBeforeUnmount(() => {
         <header><h2>{{ t("settings") }}</h2><button class="icon-button" @click="settingsOpen = false"><X /></button></header>
         <div class="settings-body">
           <div v-if="settingsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+          <div v-else-if="settingsLoadFailed" class="task-error" role="alert">
+            {{ t("settingsLoadFailed") }}
+            <button class="link-button" @click="openSettings">{{ t("refresh") }}</button>
+          </div>
           <template v-else>
             <label class="settings-field">
               <span>{{ t("settingsCredentialSource") }}</span>
@@ -6324,6 +6348,10 @@ onBeforeUnmount(() => {
               <button class="icon-button" :title="t('auditLog.clear')" @click="clearAuditLog"><Trash2 /></button>
             </div>
             <div v-if="auditLoading && !auditEntries.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+            <div v-else-if="auditLoadFailed" class="empty compact">
+              <span>{{ t("auditLog.loadFailed") }}</span>
+              <button class="link-button" @click="loadAuditEntries">{{ t("refresh") }}</button>
+            </div>
             <div v-else-if="!visibleAuditEntries.length" class="empty compact">{{ t("auditLog.empty") }}</div>
             <template v-else>
               <ul class="audit-list">
@@ -6342,9 +6370,9 @@ onBeforeUnmount(() => {
           </section>
         </div>
         <footer>
-          <button :disabled="!settingsMeta?.sudoPasswordSet && !settingsMeta?.totpConfigured" @click="clearStoredSecrets"><Trash2 />{{ t("settingsClearSecrets") }}</button>
+          <button :disabled="settingsLoading || settingsLoadFailed || settingsSaving || (!settingsMeta?.sudoPasswordSet && !settingsMeta?.totpConfigured)" @click="clearStoredSecrets"><Trash2 />{{ t("settingsClearSecrets") }}</button>
           <button @click="settingsOpen = false">{{ t("close") }}</button>
-          <button class="primary-button" :disabled="settingsSaving" @click="saveSettings"><Loader2 v-if="settingsSaving" class="spinning" />{{ t("settingsSave") }}</button>
+          <button class="primary-button" :disabled="settingsLoading || settingsLoadFailed || settingsSaving || !settingsMeta" @click="saveSettings"><Loader2 v-if="settingsSaving" class="spinning" />{{ t("settingsSave") }}</button>
         </footer>
       </article>
     </section>
@@ -6456,12 +6484,14 @@ onBeforeUnmount(() => {
           <button class="icon-button" @click="alertTriageOpen = false"><X /></button>
         </header>
         <p class="muted alert-triage-hint">{{ t("alertTriage.hint") }}</p>
-        <textarea v-model="alertTriagePayload" class="mono alert-triage-payload" rows="6" :placeholder="t('alertTriage.placeholder')" spellcheck="false" autofocus />
-        <p v-if="alertTriageError" class="task-error">{{ alertTriageError }}</p>
+        <textarea v-model="alertTriagePayload" class="mono alert-triage-payload" rows="6" :placeholder="t('alertTriage.placeholder')" :disabled="alertTriageBusy" spellcheck="false" autofocus />
+        <p v-if="alertTriageError" class="task-error" role="alert">{{ alertTriageError }}</p>
         <footer class="alert-triage-actions">
           <button class="primary-button" :disabled="alertTriageBusy || !sanitizeTriagePayload(alertTriagePayload)" @click="runAlertTriage">{{ t("alertTriage.analyze") }}</button>
         </footer>
-        <div v-if="alertTriageResult" class="alert-triage-result">
+        <div v-if="alertTriageBusy" class="empty compact" role="status"><Loader2 class="spinning" />{{ t("loading") }}</div>
+        <div v-else-if="!alertTriageResult && !alertTriageError" class="empty compact">{{ t("alertTriage.emptyResult") }}</div>
+        <div v-else-if="alertTriageResult" class="alert-triage-result">
           <div class="alert-triage-summary">
             <span class="alert-severity-badge" :class="severityClass(alertTriageResult.normalized.severity)">{{ t(`alertTriage.severity.${severityClass(alertTriageResult.normalized.severity)}`) }}</span>
             <span class="alert-category">{{ t(`alertTriage.category.${alertTriageResult.category}`) }}</span>
