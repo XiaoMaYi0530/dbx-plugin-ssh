@@ -20,6 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use crate::agent_terminal::{self, AgentTerminalMode};
+use crate::alert_triage;
 use crate::app_bridge;
 use crate::exec::{self, AuthFlowMode, Hints, SudoAuth};
 use crate::host_key::HostKeyVerifier;
@@ -825,7 +826,35 @@ impl McpState {
                 self.runtime.profiles_delete(id).await
             }
             "ssh_test_connection" => {
-                let connection = stored_connection_from_arguments(arguments)?;
+                // Saved-connection addressing first: a registry reference
+                // (embedded bridge or a normalized stdio call) dials with the
+                // stored credentials; inline credentials stay the fallback
+                // for standalone --mcp sessions. An unregistered stdio
+                // reference never reaches here — it is forwarded through the
+                // app bridge (is_connection_bound_tool) before this arm runs.
+                let connection = match self.registered_connection_by_ref(arguments).await? {
+                    Some(connection) => connection,
+                    None => stored_connection_from_arguments(arguments).map_err(|error| {
+                        // A reference the local session cannot resolve (no
+                        // registry entry, bridge down) must keep the self-heal
+                        // path visible instead of the bare "missing host".
+                        let has_reference = non_empty_argument(arguments, "connectionId")
+                            .is_some()
+                            || non_empty_argument(arguments, "connectionName").is_some()
+                            || endpoint_selector(arguments).is_some();
+                        if has_reference {
+                            format!(
+                                "{error}. The saved connection could not be resolved in this \
+                                 session: start the DBX app (its sidecar holds the credentials), \
+                                 list saved connections with ssh_list_connections, or provide \
+                                 inline credentials (host/username plus password or \
+                                 privateKeyPath)."
+                            )
+                        } else {
+                            error
+                        }
+                    })?,
+                };
                 let started = std::time::Instant::now();
                 let (handle, jumps) = self.runtime.connect_headless(&connection).await?;
                 let latency_ms = started.elapsed().as_millis() as u64;
@@ -881,6 +910,13 @@ impl McpState {
                 let verifier = HostKeyVerifier::new(self.runtime.known_hosts_path());
                 let removed = verifier.remove_known_host(host, port)?;
                 Ok(json!({ "host": host, "port": port, "removed": removed }))
+            }
+            "ssh_alert_triage" => {
+                // Offline intent recognition: the raw alert payload is
+                // normalized and classified without any SSH I/O, so the
+                // playbook can run before an operator even picks a host.
+                let payload = required_str(arguments, "payload")?;
+                Ok(alert_triage::triage_view(&alert_triage::triage(&payload)))
             }
             _ => {
                 let mut result = match name {
@@ -1308,10 +1344,15 @@ impl McpState {
     }
 
     async fn sftp_tool(&self, name: &str, arguments: &Value) -> Result<Value, String> {
+        // Same lazy-establish contract as the transfer tools: resolve the
+        // saved-connection reference (connectionId / connectionName /
+        // endpoint) and dial on first use, so browsing a host the caller
+        // never ssh_exec'd first works instead of demanding a pre-existing
+        // pool entry.
+        self.connection(arguments).await?;
         let mut guard = self.connections.write().await;
-        let pool_id = connection_pool_id(arguments);
         let entry = guard
-            .get_mut(&pool_id)
+            .get_mut(&connection_pool_key(arguments))
             .ok_or("Connection is not established")?;
         match name {
             "sftp_list_dir" => {
@@ -1962,12 +2003,13 @@ fn connection_pool_key(arguments: &Value) -> String {
 /// unregistered `connectionId` is forwarded through the DBX app bridge (L1
 /// fallback) instead of failing the local registry lookup. Local-only tools
 /// are deliberately absent: `ssh_close` keeps local pool semantics,
-/// `ssh_test_connection` is a local dial, known-hosts / quick-sudo /
-/// settings tools never target a connection, and `ssh_list_connections` is
-/// the discovery surface itself. `sftp_upload` / `sftp_download` forward
-/// too: bridge and stdio sidecar run on the same machine, so `localPath`
-/// stays valid on the app side (its sidecar re-applies the local transfer
-/// gates with the shared plugin settings).
+/// known-hosts / quick-sudo / settings tools never target a connection, and
+/// `ssh_list_connections` is the discovery surface itself. `ssh_test_connection`
+/// forwards when a saved reference cannot be resolved locally (the app-side
+/// sidecar holds the credentials) while inline-credential calls stay local.
+/// `sftp_upload` / `sftp_download` forward too: bridge and stdio sidecar run
+/// on the same machine, so `localPath` stays valid on the app side (its
+/// sidecar re-applies the local transfer gates with the shared plugin settings).
 fn is_connection_bound_tool(name: &str) -> bool {
     matches!(
         name,
@@ -1976,6 +2018,7 @@ fn is_connection_bound_tool(name: &str) -> bool {
             | "ssh_run_bg"
             | "ssh_task_status"
             | "ssh_metrics"
+            | "ssh_test_connection"
             | "sftp_list_dir"
             | "sftp_stat"
             | "sftp_exists"
@@ -2741,6 +2784,17 @@ pub fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "ssh_alert_triage",
+            "description": "Triage an ops alert OFFLINE (no SSH connection): normalizes a heterogeneous alert payload, classifies the intent by bilingual keyword scoring (cpu / memory / disk / oom / inode / network / service / generic), and returns a whitelist-safe diagnostic playbook. Pass the raw alert as a JSON string (fields like alertId/title/severity/source/message are recognized; unknown shapes degrade to generic). Read-only: nothing is executed and no suggestion contains sudo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "payload": { "type": "string", "description": "Raw alert payload as a JSON string; heterogeneous fields (alertId/title/severity/source/message/data) are normalized" },
+                },
+                "required": ["payload"],
+            },
+        },
+        {
             "name": "ssh_close",
             "description": "Close the cached SSH/SFTP connection for a host after finishing work.",
             "inputSchema": {
@@ -2751,7 +2805,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_test_connection",
-            "description": "Verify connectivity and authentication for inline SSH settings (including the jump chain) without running commands.",
+            "description": "Verify connectivity and authentication without running commands. Accepts inline SSH settings (including the jump chain) or a saved connection reference: connectionId / connectionName / a unique host+port+username endpoint resolve through the DBX app (app bridge or lifecycle registry), so no credentials need to travel in tool arguments.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[]), "anyOf": connection_selector_requirements() },
         },
         {
@@ -4606,6 +4660,76 @@ mod tests {
             error.contains("does not match"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Saved-connection addressing must reach the dialers: with the fix, an
+    /// sftp call referencing a registered connection attempts the dial (a
+    /// refused-port error) instead of dying on the pre-fix pool lookup, and
+    /// ssh_test_connection no longer demands inline `host`.    #[tokio::test]
+    async fn sftp_and_test_connection_resolve_saved_reference_before_dialing() {
+        let state = state();
+        let stored = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "conn-prod",
+                "name": "Prod",
+                "host": "127.0.0.1",
+                "port": 1,
+                "username": "ops",
+                "password": format!("pw-{}", uuid::Uuid::new_v4()),
+            }
+        }))
+        .unwrap();
+        state
+            .dbx_connections
+            .write()
+            .await
+            .insert(stored.id.clone(), stored);
+
+        for (tool, arguments) in [
+            (
+                "sftp_exists",
+                json!({ "connectionName": "Prod", "path": "/tmp" }),
+            ),
+            ("ssh_test_connection", json!({ "connectionName": "Prod" })),
+        ] {
+            let error = state.call_tool(tool, &arguments, None).await.unwrap_err();
+            assert!(
+                !error.contains("Connection is not established")
+                    && !error.contains("Missing required parameter"),
+                "{tool} bypassed saved-connection resolution: {error}"
+            );
+        }
+    }
+
+    /// The MCP tool surface must expose the alert triage playbook: the
+    /// stdio smoke asserts the tool by name, so a dispatch-only protocol
+    /// method (`ssh/alert/triage`) without an MCP tool would regress the
+    /// intent-recognition surface. Offline: no connection I/O involved.
+    #[tokio::test]
+    async fn alert_triage_is_wired_as_an_mcp_tool() {
+        let state = state();
+        let response = state
+            .call_tool(
+                "ssh_alert_triage",
+                &json!({
+                    "payload": json!({
+                        "alertId": "unit-1",
+                        "title": "CPU 使用率过高",
+                        "severity": "critical",
+                        "source": "prometheus",
+                        "message": "node-1 cpu_usage above 0.9",
+                    })
+                    .to_string()
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let envelope_text = response["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(envelope_text).unwrap();
+        assert_eq!(result["normalized"]["alertId"], "unit-1");
+        assert_eq!(result["category"], "cpu");
+        assert!(!result["suggestions"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

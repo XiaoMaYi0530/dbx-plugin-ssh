@@ -1325,22 +1325,36 @@ fn rest_after_colon(line: &str) -> Option<(&str, &str)> {
 /// Parses `df -kP <path>` output (header stripped) into a usage object.
 pub fn parse_disk_usage(df_output: &str) -> Option<serde_json::Value> {
     use serde_json::json;
-    let line = df_output
+    // `df -kP <path>` prints one data line for the filesystem holding the
+    // path, but that line does not necessarily start with '/': overlay and
+    // tmpfs mounts (containers!) name their filesystem `overlay`/`tmpfs`.
+    // Prefer a device-style line, then fall back to any 6-field line whose
+    // block counts parse as numbers (the POSIX header says "1024-blocks",
+    // so it never passes the numeric check).
+    let candidate = |line: &str| -> Option<serde_json::Value> {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 6 {
+            return None;
+        }
+        Some(json!({
+            "filesystem": fields[0],
+            "mount": fields[5],
+            "totalBytes": fields[1].parse::<u64>().ok()? * 1024,
+            "usedBytes": fields[2].parse::<u64>().ok()? * 1024,
+            "availableBytes": fields[3].parse::<u64>().ok()? * 1024,
+            "percentUsed": fields[4].trim_end_matches('%').parse::<f64>().ok()?,
+        }))
+    };
+    df_output
         .lines()
         .rev()
-        .find(|line| line.trim().starts_with('/'))?;
-    let fields = line.split_whitespace().collect::<Vec<_>>();
-    if fields.len() < 6 {
-        return None;
-    }
-    Some(json!({
-        "filesystem": fields[0],
-        "mount": fields[5],
-        "totalBytes": fields[1].parse::<u64>().ok()? * 1024,
-        "usedBytes": fields[2].parse::<u64>().ok()? * 1024,
-        "availableBytes": fields[3].parse::<u64>().ok()? * 1024,
-        "percentUsed": fields[4].trim_end_matches('%').parse::<f64>().ok()?,
-    }))
+        .find_map(|line| {
+            line.trim()
+                .starts_with('/')
+                .then(|| candidate(line))
+                .flatten()
+        })
+        .or_else(|| df_output.lines().rev().find_map(candidate))
 }
 
 /// Tracks whether a password answer was already accepted during a
@@ -2113,6 +2127,22 @@ tmpfs 8154428 0 8154428 0% /dev/shm
         assert_eq!(usage["totalBytes"], 51_469_868_u64 * 1024);
         assert_eq!(usage["percentUsed"], 48.0);
         assert!(parse_disk_usage("no output").is_none());
+    }
+
+    #[test]
+    fn parses_disk_usage_for_non_device_filesystems() {
+        // Containers (overlay) and tmpfs mounts do not start with '/' —
+        // found by the local_ubuntu MCP coverage pass against the
+        // dbx-ssh-test container.
+        let usage = parse_disk_usage(
+            "Filesystem     1024-blocks      Used Available Capacity Mounted on\noverlay           91029504  76153516  14875988      84% /",
+        )
+        .unwrap();
+        assert_eq!(usage["filesystem"], "overlay");
+        assert_eq!(usage["mount"], "/");
+        assert_eq!(usage["totalBytes"], 91_029_504_u64 * 1024);
+        assert_eq!(usage["availableBytes"], 14_875_988_u64 * 1024);
+        assert_eq!(usage["percentUsed"], 84.0);
     }
 
     #[test]

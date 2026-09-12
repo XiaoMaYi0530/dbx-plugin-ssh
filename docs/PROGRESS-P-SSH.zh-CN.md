@@ -2343,3 +2343,50 @@ preventDefault + stopPropagation；P2 mock fileTransfer.write 按解码字节确
 滞后、mock 设置写入后读取仍返回默认值。500 条文件 / 会话全量渲染、审计限
 200 的粗测已记录，未做性能重构。原弹层人工走查、off 真机、0.4.53 smoke /
 打包及 R5-P2-2 豁免维持不动。
+
+## MCP 易用性覆盖轮：local_ubuntu 真机覆盖 + 三修复 + triage 接线（2026-09-12，0.4.61）
+
+需求：用 dbx ssh MCP 对 local_ubuntu（192.168.33.11）做全工具面覆盖测试，
+发现问题并强化 e2e（连接搜索 / 命令定位 / 意图识别）。
+
+**覆盖发现的问题（真机复现）**：
+1. SFTP 浏览家族（`sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_pwd`
+   / `sftp_read_file` / `sftp_write_file` / `sftp_mkdir` 等 11 个）报
+   "Connection is not established"——`sftp_tool` 只做池查找，不像 exec/传输
+   家族那样解析 `connectionName` / 懒拨号；带 saved-ref 首次浏览必挂。
+2. `ssh_test_connection` 不支持 saved-connection 寻址：saved-ref 直达
+   `stored_connection_from_arguments` 报裸 "Missing required parameter: host"，
+   且被排除在桥转发面外，stdio 无法免凭据测连。
+3. `ssh_alert_triage` 从未接入 MCP 工具面（smoke EXPECTED_TOOLS 与
+   docs/MCP.zh-CN.md 均已声明，tools/list 实际只有 28 个）——**HEAD 上
+   smoke_mcp.py 本就 FAIL**（`missing tools: ['ssh_alert_triage']`）。
+4. `exec::parse_disk_usage` 只认 `/` 前缀 df 数据行，容器 overlay/tmpfs
+   （`overlay 91029504 … /`）解析失败——dbx-ssh-test 容器内 `sftp_disk_usage`
+   必挂。
+
+**修复**（backend/src/mcp.rs + exec.rs）：
+1. `sftp_tool` 改为 `self.connection()` 懒建立 + `connection_pool_key` 取池
+   条目（与 upload/download 同契约），SFTP 家族全量支持 saved-ref 首调。
+2. `ssh_test_connection` 先过 `registered_connection_by_ref`（注册表/桥）再
+   回落内联凭据；加入 `is_connection_bound_tool` 桥转发面；无法解析的
+   saved-ref 报错带自愈路径（启动 DBX app → `ssh_list_connections` → 内联凭据）。
+3. `ssh_alert_triage` 接入 `run_tool` 外层 match（离线、不触发
+   drop_connection）+ tool_definitions 声明，tools/list 恢复 29 个，与
+   docs/MCP.zh-CN.md 对齐。
+4. `parse_disk_usage` 保底解析任意 6 列数值行（POSIX 表头 "1024-blocks"
+   过不了数值检查，无头部误吸风险）；设备行优先级保持。
+
+**e2e/smoke 强化**（scripts/smoke_mcp.py）：
+- 新增连接寻址面：21 个连接类工具逐个断言 `connectionName` 属性 +
+  selector anyOf；`ssh_list_connections` 降级回路；saved-ref 不可解析的
+  自愈引导报错。
+- live 段扩容：browse-first（SFTP 懒建立回归，覆盖问题 1 的直接复现路径）、
+  `ssh_run_bg` + `ssh_task_status` 轮询闭环、SFTP 文件家族 11 工具全链路
+  （mkdir→write→read→stat→exists→copy→rename→chmod→move→disk_usage→remove）。
+- 意图识别：triage cpu/memory/disk 三意图断言（OOM 优先级避开）。
+- Rust 新增单测：`sftp_and_test_connection_resolve_saved_reference_before_dialing`、
+  `alert_triage_is_wired_as_an_mcp_tool`、`parses_disk_usage_for_non_device_filesystems`。
+
+验证：`cargo test --release` 332/332 全绿；`smoke_mcp.py --host`（dbx-ssh-test
+容器真机回环）all green（29 工具 + 全部新面）。前端零改动未跑前端三件套。
+宿主/协议无变更。版本 0.4.60 → 0.4.61。

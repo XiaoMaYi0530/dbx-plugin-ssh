@@ -55,7 +55,7 @@ dbx-plugin-ssh --mcp
 
 ### stdio 桥接兜底（免内联凭据）
 
-stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec_sudo` / `ssh_run_bg` / `ssh_task_status` / `ssh_metrics` / `sftp_*` 全家）时，若该 id 未在本会话注册，整次调用自动转发给运行中的 DBX 应用本地 TCP 桥执行——应用未运行会自动唤起，凭据由应用侧解析，**不经工具参数**；桥不可用（应用无法唤起、桥端口不可达等）时回落原内联凭据路径，工具面形状不变。
+stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec_sudo` / `ssh_run_bg` / `ssh_task_status` / `ssh_metrics` / `ssh_test_connection` / `sftp_*` 全家）时，若该 id 未在本会话注册，整次调用自动转发给运行中的 DBX 应用本地 TCP 桥执行——应用未运行会自动唤起，凭据由应用侧解析，**不经工具参数**；桥不可用（应用无法唤起、桥端口不可达等）时回落原内联凭据路径，工具面形状不变。
 
 转发语义注意：
 
@@ -124,10 +124,10 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 | `ssh_run_bg` | 把长命令以 nohup 方式脱离会话启动，立即返回 `taskId`/`pid`/`logPath`；输出落在服务器 `/tmp/.dbx-ssh-tasks/<taskId>.log`，断线、超时、换会话均不丢。与 `ssh_exec` 同受危险命令确认门与只读写门约束 |
 | `ssh_task_status` | 轮询 `ssh_run_bg` 任务：`state`（running/done/missing）、完成后的 `exitCode`、pid 存活状态与输出尾部（`tailBytes`，200–16000）。通过服务器侧日志文件查询，天然跨连接/跨会话 |
 | `ssh_metrics` | CPU/内存/负载/磁盘/运行时长（只读命令） |
-| `ssh_test_connection` | 验证连通性与认证（含跳板链），返回延迟 |
+| `ssh_test_connection` | 验证连通性与认证（含跳板链），返回延迟；支持全部连接寻址（`connectionId` / `connectionName` / 唯一 endpoint），保存连接经桥或注册表解析凭据，不解析成功时报自愈引导（启动 DBX app → `ssh_list_connections` → 内联凭据） |
 | `ssh_list_known_hosts` / `ssh_remove_known_host` | 管理插件 known_hosts（不改系统 `~/.ssh/known_hosts`） |
 | `ssh_close` | 关闭缓存的连接（方式二按连接键；方式一由 sidecar 生命周期管理） |
-| `sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_pwd` | 浏览、检查远端路径与登录家目录 |
+| `sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_pwd` | 浏览、检查远端路径与登录家目录；**懒建立连接**（0.4.61 起）：无需先 `ssh_exec` 预热，首次调用即按寻址解析并拨号 |
 | `sftp_read_file` / `sftp_write_file` | 读写远端文件（文本或 base64，支持 offset 分页） |
 | `sftp_upload` / `sftp_download` | 本地 ↔ 远端单文件传输（受 `maxUploadBytes` / `maxDownloadBytes` 限制；本地路径校验先于拨号，校验拒绝不清连接池）。本地路径受传输根约束：必须落在 `localTransferRoot`（未配置时为系统临时目录 + 插件数据目录）之内，且任何模式下都拒绝敏感路径（凭据库、shell 启动文件等，见下文「本地传输路径约束」） |
 | `sftp_mkdir` / `sftp_remove` / `sftp_rename` / `sftp_chmod` | 目录与文件管理 |
