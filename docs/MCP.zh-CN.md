@@ -51,7 +51,7 @@ dbx_call_plugin_tool {
 dbx-plugin-ssh --mcp
 ```
 
-此模式下没有 DBX 连接存储，凭据随每次调用内联传入（`host`/`username`/`password` 或 `privateKeyPath`，及 Quick Sudo/2FA 编排字段、`jumpHosts` 跳板链），按 `username@host:port` 进程内池化。未知主机密钥采用 **TOFU 首次信任**（记录后变化仍拒绝）。MCP 模式与 DBX 插件模式互斥：同一进程只运行其中一种。`initialize` 的 `serverInfo.name` 为完整插件 id `io.dbx.ssh`（files/ldap/kafka 同族同款）。带 `connectionId` / `connectionName` 的调用另有桥接兜底，见下节。
+此模式下没有 DBX 连接存储，凭据随每次调用内联传入（`host`/`username`/`password` 或 `privateKeyPath`，及 Quick Sudo/2FA 编排字段、`jumpHosts` 跳板链），按 `username@host:port` 进程内池化。未知主机密钥采用 **TOFU 首次信任**（记录后变化仍拒绝）。MCP 模式与 DBX 插件模式互斥：同一进程只运行其中一种。`initialize` 的 `serverInfo.name` 为完整插件 id `io.dbx.ssh`（与同系列插件一致）。带 `connectionId` / `connectionName` 的调用另有桥接兜底，见下节。
 
 ### stdio 桥接兜底（免内联凭据）
 
@@ -62,42 +62,24 @@ stdio 会话里用 `connectionId` 调用连接类工具（`ssh_exec` / `ssh_exec
 - 命令在**应用侧** sidecar 执行，本会话的进程级只读开关（`DBX_SSH_MCP_READ_ONLY`）与每连接 sudo 白名单闸门**不适用**——由应用侧连接自身的只读标志与连接配置生效。
 - 未注册 id 的报错文案给出三条出路：启动 DBX 应用 / 用 `ssh_list_connections` 列出 id / 提供内联凭据。
 - 完整列表能力要求应用版本含 `POST /list-plugin-connections` 桥路由，旧版应用上 `ssh_list_connections` 降级为"仅本会话注册表"并附 `note` 说明。
-- **桥降级矩阵（2026-09-13 第二轮覆盖钉死）**：全部 21 个连接级工具在未注册 id 下都进入同一 L1 转发计划（单测逐工具钉死）；桥端口已发布但应用已死（端口陈旧/假监听）时转发**快速回落**（不走 30s 唤醒预算挂起），回落错误带完整自愈三件套；`ssh_list_connections` 在桥不可答时降级 `session-registry` + `note`。smoke 以内嵌 stub DBX app（内存 HTTP 服务器）实转 `/list-plugin-connections` 与 `/call-plugin-tool` 全链路（连接名经桥解析、转发按解析出的 id、应用侧 MCP envelope 原样透传）。
+- **桥降级行为**：全部 21 个连接级工具在未注册 id 下都进入同一转发计划；桥端口已发布但应用已死（端口陈旧/假监听）时转发**快速回落**（不消耗唤起等待预算），回落错误带自愈引导；`ssh_list_connections` 在桥不可答时降级 `session-registry` + `note`。smoke 以内嵌 stub DBX app（内存 HTTP 服务器）实转 `/list-plugin-connections` 与 `/call-plugin-tool` 全链路（连接名经桥解析、转发按解析出的 id、应用侧 MCP envelope 原样透传）。
 
-### JSON-RPC 错误码分档（2026-09-13 第三轮族内统一）
+### JSON-RPC 错误码分档
 
-stdio JSON-RPC 层错误码与 ldap/kafka/files 同族一致：**传输层用标准码**——
-`-32700` parse error（请求行非合法 JSON）、`-32601` method not found（未注册
-的 `method`，文案仍为 `Method not found: <method>`）、`-32600` invalid request
-（缺 id 等）；**工具级/应用级错误（含 `tools/call` 内未注册工具名、门拒绝、
-远端失败）一律 `-32000`**。桥模式（DBX 插件内嵌）不经 JSON-RPC 信封，业务
-错误统一 `-32000`（`to_plugin_error`），未知 binary 通道 `-32601`——本轮无改动。
+stdio JSON-RPC 层错误码与同系列插件一致：**传输层用标准码**——`-32700` parse error（请求行非合法 JSON）、`-32601` method not found（未注册的 `method`，文案仍为 `Method not found: <method>`）、`-32600` invalid request（缺 id 等）；**工具级/应用级错误（含 `tools/call` 内未注册工具名、门拒绝、远端失败）一律 `-32000`**。桥模式（DBX 插件内嵌）不经 JSON-RPC 信封，业务错误统一 `-32000`（`to_plugin_error`），未知 binary 通道 `-32601`。
 
-### 传输层健壮性（2026-09-13 第五轮可靠性纵深）
+### 传输层健壮性
 
 stdio 分发循环对敌意输入保持"进程不崩、连接不挂、后续请求照常"：
 
-- **非法 JSON / 非法 UTF-8 字节流** → 单行 `-32700` parse error（id 为
-  null）后继续服务（非法 UTF-8 此前会以 I/O `InvalidData` 终止整个会话，
-  已修复）；真正的管道 I/O 错误仍然终止。
-- **notification**（`method` 为 `notifications/*`，无 id）→ **不产生任何
-  响应**，连接继续可用；无 id 的非 notification 请求按族内分档回
-  `-32600`（null id）。
-- **信封校验（`-32600`）**：`jsonrpc` 非 `"2.0"`（含缺失/数字形态）、
-  `method` 缺失或非字符串、`id` 为 object/null/bool 等非法形态 → 结构化
-  invalid request；合法 string/number id 原样回显。
-- **超长行**（如 8 MiB 参数串）：上限内正常解析并按工具语义应答，不 panic
-  不挂死。**单行上限（2026-09-13 第六轮族内拉齐）**：`DBX_SSH_MCP_STDIO_MAX_LINE`
-  （字节，缺省 16 MiB；非法/0 值回落缺省，与 files
-  `DBX_FILES_MCP_STDIO_MAX_LINE` 同族）。超限行整体丢弃（读取层 `read_until`
-  连同行尾换行消费完毕）并回单条 `-32700`（消息带上限字节数与 env 名），随后
-  继续服务下一请求；非法 UTF-8 经有损解码走同一 `-32700` 路径。
-- **pipelining**：请求可不等响应连发，响应按 id 一一对应（处理器并发执行，
-  单行完整性由 stdout 互斥锁保证）。
+- **非法 JSON / 非法 UTF-8 字节流** → 单行 `-32700` parse error（id 为 null）后继续服务；真正的管道 I/O 错误仍然终止。
+- **notification**（`method` 为 `notifications/*`，无 id）→ **不产生任何响应**，连接继续可用；无 id 的非 notification 请求按分档回 `-32600`（null id）。
+- **信封校验（`-32600`）**：`jsonrpc` 非 `"2.0"`（含缺失/数字形态）、`method` 缺失或非字符串、`id` 为 object/null/bool 等非法形态 → 结构化 invalid request；合法 string/number id 原样回显。
+- **超长行**（如 8 MiB 参数串）：上限内正常解析并按工具语义应答，不 panic 不挂死。**单行上限**：`DBX_SSH_MCP_STDIO_MAX_LINE`（字节，缺省 16 MiB；非法/0 值回落缺省）。超限行整体丢弃（连同行尾换行消费完毕）并回单条 `-32700`（消息带上限字节数与 env 名），随后继续服务下一请求；非法 UTF-8 经有损解码走同一 `-32700` 路径。
+- **pipelining**：请求可不等响应连发，响应按 id 一一对应（处理器并发执行，单行完整性由 stdout 互斥锁保证）。
 - **空行 / 纯空白 / CRLF 行尾**：静默容忍，不产生响应也不死循环。
 
-smoke `protocol robustness` 段逐项实发钉死（每种敌意输入后跟合法 ping 验证
-会话健康）。
+以上行为由 smoke 的 `protocol robustness` 段逐项覆盖（每种敌意输入后跟合法 ping 验证会话健康）。
 
 ### connectionId 从哪来
 
@@ -161,21 +143,23 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 | `ssh_multi_exec` | 一条命令在多个**已保存连接**上聚合执行并逐目标回结果（隐藏通道语义，不经可见终端/agentTerminalMode）。`targets`：1–10 个连接引用（connectionId/connectionName），保序去重，任一未解析整体拒绝；`mode` parallel（默认，并发）/ sequential（顺序）；`stopOnError` 仅 sequential 生效（首败即停）；`confirmDestructive` 一次覆盖全部目标的灾难门；**不提供 sudo**（提权走单目标 `ssh_exec_sudo`）。逐目标独立过只读白名单门（连接只读时仅放行巡检命令）。stdio 独立模式无注册表，targets 解析即报引导 |
 | `ssh_terminal_input` | 向连接的**存活 DBX 终端**注入原始输入（交互应答 / Ctrl+C / 方向键语义；终端必须已打开）。`\n`/`\r\n` 折叠为 Enter，NUL 剥离，8 KiB 截断；`appendNewline` 默认 false（交互应答自带 `\r`，要执行键入命令置 true）。**输出不收集**——终端本身可见，要收集输出用 `ssh_exec{runInTerminal:true}`。门禁：只读连接仅放行纯控制序列；灾难行需 `confirmDestructive: true`（只读上一律拒绝）；sudo 行受连接 sudo 白名单约束。stdio 模式无工作台 PTY，调用报引导错误 |
 | `ssh_task_status` | 轮询 `ssh_run_bg` 任务：`state`（running/done/missing）、完成后的 `exitCode`、pid 存活状态与输出尾部（`tailBytes`，200–16000）。通过服务器侧日志文件查询，天然跨连接/跨会话 |
-| `ssh_metrics` | CPU/内存/负载/磁盘/运行时长（只读命令） |
+| `ssh_metrics` | CPU/内存/负载/磁盘/运行时长（只读命令）。可选 `sections` 投影：只返回点名的顶层段（`hostname`/`kernel`/`uptimeSeconds`/`cpu`/`memory`/`disks`/`network`/`processes`/`topMemory`/`osId`/`osPretty`），接受单名或数组；未知段名在拨号前 fail-fast 并列出合法段，空数组拒绝（省略参数即全量）。用于压缩大响应的 token 占用 |
 | `ssh_test_connection` | 验证连通性与认证（含跳板链），返回延迟；支持全部连接寻址（`connectionId` / `connectionName` / 唯一 endpoint），保存连接经桥或注册表解析凭据，不解析成功时报自愈引导（启动 DBX app → `ssh_list_connections` → 内联凭据） |
 | `ssh_list_known_hosts` / `ssh_remove_known_host` | 管理插件 known_hosts（不改系统 `~/.ssh/known_hosts`） |
 | `ssh_close` | 关闭缓存的连接（方式二按连接键；方式一由 sidecar 生命周期管理） |
-| `sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_pwd` | 浏览、检查远端路径与登录家目录；**懒建立连接**（0.4.61 起）：无需先 `ssh_exec` 预热，首次调用即按寻址解析并拨号 |
+| `sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_pwd` | 浏览、检查远端路径与登录家目录；**懒建立连接**：无需先 `ssh_exec` 预热，首次调用即按寻址解析并拨号 |
 | `sftp_read_file` / `sftp_write_file` | 读写远端文件（文本或 base64，支持 offset 分页） |
 | `sftp_upload` / `sftp_download` | 本地 ↔ 远端单文件传输（受 `maxUploadBytes` / `maxDownloadBytes` 限制；本地路径校验先于拨号，校验拒绝不清连接池）。本地路径受传输根约束：必须落在 `localTransferRoot`（未配置时为系统临时目录 + 插件数据目录）之内，且任何模式下都拒绝敏感路径（凭据库、shell 启动文件等，见下文「本地传输路径约束」） |
 | `sftp_mkdir` / `sftp_remove` / `sftp_rename` / `sftp_chmod` | 目录与文件管理。`sftp_chmod` 的 `mode` 兼容多种写法：字符串 `"0644"`/`"0o644"` 按八进制数字读；数字全部由 0-7 组成时也按八进制读（`644` → `0644`），其余数字按原始权限位读（`384` = `0600`） |
 | `sftp_disk_usage` | 路径所在挂载的磁盘用量 |
 | `sftp_copy` / `sftp_move` | 服务器内复制 / 剪切（`from` 单值或数组 → `toDir`，逐项返回成败） |
-| `ssh_alert_triage` | 告警分诊（**无连接参数、从不执行**）：异构告警 JSON（任意 schema）或纯文本 → 结构化（对齐 openocta `/hooks/alert` 兼容语义）+ 双语关键词分类（`cpu/memory/disk/inode/network/oom/service/generic`）+ 只读诊断命令清单（每条带 `purposeKey`；playbook 逐条经 `mcp_safety` 白名单单测钉死，只读连接可直接执行）。执行由调用方经 `ssh_exec` 等门禁完成 |
+| `ssh_alert_triage` | 告警分诊（**无连接参数、从不执行**）：异构告警 JSON（任意 schema）或纯文本 → 结构化 + 双语关键词分类（`cpu/memory/disk/inode/network/oom/service/generic`）+ 只读诊断命令清单（每条带 `purposeKey`；playbook 全部命中只读命令白名单，只读连接上可直接执行）。执行由调用方经 `ssh_exec` 等门禁完成 |
 
 **连接寻址（保存连接优先，内联凭据兜底）**：上表除 `ssh_list_connections`、known_hosts 管理与本地工具外的连接类工具，都可用 `connectionId` 精确定位；也可用 `connectionName`，重名时补充 `host` / `port` / `username` 做唯一筛选。若不传 id/name，提供完整 endpoint（`host` + `username`，`port` 默认 22）也会唯一复用已注册连接，因此不需要重复传密码。候选为零时才回落内联凭据/stdio bridge 兜底；候选超过一个时拒绝并列出候选 id，避免静默连错主机或账户。`connectionId` 与其它 selector 同时出现但不一致也会拒绝。
 
-### LLM 输入容错（2026-09-13 覆盖审计落地）
+**工具 annotations（MCP 规范 Tool annotations）**：`tools/list` 与 `mcp/tools`（DBX MCP 桥共用同一份定义）为全部 31 个工具附加 `annotations` 元数据——`title`（客户端工具选择器的人读名）、`readOnlyHint`（可证明只读的巡检/读取类工具为 true）、`destructiveHint`（exec 家族与 remove/move/overwrite/删除类为 true；mkdir/rename/chmod/profile save/close 等变更但非破坏类为 false）、`idempotentHint`、`openWorldHint`（`ssh_alert_triage` 全离线为 false，其余默认 true）。hints 仅是建议信号，供 MCP 客户端做只读预放行与破坏性确认分级；服务端安全门（mcp_safety 白名单、confirm 门、只读连接门）始终是最终裁决，hints 分类与内部门禁分类保持一致。宿主侧两条桥路径——dbx-mcp `LocalBackend::list_plugin_tools` 与桌面 `mcp_bridge.rs` ——对工具定义响应均为 serde_json Value 纯透传，annotations 原样到达 `dbx_list_plugin_tools` 客户端。
+
+### LLM 输入容错
 
 针对"调用方是 LLM"这一现实，参数解析层做了如下宽容与 fail-fast（均在任何网络 I/O 之前）：
 
@@ -185,12 +169,12 @@ MCP 调用方是 LLM，`sftp_upload`（本地读）与 `sftp_download`（本地�
 - **未知工具名可行动**：调用未注册工具名报 `Unknown tool: '<名字>'`，分隔符/大小写变体（`sftp-listdir`、`SSH_EXEC`）附 `Did you mean '...'` 建议，所有报错都指向 `tools/list`。
 - **`sftp_exists` 只把 `NoSuchFile` 判为不存在**：权限拒绝等真实错误按错误返回，不再误报 `exists: false`。
 - **`ssh_close` 需要显式连接引用**：无任何 selector 时报指引错误，而不是对无意义的 `mcp-@:22` 池键报 "no cached connection"。
-- **缺参一次枚举全部缺失项（2026-09-13 第六轮）**：`ssh_multi_exec`
-  （`targets`/`command`）与 `sftp_upload` / `sftp_download`
-  （`localPath`/`remotePath`）在多个必填参数同时缺失时单条报错全部点名
-  （`Missing required parameters: a, b`，按 schema required 顺序），调用方
-  一轮即可补齐；缺一个时只点名那一个。出现但类型错误的参数不混入枚举，
-  仍按参数点名报 `Missing or invalid parameter: <key> (expected a non-empty string)`。
+- **缺参一次枚举全部缺失项**：`ssh_multi_exec`（`targets`/`command`）与
+  `sftp_upload` / `sftp_download`（`localPath`/`remotePath`）在多个必填参数
+  同时缺失时单条报错全部点名（`Missing required parameters: a, b`，按 schema
+  required 顺序），调用方一轮即可补齐；缺一个时只点名那一个。出现但类型错误
+  的参数不混入枚举，仍按参数点名报
+  `Missing or invalid parameter: <key> (expected a non-empty string)`。
 - 参数类型错误（必填字段传了数字/空串）统一报 `Missing or invalid parameter: <key> (expected a non-empty string)`。
 
 ## 生产环境误操作防范
@@ -227,10 +211,10 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
    fork 炸弹、`chmod/chown -R` 系统根、`/etc/passwd|shadow|sudoers|fstab` 与
    `/boot/` 覆盖或删除、`docker prune`、`find -delete`、`kill -9 -1`、SQL
    `DROP DATABASE/TABLE`。误判方向刻意保守：拦错只是多要一次确认，放错才是事故。
-   **灾难门对抗加固（2026-09-13 第五轮）**：灾难判定对经典绕过形态保持命中——
-   `sudo` 前缀剥旗标后检查内层（`sudo rm -rf /`、`sudo -u root rm -rf /etc`、
-   `sudo -- mkfs …`）、`sh/bash/zsh -c` 脚本文本递归评估（`sh -c 'rm -rf /'`）、
-   `$(…)`/反引号子命令载荷扫描（`echo $(rm -rf /)`、嵌套替换）——三者只做
+   灾难判定对常见绕过形态保持命中——`sudo` 前缀剥旗标后检查内层
+   （`sudo rm -rf /`、`sudo -u root rm -rf /etc`、`sudo -- mkfs …`）、
+   `sh/bash/zsh -c` 脚本文本递归评估（`sh -c 'rm -rf /'`）、`$(…)`/反引号
+   子命令载荷扫描（`echo $(rm -rf /)`、嵌套替换）——三者只做
    Unknown→Destructive 的**单向收紧**，绝不反向把包装命令升级为只读白名单
    （`sh -c 'df -h'` 仍是 Unknown、只读连接照拒）。敏感路径匹配统一走归一化
    形态：`//etc//shadow`、`/etc/./shadow`、相对路径 `./etc/shadow` 与系统目录
@@ -257,25 +241,25 @@ MCP 调用方是 LLM，误操作的代价与人在终端敲错相同——因此
 （`-u` 等 run-as）不建模、永不匹配。白名单非空时，`ssh_exec_sudo`、
 `ssh_exec`/`ssh_run_bg` 里的内联 `sudo …`（防 NOPASSWD/时间戳缓存绕过）与
 工作台 exec 栏的 sudo 执行都要求命中条目，未命中即拒绝并回显允许模式
-（`sudo -l` 风格，LLM 可自我纠正）；空 = 门关闭（行为同旧版）。结构化
+（`sudo -l` 风格，LLM 可自我纠正）；空 = 门关闭。结构化
 `sudo_fs` 操作（工作台 sudo 文件面板）是用户主动 UI 动作，不在门内。
 内联凭据重拨同一主机时按端点身份继承该主机的白名单（与只读门同源）。
 
 分类器不做 shell 完整解析（引号内 `;` 仍会切分、`$(...)` 与重定向按 Unknown
-处理；但替换/包装内的灾难载荷会按上文第五轮加固升级为 Destructive），所有偏差
+处理；但替换/包装内的灾难载荷会按上文包装形态规则升级为 Destructive），所有偏差
 方向都是"更严"：最坏情况是把可放行的命令降级拒绝，不会放行更危险的命令。
 新增只读动词/危险模式/敏感路径请同步 `mcp_safety.rs` 的表与
 单测，sudo 白名单语义见 `sudo_allowlist.rs`。
 
-**门序与组合不变量（2026-09-13 第二轮单测钉死）**：call_tool 门序为
+**门序与组合不变量**：call_tool 门序为
 未知工具/端口早校验 → connectionScope（fail-closed）→ 只读写门 → 敏感
-路径 → sudo 白名单 → 灾难 `confirmDestructive` →（§1.3 confirm）→ 桥转发
+路径 → sudo 白名单 → 灾难 `confirmDestructive` →（confirm 权限档）→ 桥转发
 → 执行。组合不放大权限：白名单命中的灾难命令仍要确认；确认位无法覆盖
 只读连接与进程级只读开关；只读门先于白名单（写工具救不回）；scope 非空
 时内联拨打在任何灾难判定之前整体拒绝；确认位也不解除 sudo 白名单
 （terminal_input 组合同序）。
 
-## §1.3 权限档（execPermissionMode / connectionScope）
+## 权限档（execPermissionMode / connectionScope）
 
 操作者级两个开关，`mcp/settings/set` 持久化（与尺寸限制同文件
 `mcp-settings.json`，**先全量验证再合并写盘**——拒绝的更新不动文件），
@@ -307,9 +291,9 @@ confirm fail-closed 与 scope fail-closed（含 list 在作用域下可用）。
 三层机制协同，针对"长命令 + 不稳定网络 + MCP 宿主等待上限"的组合场景：
 
 1. **stdio 请求并发**：sidecar 的 JSON-RPC 主循环逐请求 `tokio::spawn`，一个
-   慢 `ssh_exec` 不再阻塞 `ping` / `tools/list` / 其他连接的调用（此前逐请求
-   `block_on`，一个 300 秒命令会拖死整个插件直至超时）。stdin 关闭后在途请求
-   drain 至多 300 秒再退出。响应可能乱序返回，JSON-RPC 以 id 关联，语义不变。
+   慢 `ssh_exec` 不会阻塞 `ping` / `tools/list` / 其他连接的调用。stdin 关闭后
+   在途请求 drain 至多 300 秒再退出。响应可能乱序返回，JSON-RPC 以 id 关联，
+   语义不变。
 2. **后台任务工具**：`ssh_run_bg` + `ssh_task_status` 把"nohup + 日志文件 +
    轮询"产品化。日志与 pid 文件存放在服务器 `/tmp/.dbx-ssh-tasks/`，是任务的
    持久记录——宿主放弃等待、连接反复断开、sidecar 重启、换一个会话，都能重新
@@ -333,8 +317,8 @@ confirm fail-closed 与 scope fail-closed（含 list 在作用域下可用）。
   app 未运行会尝试 `open -a DBX.app` 唤起，可用 `DBX_APP_LAUNCH_CMD` 自定义）把调用
   转发到 **app 自己的插件 sidecar**——与工作台同一进程，命令出现在 app 终端里。
   转发要求 `connectionId` 指向 DBX 已保存的连接（凭据由 app 侧解析，不经 stdio 调用方）。
-  `connectionId` 已随全部连接类工具的 inputSchema 声明（0.4.12：`ssh_*` / `sftp_*` 共
-  22 个），严格校验的 stdio 客户端（如 ZCode）不会再以「未声明参数」拒绝该字段；
+  `connectionId` 已随全部连接类工具的 inputSchema 声明，严格校验的 stdio 客户端
+  （如 ZCode）不会以「未声明参数」拒绝该字段；
   连接 id 可用 `ssh_list_connections` 列出（见「connectionId 从哪来」；DBX 连接存储
   `connections` 表 `id` 列、连接名在 `config_json.name` 为最后兜底）。
 - 该连接没有打开的终端会话时报错引导（"open the SSH workbench terminal first"），
@@ -344,25 +328,24 @@ confirm fail-closed 与 scope fail-closed（含 list 在作用域下可用）。
 - 连接级默认行为由工作台设置 `agentTerminalMode` 决定（`off` 默认不路由 /
   `auto` 分级审批 / `strict` 每条必审，协议见 PROTOCOL「AI 终端同步执行」）；
   `runInTerminal` 显式值优先于连接模式。**终端工具栏快速开关**：工作台按钮行
-  新增「终端 MCP 模式」弹出层（`Bot` 图标，非 `off` 高亮），就地切换连接级模式——
+  的「终端 MCP 模式」弹出层（`Bot` 图标，非 `off` 高亮）可就地切换连接级模式——
   开启后 MCP exec 命令（即使不传 `runInTerminal`）都经该终端可见执行（审计/学习），
-  关闭则全部走静默隐藏通道。**模式持久化（0.4.49）**：`agentTerminalMode` 落盘到
-  插件数据目录 `agent-modes.json`（按 connectionId 记录，off 移除条目），app/sidecar
-  重启后保持，不再静默回落 `off`——此前「设置过、重启后无效」即此原因。
+  关闭则全部走静默隐藏通道。**模式持久化**：`agentTerminalMode` 落盘到
+  插件数据目录 `agent-modes.json`（按 connectionId 记录，off 移除条目），
+  app/sidecar 重启后保持。
 - **agent 可自主决定**：`runInTerminal` 是 agent 决策参数——工具 schema 引导 AI 在
   任务需要可见性、人工监督或交互性时主动传 `true`，不必等用户开模式。`off` 连接上
-  显式 `runInTerminal: true` 的提权命令（sudo/灾难命中）不再死路拒绝，而是触发
+  显式 `runInTerminal: true` 的提权命令（sudo/灾难命中）不直接死路拒绝，而是触发
   工作台人工审批弹窗（超时即拒绝）；隐式路由（未传参）在 `off` 下维持隐藏通道不变。
 - **静默调用不打扰**：宿主桥转发前按「工具是否为 ssh_exec 族 + 显式 `runInTerminal`
   + 连接模式探针（`ssh/agent/mode/get`，任何失败回落 `off`）」判定是否需要打开
-  工作台标签；静默调用（隐藏通道）不再自动开标签，事件监听也不再抢 macOS 窗口
+  工作台标签；静默调用（隐藏通道）不自动开标签，事件监听也不抢 macOS 窗口
   焦点——标签在后台就位、命令写入终端缓冲，用户回到 DBX 时可完整回看。
 - 审批：`auto` 下 elevated（sudo / 灾难命中）与 `strict` 下全部命令会触发工作台
   弹窗（完整命令原文 + 风险徽标 + 倒计时，默认 120s 超时即拒绝）；AI 侧表现为
   明确的 denied/timed out 错误。`off` 连接上 agent 显式 `runInTerminal: true` 的
-  提权命令走同一审批弹窗（0.4.49：此前直接拒绝且引导指向 agent 无法操作的 UI
-  开关，现按「agent 显式申请 + 人工批准」放行）。
-- **审批记忆（0.4.52）**：弹窗新增「记住此命令」勾选（resolve 请求 `remember: true`），
+  提权命令走同一审批弹窗（按「agent 显式申请 + 人工批准」放行）。
+- **审批记忆**：弹窗提供「记住此命令」勾选（resolve 请求 `remember: true`），
   批准的命令写入连接级免审批清单（`agent-approved-commands.json`，匹配复用 sudo
   白名单 token 语义，设置弹窗可查看/删除/手工泛化通配）；后续命中清单的命令在
   任何模式下免审批直接执行。破坏性命令双重锁定：拒绝入库且命中重检无效——灾难
@@ -376,12 +359,11 @@ confirm fail-closed 与 scope fail-closed（含 list 在作用域下可用）。
 ## 告警 → 排查（组合用法）
 
 监控告警（Prometheus / Grafana / Zabbix / Sentry webhook 文本等）直接粘给
-`ssh_alert_triage`：工具把任意 schema 的告警体标准化（解析失败整包当 message，
-对齐 openocta `/hooks/alert` 兼容语义），按双语关键词分类（cpu / memory / disk /
-inode / network / oom / service / generic），返回一组**带 purposeKey 的只读诊断
-命令**（uptime / free / df / ps 排序 / journalctl -k / systemctl status 等静态
-playbook，逐条经 `mcp_safety` 白名单单测钉死——只读连接上可直接执行，普通连接
-不受限）。典型组合：
+`ssh_alert_triage`：工具把任意 schema 的告警体标准化（解析失败整包当 message），
+按双语关键词分类（cpu / memory / disk / inode / network / oom / service / generic），
+返回一组**带 purposeKey 的只读诊断命令**（uptime / free / df / ps 排序 /
+journalctl -k / systemctl status 等静态 playbook，全部命中只读命令白名单——
+只读连接上可直接执行，普通连接不受限）。典型组合：
 
 1. `ssh_alert_triage {payload: <告警原文>}` → 拿到 `normalized` + `category` +
    `suggestions`；

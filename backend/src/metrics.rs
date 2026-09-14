@@ -59,12 +59,67 @@ const METRICS_SCRIPT: &str = concat!(
 pub async fn collect_metrics(handle: &Handle<SshClient>) -> Result<serde_json::Value, String> {
     // Plugin-internal collector: no client setEnv so locale overrides on the
     // connection cannot reshape the output this parser expects.
-    let outcome =
-        exec_plain(handle, METRICS_SCRIPT, std::time::Duration::from_secs(30), &[]).await?;
+    let outcome = exec_plain(
+        handle,
+        METRICS_SCRIPT,
+        std::time::Duration::from_secs(30),
+        &[],
+    )
+    .await?;
     if outcome.exit_code != 0 && outcome.output.is_empty() {
         return Err(format!("metrics collection failed: {}", outcome.output));
     }
     Ok(parse_metrics_output(&outcome.output))
+}
+
+/// Top-level section names of the metrics document, used by the MCP
+/// `ssh_metrics` tool's optional `sections` projection so agents can pull
+/// just the slice they need instead of the full document. Keep in sync with
+/// what [`collect_metrics`] / [`parse_metrics_output`] actually emit.
+pub const METRICS_SECTIONS: &[&str] = &[
+    "hostname",
+    "kernel",
+    "uptimeSeconds",
+    "cpu",
+    "memory",
+    "disks",
+    "network",
+    "processes",
+    "topMemory",
+    "osId",
+    "osPretty",
+];
+
+/// Validates requested section names against the known universe. Unknown
+/// names fail fast with the valid list in the error (matching the tool
+/// layer's typo-guidance style) so a typo cannot silently return a
+/// near-empty document.
+pub fn validate_section_names(requested: &[String]) -> Result<(), String> {
+    for name in requested {
+        if !METRICS_SECTIONS.contains(&name.as_str()) {
+            return Err(format!(
+                "Unknown section: '{}'. Valid sections: {}",
+                name,
+                METRICS_SECTIONS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Projects the metrics document onto the requested top-level sections.
+/// Known-but-absent names (e.g. `osId` on hosts with no readable
+/// os-release) are simply omitted. Pure so it is unit-testable without a
+/// server.
+pub fn project_metrics_sections(
+    metrics: &mut serde_json::Value,
+    requested: &[String],
+) -> Result<(), String> {
+    validate_section_names(requested)?;
+    if let Some(object) = metrics.as_object_mut() {
+        object.retain(|key, _| requested.iter().any(|name| name == key));
+    }
+    Ok(())
 }
 
 /// Parses the collector output into the metrics JSON object: the base
@@ -317,7 +372,7 @@ pub fn parse_processes(output: &str) -> Vec<ProcessMetrics> {
 pub fn parse_process_lines(text: &str) -> Vec<ProcessMetrics> {
     let mut processes = Vec::new();
     for line in text.lines() {
-        let fields: Vec<&str> = line.trim().split_whitespace().collect();
+        let fields: Vec<&str> = line.split_whitespace().collect();
         // pid user cpu% mem% + at least one command token.
         if fields.len() < 5 {
             continue;
@@ -381,8 +436,13 @@ pub struct ProcessListRow {
 
 /// Collects the full process list over a new exec channel. Read-only.
 pub async fn collect_process_list(handle: &Handle<SshClient>) -> Result<serde_json::Value, String> {
-    let outcome =
-        exec_plain(handle, PROCESS_LIST_SCRIPT, std::time::Duration::from_secs(15), &[]).await?;
+    let outcome = exec_plain(
+        handle,
+        PROCESS_LIST_SCRIPT,
+        std::time::Duration::from_secs(15),
+        &[],
+    )
+    .await?;
     Ok(serde_json::json!({ "processes": parse_process_list(&outcome.output) }))
 }
 
@@ -391,7 +451,7 @@ pub async fn collect_process_list(handle: &Handle<SshClient>) -> Result<serde_js
 pub fn parse_process_list(text: &str) -> Vec<ProcessListRow> {
     let mut rows = Vec::new();
     for line in text.lines() {
-        let fields: Vec<&str> = line.trim().split_whitespace().collect();
+        let fields: Vec<&str> = line.split_whitespace().collect();
         // pid ppid user cpu% mem% etime state + at least one command token.
         if fields.len() < 8 {
             continue;
@@ -446,14 +506,9 @@ pub fn kill_command(pid: u64, signal: u32) -> Result<String, String> {
 
 /// Sends one signal to a remote process. Executed through the same
 /// plugin-internal exec path as the metrics collector.
-pub async fn kill_process(
-    handle: &Handle<SshClient>,
-    pid: u64,
-    signal: u32,
-) -> Result<(), String> {
+pub async fn kill_process(handle: &Handle<SshClient>, pid: u64, signal: u32) -> Result<(), String> {
     let command = kill_command(pid, signal)?;
-    let outcome =
-        exec_plain(handle, &command, std::time::Duration::from_secs(10), &[]).await?;
+    let outcome = exec_plain(handle, &command, std::time::Duration::from_secs(10), &[]).await?;
     if outcome.exit_code != 0 {
         return Err(format!(
             "kill failed (exit {}): {}",
@@ -883,5 +938,33 @@ bad line here
         assert!(kill_command(1, 15).is_err());
         assert!(kill_command(0, 9).is_err());
         assert!(kill_command(1234, 19).is_err());
+    }
+
+    #[test]
+    fn section_projection_keeps_only_requested_keys() {
+        let mut doc = parse_metrics_output(LINUX_FIXTURE);
+        assert!(doc.as_object().unwrap().contains_key("network"));
+        project_metrics_sections(&mut doc, &["cpu".to_string(), "memory".to_string()]).unwrap();
+        let keys: Vec<&str> = doc
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["cpu", "memory"]);
+    }
+
+    #[test]
+    fn section_projection_rejects_unknown_and_tolerates_absent() {
+        let mut doc = parse_metrics_output(LINUX_FIXTURE);
+        // 未知段名 fail-fast 并列出合法段。
+        let error = project_metrics_sections(&mut doc, &["memry".to_string()]).unwrap_err();
+        assert!(error.contains("Unknown section: 'memry'"), "{error}");
+        assert!(error.contains("topMemory"), "{error}");
+        // 原文档未被错误路径破坏。
+        assert!(doc.as_object().unwrap().len() > 3);
+        // 合法但该主机缺失的段（如 osId）静默省略，不算错。
+        project_metrics_sections(&mut doc, &["osId".to_string(), "cpu".to_string()]).unwrap();
+        assert!(doc.as_object().unwrap().contains_key("cpu"));
     }
 }

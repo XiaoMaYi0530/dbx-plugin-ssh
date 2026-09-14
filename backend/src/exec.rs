@@ -53,6 +53,9 @@ pub fn sanitize_sudo_command(command: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// 变体名刻意与协议值一一对应（password_only / password_plus_otp /
+// password_then_otp），共享的 Password 前缀是契约不是冗余。
+#[allow(clippy::enum_variant_names)]
 pub enum AuthFlowMode {
     PasswordOnly,
     PasswordPlusOtp,
@@ -318,7 +321,7 @@ impl SudoAuth {
         let mut candidates: Vec<Candidate> = self
             .totp_secrets
             .iter()
-            .filter_map(|secret| {
+            .map(|secret| {
                 let fingerprint = otp_secret_fingerprint(secret);
                 match secret {
                     TotpSecret::Static(code) => {
@@ -326,7 +329,7 @@ impl SudoAuth {
                         // Static codes carry no aligned window: keying usage
                         // on the fingerprint alone keeps marks stable across
                         // calls whose `now + window` boundary moved.
-                        Some(Candidate {
+                        Candidate {
                             usage_key: format!("{scope}|{fingerprint}|{code}"),
                             fingerprint,
                             code: code.clone(),
@@ -334,7 +337,7 @@ impl SudoAuth {
                             period: OTP_STATIC_WINDOW,
                             remaining: OTP_STATIC_WINDOW,
                             used: false,
-                        })
+                        }
                     }
                     TotpSecret::Key {
                         key,
@@ -345,7 +348,7 @@ impl SudoAuth {
                         let counter = now / period;
                         let valid_until = (counter + 1) * period;
                         let code = hotp(key, counter, *digits, *algorithm);
-                        Some(Candidate {
+                        Candidate {
                             usage_key: format!("{scope}|{fingerprint}|{valid_until}|{code}"),
                             fingerprint,
                             code,
@@ -353,7 +356,7 @@ impl SudoAuth {
                             period: *period,
                             remaining: valid_until.saturating_sub(now),
                             used: false,
-                        })
+                        }
                     }
                 }
             })
@@ -748,13 +751,14 @@ pub(crate) fn can_respond_to_prompt(
                 && (mode != AuthFlowMode::PasswordThenOtp || password_answered)
         }
         PromptKind::Combined => {
-            if mode == AuthFlowMode::PasswordPlusOtp {
-                true
-            } else if mode == AuthFlowMode::PasswordOnly {
-                true
-            } else {
-                password_answered
-            }
+            // PasswordPlusOtp answers combined prompts by design; PasswordOnly
+            // answers them too (its password half is all it sends — refusing
+            // the prompt would strand the session, see the flow-modes test).
+            // PasswordThenOtp waits until the password has been answered.
+            matches!(
+                mode,
+                AuthFlowMode::PasswordPlusOtp | AuthFlowMode::PasswordOnly
+            ) || password_answered
         }
     }
 }
@@ -782,10 +786,7 @@ struct ChannelEnv {
 /// `setEnv` entries: user entries win on duplicate keys and every variable
 /// ends up requested exactly once — dedup is decided locally here instead
 /// of relying on server-side ordering of duplicate env requests.
-fn merge_channel_env(
-    defaults: &[(&str, &str)],
-    user_env: &[(String, String)],
-) -> Vec<ChannelEnv> {
+fn merge_channel_env(defaults: &[(&str, &str)], user_env: &[(String, String)]) -> Vec<ChannelEnv> {
     let mut merged: Vec<ChannelEnv> = defaults
         .iter()
         .map(|(key, value)| ChannelEnv {
@@ -944,7 +945,11 @@ pub async fn exec_with_sudo(
         otp_piped = true;
     }
     if let Err(error) = channel.data(payload.as_slice()).await {
-        return Err(abort_exec_channel(&mut channel, format!("Failed to write sudo password: {error}")).await);
+        return Err(abort_exec_channel(
+            &mut channel,
+            format!("Failed to write sudo password: {error}"),
+        )
+        .await);
     }
 
     // Phase 2: watch for follow-up prompts and collect output. Both factors
@@ -991,9 +996,7 @@ pub fn is_pre_exec_transport_error(error: &str) -> bool {
         "Failed to start command",
         "Failed to start sudo command",
     ];
-    PRE_EXEC_MARKERS
-        .iter()
-        .any(|marker| error.contains(marker))
+    PRE_EXEC_MARKERS.iter().any(|marker| error.contains(marker))
 }
 
 /// `(auth, use_pty, otp_piped)` — the third flag records that the OTP code
@@ -1002,7 +1005,8 @@ pub fn is_pre_exec_transport_error(error: &str) -> bool {
 /// secret's code on the same prompt.
 type PromptContext<'a> = (&'a SudoAuth, bool, bool);
 
-const SUDO_WAIT_TIMEOUT_MESSAGE: &str = "Timed out waiting for the remote command to finish. The command may \
+const SUDO_WAIT_TIMEOUT_MESSAGE: &str =
+    "Timed out waiting for the remote command to finish. The command may \
      STILL be running on the remote host - check for stray processes or \
      package-manager locks before retrying; for long jobs start them \
      detached (ssh_run_bg + ssh_task_status) instead of extending the wait.";
@@ -1179,6 +1183,8 @@ pub fn shell_quote(value: &str) -> String {
 pub async fn collect_metrics(handle: &Handle<SshClient>) -> Result<serde_json::Value, String> {
     crate::metrics::collect_metrics(handle).await
 }
+
+pub use crate::metrics::{project_metrics_sections, validate_section_names, METRICS_SECTIONS};
 
 /// Parses the output of [`METRICS_SCRIPT`] into a metrics JSON object.
 /// Pure so it can be unit-tested without a server.
@@ -1693,7 +1699,10 @@ mod tests {
             sanitize_prompt_hint("\x1b[1midentity token\x1b[0m\u{7}"),
             "identity token"
         );
-        assert_eq!(sanitize_prompt_hint("  duo \r passcode \n"), "duo \n passcode");
+        assert_eq!(
+            sanitize_prompt_hint("  duo \r passcode \n"),
+            "duo \n passcode"
+        );
         // Overlong hints are capped on a char boundary.
         let long = "a".repeat(MAX_PROMPT_HINT_LEN + 4096);
         let sanitized = sanitize_prompt_hint(&long);
@@ -1702,7 +1711,10 @@ mod tests {
         assert!(sanitize_prompt_hint(&multibyte).is_char_boundary(0));
         assert!(sanitize_prompt_hint(&multibyte).len() <= MAX_PROMPT_HINT_LEN);
         // Clean input passes through unchanged.
-        assert_eq!(sanitize_prompt_hint("verification code"), "verification code");
+        assert_eq!(
+            sanitize_prompt_hint("verification code"),
+            "verification code"
+        );
     }
 
     #[test]
@@ -1736,9 +1748,18 @@ mod tests {
         ] {
             let _ = AuthFlowMode::parse(value);
         }
-        assert_eq!(AuthFlowMode::parse("garbage"), AuthFlowMode::PasswordThenOtp);
-        assert_eq!(AuthFlowMode::parse("PASSWORD+OTP"), AuthFlowMode::PasswordPlusOtp);
-        assert_eq!(AuthFlowMode::parse(" password_only\t"), AuthFlowMode::PasswordOnly);
+        assert_eq!(
+            AuthFlowMode::parse("garbage"),
+            AuthFlowMode::PasswordThenOtp
+        );
+        assert_eq!(
+            AuthFlowMode::parse("PASSWORD+OTP"),
+            AuthFlowMode::PasswordPlusOtp
+        );
+        assert_eq!(
+            AuthFlowMode::parse(" password_only\t"),
+            AuthFlowMode::PasswordOnly
+        );
     }
 
     #[test]
@@ -2060,7 +2081,10 @@ mod tests {
         committed_otp_ledger()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(format!("{scope}|{fingerprint}|{code}"), now.saturating_sub(1));
+            .insert(
+                format!("{scope}|{fingerprint}|{code}"),
+                now.saturating_sub(1),
+            );
         let answered = auto.take_deferred_otp(boundary);
         assert_eq!(answered.map(|(kind, _)| kind), Some(AutoSudoKind::Totp));
         // 推迟态一次性：补答后不再重复注入。

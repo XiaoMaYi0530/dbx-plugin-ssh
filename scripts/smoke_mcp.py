@@ -559,6 +559,32 @@ def main() -> None:
         missing = [name for name in EXPECTED_TOOLS if name not in names]
         assert not missing, f"missing tools: {missing}"
         assert all(tool["inputSchema"].get("type") == "object" for tool in tools), "bad schemas"
+
+        # MCP tool annotations: every tool carries the four advisory hints
+        # plus a title; the confirm-gated exec family must advertise
+        # destructive=true and the read-only family readOnly=true.
+        HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+        by_name = {tool["name"]: tool for tool in tools}
+        for name, tool in by_name.items():
+            annotations = tool.get("annotations")
+            assert isinstance(annotations, dict), f"{name} lacks annotations"
+            for hint in HINTS:
+                assert isinstance(annotations.get(hint), bool), f"{name} lacks boolean {hint}"
+            assert isinstance(annotations.get("title"), str) and annotations["title"], \
+                f"{name} lacks title"
+        for destructive_tool in ("ssh_exec", "ssh_exec_sudo", "ssh_multi_exec", "sftp_remove",
+                                 "ssh_run_bg", "sftp_write_file", "ssh_remove_known_host"):
+            assert by_name[destructive_tool]["annotations"]["destructiveHint"] is True, \
+                f"{destructive_tool} must advertise destructiveHint"
+        for read_only_tool in ("ssh_list_connections", "ssh_list_known_hosts", "ssh_metrics",
+                               "ssh_alert_triage", "sftp_list_dir", "sftp_stat", "sftp_exists",
+                               "sftp_pwd", "sftp_read_file", "sftp_disk_usage"):
+            annotations = by_name[read_only_tool]["annotations"]
+            assert annotations["readOnlyHint"] is True and annotations["destructiveHint"] is False, \
+                f"{read_only_tool} must advertise readOnlyHint"
+        assert by_name["ssh_alert_triage"]["annotations"]["openWorldHint"] is False, \
+            "ssh_alert_triage runs fully offline"
+        print("annotations ok: all tools carry hints + title")
         print(f"tools/list ok: {len(names)} tools")
 
         # A connection-bound tool without credentials must be rejected before
@@ -572,6 +598,26 @@ def main() -> None:
         error = recv(proc, 3)["error"]["message"]
         assert "password" in error, f"unexpected error: {error}"
         print("parameter validation ok")
+
+        # ssh_metrics sections projection: an unknown section name must be
+        # rejected BEFORE any dialing (no credentials in the call at all).
+        send(proc, {
+            "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+            "params": {"name": "ssh_metrics", "arguments": {
+                "host": "203.0.113.1", "username": "u", "sections": ["memry"],
+            }},
+        })
+        error = recv(proc, 31)["error"]["message"]
+        assert "Unknown section: 'memry'" in error and "topMemory" in error, f"unexpected error: {error}"
+        send(proc, {
+            "jsonrpc": "2.0", "id": 32, "method": "tools/call",
+            "params": {"name": "ssh_metrics", "arguments": {
+                "host": "203.0.113.1", "username": "u", "sections": [],
+            }},
+        })
+        error = recv(proc, 32)["error"]["message"]
+        assert "at least one section" in error, f"unexpected error: {error}"
+        print("metrics sections pre-dial validation ok")
 
         # A connection-free tool round-trips through the real sidecar path.
         send(proc, {

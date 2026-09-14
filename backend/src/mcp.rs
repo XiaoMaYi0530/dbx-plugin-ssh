@@ -92,7 +92,8 @@ impl McpLimits {
             max_download_bytes: self.max_download_bytes.clamp(1, DOWNLOAD_LIMIT_CEILING),
             local_transfer_root: self.local_transfer_root,
         }
-    }    /// Parses the persisted JSON, falling back per-field to the defaults for
+    }
+    /// Parses the persisted JSON, falling back per-field to the defaults for
     /// missing or non-numeric entries.
     fn from_json(value: &Value) -> Self {
         let defaults = Self::default();
@@ -112,7 +113,7 @@ impl McpLimits {
         .sanitized()
     }
 
-    pub fn to_json(self) -> Value {
+    pub fn to_json(&self) -> Value {
         json!({
             "maxReadBytes": self.max_read_bytes,
             "maxUploadBytes": self.max_upload_bytes,
@@ -175,10 +176,7 @@ impl McpPermission {
         let mode = value
             .get("execPermissionMode")
             .and_then(Value::as_str)
-            .filter(|text| {
-                matches!(*text,
-                    PERMISSION_MODE_AUTONOMOUS | PERMISSION_MODE_CONFIRM)
-            })
+            .filter(|text| matches!(*text, PERMISSION_MODE_AUTONOMOUS | PERMISSION_MODE_CONFIRM))
             .unwrap_or(PERMISSION_MODE_AUTONOMOUS);
         let scope = value
             .get("connectionScope")
@@ -199,7 +197,7 @@ impl McpPermission {
         }
     }
 
-    fn to_json(self) -> Value {
+    fn to_json(&self) -> Value {
         json!({
             "execPermissionMode": self.exec_permission_mode,
             "connectionScope": self.connection_scope,
@@ -280,12 +278,7 @@ fn scope_from_env(lookup: impl FnOnce(&str) -> Option<String>) -> Option<Vec<Str
 /// Scope match rule (§1.3): an entry allows a connection when it equals the
 /// connection id, equals the connection name, or equals the host ASCII
 /// case-insensitively. An empty scope allows everything.
-pub fn scope_allows(
-    scope: &[String],
-    id: &str,
-    name: Option<&str>,
-    host: &str,
-) -> bool {
+pub fn scope_allows(scope: &[String], id: &str, name: Option<&str>, host: &str) -> bool {
     if scope.is_empty() {
         return true;
     }
@@ -733,8 +726,8 @@ impl McpState {
             .clone();
         let mode = permission_mode_from_env(|key| std::env::var(key).ok())
             .unwrap_or(persisted.exec_permission_mode);
-        let scope = scope_from_env(|key| std::env::var(key).ok())
-            .unwrap_or(persisted.connection_scope);
+        let scope =
+            scope_from_env(|key| std::env::var(key).ok()).unwrap_or(persisted.connection_scope);
         (mode, scope)
     }
 
@@ -1073,7 +1066,11 @@ impl McpState {
                      server inside the DBX workbench session."
                 ));
             };
-            let command_key = if name == "ssh_terminal_input" { "input" } else { "command" };
+            let command_key = if name == "ssh_terminal_input" {
+                "input"
+            } else {
+                "command"
+            };
             let command = required_str(arguments, command_key)?;
             let connection_id = arguments.get("connectionId").and_then(Value::as_str);
             let approved = self
@@ -1256,9 +1253,13 @@ impl McpState {
     /// error, not a silent gate-off.
     async fn sudo_allowlist_for(&self, arguments: &Value) -> Result<Vec<Vec<String>>, String> {
         Ok(match self.registered_connection_by_ref(arguments).await? {
-            Some(connection) => (!connection.sudo_whitelist.is_empty())
-                .then(|| sudo_allowlist::entries_from_lines(&connection.sudo_whitelist))
-                .unwrap_or_default(),
+            Some(connection) => {
+                if !connection.sudo_whitelist.is_empty() {
+                    sudo_allowlist::entries_from_lines(&connection.sudo_whitelist)
+                } else {
+                    Default::default()
+                }
+            }
             None => self
                 .registered_connection_matching_inline(arguments)
                 .await
@@ -1422,8 +1423,7 @@ impl McpState {
                         // A reference the local session cannot resolve (no
                         // registry entry, bridge down) must keep the self-heal
                         // path visible instead of the bare "missing host".
-                        let has_reference = non_empty_argument(arguments, "connectionId")
-                            .is_some()
+                        let has_reference = non_empty_argument(arguments, "connectionId").is_some()
                             || non_empty_argument(arguments, "connectionName").is_some()
                             || endpoint_selector(arguments).is_some();
                         if has_reference {
@@ -1495,7 +1495,7 @@ impl McpState {
                 // normalized and classified without any SSH I/O, so the
                 // playbook can run before an operator even picks a host.
                 let payload = required_str(arguments, "payload")?;
-                Ok(alert_triage::triage_view(&alert_triage::triage(&payload)))
+                Ok(alert_triage::triage_view(&alert_triage::triage(payload)))
             }
             _ => {
                 let mut result = match name {
@@ -1507,13 +1507,20 @@ impl McpState {
                     "ssh_multi_exec" => self.ssh_multi_exec_tool(arguments).await,
                     "ssh_task_status" => self.ssh_task_status_tool(arguments).await,
                     "ssh_metrics" => {
+                        // Section names are validated before dialing so a
+                        // typo fails fast without a connection round-trip.
+                        let sections = metrics_sections(arguments)?;
                         let connection = self.connection(arguments).await?;
-                        exec::collect_metrics(&connection).await
+                        let mut metrics = exec::collect_metrics(&connection).await?;
+                        if let Some(sections) = &sections {
+                            exec::project_metrics_sections(&mut metrics, sections)?;
+                        }
+                        Ok(metrics)
                     }
                     "sftp_disk_usage" => {
                         let path = required_str(arguments, "path")?;
                         let connection = self.connection(arguments).await?;
-                        let command = format!("df -kP {}", exec::shell_quote(&path));
+                        let command = format!("df -kP {}", exec::shell_quote(path));
                         // Plugin-internal plumbing: no client setEnv, keeping
                         // the df output parseable regardless of locale overrides.
                         let outcome =
@@ -1564,8 +1571,8 @@ impl McpState {
         emitter: Option<&PluginEmitter>,
     ) -> Result<Value, String> {
         let command = required_str(arguments, "command")?;
-        let timeout_secs = arg_u64(arguments, "timeoutSecs")?
-            .map(|secs| Duration::from_secs(secs.clamp(5, 300)));
+        let timeout_secs =
+            arg_u64(arguments, "timeoutSecs")?.map(|secs| Duration::from_secs(secs.clamp(5, 300)));
         // A quickSudoProfile reference is resolved (and validated) before any
         // connection I/O so unknown ids/names fail fast.
         let sudo_profile = if name == "ssh_exec_sudo" {
@@ -1949,11 +1956,15 @@ impl McpState {
         let sequential = match mode {
             "parallel" => false,
             "sequential" => true,
-            other => return Err(format!("mode must be \"parallel\" or \"sequential\"; got '{other}'")),
+            other => {
+                return Err(format!(
+                    "mode must be \"parallel\" or \"sequential\"; got '{other}'"
+                ))
+            }
         };
         let stop_on_error = arg_bool(arguments, "stopOnError")?.unwrap_or(false);
-        let timeout_secs = arg_u64(arguments, "timeoutSecs")?
-            .map(|secs| Duration::from_secs(secs.clamp(5, 300)));
+        let timeout_secs =
+            arg_u64(arguments, "timeoutSecs")?.map(|secs| Duration::from_secs(secs.clamp(5, 300)));
         let confirm_destructive = arg_bool(arguments, "confirmDestructive")?.unwrap_or(false);
         let read_only = self.connection_is_read_only(arguments).await;
         // Per-target gates are arguments-only (command text), so they run
@@ -1961,15 +1972,14 @@ impl McpState {
         // flag is enforced per dial in `multi_exec_one`. No sudo allowlist
         // lookup: `command_gate` refuses `sudo …` outright (escalation goes
         // through single-target `ssh_exec_sudo`).
-        multi_exec::command_gate(&command, read_only, confirm_destructive)?;
+        multi_exec::command_gate(command, read_only, confirm_destructive)?;
 
         // Resolve every raw selector into its registry identity up front so
         // an unknown/ambiguous reference refuses the whole call before any
         // dial (IMPL_PLAN §1.1: 全量归一化 + 作用域门在执行前)。§1.3 作用域：
         // 任一目标越界整体拒绝。
         let scope = self.effective_scope();
-        let mut targets_resolved: Vec<multi_exec::TargetRef> =
-            Vec::with_capacity(parallel.len());
+        let mut targets_resolved: Vec<multi_exec::TargetRef> = Vec::with_capacity(parallel.len());
         for raw in &parallel {
             let mut selector = json!({ "connectionId": raw });
             let resolved = match self.registered_connection_by_ref(&selector).await? {
@@ -1982,7 +1992,12 @@ impl McpState {
                 }
             };
             if !scope.is_empty()
-                && !scope_allows(&scope, &resolved.id, resolved.name.as_deref(), &resolved.host)
+                && !scope_allows(
+                    &scope,
+                    &resolved.id,
+                    resolved.name.as_deref(),
+                    &resolved.host,
+                )
             {
                 return Err(format!(
                     "Connection '{}' ({} / {}) is outside this MCP server's connectionScope; \
@@ -2005,7 +2020,7 @@ impl McpState {
         let mut results: Vec<Value> = Vec::with_capacity(targets_resolved.len());
         if sequential {
             for target in &targets_resolved {
-                let row = self.multi_exec_one(target, &command, timeout_secs).await;
+                let row = self.multi_exec_one(target, command, timeout_secs).await;
                 let failed = row.get("ok").and_then(Value::as_bool) != Some(true);
                 results.push(row);
                 if failed && stop_on_error {
@@ -2015,7 +2030,7 @@ impl McpState {
         } else {
             let mut runs = Vec::with_capacity(targets_resolved.len());
             for target in &targets_resolved {
-                runs.push(self.multi_exec_one(target, &command, timeout_secs));
+                runs.push(self.multi_exec_one(target, command, timeout_secs));
             }
             // join! 的参数个数是静态的，动态 1–10 路扇出用递归 helper。
             let rows = join_all(runs).await;
@@ -2023,7 +2038,10 @@ impl McpState {
                 results.push(row);
             }
         }
-        let sent = results.iter().filter(|row| row.get("ok").and_then(Value::as_bool) == Some(true)).count();
+        let sent = results
+            .iter()
+            .filter(|row| row.get("ok").and_then(Value::as_bool) == Some(true))
+            .count();
         let failed = results.len() - sent;
         Ok(json!({
             "ok": failed == 0,
@@ -2125,7 +2143,11 @@ impl McpState {
         // as a call); a full/closed input queue surfaces in the row error.
         let outcome = self
             .runtime
-            .batch_terminal_input(&[session_id.clone()], &normalized, append_newline)
+            .batch_terminal_input(
+                std::slice::from_ref(&session_id),
+                &normalized,
+                append_newline,
+            )
             .await;
         let row = outcome
             .get("results")
@@ -2411,7 +2433,7 @@ impl McpState {
         let local_path = required_str(arguments, "localPath")?;
         let remote_path = required_str(arguments, "remotePath")?;
         let overwrite = arg_bool(arguments, "overwrite")?.unwrap_or(false);
-        let local_source = std::fs::canonicalize(&local_path)
+        let local_source = std::fs::canonicalize(local_path)
             .map_err(|error| format!("Cannot read local file {local_path}: {error}"))?;
         self.ensure_local_transfer_allowed(&local_source)?;
         let data = std::fs::read(&local_source).map_err(|error| {
@@ -2797,6 +2819,45 @@ fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("Missing or invalid parameter: {key} (expected a non-empty string)"))
 }
 
+/// Parses the optional `ssh_metrics` `sections` projection argument.
+/// Accepted shapes (LLM input tolerance): absent/null, a single section
+/// name string, or an array of section names. An empty array is refused so
+/// a caller can never mistake "no sections" for "all sections"; unknown
+/// names fail fast against the known universe before any dialing.
+fn metrics_sections(arguments: &Value) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = arguments.get("sections").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let names: Vec<String> = match value {
+        Value::String(name) => vec![name.clone()],
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| "sections must be non-empty section-name strings".to_string())
+            })
+            .collect::<Result<Vec<String>, String>>()?,
+        _ => {
+            return Err(
+                "sections must be a section name or an array of section names \
+                 (e.g. [\"cpu\", \"memory\"]); omit it for the full document"
+                    .to_string(),
+            )
+        }
+    };
+    if names.is_empty() {
+        return Err(
+            "sections must name at least one section; omit the argument for \
+             the full document"
+                .to_string(),
+        );
+    }
+    exec::validate_section_names(&names)?;
+    Ok(Some(names))
+}
+
 /// Enumerates EVERY absent required string parameter in one error
 /// (`Missing required parameters: a, b`): an LLM caller fixes all gaps in a
 /// single turn instead of discovering them one fail-fast round at a time.
@@ -2891,7 +2952,8 @@ pub(crate) fn arg_bool(arguments: &Value, key: &str) -> Result<Option<bool>, Str
 /// - a number whose decimal digits are all 0-7 (`644`) → octal digits;
 /// - any other number (`384` = 0o600, `493` = 0o755) → raw permission bits.
 fn parse_chmod_mode(value: &Value) -> Result<u32, String> {
-    const MAX_MODE_TEXT: &str = "mode must be an octal value up to 7777 (e.g. \"644\", \"0755\" or 644)";
+    const MAX_MODE_TEXT: &str =
+        "mode must be an octal value up to 7777 (e.g. \"644\", \"0755\" or 644)";
     let octal = |text: &str| {
         u32::from_str_radix(text, 8)
             .ok()
@@ -3015,18 +3077,15 @@ where
         .into_iter()
         .map(|future| Box::pin(future) as std::pin::Pin<Box<dyn Future<Output = T> + Send>>)
         .collect();
-    let mut outputs: Vec<Option<T>> = std::iter::repeat_with(|| None)
-        .take(slots.len())
-        .collect();
+    let mut outputs: Vec<Option<T>> = std::iter::repeat_with(|| None).take(slots.len()).collect();
     loop {
         let mut pending = false;
         for (index, slot) in slots.iter_mut().enumerate() {
             if outputs[index].is_some() {
                 continue;
             }
-            match slot.as_mut().await {
-                output => outputs[index] = Some(output),
-            }
+            let output = slot.as_mut().await;
+            outputs[index] = Some(output);
             // Reset the await point for the next sweep; completed slots are
             // skipped by the `outputs` guard above.
             pending = true;
@@ -3140,7 +3199,10 @@ fn connection_list_result(
                 scope,
                 entry.get("id").and_then(Value::as_str).unwrap_or_default(),
                 entry.get("name").and_then(Value::as_str),
-                entry.get("host").and_then(Value::as_str).unwrap_or_default(),
+                entry
+                    .get("host")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
             )
     }
     match bridge {
@@ -3813,7 +3875,8 @@ fn parse_jump_hosts(arguments: &Value) -> Result<Vec<JumpHost>, String> {
 /// carry an accurate description; defined once here, referenced by both
 /// schema sites so the wording can never drift apart).
 const AUTHENTICATION_DESCRIPTION: &str = "Authentication method for inline dials: password (default), private-key, private-key-password, or agent. Omitted is inferred: privateKeyPath present selects private-key, otherwise password; private-key* requires privateKeyPath and password requires password";
-const CONNECT_TIMEOUT_DESCRIPTION: &str = "TCP connect timeout in seconds for inline dials (default 15, minimum 1)";
+const CONNECT_TIMEOUT_DESCRIPTION: &str =
+    "TCP connect timeout in seconds for inline dials (default 15, minimum 1)";
 const AUTH_FLOW_MODE_DESCRIPTION: &str = "Two-factor sudo authentication flow: password_only (no OTP), password_plus_otp (password and TOTP code submitted together at a combined prompt), password_then_otp (password first, TOTP answered at a separate later prompt; default when omitted). Values are matched case-insensitively (PASSWORD_PLUS_OTP works); unrecognized values fall back to the default flow instead of erroring. When set both inline and via a Quick Sudo profile, explicit arguments win";
 const PASSWORD_PROMPT_HINT_DESCRIPTION: &str = "Text fragment used to recognize a non-standard sudo password prompt (localized or custom message) when the built-in prompt patterns miss it";
 const TOTP_PROMPT_HINT_DESCRIPTION: &str = "Text fragment used to recognize a non-standard TOTP/verification-code prompt when the built-in prompt patterns miss it";
@@ -3863,6 +3926,112 @@ fn connection_selector_requirements() -> Value {
         { "required": ["connectionName"] },
         { "required": ["host", "username"] },
     ])
+}
+
+/// Advisory MCP tool annotations (spec "Tool annotations"): per-tool hints
+/// clients may use to pre-approve read-only tools or gate destructive ones.
+/// Advisory only — the server-side gates (mcp_safety whitelist, confirm
+/// gate, read-only connection gate) stay authoritative regardless of what
+/// a client does with these hints. The classification deliberately mirrors
+/// the internal gate sets (`is_write_tool` / `is_confirm_gated_tool` /
+/// read-only sparing) so hints and enforcement cannot drift apart in
+/// opposite directions: the whole exec family and every
+/// remove/move/overwrite/delete tool is destructive=true, everything the
+/// confirm gate spares as provably read-only is readOnly=true, and the
+/// mutating-but-non-destructive writes (mkdir/rename/chmod, profile save,
+/// close) sit destructive=false between the two.
+fn tool_annotations(name: &str) -> Value {
+    // Provably no mutation of remote or local state (matches the set the
+    // confirm gate spares).
+    const READ_ONLY: &[&str] = &[
+        "ssh_list_connections",
+        "ssh_list_known_hosts",
+        "ssh_quick_sudo_profiles_list",
+        "ssh_metrics",
+        "ssh_alert_triage",
+        "ssh_test_connection",
+        "ssh_task_status",
+        "sftp_list_dir",
+        "sftp_stat",
+        "sftp_exists",
+        "sftp_pwd",
+        "sftp_read_file",
+        "sftp_disk_usage",
+    ];
+    // May destroy or replace existing state: the exec family (arbitrary
+    // remote commands), store deletions, and remove/move/overwrite-capable
+    // writes (matches the confirm-gated set plus the delete tools).
+    const DESTRUCTIVE: &[&str] = &[
+        "ssh_exec",
+        "ssh_exec_sudo",
+        "ssh_multi_exec",
+        "ssh_terminal_input",
+        "ssh_run_bg",
+        "ssh_remove_known_host",
+        "ssh_quick_sudo_profiles_delete",
+        "sftp_remove",
+        "sftp_move",
+        "sftp_copy",
+        "sftp_upload",
+        "sftp_download",
+        "sftp_write_file",
+    ];
+    // Mutating but non-destructive, and repeating them converges to the
+    // same state instead of compounding (idempotentHint).
+    const IDEMPOTENT_MUTATING: &[&str] =
+        &["ssh_close", "ssh_quick_sudo_profiles_save", "sftp_chmod"];
+    let read_only = READ_ONLY.contains(&name);
+    let destructive = DESTRUCTIVE.contains(&name);
+    let mut annotations = json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": read_only || IDEMPOTENT_MUTATING.contains(&name),
+        "openWorldHint": name != "ssh_alert_triage",
+    });
+    if let Some(title) = tool_title(name) {
+        annotations["title"] = json!(title);
+    }
+    annotations
+}
+
+/// Human-readable display names (spec `annotations.title`) for MCP client
+/// tool pickers. Unknown names yield no title and keep the conservative
+/// default hints from [`tool_annotations`].
+fn tool_title(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "ssh_exec" => "Run SSH command",
+        "ssh_exec_sudo" => "Run SSH command with sudo",
+        "ssh_multi_exec" => "Run SSH command on several connections",
+        "ssh_terminal_input" => "Inject terminal input",
+        "ssh_run_bg" => "Start background SSH task",
+        "ssh_task_status" => "Poll background SSH task",
+        "ssh_metrics" => "Collect server metrics",
+        "ssh_alert_triage" => "SSH alert triage",
+        "ssh_close" => "Close SSH connection",
+        "ssh_test_connection" => "Test SSH connection",
+        "ssh_list_known_hosts" => "List known hosts",
+        "ssh_list_connections" => "List SSH connections",
+        "ssh_remove_known_host" => "Remove known host",
+        "ssh_quick_sudo_profiles_list" => "List Quick Sudo profiles",
+        "ssh_quick_sudo_profiles_save" => "Save Quick Sudo profile",
+        "ssh_quick_sudo_profiles_delete" => "Delete Quick Sudo profile",
+        "sftp_list_dir" => "List remote directory",
+        "sftp_stat" => "Stat remote path",
+        "sftp_exists" => "Check remote path exists",
+        "sftp_pwd" => "Remote home directory",
+        "sftp_upload" => "Upload file over SFTP",
+        "sftp_download" => "Download file over SFTP",
+        "sftp_read_file" => "Read remote file",
+        "sftp_write_file" => "Write remote file",
+        "sftp_mkdir" => "Create remote directory",
+        "sftp_remove" => "Remove remote path",
+        "sftp_rename" => "Rename remote path",
+        "sftp_chmod" => "Change remote permissions",
+        "sftp_copy" => "Copy remote files",
+        "sftp_move" => "Move remote files",
+        "sftp_disk_usage" => "Remote disk usage",
+        _ => return None,
+    })
 }
 
 pub fn tool_definitions() -> Value {
@@ -3958,7 +4127,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "ssh_metrics",
-            "description": "Collect server metrics (CPU utilization, load, memory, swap, disk mounts with inode usage, uptime, per-interface network rx/tx rates, top 8 processes by CPU and by memory) using read-only commands.",
+            "description": "Collect server metrics (CPU utilization, load, memory, swap, disk mounts with inode usage, uptime, per-interface network rx/tx rates, top 8 processes by CPU and by memory) using read-only commands. Pass sections to return only the named top-level sections and keep the response small.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[]),
@@ -4160,11 +4329,17 @@ pub fn tool_definitions() -> Value {
     ]);
     // Connection-bound tools share the selector alternatives; add them here
     // after the compact JSON declarations so path/command required fields
-    // stay independent from connection addressing.
+    // stay independent from connection addressing. Every tool additionally
+    // gets its advisory annotations (see `tool_annotations`).
     if let Some(tool_list) = tools.as_array_mut() {
         for tool in tool_list {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let is_connection_bound = matches!(
-                tool.get("name").and_then(Value::as_str).unwrap_or(""),
+                name.as_str(),
                 "sftp_list_dir"
                     | "sftp_stat"
                     | "sftp_exists"
@@ -4182,10 +4357,31 @@ pub fn tool_definitions() -> Value {
                     | "sftp_disk_usage"
             );
             if !is_connection_bound {
-                continue;
+                tool["annotations"] = tool_annotations(&name);
+            } else {
+                if let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) {
+                    schema.insert("anyOf".to_string(), connection_selector_requirements());
+                }
+                tool["annotations"] = tool_annotations(&name);
             }
-            if let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) {
-                schema.insert("anyOf".to_string(), connection_selector_requirements());
+            // ssh_metrics advertises its optional sections projection
+            // (declared post-hoc: the property carries a dynamic enum from
+            // METRICS_SECTIONS, which the compact literal cannot inline).
+            if name == "ssh_metrics" {
+                if let Some(props) = tool
+                    .pointer_mut("/inputSchema/properties")
+                    .and_then(Value::as_object_mut)
+                {
+                    props.insert(
+                        "sections".to_string(),
+                        json!({
+                            "type": "array",
+                            "items": { "type": "string", "enum": exec::METRICS_SECTIONS },
+                            "uniqueItems": true,
+                            "description": "Optional projection onto top-level sections (hostname, kernel, uptimeSeconds, cpu, memory, disks, network, processes, topMemory, osId, osPretty); a single name string is accepted too. Omit for the full document"
+                        }),
+                    );
+                }
             }
         }
     }
@@ -4199,10 +4395,7 @@ mod tests {
     fn state() -> McpState {
         // Unique data dir per call: settings persistence (limits AND the
         // §1.3 permission keys) must not leak across parallel tests.
-        McpState::new(
-            std::env::temp_dir()
-                .join(format!("dbx-mcp-test-{}", uuid::Uuid::new_v4())),
-        )
+        McpState::new(std::env::temp_dir().join(format!("dbx-mcp-test-{}", uuid::Uuid::new_v4())))
     }
 
     // —— §1.3 confirm 档 + connectionScope ——
@@ -4218,7 +4411,12 @@ mod tests {
         assert!(scope_allows(&entries, "conn-9", None, "other.local"));
         assert!(scope_allows(&entries, "other-id", Some("ops@LEGACY"), "x")); // name 精确（大小写敏感）
         assert!(scope_allows(&entries, "other-id", None, "web-01")); // host 大小写不敏感
-        assert!(!scope_allows(&entries, "other-id", Some("prod"), "db.local"));
+        assert!(!scope_allows(
+            &entries,
+            "other-id",
+            Some("prod"),
+            "db.local"
+        ));
         assert!(!scope_allows(&entries, "other-id", None, "db.local"));
     }
 
@@ -4284,6 +4482,186 @@ mod tests {
     }
 
     #[test]
+    fn every_tool_carries_complete_annotations() {
+        let definitions = tool_definitions();
+        let tools = definitions.as_array().unwrap();
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let annotations = &tool["annotations"];
+            let obj = annotations
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} lacks annotations"));
+            for hint in [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(
+                    obj.get(hint).and_then(Value::as_bool).is_some(),
+                    "{name} annotations lack boolean {hint}"
+                );
+            }
+            assert!(
+                obj.get("title").and_then(Value::as_str).is_some(),
+                "{name} annotations lack a title"
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_hints_align_with_gate_classification() {
+        let definitions = tool_definitions();
+        let annotations = |name: &str| {
+            definitions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from tools/list"))["annotations"]
+                .clone()
+        };
+        // Provably read-only: the whole set the confirm gate spares for
+        // being read-only (plus ssh_close, which is also spared).
+        for name in [
+            "ssh_list_connections",
+            "ssh_list_known_hosts",
+            "ssh_quick_sudo_profiles_list",
+            "ssh_metrics",
+            "ssh_alert_triage",
+            "ssh_test_connection",
+            "ssh_task_status",
+            "sftp_list_dir",
+            "sftp_stat",
+            "sftp_exists",
+            "sftp_pwd",
+            "sftp_read_file",
+            "sftp_disk_usage",
+        ] {
+            let a = annotations(name);
+            assert_eq!(a["readOnlyHint"], true, "{name} should be readOnly");
+            assert_eq!(
+                a["destructiveHint"], false,
+                "{name} should not be destructive"
+            );
+        }
+        // Exec family and remove/move/overwrite/delete tools advertise
+        // destructive so clients gate them like the confirm gate does.
+        for name in [
+            "ssh_exec",
+            "ssh_exec_sudo",
+            "ssh_multi_exec",
+            "ssh_terminal_input",
+            "ssh_run_bg",
+            "ssh_remove_known_host",
+            "ssh_quick_sudo_profiles_delete",
+            "sftp_remove",
+            "sftp_move",
+            "sftp_copy",
+            "sftp_upload",
+            "sftp_download",
+            "sftp_write_file",
+        ] {
+            let a = annotations(name);
+            assert_eq!(a["readOnlyHint"], false, "{name} should not be readOnly");
+            assert_eq!(a["destructiveHint"], true, "{name} should be destructive");
+        }
+        // Mutating but non-destructive writes.
+        for name in [
+            "sftp_mkdir",
+            "sftp_rename",
+            "sftp_chmod",
+            "ssh_quick_sudo_profiles_save",
+        ] {
+            let a = annotations(name);
+            assert_eq!(a["readOnlyHint"], false, "{name}");
+            assert_eq!(a["destructiveHint"], false, "{name}");
+        }
+        // Closed-world: alert triage runs fully offline.
+        assert_eq!(annotations("ssh_alert_triage")["openWorldHint"], false);
+        assert_eq!(annotations("ssh_exec")["openWorldHint"], true);
+        // Every declared tool is covered by the explicit sets — no tool may
+        // slip through with unreviewed hints.
+        let tools = definitions.as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            31,
+            "tool count changed; revisit annotation sets"
+        );
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let a = &tool["annotations"];
+            assert_eq!(
+                a["readOnlyHint"].as_bool().unwrap(),
+                matches!(
+                    name,
+                    "ssh_list_connections"
+                        | "ssh_list_known_hosts"
+                        | "ssh_quick_sudo_profiles_list"
+                        | "ssh_metrics"
+                        | "ssh_alert_triage"
+                        | "ssh_test_connection"
+                        | "ssh_task_status"
+                        | "sftp_list_dir"
+                        | "sftp_stat"
+                        | "sftp_exists"
+                        | "sftp_pwd"
+                        | "sftp_read_file"
+                        | "sftp_disk_usage"
+                ),
+                "{name} readOnlyHint drift"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_sections_argument_shapes_and_fail_fast() {
+        // 缺省/null → None（返回全量文档）。
+        assert_eq!(metrics_sections(&json!({})).unwrap(), None);
+        assert_eq!(
+            metrics_sections(&json!({ "sections": null })).unwrap(),
+            None
+        );
+        // 单字符串 / 数组两种形态都收（LLM 容错）。
+        assert_eq!(
+            metrics_sections(&json!({ "sections": "cpu" })).unwrap(),
+            Some(vec!["cpu".to_string()])
+        );
+        assert_eq!(
+            metrics_sections(&json!({ "sections": ["cpu", "memory"] })).unwrap(),
+            Some(vec!["cpu".to_string(), "memory".to_string()])
+        );
+        // 空数组拒绝：绝不能把"没点名"误当"全量"。
+        assert!(metrics_sections(&json!({ "sections": [] })).is_err());
+        // 未知段名 fail-fast 并列出合法段（拨号前拒绝）。
+        let error = metrics_sections(&json!({ "sections": ["memry"] })).unwrap_err();
+        assert!(error.contains("Unknown section: 'memry'"), "{error}");
+        assert!(error.contains("topMemory"), "{error}");
+        // 非字符串项精确报错。
+        assert!(metrics_sections(&json!({ "sections": [42] })).is_err());
+    }
+
+    #[test]
+    fn metrics_schema_advertises_sections_projection() {
+        let definitions = tool_definitions();
+        let metrics = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "ssh_metrics")
+            .unwrap();
+        let sections = &metrics["inputSchema"]["properties"]["sections"];
+        assert_eq!(sections["type"], "array");
+        let enum_names: Vec<&str> = sections["items"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(enum_names, exec::METRICS_SECTIONS);
+    }
+
+    #[test]
     fn settings_roundtrip_permission_fields_and_env_override() {
         let state = state();
         // 默认 autonomous + 空作用域。
@@ -4301,18 +4679,25 @@ mod tests {
         assert_eq!(updated["connectionScope"], json!(["conn-1", "Prod-DB"]));
         assert_eq!(updated["persistedExecPermissionMode"], "confirm");
         // 非法 mode / 非 scope 数组被拒绝。
-        assert!(state.settings_set(&json!({ "execPermissionMode": "yolo" })).is_err());
-        assert!(state.settings_set(&json!({ "connectionScope": "conn-1" })).is_err());
+        assert!(state
+            .settings_set(&json!({ "execPermissionMode": "yolo" }))
+            .is_err());
+        assert!(state
+            .settings_set(&json!({ "connectionScope": "conn-1" }))
+            .is_err());
         // 重读（含从盘加载路径）不丢。
         let reloaded = McpPermission::load(&state.limits_path);
         assert_eq!(reloaded.exec_permission_mode, "confirm");
-        assert_eq!(reloaded.connection_scope, vec!["conn-1".to_string(), "Prod-DB".to_string()]);
+        assert_eq!(
+            reloaded.connection_scope,
+            vec!["conn-1".to_string(), "Prod-DB".to_string()]
+        );
         // size-limit 键与 permission 键同文件共存（merge 写入）。
-        state.settings_set(&json!({ "maxReadBytes": 4096 })).unwrap();
-        let document: Value = serde_json::from_str(
-            &std::fs::read_to_string(&state.limits_path).unwrap(),
-        )
-        .unwrap();
+        state
+            .settings_set(&json!({ "maxReadBytes": 4096 }))
+            .unwrap();
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state.limits_path).unwrap()).unwrap();
         assert_eq!(document["maxReadBytes"], 4096);
         assert_eq!(document["execPermissionMode"], "confirm");
     }
@@ -4328,7 +4713,9 @@ mod tests {
         };
         // 空作用域：两来源都全量。
         let all = connection_list_result(
-            Ok(vec![json!({"id":"conn-9","name":"staging","host":"stg.local"})]),
+            Ok(vec![
+                json!({"id":"conn-9","name":"staging","host":"stg.local"}),
+            ]),
             &[stored()],
             &[],
         );
@@ -4788,11 +5175,17 @@ mod tests {
     #[test]
     fn terminal_input_gate_sudo_lines_follow_the_allowlist() {
         // 连接声明了白名单：sudo 行必须命中条目。
-        let allowlist = vec![vec!["systemctl".to_string(), "restart".to_string(), "*".to_string()]];
+        let allowlist = vec![vec![
+            "systemctl".to_string(),
+            "restart".to_string(),
+            "*".to_string(),
+        ]];
         let error =
             terminal_input_gate("sudo yum update -y\r", false, false, &allowlist).unwrap_err();
         assert!(error.contains("whitelist"), "{error}");
-        assert!(terminal_input_gate("sudo systemctl restart nginx\r", false, false, &allowlist).is_ok());
+        assert!(
+            terminal_input_gate("sudo systemctl restart nginx\r", false, false, &allowlist).is_ok()
+        );
         // 未声明白名单的连接不做该门（行为与 ssh_exec 一致）。
         assert!(terminal_input_gate("sudo yum update -y\r", false, false, &[]).is_ok());
     }
@@ -5013,14 +5406,8 @@ mod tests {
             ),
             // Missing / non-string method.
             (json!({ "jsonrpc": "2.0", "id": 4 }), "method"),
-            (
-                json!({ "jsonrpc": "2.0", "id": 5, "method": 42 }),
-                "method",
-            ),
-            (
-                json!({ "jsonrpc": "2.0", "id": 6, "method": "" }),
-                "method",
-            ),
+            (json!({ "jsonrpc": "2.0", "id": 5, "method": 42 }), "method"),
+            (json!({ "jsonrpc": "2.0", "id": 6, "method": "" }), "method"),
         ];
         for (request, fragment) in hostile {
             let response = state.dispatch(request).await.unwrap();
@@ -5167,7 +5554,10 @@ mod tests {
         // ssh_multi_exec: both gaps named in one error, schema required order.
         let message = multi_exec_error(&state, json!({})).await;
         assert!(message.contains("Missing required parameters"), "{message}");
-        assert!(message.contains("targets") && message.contains("command"), "{message}");
+        assert!(
+            message.contains("targets") && message.contains("command"),
+            "{message}"
+        );
 
         // Only one gap → only that one named (the other was supplied).
         let message = multi_exec_error(&state, json!({ "targets": ["conn-1"] })).await;
@@ -5178,7 +5568,10 @@ mod tests {
         // sftp_upload / sftp_download: both paths enumerated together.
         for name in ["sftp_upload", "sftp_download"] {
             let message = tool_error(&state, name, json!({})).await;
-            assert!(message.contains("Missing required parameters"), "{name}: {message}");
+            assert!(
+                message.contains("Missing required parameters"),
+                "{name}: {message}"
+            );
             assert!(
                 message.contains("localPath") && message.contains("remotePath"),
                 "{name}: {message}"
@@ -5193,8 +5586,8 @@ mod tests {
             multi_exec_error(&state, json!({ "targets": "conn-1", "command": "uptime" })).await;
         assert!(message.contains("targets must be an array"), "{message}");
         // Null counts as absent (JSON's explicit "no value").
-        let message = multi_exec_error(&state, json!({ "targets": ["conn-1"], "command": null }))
-            .await;
+        let message =
+            multi_exec_error(&state, json!({ "targets": ["conn-1"], "command": null })).await;
         assert_eq!(message, "Missing required parameters: command", "{message}");
     }
 
@@ -5949,7 +6342,8 @@ mod tests {
             let name = format!("Web {index}");
             let connection = stored_connection(&id, "192.0.2.10", 22, json!({ "name": name }));
             // Register.
-            state.dbx_connections
+            state
+                .dbx_connections
                 .write()
                 .await
                 .insert(id.clone(), connection);
@@ -5971,19 +6365,19 @@ mod tests {
             assert_eq!(resolved.unwrap().id, id);
             // Endpoint lookup (host + username, default port).
             let resolved = state
-                .registered_connection_by_ref(&json!({ "host": "192.0.2.10", "username": "deploy" }))
+                .registered_connection_by_ref(
+                    &json!({ "host": "192.0.2.10", "username": "deploy" }),
+                )
                 .await
                 .expect("endpoint lookup");
             assert_eq!(resolved.unwrap().id, id);
             // Mismatched selectors are an error, not a silent miss.
-            assert!(
-                state
-                    .registered_connection_by_ref(&json!({
-                        "connectionId": id, "connectionName": "other"
-                    }))
-                    .await
-                    .is_err()
-            );
+            assert!(state
+                .registered_connection_by_ref(&json!({
+                    "connectionId": id, "connectionName": "other"
+                }))
+                .await
+                .is_err());
             // Drop and confirm the miss (stale ids keep the self-heal path).
             state.dbx_connections.write().await.remove(&id);
             let resolved = state
@@ -6008,7 +6402,11 @@ mod tests {
             "message": "node-1 cpu_usage above 0.9",
         });
         let first_triage = state
-            .call_tool("ssh_alert_triage", &json!({ "payload": payload.to_string() }), None)
+            .call_tool(
+                "ssh_alert_triage",
+                &json!({ "payload": payload.to_string() }),
+                None,
+            )
             .await
             .expect("triage");
         let first_hosts = state
@@ -6018,7 +6416,11 @@ mod tests {
         let first_settings = state.settings_get();
         for index in 1..100 {
             let triage = state
-                .call_tool("ssh_alert_triage", &json!({ "payload": payload.to_string() }), None)
+                .call_tool(
+                    "ssh_alert_triage",
+                    &json!({ "payload": payload.to_string() }),
+                    None,
+                )
                 .await
                 .expect("triage");
             assert_eq!(triage, first_triage, "triage drifted at call {index}");
@@ -6049,7 +6451,11 @@ mod tests {
             .expect("data dir")
             .count();
         for index in 0..500 {
-            let mode = if index % 2 == 0 { "confirm" } else { "autonomous" };
+            let mode = if index % 2 == 0 {
+                "confirm"
+            } else {
+                "autonomous"
+            };
             let upload: u64 = if index % 3 == 0 { 1024 } else { 2048 };
             state
                 .settings_set(&json!({
@@ -6059,7 +6465,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("settings_set failed at {index}: {error}"));
             let settings = state.settings_get();
             assert_eq!(
-                settings["execPermissionMode"], json!(mode),
+                settings["execPermissionMode"],
+                json!(mode),
                 "mode not visible immediately at {index}"
             );
             assert_eq!(settings["maxUploadBytes"], json!(upload));
@@ -6096,17 +6503,30 @@ mod tests {
         for cycle in 0..300 {
             assert_eq!(
                 parse_bg_start_output(start, "/tmp/.dbx-ssh-tasks/default.log".to_string()),
-                ("4242".to_string(), "/tmp/.dbx-ssh-tasks/bg-1.log".to_string()),
+                (
+                    "4242".to_string(),
+                    "/tmp/.dbx-ssh-tasks/bg-1.log".to_string()
+                ),
                 "bg start drifted at cycle {cycle}"
             );
             assert_eq!(
                 parse_task_status_output(running),
-                ("running".to_string(), None, Some(true), "working\n".to_string()),
+                (
+                    "running".to_string(),
+                    None,
+                    Some(true),
+                    "working\n".to_string()
+                ),
                 "running parse drifted at cycle {cycle}"
             );
             assert_eq!(
                 parse_task_status_output(done),
-                ("done".to_string(), Some(0), Some(false), "EXIT_0\n".to_string()),
+                (
+                    "done".to_string(),
+                    Some(0),
+                    Some(false),
+                    "EXIT_0\n".to_string()
+                ),
                 "done parse drifted at cycle {cycle}"
             );
             assert_eq!(
@@ -6312,7 +6732,11 @@ mod tests {
         assert_eq!(stored.name.as_deref(), Some("Web"));
 
         // Degraded branch: registry alone + note.
-        let degraded = connection_list_result(Err("bridge down".to_string()), &[stored.clone()], &[]);
+        let degraded = connection_list_result(
+            Err("bridge down".to_string()),
+            std::slice::from_ref(&stored),
+            &[],
+        );
         assert_eq!(degraded["source"], "session-registry");
         assert!(
             degraded["note"]
@@ -6673,8 +7097,7 @@ mod tests {
                     None,
                 )
                 .await
-                .err()
-                .expect("write tool must be refused on a read-only connection");
+                .expect_err("write tool must be refused on a read-only connection");
             assert!(error.contains("read-only"), "unexpected: {error}");
         }
 
@@ -6743,11 +7166,18 @@ mod tests {
         assert_eq!(arg_u64(&json!({}), "port").unwrap(), None);
         assert_eq!(arg_u64(&json!({ "port": null }), "port").unwrap(), None);
         let error = arg_u64(&json!({ "port": "abc" }), "port").unwrap_err();
-        assert!(error.contains("port must be an integer") && error.contains("abc"), "{error}");
+        assert!(
+            error.contains("port must be an integer") && error.contains("abc"),
+            "{error}"
+        );
         assert_eq!(arg_port(&json!({})).unwrap(), 22);
         assert_eq!(arg_port(&json!({ "port": "22" })).unwrap(), 22);
-        assert!(arg_port(&json!({ "port": 0 })).unwrap_err().contains("between 1 and 65535"));
-        assert!(arg_port(&json!({ "port": 99999 })).unwrap_err().contains("between 1 and 65535"));
+        assert!(arg_port(&json!({ "port": 0 }))
+            .unwrap_err()
+            .contains("between 1 and 65535"));
+        assert!(arg_port(&json!({ "port": 99999 }))
+            .unwrap_err()
+            .contains("between 1 and 65535"));
         // 布尔字符串变体："true"/"yes"/"1" 为真，"off"/"0" 为假。
         for (value, expected) in [
             ("true", true),
@@ -6830,7 +7260,10 @@ mod tests {
             .call_tool("database_query", &json!({}), None)
             .await
             .unwrap_err();
-        assert!(error.contains("Unknown tool") && error.contains("tools/list"), "{error}");
+        assert!(
+            error.contains("Unknown tool") && error.contains("tools/list"),
+            "{error}"
+        );
         // 未注册的 tool 名是 tools/call 之内的工具级错误，仍是 -32000
         // （传输层未知 method 才用标准 -32601，见 dispatch 注释）。
         let response = state
@@ -6841,7 +7274,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["error"]["code"], -32000);
-        assert!(response["error"]["message"].as_str().unwrap().contains("Unknown tool"));
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tool"));
     }
 
     #[tokio::test]
@@ -6906,7 +7342,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.contains("confirmDestructive must be a boolean"), "{error}");
+        assert!(
+            error.contains("confirmDestructive must be a boolean"),
+            "{error}"
+        );
         // timeoutSecs 数字字符串被解析（非法值同样报错）。
         let error = state
             .call_tool(
@@ -6948,7 +7387,10 @@ mod tests {
     #[tokio::test]
     async fn ssh_close_demands_a_connection_reference() {
         let state = state();
-        let error = state.call_tool("ssh_close", &json!({}), None).await.unwrap_err();
+        let error = state
+            .call_tool("ssh_close", &json!({}), None)
+            .await
+            .unwrap_err();
         assert!(
             error.contains("ssh_close needs a connection reference"),
             "{error}"
@@ -7097,38 +7539,30 @@ mod tests {
     async fn gate_combo_matrix_read_only_destructive_sudo_and_scope() {
         // 普通连接（sudo 白名单：精确 systemctl restart nginx + shutdown *）。
         let rw_state = state();
-        rw_state
-            .dbx_connections
-            .write()
-            .await
-            .insert(
-                "conn-rw".to_string(),
-                stored_connection(
-                    "conn-rw",
-                    "web.example.test",
-                    22,
-                    json!({ "external_config": {
+        rw_state.dbx_connections.write().await.insert(
+            "conn-rw".to_string(),
+            stored_connection(
+                "conn-rw",
+                "web.example.test",
+                22,
+                json!({ "external_config": {
                         "sudo_whitelist": "systemctl restart nginx\nshutdown *"
                     } }),
-                ),
-            );
+            ),
+        );
         // 只读连接（同白名单）：只读门必须先于白名单与确认位。
         let ro_state = state();
-        ro_state
-            .dbx_connections
-            .write()
-            .await
-            .insert(
-                "conn-ro".to_string(),
-                stored_connection(
-                    "conn-ro",
-                    "web.example.test",
-                    22,
-                    json!({ "read_only": true, "external_config": {
+        ro_state.dbx_connections.write().await.insert(
+            "conn-ro".to_string(),
+            stored_connection(
+                "conn-ro",
+                "web.example.test",
+                22,
+                json!({ "read_only": true, "external_config": {
                         "sudo_whitelist": "systemctl restart nginx\nshutdown *"
                     } }),
-                ),
-            );
+            ),
+        );
         // 组合 1：非只读 + 灾难命令 + confirmDestructive:true → 过灾难门
         // （错误是拨号失败，不再是 confirm 提示）。
         let error = rw_state
@@ -7248,11 +7682,10 @@ mod tests {
         // × 灾难命令 + 确认 → 操作员开关压过连接自身的可写属性。
         let mut killed_state = state();
         killed_state.global_read_only = true;
-        killed_state
-            .dbx_connections
-            .write()
-            .await
-            .insert("conn-rw".to_string(), stored_connection("conn-rw", "web.example.test", 22, json!({})));
+        killed_state.dbx_connections.write().await.insert(
+            "conn-rw".to_string(),
+            stored_connection("conn-rw", "web.example.test", 22, json!({})),
+        );
         let error = killed_state
             .call_tool(
                 "ssh_exec",
@@ -7314,19 +7747,15 @@ mod tests {
     #[tokio::test]
     async fn terminal_input_combo_gates_stack_in_order() {
         let state = state();
-        state
-            .dbx_connections
-            .write()
-            .await
-            .insert(
-                "conn-ti".to_string(),
-                stored_connection(
-                    "conn-ti",
-                    "web.example.test",
-                    22,
-                    json!({ "external_config": { "sudo_whitelist": "systemctl restart nginx" } }),
-                ),
-            );
+        state.dbx_connections.write().await.insert(
+            "conn-ti".to_string(),
+            stored_connection(
+                "conn-ti",
+                "web.example.test",
+                22,
+                json!({ "external_config": { "sudo_whitelist": "systemctl restart nginx" } }),
+            ),
+        );
         // 灾难行 + confirmDestructive → 过灾难门，但 sudo 行仍受白名单拒绝。
         let error = state
             .call_tool(
@@ -7371,14 +7800,29 @@ mod tests {
         let state = state();
         let cases: [(&str, &str); 9] = [
             // (payload, 期望 category)
-            (r#"{"alertId":"n1","message":"network eth0 packet loss 5%, bandwidth saturated"}"#, "network"),
+            (
+                r#"{"alertId":"n1","message":"network eth0 packet loss 5%, bandwidth saturated"}"#,
+                "network",
+            ),
             // 中英混合：丢包 + bandwidth 双命中仍归 network。
-            (r#"{"message":"网络抖动, 丢包严重, bandwidth 不足"}"#, "network"),
+            (
+                r#"{"message":"网络抖动, 丢包严重, bandwidth 不足"}"#,
+                "network",
+            ),
             // OOM 优先于 memory（out of memory 同时命中 memory 关键词）。
-            (r#"{"message":"Out of memory: oom-kill killed process 4321 (java)"}"#, "oom"),
-            (r#"{"message":"systemd unit cron.service restart failed"}"#, "service"),
+            (
+                r#"{"message":"Out of memory: oom-kill killed process 4321 (java)"}"#,
+                "oom",
+            ),
+            (
+                r#"{"message":"systemd unit cron.service restart failed"}"#,
+                "service",
+            ),
             // 零命中回落 generic。
-            (r#"{"message":"backup job completed without errors at 03:00"}"#, "generic"),
+            (
+                r#"{"message":"backup job completed without errors at 03:00"}"#,
+                "generic",
+            ),
             // 中英混合 CPU。
             (r#"{"message":"CPU loadavg 飙升, 处理器过热"}"#, "cpu"),
             (r#"{"message":"内存 swap 已满, mem usage 99%"}"#, "memory"),
@@ -7443,7 +7887,11 @@ mod tests {
         };
         // 默认允许根（系统临时目录）放行两个文件 → 错误是拨号失败而非根拒绝。
         let error = st
-            .call_tool("sftp_upload", &upload_args(&outside.path().join("outside.bin")), None)
+            .call_tool(
+                "sftp_upload",
+                &upload_args(&outside.path().join("outside.bin")),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -7454,7 +7902,11 @@ mod tests {
         st.settings_set(&json!({ "localTransferRoot": root.path().to_str().unwrap() }))
             .unwrap();
         let error = st
-            .call_tool("sftp_upload", &upload_args(&outside.path().join("outside.bin")), None)
+            .call_tool(
+                "sftp_upload",
+                &upload_args(&outside.path().join("outside.bin")),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -7463,7 +7915,11 @@ mod tests {
         );
         // 根内文件过根闸（错误回到拨号层）。
         let error = st
-            .call_tool("sftp_upload", &upload_args(&root.path().join("inside.bin")), None)
+            .call_tool(
+                "sftp_upload",
+                &upload_args(&root.path().join("inside.bin")),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -7582,7 +8038,11 @@ mod tests {
         );
         // ssh_close：端口早校验先于工具自身的引用指引。
         let error = st
-            .call_tool("ssh_close", &json!({ "connectionName": "x", "port": 0 }), None)
+            .call_tool(
+                "ssh_close",
+                &json!({ "connectionName": "x", "port": 0 }),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(

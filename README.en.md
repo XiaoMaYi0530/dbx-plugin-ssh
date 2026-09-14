@@ -65,16 +65,51 @@ More screenshots live in the [showcase page](docs/MEDIA.en.md).
 
 ## MCP automation
 
-Use the DBX MCP bridge to reuse saved connections, approvals, and sudo allowlists.
-For standalone read-only access:
+The plugin ships 31 MCP tools — remote commands, sudo elevation, SFTP file transfer,
+server metrics, and alert triage — so AI coding agents (ZCode, Claude, or any MCP
+client) can operate your servers inside your permission boundaries. Two ways to connect:
 
-```bash
-DBX_SSH_MCP_READ_ONLY=1 backend/target/release/dbx-plugin-ssh --mcp
+**Option 1: the DBX MCP bridge (recommended).** DBX's MCP server ships two generic
+bridge tools, `dbx_list_plugin_tools` and `dbx_call_plugin_tool`, that discover and call
+every installed plugin's MCP tools. Pass a `connectionId` to reference a saved SSH
+connection: credentials are resolved host-side and never appear in tool arguments, while
+approvals, sudo allowlists, and read-only mode keep working.
+
+**Option 2: standalone stdio mode.** Register the plugin binary directly as an MCP
+server — no DBX required:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "dbx-ssh": {
+        "type": "stdio",
+        "command": "/absolute/path/dbx-plugin-ssh",
+        "args": ["--mcp"]
+      }
+    }
+  }
+}
 ```
 
-Useful tools include `ssh_exec`, `ssh_metrics`, `sftp_list`, `sftp_upload`, and
-`sftp_download`. See the [MCP guide](docs/MCP_USAGE.en.md) and the
-[SSH MCP reference](docs/MCP.zh-CN.md) for configuration and safety details.
+For production hosts, expose a read-only MCP entry point (the whole process is forced
+through the read-only gate; tools cannot turn it off):
+
+```bash
+DBX_SSH_MCP_READ_ONLY=1 dbx-plugin-ssh --mcp
+```
+
+| Job | Tools |
+| --- | --- |
+| Remote inspection | `ssh_exec`, `ssh_metrics`, `sftp_list_dir`, `ssh_test_connection` |
+| Privileged work | `ssh_exec_sudo` (auto-answers TOTP), Quick Sudo profiles |
+| Long-running jobs | `ssh_run_bg` + `ssh_task_status` (survive disconnects and new sessions) |
+| File transfer | `sftp_upload` / `sftp_download` / `sftp_read_file` / `sftp_write_file` |
+| Alert triage | `ssh_alert_triage` → read-only diagnostic playbook → `ssh_exec` |
+
+For full configuration, credential-free connection addressing, the tool catalog, and the
+safety model, see the [MCP guide](docs/MCP_USAGE.en.md) and the
+[SSH MCP reference](docs/MCP.zh-CN.md).
 
 ## Security
 

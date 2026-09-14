@@ -59,14 +59,46 @@ DBX SSH 终端（DBX SSH Terminal）是面向现代运维团队的服务器终�
 
 ## MCP 自动化
 
-推荐通过 DBX MCP 桥调用，以复用已保存连接、审批和 sudo 白名单。独立模式可运行：
+插件内置 31 个 MCP 工具——远程命令、sudo 提权、SFTP 文件、服务器指标、告警分诊——
+让 AI 编码代理（ZCode、Claude 等任何 MCP 客户端）在你的权限边界内操作服务器。
+支持两种接入方式：
 
-```bash
-DBX_SSH_MCP_READ_ONLY=1 backend/target/release/dbx-plugin-ssh --mcp
+**方式一：DBX MCP 桥（推荐）**。DBX 的 MCP 服务器内置 `dbx_list_plugin_tools` /
+`dbx_call_plugin_tool` 两个通用桥工具，可发现并调用已装插件的全部 MCP 工具。
+传 `connectionId` 即引用 DBX 已保存的 SSH 连接，凭据由 DBX 解析转发，
+工具参数中不出现任何密码，审批、sudo 白名单与只读模式照常生效。
+
+**方式二：独立 stdio 模式**。无需 DBX 在场，把插件二进制直接注册为 MCP 服务器：
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "dbx-ssh": {
+        "type": "stdio",
+        "command": "/绝对路径/dbx-plugin-ssh",
+        "args": ["--mcp"]
+      }
+    }
+  }
+}
 ```
 
-常用工具包括 `ssh_exec`、`ssh_metrics`、`sftp_list`、`sftp_upload` 和
-`sftp_download`。完整配置、工具调用和安全边界见
+生产环境可以开一个只读 MCP 入口（整个进程强制走只读门，工具无法自行关闭）：
+
+```bash
+DBX_SSH_MCP_READ_ONLY=1 dbx-plugin-ssh --mcp
+```
+
+| 任务 | 工具 |
+| --- | --- |
+| 远程巡检 | `ssh_exec`、`ssh_metrics`、`sftp_list_dir`、`ssh_test_connection` |
+| 特权操作 | `ssh_exec_sudo`（自动应答 TOTP）、Quick Sudo 档案 |
+| 长任务 | `ssh_run_bg` + `ssh_task_status`（断线、换会话不丢） |
+| 文件传输 | `sftp_upload` / `sftp_download` / `sftp_read_file` / `sftp_write_file` |
+| 告警排查 | `ssh_alert_triage` → 只读诊断命令清单 → `ssh_exec` 执行 |
+
+完整配置、连接寻址（免内联凭据）、工具清单与安全边界见
 [MCP 使用指南](docs/MCP_USAGE.zh-CN.md)与[SSH MCP 参考](docs/MCP.zh-CN.md)。
 
 ## 安全设计
