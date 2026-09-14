@@ -5,20 +5,34 @@
 
 [English](README.en.md) · [产品宣传页](docs/MEDIA.zh-CN.md) · [特性与竞品对比](docs/COMPARISON.zh-CN.md) · [独立仓库迁移说明](docs/REPOSITORY_SPLIT.zh-CN.md)
 
-DBX SSH & SFTP 是面向日常服务器运维的连接工作台。它把交互式终端、远程命令、
-SFTP 文件管理和安全认证集中在一个界面中，并支持通过宿主连接与传输能力访问
-远程环境。
+DBX SSH & SFTP 是面向现代运维团队的服务器工作台：打开一个连接，就能完成终端操作、
+文件传输、跳板访问、受控提权和 MCP 自动化。它把“登录服务器之后的下一小时”压缩成
+一个连贯、可审计、可复用的工作流。
 
 ![DBX SSH & SFTP 工作台](docs/screenshots-a-ssh/01-toolbar-dark.png)
 
 > 终端、SFTP、MCP 自动化和受控运维操作集中在一个 DBX 工作台中。
 
-## 产品演示
+## 先看效果
 
+[观看 87 秒真实操作演示](docs/media/dbx-ssh-live-demo.mp4) ·
 [观看 15 秒功能预览](docs/media/dbx-ssh-demo.mp4)
 
-![连接与终端](docs/screenshots-a-ssh/05-connection-info.png)
-![命令历史](docs/screenshots-a-ssh/03-command-history.png)
+![DBX SSH & SFTP 产品总览](docs/media/dbx-ssh-overview.png)
+
+如果你正在工具之间来回切换：终端一个窗口、SFTP 一个窗口、跳板机靠配置文件、
+自动化又要另写脚本，那么 DBX SSH & SFTP 的价值很直接——连接、终端、文件和自动化
+都围绕同一个 DBX 连接上下文工作。
+
+## 为什么值得用
+
+| 你要完成的事 | DBX SSH & SFTP 给你的体验 |
+| --- | --- |
+| 快速处理线上问题 | PTY 终端、命令历史、快速命令、可取消命令和目录跟随 |
+| 安全地传文件 | SFTP 预览、拖放、断点确认、进度、取消和原子替换 |
+| 进入私网服务器 | 最多三跳 ProxyJump、连接保活和 Known Hosts 校验 |
+| 限制高风险操作 | 只读模式、sudo 来源选择、命令白名单和宿主 secret binding |
+| 把重复工作自动化 | MCP 工具复用连接、审批和权限边界 |
 
 ## 适合场景
 

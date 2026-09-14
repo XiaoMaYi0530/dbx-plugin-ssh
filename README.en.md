@@ -5,20 +5,35 @@
 
 [中文](README.md) · [Showcase](docs/MEDIA.en.md) · [Feature comparison](docs/COMPARISON.en.md) · [Repository split notes](docs/REPOSITORY_SPLIT.en.md)
 
-DBX SSH & SFTP is a practical workspace for server operations. It brings an
-interactive terminal, remote commands, SFTP file management, and secure
-authentication into one consistent interface.
+DBX SSH & SFTP is a server workspace for modern operations teams. Open one connection
+and move from terminal work to file transfer, jump-host access, guarded elevation, and
+MCP automation without losing context. It turns the next hour after “logging into a
+server” into one coherent, reusable, auditable workflow.
 
 ![DBX SSH & SFTP workspace](docs/screenshots-a-ssh/01-toolbar-dark.png)
 
 > One DBX workspace for interactive terminals, SFTP, MCP automation, and guarded server operations.
 
-## Product preview
+## See it in action
 
+[Watch the 87-second live workflow demo](docs/media/dbx-ssh-live-demo.mp4) ·
 [Watch the 15-second feature preview](docs/media/dbx-ssh-demo.mp4)
 
-![Connection and terminal](docs/screenshots-a-ssh/05-connection-info.png)
-![Command history](docs/screenshots-a-ssh/03-command-history.png)
+![DBX SSH & SFTP product overview](docs/media/dbx-ssh-overview.png)
+
+If your workflow jumps between a terminal, a separate SFTP client, jump-host config files,
+and one-off automation scripts, DBX SSH & SFTP gives you a simpler center of gravity:
+connections, terminal, files, and automation share the same DBX connection context.
+
+## Why teams reach for it
+
+| Your job | The DBX SSH & SFTP workflow |
+| --- | --- |
+| Resolve an incident quickly | PTY terminal, command history, quick commands, cancellable commands, and directory tracking |
+| Move files safely | SFTP preview, drag and drop, progress, cancellation, acknowledgements, and atomic replacement |
+| Reach private servers | Up to three ProxyJump hops, keepalive, and Known Hosts verification |
+| Put guardrails around risk | Read-only mode, selectable sudo source, command allowlists, and host secret bindings |
+| Automate repeatable work | MCP tools that reuse connections, approvals, and permission boundaries |
 
 ## Use cases
 

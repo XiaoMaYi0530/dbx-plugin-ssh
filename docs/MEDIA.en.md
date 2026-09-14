@@ -1,18 +1,22 @@
 # DBX SSH & SFTP showcase assets
 
-This page collects assets for GitHub, release notes, and product introductions. The video is
-a 15-second silent preview generated from real SSH UI screenshots in this repository; it does
-not claim live connection performance or remote-service availability.
+This page collects assets for GitHub, release notes, and product introductions. The repository
+includes a real workflow recording copied from `dbx-plugins/docs/ssh.mp4`, plus a short preview
+generated from the SSH UI screenshots.
 
 ## Video preview
 
-[Download or play the 15-second DBX SSH & SFTP preview](media/dbx-ssh-demo.mp4)
+[Download or play the 87-second DBX SSH & SFTP workflow demo](media/dbx-ssh-live-demo.mp4)
+
+[Download or play the 15-second feature preview](media/dbx-ssh-demo.mp4)
 
 ## Image gallery
 
 ### Workspace and connections
 
 ![Workspace overview](screenshots-a-ssh/01-toolbar-dark.png)
+
+![Product overview](media/dbx-ssh-overview.png)
 
 ![Connection details](screenshots-a-ssh/05-connection-info.png)
 
@@ -32,9 +36,19 @@ not claim live connection performance or remote-service availability.
 
 Short: `DBX SSH & SFTP puts terminal, SFTP, MCP automation, and guarded server operations in one workspace.`
 
-Long: `A DBX plugin for everyday server operations with password, private-key, SSH Agent,
-jump-host chains, PTY terminal, SFTP file operations, Known Hosts, read-only policies,
-Quick Sudo, TOTP, MCP automation, and a seven-language UI.`
+Long: `A DBX plugin for everyday server operations where one connection takes you from terminal
+to SFTP, jump-host access, guarded elevation, and MCP automation. It supports password,
+private-key, SSH Agent, up to three ProxyJump hops, PTY terminal, Known Hosts, read-only
+policies, Quick Sudo, TOTP, and a seven-language UI.`
+
+## Three reasons to try it
+
+- **From login to resolution**: terminal, directory, command history, and file operations stay
+  in the same context.
+- **From usable to governable**: Known Hosts, secret bindings, read-only mode, and sudo
+  allowlists make high-risk operations explicit.
+- **From manual to automated**: MCP tools reuse saved connections, approvals, and safety policy
+  instead of rebuilding scripts for every task.
 
 ## Scope note
 

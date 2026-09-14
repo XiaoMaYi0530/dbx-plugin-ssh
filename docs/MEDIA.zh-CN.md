@@ -1,17 +1,21 @@
 # DBX SSH & SFTP 产品宣传素材
 
-本页集中放置可直接用于 GitHub、发布说明和产品介绍的素材。视频是由仓库内的真实
-SSH UI 截图生成的 15 秒无声预览，不代表实时连接性能或远端服务可用性。
+本页集中放置可直接用于 GitHub、发布说明和产品介绍的素材。仓库同时提供一段来自
+`dbx-plugins/docs/ssh.mp4` 的真实操作演示，以及一段由 UI 截图生成的短预览。
 
 ## 视频预览
 
-[下载或播放 DBX SSH & SFTP 15 秒功能预览](media/dbx-ssh-demo.mp4)
+[下载或播放 DBX SSH & SFTP 87 秒真实操作演示](media/dbx-ssh-live-demo.mp4)
+
+[下载或播放 15 秒功能预览](media/dbx-ssh-demo.mp4)
 
 ## 图片画廊
 
 ### 工作台与连接
 
 ![工作台总览](screenshots-a-ssh/01-toolbar-dark.png)
+
+![产品宣传总览](media/dbx-ssh-overview.png)
 
 ![连接信息](screenshots-a-ssh/05-connection-info.png)
 
@@ -31,9 +35,16 @@ SSH UI 截图生成的 15 秒无声预览，不代表实时连接性能或远端
 
 短版：`DBX SSH & SFTP：把终端、SFTP、MCP 自动化和受控运维集中到一个工作台。`
 
-长版：`面向日常服务器运维的 DBX 插件，支持密码、私钥、SSH Agent、跳板链、PTY
-终端、SFTP 文件操作、Known Hosts、只读策略、Quick Sudo、TOTP 和 MCP 自动化，
-并提供七语界面。`
+长版：`面向日常服务器运维的 DBX 插件，打开一个连接即可完成终端、SFTP、跳板访问、
+受控提权和 MCP 自动化。支持密码、私钥、SSH Agent、最多三跳 ProxyJump、PTY 终端、
+Known Hosts、只读策略、Quick Sudo、TOTP，并提供七语界面。`
+
+## 三句卖点
+
+- **从登录到解决问题**：终端、目录、命令历史和文件操作始终保持在同一个上下文。
+- **从能用到敢用**：Known Hosts、secret binding、只读模式和 sudo 白名单把高风险操作
+  放进明确的权限边界。
+- **从手动到自动化**：MCP 工具可以复用已保存连接、审批和安全策略，减少重复脚本。
 
 ## 使用边界
 
