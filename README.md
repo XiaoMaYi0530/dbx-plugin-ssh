@@ -54,6 +54,9 @@ DBX SSH & SFTP 是面向现代运维团队的服务器工作台：打开一个�
 完整的能力矩阵和与 OpenSSH、Tabby、Termius、FinalShell 等方案的定位对比见
 [特性与竞品对比](docs/COMPARISON.zh-CN.md)。
 
+> **协议路线**：当前版本聚焦 SSH/SFTP 运维；RDP、Telnet 等协议支持仍在持续加强，
+> 后续会逐步补齐更多远程访问场景，请以对应版本发布说明为准。
+
 ![快速命令与终端操作](docs/screenshots-a-ssh/02-quick-commands.png)
 
 ## MCP 自动化

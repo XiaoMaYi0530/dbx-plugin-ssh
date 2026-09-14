@@ -57,7 +57,11 @@ connections, terminal, files, and automation share the same DBX connection conte
   and Portuguese UI.
 
 See the [feature and competitor comparison](docs/COMPARISON.en.md) for a capability matrix
-covering OpenSSH + sftp, Tabby, Termius, and FinalShell.
+covering OpenSSH + sftp, Tabby, Termius, FinalShell, electerm, and iSHell Pro.
+
+> **Protocol roadmap:** the current release focuses on SSH/SFTP operations. RDP, Telnet, and
+> additional remote-access protocols are still being strengthened; check the release notes for
+> the exact capability in each version.
 
 ![Quick commands and terminal operations](docs/screenshots-a-ssh/02-quick-commands.png)
 
