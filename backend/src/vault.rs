@@ -31,8 +31,11 @@ use zeroize::Zeroizing;
 
 const DEK_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-/// Keychain coordinates for the DEK (v1 envelope layout).
+/// Keychain coordinates for the DEK (v1 envelope layout). Only platforms
+/// with a native `keyring` backend reference these.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYCHAIN_SERVICE: &str = "io.dbx.ssh";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYCHAIN_ACCOUNT: &str = "vault-dek-v1";
 const KEYFILE_NAME: &str = "vault.key";
 
@@ -111,6 +114,7 @@ impl KeyProvider for KeychainProvider {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn resolve_keychain_dek() -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
         .map_err(|error| format!("Failed to open keychain entry: {error}"))?;
@@ -129,10 +133,20 @@ fn resolve_keychain_dek() -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
     }
 }
 
+/// No native keychain crate on this platform (the Linux secret-service
+/// backend pulls libdbus, absent in store build containers and on headless
+/// servers): an explicit keychain opt-in degrades to empty-secret mode per
+/// the "secrets may be lost, the store must not break" policy.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn resolve_keychain_dek() -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
+    Err("OS keychain tier is unavailable on this platform; the keyfile tier is used instead".to_string())
+}
+
 /// Best-effort removal of the keychain DEK entry after a successful
 /// keychain → keyfile migration. Only called when the keychain was readable
 /// this process, so the ACL grants cleanup; a denied delete is not fatal —
 /// the orphaned entry is harmless.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn delete_keychain_dek() {
     match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
         Ok(entry) => {
@@ -143,6 +157,9 @@ pub fn delete_keychain_dek() {
         Err(error) => eprintln!("[ssh] failed to open keychain entry for cleanup: {error}"),
     }
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn delete_keychain_dek() {}
 
 /// DEK stored in `<data_dir>/vault.key` (0600): the fallback tier for hosts
 /// without a usable keychain. Anti-copy / backup-exfiltration grade only.

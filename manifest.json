@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH Terminal",
-  "version": "0.4.71",
+  "version": "0.4.72",
   "publisher": "jinpy",
   "description": "A secure SSH terminal for interactive sessions, SFTP file transfer, remote commands, and guarded server operations.",
   "source": "https://github.com/jinpy666/dbx-plugin-ssh",
@@ -914,7 +914,7 @@
       }
     },
     "zh-CN": {
-      "name": "DBX SSH 终端",
+      "name": "SSH Terminal",
       "description": "面向服务器运维的 SSH 终端：交互式会话、SFTP 文件传输、远程命令和受控运维操作集中在一个界面。",
       "contributions": {
         "io.dbx.ssh.connection": {

@@ -1,9 +1,9 @@
 [package]
 name = "dbx-plugin-ssh"
-version = "0.4.71"
+version = "0.4.72"
 edition = "2021"
-license = "Apache-2.0"
-authors = ["Jinpy"]
+license = "MIT"
+authors = ["jinpy"]
 
 [workspace]
 
@@ -13,11 +13,6 @@ base64 = "0.22"
 data-encoding = "2"
 dbx-plugin-sdk = "0.1.0"
 hmac = "0.12"
-keyring = { version = "3", features = [
-    "apple-native",
-    "windows-native",
-    "sync-secret-service",
-] }
 rand = "0.8"
 russh = "0.60"
 russh-sftp = "2.3.0"
@@ -31,6 +26,15 @@ zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]
 pageant = "0.2"
+
+# The OS keychain tier only ships where a native keychain exists; the Linux
+# secret-service backend pulls libdbus (absent in store build containers and
+# on headless servers), so Linux always uses the keyfile tier.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+] }
 
 # The DBX sidecar SDK is vendored under shared/ so a standalone checkout does
 # not depend on the source monorepo or a sibling host checkout. See
