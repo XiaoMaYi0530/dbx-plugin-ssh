@@ -228,20 +228,25 @@ impl JumpHost {
                 position + 1,
                 self.host
             )),
-            "private-key" | "private-key-password" if self.private_key_path.is_empty() => Err(
-                format!(
+            "private-key" | "private-key-password" if self.private_key_path.is_empty() => {
+                Err(format!(
                     "Jump host #{} ({}) requires a private key path",
                     position + 1,
                     self.host
-                ),
-            ),
+                ))
+            }
             _ => Ok(()),
         }
     }
 
     /// Synthesizes a StoredConnection so the shared connect/auth pipeline
     /// (including keyboard-interactive 2FA) applies to jump hops as well.
-    pub fn to_connection(&self, id: &str, timeout_secs: u64, keepalive_secs: u64) -> StoredConnection {
+    pub fn to_connection(
+        &self,
+        id: &str,
+        timeout_secs: u64,
+        keepalive_secs: u64,
+    ) -> StoredConnection {
         StoredConnection {
             id: id.to_string(),
             // Jump hops are referenced by position in the chain, never by
@@ -346,10 +351,7 @@ impl StoredConnection {
         // 会话特性两件套（camelCase 为主；snake_case 别名兼容手改配置/历史
         // 草稿）。setEnv 严格校验，非法条目让连接直接失败（宁可连不上也
         // 不错配）；remoteCommand trim 后非空才生效。
-        let set_env = parse_set_env(config_text(
-            external_config,
-            &["setEnv", "set_env"],
-        ))?;
+        let set_env = parse_set_env(config_text(external_config, &["setEnv", "set_env"]))?;
         let remote_command = config_text(external_config, &["remoteCommand", "remote_command"])
             .unwrap_or_default()
             .trim()
@@ -420,12 +422,9 @@ impl StoredConnection {
                 "keepalive_interval_secs",
             )
             .unwrap_or(30),
-            terminal_keepalive_secs: clamp_terminal_keepalive(config_u64(
-                external_config,
-                connection,
-                "terminal_keepalive_secs",
-            )
-            .unwrap_or(0)),
+            terminal_keepalive_secs: clamp_terminal_keepalive(
+                config_u64(external_config, connection, "terminal_keepalive_secs").unwrap_or(0),
+            ),
             // 只读门禁收敛：连接表单 read_only（插件特定配置项）∥ 宿主标准
             // read_only（ConnectionConfig 通用设置）。
             read_only: external_config
@@ -582,7 +581,9 @@ fn parse_jump_hosts(
 /// target instead of failing fast at parse time.
 fn validate_host_field(host: String) -> Result<String, String> {
     if host.chars().any(char::is_whitespace) {
-        return Err(format!("Invalid SSH host '{host}': must not contain whitespace"));
+        return Err(format!(
+            "Invalid SSH host '{host}': must not contain whitespace"
+        ));
     }
     if host.contains("://") {
         return Err(format!(
@@ -594,10 +595,7 @@ fn validate_host_field(host: String) -> Result<String, String> {
 
 /// Reads a credential field verbatim (no trimming): passwords and
 /// passphrases may legitimately start or end with spaces.
-fn credential_string(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-) -> String {
+fn credential_string(object: &serde_json::Map<String, Value>, key: &str) -> String {
     object
         .get(key)
         .and_then(Value::as_str)
@@ -777,7 +775,10 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(form_read_only.read_only, "form read_only must force the gate");
+        assert!(
+            form_read_only.read_only,
+            "form read_only must force the gate"
+        );
 
         // 宿主标准 read_only（ConnectionConfig.read_only，通用连接设置）同样生效。
         let host_read_only = StoredConnection::from_lifecycle_params(&serde_json::json!({
@@ -791,7 +792,10 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(host_read_only.read_only, "host read_only must force the gate");
+        assert!(
+            host_read_only.read_only,
+            "host read_only must force the gate"
+        );
 
         let writable = StoredConnection::from_lifecycle_params(&serde_json::json!({
             "connection": {
@@ -803,7 +807,10 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(!writable.read_only, "writable connections must stay writable");
+        assert!(
+            !writable.read_only,
+            "writable connections must stay writable"
+        );
     }
 
     #[test]
@@ -856,7 +863,13 @@ mod tests {
         // secret binding 只允许落在凭据字段；config binding 不得承载凭据语义。
         // private_key 是隐藏的兼容槽位：外部工具（如宿主迁移）写进 Secret Store
         // 的存量条目必须被 provider 声明，否则宿主校验拒绝整个连接。
-        let secret_keys = ["password", "private_key_passphrase", "private_key", "sudo_password", "totp_secret"];
+        let secret_keys = [
+            "password",
+            "private_key_passphrase",
+            "private_key",
+            "sudo_password",
+            "totp_secret",
+        ];
         for field in fields {
             let key = field["key"].as_str().unwrap();
             match field["binding"].as_str() {
@@ -875,10 +888,7 @@ mod tests {
         // required_when 链必须与 from_lifecycle_params 的凭据校验一致
         // （model.rs: password/private-key-password 校验密码、private-key* 校验私钥路径）。
         let one_of = |key: &str, constraint: &str| -> Vec<String> {
-            fields
-                .iter()
-                .find(|field| field["key"] == key)
-                .unwrap()[constraint]
+            fields.iter().find(|field| field["key"] == key).unwrap()[constraint]
                 .as_object()
                 .map(|gate| {
                     gate["one_of"]
@@ -890,7 +900,10 @@ mod tests {
                 })
                 .unwrap_or_default()
         };
-        assert_eq!(one_of("password", "required_when"), ["password", "private-key-password"]);
+        assert_eq!(
+            one_of("password", "required_when"),
+            ["password", "private-key-password"]
+        );
         assert_eq!(
             one_of("private_key_path", "required_when"),
             ["private-key", "private-key-password"]
@@ -941,13 +954,28 @@ mod tests {
             );
         }
         for key in ["totp_secret", "totp_prompt_hint"] {
-            assert_eq!(visible_when(key), Some(("auth_flow_mode".to_string(), vec!["password_then_otp".to_string(), "password_plus_otp".to_string()])));
+            assert_eq!(
+                visible_when(key),
+                Some((
+                    "auth_flow_mode".to_string(),
+                    vec![
+                        "password_then_otp".to_string(),
+                        "password_plus_otp".to_string()
+                    ]
+                ))
+            );
         }
     }
 
     #[test]
     fn auth_method_names_round_trip_for_display() {
-        for name in ["password", "private-key", "private-key-password", "agent", "none"] {
+        for name in [
+            "password",
+            "private-key",
+            "private-key-password",
+            "agent",
+            "none",
+        ] {
             // Name round-trip is a pure enum mapping; credential validation is
             // exercised separately by the connection parsing tests.
             let method = AuthenticationMethod::from_method_name(name);
@@ -1181,8 +1209,14 @@ mod tests {
         assert!(build(serde_json::json!({ "host": "bastion", "username": "  " })).is_err());
         // Host with internal whitespace or URI syntax must fail fast instead
         // of becoming a bogus TCP target.
-        assert!(build(serde_json::json!({ "host": "my bastion", "username": "u", "password": "p" })).is_err());
-        assert!(build(serde_json::json!({ "host": "ssh://bastion:22", "username": "u", "password": "p" })).is_err());
+        assert!(build(
+            serde_json::json!({ "host": "my bastion", "username": "u", "password": "p" })
+        )
+        .is_err());
+        assert!(build(
+            serde_json::json!({ "host": "ssh://bastion:22", "username": "u", "password": "p" })
+        )
+        .is_err());
         // The target host field is held to the same rules.
         let bad_target = serde_json::json!({
             "connection": {
@@ -1285,14 +1319,12 @@ mod manifest_contract_tests {
     }
 
     fn condition_one_of(entry: &Value, condition: &str) -> Option<Vec<String>> {
-        entry[condition]["one_of"]
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|value| value.as_str().unwrap_or_default().to_string())
-                    .collect()
-            })
+        entry[condition]["one_of"].as_array().map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
     }
 
     fn condition_field<'a>(entry: &'a Value, condition: &str) -> Option<&'a str> {
@@ -1320,11 +1352,7 @@ mod manifest_contract_tests {
                 let key = entry["key"].as_str().unwrap().to_string();
                 let binding = entry["binding"].as_str().unwrap_or("");
                 // Only credential/config surfaces take part in the auth chain.
-                if !matches!(
-                    binding,
-                    "password" | "secret" | "config"
-                ) || key == "authentication"
-                {
+                if !matches!(binding, "password" | "secret" | "config") || key == "authentication" {
                     continue;
                 }
                 let statically_required = entry["required"].as_bool().unwrap_or(false);
@@ -1348,6 +1376,275 @@ mod manifest_contract_tests {
         }
     }
 
+    /// 发布前的表单组合矩阵：认证方式、sudo 来源、只读开关、2FA 模式等
+    /// 下拉/开关的每一种交叉，在解析层要么成功且语义正确，要么干净报错
+    /// ——绝不 panic、绝不静默错位。表单切换认证方式会在不可见字段里留下
+    /// 残留凭据，这类组合必须被容忍（多余凭据被忽略而非报错），否则用户改
+    /// 一个下拉框就再也连不上。
+    #[test]
+    fn form_option_combinations_parse_without_conflicts() {
+        let connection_with = |authentication: &str,
+                               password: Option<&str>,
+                               mut external_config: Value,
+                               secrets: Value|
+         -> Result<StoredConnection, String> {
+            external_config["authentication"] = Value::String(authentication.to_string());
+            let mut connection = serde_json::json!({
+                "id": "combo-matrix",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "external_config": external_config
+            });
+            if let Some(password) = password {
+                connection["password"] = Value::String(password.to_string());
+            }
+            if !secrets.is_null() {
+                connection["connection_secrets"] = secrets;
+            }
+            StoredConnection::from_lifecycle_params(
+                &serde_json::json!({ "connection": connection }),
+            )
+        };
+
+        // ① 每个认证方式的最小必需凭据组合都必须通过（含表单里显式提供
+        //    的 none / agent 这两个"零凭据"选项）。
+        let minimal: &[(&str, Option<&str>, Value, Value, AuthenticationMethod)] = &[
+            (
+                "password",
+                Some("pw"),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                AuthenticationMethod::Password,
+            ),
+            (
+                "private-key",
+                None,
+                serde_json::json!({ "private_key_path": "~/.ssh/id_ed25519" }),
+                serde_json::json!({}),
+                AuthenticationMethod::PrivateKey,
+            ),
+            (
+                "private-key-password",
+                Some("pw"),
+                serde_json::json!({ "private_key_path": "/keys/id_ed25519" }),
+                serde_json::json!({ "private_key_passphrase": "pp" }),
+                AuthenticationMethod::PrivateKeyPassword,
+            ),
+            (
+                "agent",
+                None,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                AuthenticationMethod::Agent,
+            ),
+            (
+                "none",
+                None,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                AuthenticationMethod::None,
+            ),
+        ];
+        for (authentication, password, external, secrets, expected) in minimal {
+            let parsed =
+                connection_with(authentication, *password, external.clone(), secrets.clone())
+                    .unwrap_or_else(|error| {
+                        panic!("{authentication} minimal combo rejected: {error}")
+                    });
+            assert_eq!(
+                parsed.authentication, *expected,
+                "minimal combo for '{authentication}' misparses"
+            );
+        }
+
+        // ② 残留凭据容忍：表单里所有凭据字段都有值时（用户来回切换过
+        //    认证方式），每种认证方式都必须照常解析且方法正确。
+        let everything_external = serde_json::json!({ "private_key_path": "/keys/k" });
+        let everything_secrets = serde_json::json!({ "private_key_passphrase": "pp", "totp_secret": "JBSWY3DPEHPK3PXP" });
+        for (authentication, _, _, _, expected) in minimal {
+            let parsed = connection_with(
+                authentication,
+                Some("pw"),
+                everything_external.clone(),
+                everything_secrets.clone(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{authentication} leftover-credential combo rejected: {error}")
+            });
+            assert_eq!(
+                parsed.authentication, *expected,
+                "leftover-credential combo for '{authentication}' misparses"
+            );
+        }
+
+        // ③ 必需凭据缺失 → 干净报错并指出缺什么。
+        let missing_password = connection_with(
+            "password",
+            None,
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            missing_password.contains("requires a password"),
+            "{missing_password}"
+        );
+        let missing_key = connection_with(
+            "private-key",
+            None,
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            missing_key.contains("requires a private key path"),
+            "{missing_key}"
+        );
+        let half_of_private_key_password = connection_with(
+            "private-key-password",
+            None,
+            serde_json::json!({ "private_key_path": "/keys/k" }),
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            half_of_private_key_password.contains("requires a password"),
+            "{half_of_private_key_password}"
+        );
+        let other_half = connection_with(
+            "private-key-password",
+            Some("pw"),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            other_half.contains("requires a private key path"),
+            "{other_half}"
+        );
+
+        // ④ 无法识别的认证值 → 明确报错（而非静默回落 password，那会把
+        //    拼错的组合变成一次注定失败的密码登录）。
+        let typo = connection_with(
+            "publickey",
+            Some("pw"),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            typo.contains("Unsupported SSH authentication method 'publickey'"),
+            "{typo}"
+        );
+
+        // ⑤ read_only × sudo_source 全矩阵：六个组合都必须可解析，
+        //    sudo_enabled 只反映凭据来源——只读是正交的运行时门禁
+        //    （ssh.rs 的 exec/sudo 通道负责拦截），解析层不得混淆二者。
+        for read_only in [false, true] {
+            for source in ["custom", "global", "off"] {
+                let parsed = connection_with(
+                    "password",
+                    Some("pw"),
+                    serde_json::json!({ "sudo_source": source, "read_only": read_only }),
+                    serde_json::json!({}),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("read_only={read_only} sudo_source={source} rejected: {error}")
+                });
+                assert_eq!(parsed.read_only, read_only, "sudo_source={source}");
+                assert_eq!(
+                    parsed.sudo_enabled(),
+                    source != "off",
+                    "read_only={read_only} sudo_source={source}"
+                );
+            }
+        }
+
+        // ⑥ auth_flow_mode 交叉：sudo_source=global 时连接自身的 2FA 模式
+        //    仍可解析（表单隐藏它，但登录期 keyboard-interactive 还要用）；
+        //    password_only 携带 totp_secret 也合法——运行时静默忽略 OTP，
+        //    不算配置冲突。
+        for flow in [
+            "password_only",
+            "password_plus_otp",
+            "password_then_otp",
+            "ssh-agent-garbage",
+        ] {
+            for source in ["custom", "global", "off"] {
+                let parsed = connection_with(
+                    "password",
+                    Some("pw"),
+                    serde_json::json!({
+                        "sudo_source": source,
+                        "auth_flow_mode": flow,
+                        "totp_prompt_hint": "duo passcode"
+                    }),
+                    serde_json::json!({ "totp_secret": "JBSWY3DPEHPK3PXP" }),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("auth_flow_mode={flow} sudo_source={source} rejected: {error}")
+                });
+                assert_eq!(parsed.auth_flow_mode, flow, "sudo_source={source}");
+            }
+        }
+
+        // ⑦ 端口边界：0 与 65536 报错，1 与 65535 合法。
+        for (port, ok) in [(0u64, false), (1, true), (65535, true), (65536, false)] {
+            let connection = serde_json::json!({
+                "id": "port-edge",
+                "host": "example.com",
+                "port": port,
+                "username": "user",
+                "password": "pw",
+                "external_config": { "authentication": "password" }
+            });
+            let result = StoredConnection::from_lifecycle_params(
+                &serde_json::json!({ "connection": connection }),
+            );
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "port {port} should {}",
+                if ok { "parse" } else { "be rejected" }
+            );
+        }
+
+        // ⑧ connect_timeout_secs=0 钳到下限 1，而非让握手等待 0 秒后立即
+        //    超时（表单允许输入 0，解析层负责收敛）。
+        let zero_timeout = connection_with(
+            "password",
+            Some("pw"),
+            serde_json::json!({ "connect_timeout_secs": 0 }),
+            serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(zero_timeout.connect_timeout_secs, 1);
+
+        // ⑨ 跳板机不接受 none：链上每一跳都必须认证，"No authentication"
+        //    只对最终会话合法。
+        let none_hop = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "hop-none",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": "pw",
+                "external_config": {
+                    "authentication": "password",
+                    "jump_hosts": [
+                        { "host": "bastion", "port": 22, "username": "ops", "authentication": "none" }
+                    ]
+                }
+            }
+        }))
+        .unwrap_err();
+        assert!(
+            none_hop.contains("Unsupported jump host authentication method 'none'"),
+            "{none_hop}"
+        );
+    }
+
     /// Every manifest field must land in the store the model reads it from:
     /// `secret` bindings come from `connection_secrets`, `config` bindings
     /// from `external_config` and are consumed by the parser.
@@ -1355,7 +1652,12 @@ mod manifest_contract_tests {
     fn bindings_match_parse_surfaces() {
         // private_key 是隐藏兼容槽位：只为让宿主接受外部工具写入的存量
         // secret，解析面故意不消费它。
-        let secret_keys = ["private_key", "private_key_passphrase", "sudo_password", "totp_secret"];
+        let secret_keys = [
+            "private_key",
+            "private_key_passphrase",
+            "sudo_password",
+            "totp_secret",
+        ];
         let config_keys = [
             "authentication",
             "private_key_path",
@@ -1383,7 +1685,10 @@ mod manifest_contract_tests {
                 "name" | "host" | "port" | "username" | "password" => {
                     let key = entry["key"].as_str().unwrap();
                     assert!(
-                        matches!(key, "display_name" | "host" | "port" | "username" | "password"),
+                        matches!(
+                            key,
+                            "display_name" | "host" | "port" | "username" | "password"
+                        ),
                         "unexpected binding for field '{key}'"
                     );
                 }
@@ -1439,10 +1744,7 @@ mod manifest_contract_tests {
             Some(vec!["global".to_string()]),
             "sudo_profile must be visible only while sudo_source is global"
         );
-        for key in [
-            "auth_flow_mode",
-            "password_prompt_hint",
-        ] {
+        for key in ["auth_flow_mode", "password_prompt_hint"] {
             assert_eq!(
                 condition_field(&field(key), "visible_when"),
                 Some("sudo_source"),
@@ -1455,8 +1757,17 @@ mod manifest_contract_tests {
             );
         }
         for key in ["totp_secret", "totp_prompt_hint"] {
-            assert_eq!(condition_field(&field(key), "visible_when"), Some("auth_flow_mode"));
-            assert_eq!(condition_one_of(&field(key), "visible_when"), Some(vec!["password_then_otp".to_string(), "password_plus_otp".to_string()]));
+            assert_eq!(
+                condition_field(&field(key), "visible_when"),
+                Some("auth_flow_mode")
+            );
+            assert_eq!(
+                condition_one_of(&field(key), "visible_when"),
+                Some(vec![
+                    "password_then_otp".to_string(),
+                    "password_plus_otp".to_string()
+                ])
+            );
         }
     }
 
@@ -1482,7 +1793,8 @@ mod manifest_contract_tests {
         ];
         for (key, expected) in expected_defaults {
             assert_eq!(
-                field(key)["default"], *expected,
+                field(key)["default"],
+                *expected,
                 "manifest default mismatch for '{key}'"
             );
         }
@@ -1579,21 +1891,20 @@ mod manifest_contract_tests {
         );
         assert!(field("private_key_passphrase")["required_when"].is_null());
 
-        let without_passphrase =
-            StoredConnection::from_lifecycle_params(&serde_json::json!({
-                "connection": {
-                    "id": "plain-key",
-                    "host": "example.com",
-                    "port": 22,
-                    "username": "user",
-                    "external_config": {
-                        "authentication": "private-key-password",
-                        "private_key_path": "/keys/id_ed25519"
-                    },
-                    "connection_secrets": {}
-                }
-            }))
-            .unwrap_err();
+        let without_passphrase = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "plain-key",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "external_config": {
+                    "authentication": "private-key-password",
+                    "private_key_path": "/keys/id_ed25519"
+                },
+                "connection_secrets": {}
+            }
+        }))
+        .unwrap_err();
         assert!(
             !without_passphrase.contains("private key path"),
             "unencrypted private-key-password keys must not be rejected for a missing passphrase"
