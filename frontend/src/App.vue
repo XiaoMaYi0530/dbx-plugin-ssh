@@ -7191,8 +7191,11 @@ onBeforeUnmount(() => {
 .proc-kill-force { color: var(--destructive, #e5484d); }
 .replay-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 90; display: flex; align-items: center; justify-content: center; }
 .replay-modal { background: var(--background); color: var(--foreground); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px 14px; width: min(920px, 92vw); display: flex; flex-direction: column; gap: 10px; }
-.replay-modal header h2 { margin: 0; font-size: 14px; }
-.replay-terminal { height: 420px; }
+/* 标题行弹性布局：关闭按钮固定右上角（block 布局下按钮会掉到标题下一行）。 */
+.replay-modal header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.replay-modal header h2 { margin: 0; min-width: 0; overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+/* 不固定高度：xterm 26 行实际渲染 442px，写死 420px 会让终端溢出压住下方控制条。 */
+.replay-terminal { min-height: 44px; }
 .replay-controls { display: flex; align-items: center; gap: 10px; }
 .replay-seek { flex: 1; }
 .replay-speed { width: 76px; }

@@ -1,22 +1,20 @@
-# DBX SSH Workbench
+# DBX SSH Terminal
 
 [![CI](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/jinpy666/dbx-plugin-ssh?display_name=tag)](https://github.com/jinpy666/dbx-plugin-ssh/releases)
 
 [中文](README.md) · [Showcase](docs/MEDIA.en.md) · [Feature comparison](docs/COMPARISON.en.md) · [Repository split notes](docs/REPOSITORY_SPLIT.en.md)
 
-DBX SSH Workbench is a server workspace for modern operations teams. Open one connection
+DBX SSH Terminal is a server terminal for modern operations teams. Open one connection
 and move from terminal work to file transfer, jump-host access, guarded elevation, and
 MCP automation without losing context. It turns the next hour after “logging into a
 server” into one coherent, reusable, auditable workflow.
-
-![DBX SSH & SFTP workspace](docs/screenshots-a-ssh/01-toolbar-dark.png)
 
 > SSH Terminal · SFTP · Remote Operations: one DBX workspace for interactive terminals, files, automation, and guarded server operations.
 
 ## See it in action
 
-[Watch the 87-second live workflow demo](docs/media/dbx-ssh-live-demo.mp4) ·
+[Watch the 87-second live workflow demo (click to play)](docs/media/dbx-ssh-live-demo.mp4) ·
 [Watch the 15-second feature preview](docs/media/dbx-ssh-demo.mp4)
 
 ![DBX SSH & SFTP product overview](docs/media/dbx-ssh-overview.png)
@@ -63,7 +61,7 @@ covering OpenSSH + sftp, Tabby, Termius, FinalShell, electerm, and iSHell Pro.
 > additional remote-access protocols are still being strengthened; check the release notes for
 > the exact capability in each version.
 
-![Quick commands and terminal operations](docs/screenshots-a-ssh/02-quick-commands.png)
+More screenshots live in the [showcase page](docs/MEDIA.en.md).
 
 ## MCP automation
 

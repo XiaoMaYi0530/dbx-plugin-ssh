@@ -3,6 +3,7 @@ name = "dbx-plugin-ssh"
 version = "0.4.71"
 edition = "2021"
 license = "Apache-2.0"
+authors = ["Jinpy"]
 
 [workspace]
 

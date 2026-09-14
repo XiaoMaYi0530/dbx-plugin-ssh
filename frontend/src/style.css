@@ -50,7 +50,11 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 
 .toolbar {
   position: relative;
-  z-index: 5;
+  /* 工具栏弹层（.popover）随本层叠上下文整体参与根级排序：必须高于终端
+     xterm 内部层（关键词高亮装饰 .xterm-decoration z=6、.xterm-helpers z=5）
+     与指标/录制浮动卡（.metrics-float z=6），否则弹窗下探部分会被这些层
+     盖住；仍低于 context-menu(50)/modal(80)/回放(90)。 */
+  z-index: 20;
   display: flex;
   height: 36px;
   min-height: 36px;
@@ -390,6 +394,9 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .settings-modal { width: min(520px, 100%); }
 .settings-body { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 14px; overflow-y: auto; padding-right: 4px; }
 .settings-field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--muted-foreground); }
+/* 开关行恢复横向布局：.settings-field 的 column 会让 .switch-control 在列向
+   flex 里被 stretch/flex-basis 拉成方块、文字掉到下一行（WebGL 开关）。 */
+.settings-switch-row { flex-direction: row; align-items: center; gap: 8px; }
 .settings-field input, .settings-field select, .settings-field textarea { border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
 .settings-field textarea { resize: vertical; font-family: var(--terminal-font-family); }
 .settings-note { margin: 0; font-size: 10px; }

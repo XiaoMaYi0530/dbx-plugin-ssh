@@ -1,21 +1,19 @@
-# DBX SSH 运维工作台
+# DBX SSH 终端
 
 [![CI](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/jinpy666/dbx-plugin-ssh?display_name=tag)](https://github.com/jinpy666/dbx-plugin-ssh/releases)
 
 [English](README.en.md) · [产品宣传页](docs/MEDIA.zh-CN.md) · [特性与竞品对比](docs/COMPARISON.zh-CN.md) · [独立仓库迁移说明](docs/REPOSITORY_SPLIT.zh-CN.md)
 
-DBX SSH 运维工作台（DBX SSH Workbench）是面向现代运维团队的服务器工作台：打开一个连接，就能完成终端操作、
+DBX SSH 终端（DBX SSH Terminal）是面向现代运维团队的服务器终端：打开一个连接，就能完成终端操作、
 文件传输、跳板访问、受控提权和 MCP 自动化。它把“登录服务器之后的下一小时”压缩成
 一个连贯、可审计、可复用的工作流。
 
-![DBX SSH & SFTP 工作台](docs/screenshots-a-ssh/01-toolbar-dark.png)
-
-> SSH Terminal · SFTP · Remote Operations：终端、文件、自动化和受控运维操作集中在一个 DBX 工作台中。
+> SSH Terminal · SFTP · Remote Operations：终端、文件、自动化和受控运维操作集中在一个 DBX 终端面板中。
 
 ## 先看效果
 
-[观看 87 秒真实操作演示](docs/media/dbx-ssh-live-demo.mp4) ·
+[观看 87 秒真实操作演示（点击在线播放）](docs/media/dbx-ssh-live-demo.mp4) ·
 [观看 15 秒功能预览](docs/media/dbx-ssh-demo.mp4)
 
 ![DBX SSH & SFTP 产品总览](docs/media/dbx-ssh-overview.png)
@@ -57,7 +55,7 @@ DBX SSH 运维工作台（DBX SSH Workbench）是面向现代运维团队的服�
 > **协议路线**：当前版本聚焦 SSH/SFTP 运维；RDP、Telnet 等协议支持仍在持续加强，
 > 后续会逐步补齐更多远程访问场景，请以对应版本发布说明为准。
 
-![快速命令与终端操作](docs/screenshots-a-ssh/02-quick-commands.png)
+更多截图见[产品宣传页](docs/MEDIA.zh-CN.md)。
 
 ## MCP 自动化
 
@@ -93,6 +91,5 @@ python3 scripts/validate_repo.py && node scripts/connection-forms/verify.mjs
 scripts/test.sh --skip-host
 ```
 
-协议、构建和完整集成验证说明位于 `docs/`；公开贡献请先阅读
-独立仓库的迁移边界、公共依赖和发布前置条件见
-[迁移说明](docs/REPOSITORY_SPLIT.zh-CN.md)。
+协议、构建和完整集成验证说明位于 `docs/`。公开贡献前请先阅读
+[迁移说明](docs/REPOSITORY_SPLIT.zh-CN.md)，了解独立仓库的迁移边界、公共依赖和发布前置条件。

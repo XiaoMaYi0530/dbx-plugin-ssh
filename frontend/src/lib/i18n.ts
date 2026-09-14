@@ -19,7 +19,7 @@ const messages = {
       refused: "The server refused the connection. Verify the host and port, and make sure the SSH service is running.",
       dns: "The host name could not be resolved. Check the spelling of the host address.",
       timeout: "The connection timed out. Check network reachability, firewalls and VPN routes.",
-      hostKey: "The server's host key was rejected. If the server was rebuilt, update the known-hosts entry from the workbench tools.",
+      hostKey: "The server's host key was rejected. If the server was rebuilt, open the Known hosts panel to update the stored entry, then reconnect.",
       network: "The server is unreachable over the network. Check routing and firewalls, then press Reconnect.",
     },
     terminalSelectCopy: {
@@ -137,7 +137,7 @@ const messages = {
       open: "Open SFTP panel",
       close: "Collapse SFTP panel",
       defaultOpen: "Open SFTP panel by default",
-      defaultOpenHint: "Applies to newly opened workbenches",
+      defaultOpenHint: "Applies to newly opened SSH terminal sessions",
     },
     sftpBatch: {
       selected: "{count} selected",
@@ -302,7 +302,7 @@ const messages = {
     },
     mcpSettings: {
       permissionMode: "MCP execution approval",
-      permissionModeConfirmHint: "In confirm mode, write operations and remote command execution require manual approval in this workbench; with no workbench open they are rejected immediately.",
+      permissionModeConfirmHint: "In confirm mode, write operations and remote command execution require manual approval in the SSH terminal panel; with no terminal session open they are rejected immediately.",
       connectionScope: "Connection scope",
       connectionScopeHint: "One entry per line: connection id, connection name or hostname. Empty = no restriction.",
     },
@@ -345,7 +345,7 @@ const messages = {
       refused: "El servidor rechazó la conexión. Verifica el host y el puerto, y asegúrate de que el servicio SSH esté en ejecución.",
       dns: "No se pudo resolver el nombre del host. Revisa la escritura de la dirección del host.",
       timeout: "La conexión agotó el tiempo de espera. Comprueba la accesibilidad de la red, los cortafuegos y las rutas VPN.",
-      hostKey: "La clave de host del servidor fue rechazada. Si el servidor se reconstruyó, actualiza la entrada de known-hosts desde las herramientas del área de trabajo.",
+      hostKey: "La clave de host del servidor fue rechazada. Si el servidor se reconstruyó, abre el panel de Hosts conocidos para actualizar la entrada guardada y vuelve a conectar.",
       network: "No se puede alcanzar el servidor por la red. Revisa el enrutamiento y los cortafuegos y pulsa Reconectar.",
     },
     terminalSelectCopy: {
@@ -463,7 +463,7 @@ const messages = {
       open: "Abrir panel SFTP",
       close: "Plegar panel SFTP",
       defaultOpen: "Abrir el panel SFTP por defecto",
-      defaultOpenHint: "Se aplica a las áreas de trabajo nuevas",
+      defaultOpenHint: "Se aplica a las sesiones de terminal SSH nuevas",
     },
     sftpBatch: {
       selected: "{count} seleccionados",
@@ -622,7 +622,7 @@ const messages = {
     },
     mcpSettings: {
       permissionMode: "Aprobación de ejecución MCP",
-      permissionModeConfirmHint: "En modo confirm, las operaciones de escritura y la ejecución remota de comandos requieren aprobación manual en este workbench; sin un workbench abierto se rechazan de inmediato.",
+      permissionModeConfirmHint: "En modo confirm, las operaciones de escritura y la ejecución remota de comandos requieren aprobación manual en el panel del terminal SSH; sin una sesión de terminal abierta se rechazan de inmediato.",
       connectionScope: "Ámbito de conexiones",
       connectionScopeHint: "Una entrada por línea: id de conexión, nombre de conexión o nombre de host. Vacío = sin restricción.",
     },
@@ -665,7 +665,7 @@ const messages = {
       refused: "Il server ha rifiutato la connessione. Verifica host e porta e assicurati che il servizio SSH sia in esecuzione.",
       dns: "Impossibile risolvere il nome host. Controlla l'ortografia dell'indirizzo host.",
       timeout: "Connessione scaduta. Verifica raggiungibilità di rete, firewall e route VPN.",
-      hostKey: "La host key del server è stata rifiutata. Se il server è stato ricostruito, aggiorna la voce known-hosts dagli strumenti del workbench.",
+      hostKey: "La host key del server è stata rifiutata. Se il server è stato ricostruito, apri il pannello Host noti per aggiornare la voce salvata, poi riconnettiti.",
       network: "Il server non è raggiungibile in rete. Controlla routing e firewall, poi premi Riconnetti.",
     },
     terminalSelectCopy: {
@@ -783,7 +783,7 @@ const messages = {
       open: "Apri pannello SFTP",
       close: "Comprimi pannello SFTP",
       defaultOpen: "Apri il pannello SFTP per impostazione predefinita",
-      defaultOpenHint: "Si applica alle nuove aree di lavoro",
+      defaultOpenHint: "Si applica alle nuove sessioni del terminale SSH",
     },
     sftpBatch: {
       selected: "{count} selezionati",
@@ -942,7 +942,7 @@ const messages = {
     },
     mcpSettings: {
       permissionMode: "Approvazione esecuzione MCP",
-      permissionModeConfirmHint: "In modalità confirm, le operazioni di scrittura e l'esecuzione remota di comandi richiedono l'approvazione manuale in questo workbench; senza un workbench aperto vengono rifiutate immediatamente.",
+      permissionModeConfirmHint: "In modalità confirm, le operazioni di scrittura e l'esecuzione remota di comandi richiedono l'approvazione manuale nel pannello del terminale SSH; senza una sessione di terminale aperta vengono rifiutate immediatamente.",
       connectionScope: "Ambito connessioni",
       connectionScopeHint: "Una voce per riga: id connessione, nome connessione o nome host. Vuoto = nessuna restrizione.",
     },
@@ -985,7 +985,7 @@ const messages = {
       refused: "サーバーが接続を拒否しました。ホストとポートを確認し、SSH サービスが起動しているか確認してください。",
       dns: "ホスト名を解決できませんでした。ホストアドレスの綴りを確認してください。",
       timeout: "接続がタイムアウトしました。ネットワークの到達性・ファイアウォール・VPN 経路を確認してください。",
-      hostKey: "サーバーのホスト鍵が拒否されました。サーバーを再構築した場合は、ワークベンチのツールから known-hosts のエントリを更新してください。",
+      hostKey: "サーバーのホスト鍵が拒否されました。サーバーを再構築した場合は、「既知のホスト」パネルで保存済みのエントリを更新してから再接続してください。",
       network: "ネットワーク経由でサーバーに到達できません。ルーティングとファイアウォールを確認してから、再接続を押してください。",
     },
     terminalSelectCopy: {
@@ -1103,7 +1103,7 @@ const messages = {
       open: "SFTP パネルを開く",
       close: "SFTP パネルを折りたたむ",
       defaultOpen: "SFTP パネルを既定で開く",
-      defaultOpenHint: "新しく開くワークベンチに適用されます",
+      defaultOpenHint: "新しく開く SSH ターミナルセッションに適用されます",
     },
     sftpBatch: {
       selected: "{count} 件を選択中",
@@ -1262,7 +1262,7 @@ const messages = {
     },
     mcpSettings: {
       permissionMode: "MCP 実行承認",
-      permissionModeConfirmHint: "confirm モードでは、書き込み操作とリモートコマンド実行にこのワークベンチでの手動承認が必要です。ワークベンチが開いていない場合は即時に拒否されます。",
+      permissionModeConfirmHint: "confirm モードでは、書き込み操作とリモートコマンド実行に SSH ターミナルパネルでの手動承認が必要です。ターミナルセッションが開いていない場合は即時に拒否されます。",
       connectionScope: "接続スコープ",
       connectionScopeHint: "1 行に 1 件：接続 ID、接続名、またはホスト名。空欄 = 制限なし。",
     },
@@ -1305,7 +1305,7 @@ const messages = {
       refused: "O servidor recusou a conexão. Confirme o host e a porta e verifique se o serviço SSH está em execução.",
       dns: "Não foi possível resolver o nome do host. Verifique a grafia do endereço do host.",
       timeout: "A conexão expirou. Verifique a acessibilidade da rede, firewalls e rotas de VPN.",
-      hostKey: "A host key do servidor foi rejeitada. Se o servidor foi reconstruído, atualize a entrada de known-hosts nas ferramentas do workbench.",
+      hostKey: "A host key do servidor foi rejeitada. Se o servidor foi reconstruído, abra o painel de Hosts conhecidos para atualizar a entrada salva e reconecte.",
       network: "O servidor está inacessível pela rede. Verifique roteamento e firewalls e pressione Reconectar.",
     },
     terminalSelectCopy: {
@@ -1423,7 +1423,7 @@ const messages = {
       open: "Abrir painel SFTP",
       close: "Recolher painel SFTP",
       defaultOpen: "Abrir o painel SFTP por padrão",
-      defaultOpenHint: "Aplica-se às novas áreas de trabalho",
+      defaultOpenHint: "Aplica-se às novas sessões do terminal SSH",
     },
     sftpBatch: {
       selected: "{count} selecionados",
@@ -1582,7 +1582,7 @@ const messages = {
     },
     mcpSettings: {
       permissionMode: "Aprovação de execução MCP",
-      permissionModeConfirmHint: "No modo confirm, operações de escrita e execução remota de comandos exigem aprovação manual neste workbench; sem um workbench aberto são recusadas imediatamente.",
+      permissionModeConfirmHint: "No modo confirm, operações de escrita e execução remota de comandos exigem aprovação manual no painel do terminal SSH; sem uma sessão de terminal aberta são recusadas imediatamente.",
       connectionScope: "Escopo de conexões",
       connectionScopeHint: "Uma entrada por linha: id da conexão, nome da conexão ou nome do host. Vazio = sem restrição.",
     },
@@ -1625,7 +1625,7 @@ const messages = {
       refused: "服务器拒绝了连接。请确认主机地址与端口正确，且 SSH 服务正在运行。",
       dns: "无法解析主机名。请检查主机地址拼写是否正确。",
       timeout: "连接超时。请检查网络可达性、防火墙与 VPN 路由。",
-      hostKey: "服务器主机密钥被拒绝。若服务器曾重装，请在工作台工具中更新 known-hosts 记录。",
+      hostKey: "服务器主机密钥被拒绝。若服务器曾重装，请在「已知主机」面板更新记录，然后重新连接。",
       network: "网络无法到达服务器。请检查路由与防火墙，然后点击“重新连接”。",
     },
     terminalSelectCopy: {
@@ -1743,7 +1743,7 @@ const messages = {
       open: "打开 SFTP 面板",
       close: "收起 SFTP 面板",
       defaultOpen: "默认打开 SFTP 面板",
-      defaultOpenHint: "仅对新打开的工作台生效",
+      defaultOpenHint: "仅对新打开的 SSH 终端会话生效",
     },
     sftpBatch: {
       selected: "已选择 {count} 项",
@@ -1908,7 +1908,7 @@ const messages = {
     },
     mcpSettings: {
       permissionMode: "MCP 执行审批",
-      permissionModeConfirmHint: "confirm 档下，写操作与远程命令执行需要在本工作台人工批准；没有打开的工作台时会被立即拒绝。",
+      permissionModeConfirmHint: "confirm 模式下，写操作与远程命令执行需要在 SSH 终端面板人工批准；未打开终端会话时会被立即拒绝。",
       connectionScope: "连接作用域",
       connectionScopeHint: "每行一条：连接 id、连接名或主机名。留空 = 不限制。",
     },
@@ -1951,7 +1951,7 @@ const messages = {
       refused: "伺服器拒絕了連線。請確認主機位址與連接埠正確，且 SSH 服務正在執行。",
       dns: "無法解析主機名稱。請檢查主機位址拼寫是否正確。",
       timeout: "連線逾時。請檢查網路可達性、防火牆與 VPN 路由。",
-      hostKey: "伺服器主機金鑰被拒絕。若伺服器曾重裝，請在工作台工具中更新 known-hosts 記錄。",
+      hostKey: "伺服器主機金鑰被拒絕。若伺服器曾重裝，請在「已知主機」面板更新記錄，然後重新連線。",
       network: "網路無法抵達伺服器。請檢查路由與防火牆，然後點擊「重新連線」。",
     },
     terminalSelectCopy: {
@@ -2069,7 +2069,7 @@ const messages = {
       open: "開啟 SFTP 面板",
       close: "收合 SFTP 面板",
       defaultOpen: "預設開啟 SFTP 面板",
-      defaultOpenHint: "僅對新開啟的工作台生效",
+      defaultOpenHint: "僅對新開啟的 SSH 終端工作階段生效",
     },
     sftpBatch: {
       selected: "已選擇 {count} 項",
@@ -2234,7 +2234,7 @@ const messages = {
     },
     mcpSettings: {
       permissionMode: "MCP 執行審批",
-      permissionModeConfirmHint: "confirm 檔下，寫入操作與遠端命令執行需要在本工作台人工批准；沒有開啟的工作台時會被立即拒絕。",
+      permissionModeConfirmHint: "confirm 模式下，寫入操作與遠端命令執行需要在 SSH 終端面板人工批准；未開啟終端工作階段時會被立即拒絕。",
       connectionScope: "連線作用域",
       connectionScopeHint: "每行一條：連線 id、連線名稱或主機名稱。留空 = 不限制。",
     },

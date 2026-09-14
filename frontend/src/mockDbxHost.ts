@@ -234,6 +234,26 @@ const AUDIT_FIXTURE: Array<Record<string, unknown>> = [
 ];
 let auditEntriesState: Array<Record<string, unknown>> = AUDIT_FIXTURE.map((entry) => ({ ...entry }));
 
+// 录制回放 fixture：一条 ~24s 的输出事件流，供录制浮条与回放弹窗（进度条/
+// 倍速/GIF 导出）走查。data 为直写 xterm 的原始文本（asciicast eventdata）。
+const RECORDING_FIXTURE_EVENTS = [
+  { time: 0, type: "o", data: "user@server:~$ ./deploy.sh --env=production\r\n" },
+  { time: 1.2, type: "o", data: "[1/4] building image …\r\n" },
+  { time: 4.5, type: "o", data: "[2/4] pushing registry.demo.internal/app:1.4.2\r\n" },
+  { time: 9.8, type: "o", data: "[3/4] rolling update 3/3 replicas ✓\r\n" },
+  { time: 15.4, type: "o", data: "[4/4] health check passed (200 OK)\r\n" },
+  { time: 18.0, type: "o", data: "deploy finished SUCCESS in 17.6s\r\n" },
+  { time: 23.5, type: "o", data: "user@server:~$ " },
+];
+const RECORDING_FIXTURE_SUMMARY = {
+  recordingId: "visual-recording-1",
+  sessionId: "visual-session",
+  host: "server.demo.internal",
+  startedAt: Date.now() - 3_600_000,
+  durationSecs: 23.5,
+  bytes: 4096,
+};
+
 
 // 模拟 VS Code 风格 shell-integration 周期（OSC 633），让 command-marker 条
 // 在 open 与 reattach 两条启动路径下都有内容可渲染（P2-2）。
@@ -359,6 +379,15 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { path: normalizeMockPath(String((params as Record<string, unknown>)?.path || "")), kind: node.kind, ...(node.kind === "file" ? { size: node.size } : {}), modifiedAt: node.modifiedAt, mode: node.permissions };
   }
   else if (method === "sftp/transfer/list") result = { tasks: [] };
+  else if (method === "ssh/recording/list") result = { recordings: [RECORDING_FIXTURE_SUMMARY] };
+  else if (method === "ssh/recording/get") {
+    const input = (params || {}) as Record<string, unknown>;
+    const offset = Math.max(0, Math.floor(Number(input.offset) || 0));
+    const limit = Math.max(1, Math.floor(Number(input.limit) || 500));
+    const events = RECORDING_FIXTURE_EVENTS.slice(offset, offset + limit);
+    result = { events, total: RECORDING_FIXTURE_EVENTS.length, hasMore: offset + events.length < RECORDING_FIXTURE_EVENTS.length };
+  }
+  else if (method === "ssh/recording/delete") result = { success: true };
   else if (method === "sftp/transfer/history") {
     // ?err=transferHistory 模拟历史查询失败，供面板 loadFailed+重试态走查。
     if (fixtureParams.get("err") === "transferHistory") throw new Error("sftp: transfer history unavailable");

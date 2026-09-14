@@ -37,12 +37,12 @@ positioning and should be verified against the target platform and exact version
 
 | Plugin | Primary object | Best for |
 | --- | --- | --- |
-| DBX SSH Workbench | SSH hosts, terminals, SFTP, remote operations | Log in, run commands, browse and transfer files |
+| DBX SSH Terminal | SSH hosts, terminals, SFTP, remote operations | Log in, run commands, browse and transfer files |
 | DBX Files | File systems and object storage | Browse, upload/download, archive, and organize storage |
 | DBX LDAP | LDAP directories | Search, aggregate, and edit directory entries |
 | DBX Kafka | Kafka clusters | Topics, messages, consumer groups, and schemas |
 
-SSH Workbench does not duplicate the dedicated Files, LDAP, or Kafka protocols. It focuses on
+SSH Terminal does not duplicate the dedicated Files, LDAP, or Kafka protocols. It focuses on
 terminal and SFTP operations after reaching a host over SSH, while reusing DBX connection,
 secret, and workbench boundaries.
 

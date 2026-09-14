@@ -1,12 +1,12 @@
-# DBX SSH Workbench showcase assets
+# DBX SSH Terminal showcase assets
 
 This page collects assets for GitHub, release notes, and product introductions. The repository
-includes a real workflow recording copied from `dbx-plugins/docs/ssh.mp4`, plus a short preview
+includes two demo videos: an 87-second real workflow recording, plus a 15-second preview
 generated from the SSH UI screenshots.
 
 ## Video preview
 
-[Download or play the 87-second DBX SSH Workbench workflow demo](media/dbx-ssh-live-demo.mp4)
+[Download or play the 87-second DBX SSH Terminal workflow demo](media/dbx-ssh-live-demo.mp4)
 
 [Download or play the 15-second feature preview](media/dbx-ssh-demo.mp4)
 
@@ -34,9 +34,9 @@ generated from the SSH UI screenshots.
 
 ## Copy-ready messaging
 
-Short: `DBX SSH Workbench puts SSH Terminal, SFTP, MCP automation, and guarded server operations in one workspace.`
+Short: `DBX SSH Terminal puts interactive sessions, SFTP, MCP automation, and guarded server operations in one workspace.`
 
-Long: `DBX SSH Workbench is a plugin for everyday server operations where one connection takes you from terminal
+Long: `DBX SSH Terminal is a plugin for everyday server operations where one connection takes you from terminal
 to SFTP, jump-host access, guarded elevation, and MCP automation. It supports password,
 private-key, SSH Agent, up to three ProxyJump hops, PTY terminal, Known Hosts, read-only
 policies, Quick Sudo, TOTP, and a seven-language UI.`
