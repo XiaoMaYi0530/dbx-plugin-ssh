@@ -1,18 +1,18 @@
-# DBX SSH & SFTP
+# DBX SSH Workbench
 
 [![CI](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/jinpy666/dbx-plugin-ssh?display_name=tag)](https://github.com/jinpy666/dbx-plugin-ssh/releases)
 
 [中文](README.md) · [Showcase](docs/MEDIA.en.md) · [Feature comparison](docs/COMPARISON.en.md) · [Repository split notes](docs/REPOSITORY_SPLIT.en.md)
 
-DBX SSH & SFTP is a server workspace for modern operations teams. Open one connection
+DBX SSH Workbench is a server workspace for modern operations teams. Open one connection
 and move from terminal work to file transfer, jump-host access, guarded elevation, and
 MCP automation without losing context. It turns the next hour after “logging into a
 server” into one coherent, reusable, auditable workflow.
 
 ![DBX SSH & SFTP workspace](docs/screenshots-a-ssh/01-toolbar-dark.png)
 
-> One DBX workspace for interactive terminals, SFTP, MCP automation, and guarded server operations.
+> SSH Terminal · SFTP · Remote Operations: one DBX workspace for interactive terminals, files, automation, and guarded server operations.
 
 ## See it in action
 

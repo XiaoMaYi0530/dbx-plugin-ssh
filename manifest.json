@@ -2,10 +2,10 @@
   "$schema": "https://raw.githubusercontent.com/t8y2/dbx/dev/plugin-framework-current/plugins/manifest.schema.json",
   "manifest_version": 1,
   "id": "io.dbx.ssh",
-  "name": "SSH & SFTP",
+  "name": "SSH Workbench",
   "version": "0.4.71",
   "publisher": "xynanan",
-  "description": "A secure SSH and SFTP workspace for interactive terminals, file transfer, remote commands, and everyday server operations.",
+  "description": "A secure SSH operations workbench for interactive terminals, SFTP file transfer, remote commands, and guarded server operations.",
   "source": "https://github.com/jinpy666/dbx-plugin-ssh",
   "homepage": "https://github.com/jinpy666/dbx-plugin-ssh",
   "icon": "assets/plugin.svg",
@@ -388,8 +388,8 @@
     {
       "type": "workbench",
       "id": "io.dbx.ssh.workbench",
-      "label": "SSH & SFTP Workbench",
-      "description": "Interactive terminal and SFTP file manager.",
+      "label": "SSH Workbench",
+      "description": "SSH terminal, SFTP file manager, and remote operations workspace.",
       "icon": "assets/plugin.svg"
     },
     {
@@ -412,12 +412,12 @@
   ],
   "localizations": {
     "en": {
-      "name": "DBX SSH & SFTP",
-      "description": "A secure SSH and SFTP workspace for interactive terminals, file transfer, remote commands, and everyday server operations."
+      "name": "DBX SSH Workbench",
+      "description": "A secure SSH operations workbench for interactive terminals, SFTP file transfer, remote commands, and guarded server operations."
     },
     "es": {
-      "name": "DBX SSH y SFTP",
-      "description": "Terminal SSH y área de trabajo SFTP completa para DBX.",
+      "name": "DBX SSH Workbench",
+      "description": "Terminal SSH, gestor SFTP y espacio de trabajo para operaciones remotas en DBX.",
       "contributions": {
         "io.dbx.ssh.connection": {
           "label": "Servidor SSH",
@@ -527,8 +527,8 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "Área de trabajo SSH y SFTP",
-          "description": "Terminal interactivo y gestor de archivos SFTP."
+          "label": "SSH Workbench",
+          "description": "Terminal SSH, gestor SFTP y operaciones remotas."
         },
         "io.dbx.ssh.files": {
           "label": "Archivos SFTP",
@@ -537,8 +537,8 @@
       }
     },
     "it": {
-      "name": "DBX SSH e SFTP",
-      "description": "Terminale SSH e area di lavoro SFTP completa per DBX.",
+      "name": "DBX SSH Workbench",
+      "description": "Terminale SSH, gestore SFTP e area di lavoro per le operazioni remote in DBX.",
       "contributions": {
         "io.dbx.ssh.connection": {
           "label": "Server SSH",
@@ -655,8 +655,8 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "Area di lavoro SSH e SFTP",
-          "description": "Terminale interattivo e gestore file SFTP."
+          "label": "SSH Workbench",
+          "description": "Terminale SSH, gestore SFTP e operazioni remote."
         },
         "io.dbx.ssh.files": {
           "label": "File SFTP",
@@ -665,8 +665,8 @@
       }
     },
     "ja": {
-      "name": "DBX SSH & SFTP",
-      "description": "DBX 用の完全な SSH ターミナルと SFTP ワークベンチ。",
+      "name": "DBX SSH Workbench",
+      "description": "SSH ターミナル、SFTP ファイル管理、リモート運用をまとめた DBX ワークベンチ。",
       "contributions": {
         "io.dbx.ssh.connection": {
           "label": "SSH サーバー",
@@ -776,8 +776,8 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "SSH & SFTP ワークベンチ",
-          "description": "対話型ターミナルと SFTP ファイルマネージャー。"
+          "label": "SSH Workbench",
+          "description": "SSH ターミナル、SFTP ファイル管理、リモート運用。"
         },
         "io.dbx.ssh.files": {
           "label": "SFTP ファイル",
@@ -786,8 +786,8 @@
       }
     },
     "pt-BR": {
-      "name": "DBX SSH e SFTP",
-      "description": "Terminal SSH e área de trabalho SFTP completa para DBX.",
+      "name": "DBX SSH Workbench",
+      "description": "Terminal SSH, gestor SFTP e espaço de trabalho para operações remotas no DBX.",
       "contributions": {
         "io.dbx.ssh.connection": {
           "label": "Servidor SSH",
@@ -904,8 +904,8 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "Área de trabalho SSH e SFTP",
-          "description": "Terminal interativo e gerenciador de arquivos SFTP."
+          "label": "SSH Workbench",
+          "description": "Terminal SSH, gestor SFTP e operações remotas."
         },
         "io.dbx.ssh.files": {
           "label": "Arquivos SFTP",
@@ -914,8 +914,8 @@
       }
     },
     "zh-CN": {
-      "name": "DBX SSH/SFTP",
-      "description": "面向服务器运维的 SSH 与 SFTP 工作台：交互式终端、文件传输、远程命令和常用文件操作集中在一个界面。",
+      "name": "DBX SSH 运维工作台",
+      "description": "面向服务器运维的 SSH 工作台：交互式终端、SFTP 文件传输、远程命令和受控运维操作集中在一个界面。",
       "contributions": {
         "io.dbx.ssh.connection": {
           "label": "SSH 服务器",
@@ -1025,8 +1025,8 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "SSH 与 SFTP 工作台",
-          "description": "交互式终端与 SFTP 文件管理器。"
+          "label": "SSH 运维工作台",
+          "description": "SSH 终端、SFTP 文件管理与远程运维。"
         },
         "io.dbx.ssh.files": {
           "label": "SFTP 文件",
@@ -1035,8 +1035,8 @@
       }
     },
     "zh-TW": {
-      "name": "DBX SSH 與 SFTP",
-      "description": "為 DBX 提供完整的 SSH 終端與 SFTP 工作臺。",
+      "name": "DBX SSH 維運工作台",
+      "description": "為 DBX 提供 SSH 終端、SFTP 檔案傳輸與受控遠端維運工作流程。",
       "contributions": {
         "io.dbx.ssh.connection": {
           "label": "SSH 伺服器",
@@ -1146,8 +1146,8 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "SSH 與 SFTP 工作臺",
-          "description": "互動式終端與 SFTP 檔案管理器。"
+          "label": "SSH 維運工作台",
+          "description": "SSH 終端、SFTP 檔案管理與遠端維運。"
         },
         "io.dbx.ssh.files": {
           "label": "SFTP 檔案",

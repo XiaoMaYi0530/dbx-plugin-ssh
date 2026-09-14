@@ -35,12 +35,12 @@
 
 | 插件 | 主要对象 | 适合任务 |
 | --- | --- | --- |
-| DBX SSH & SFTP | SSH 主机、终端、SFTP、远程运维 | 登录服务器、执行命令、浏览与传输文件 |
+| DBX SSH Workbench | SSH 主机、终端、SFTP、远程运维 | 登录服务器、执行命令、浏览与传输文件 |
 | DBX Files | 文件系统与对象存储 | 文件浏览、上传下载、归档和跨存储整理 |
 | DBX LDAP | LDAP 目录 | 查询、统计、编辑目录条目 |
 | DBX Kafka | Kafka 集群 | Topic、消息、消费组和 Schema 运维 |
 
-SSH 插件不重复实现文件、LDAP 或 Kafka 的专用协议；它专注于“通过 SSH 到达主机后
+SSH Workbench 不重复实现文件、LDAP 或 Kafka 的专用协议；它专注于“通过 SSH 到达主机后
 进行终端和 SFTP 运维”，并通过 DBX 宿主能力复用连接、密钥和工作台桥接。
 
 ## 如何选择
