@@ -155,6 +155,20 @@
           }
         },
         {
+          "key": "private_key",
+          "label": "Legacy private key slot",
+          "type": "password",
+          "binding": "secret",
+          "required": false,
+          "description": "Compatibility slot for secrets recorded by external tooling. Never shown and never read by the sidecar.",
+          "visible_when": {
+            "field": "private_key_path",
+            "one_of": [
+              "__never_legacy_private_key__"
+            ]
+          }
+        },
+        {
           "key": "agent_socket",
           "label": "Agent socket",
           "type": "text",
@@ -413,7 +427,10 @@
   "localizations": {
     "en": {
       "name": "DBX SSH Terminal",
-      "description": "A secure SSH terminal for interactive sessions, SFTP file transfer, remote commands, and guarded server operations."
+      "description": "A secure SSH terminal for interactive sessions, SFTP file transfer, remote commands, and guarded server operations.",
+      "contributions": {
+        "io.dbx.ssh.connection": {}
+      }
     },
     "es": {
       "name": "DBX SSH Terminal",
@@ -454,6 +471,9 @@
             },
             "private_key_passphrase": {
               "label": "Frase de contraseña de la clave"
+            },
+            "private_key": {
+              "label": "Ranura heredada de clave privada"
             },
             "agent_socket": {
               "label": "Socket del agente"
@@ -575,6 +595,9 @@
             },
             "private_key_passphrase": {
               "label": "Passphrase chiave privata"
+            },
+            "private_key": {
+              "label": "Slot legacy della chiave privata"
             },
             "agent_socket": {
               "label": "Socket agent"
@@ -704,6 +727,9 @@
             "private_key_passphrase": {
               "label": "秘密鍵のパスフレーズ"
             },
+            "private_key": {
+              "label": "レガシー秘密鍵スロット"
+            },
             "agent_socket": {
               "label": "エージェントソケット"
             },
@@ -824,6 +850,9 @@
             },
             "private_key_passphrase": {
               "label": "Frase secreta da chave"
+            },
+            "private_key": {
+              "label": "Slot legado de chave privada"
             },
             "agent_socket": {
               "label": "Socket do agente"
@@ -953,6 +982,9 @@
             "private_key_passphrase": {
               "label": "私钥口令"
             },
+            "private_key": {
+              "label": "旧版私钥槽位"
+            },
             "agent_socket": {
               "label": "Agent Socket"
             },
@@ -1073,6 +1105,9 @@
             },
             "private_key_passphrase": {
               "label": "私鑰密語"
+            },
+            "private_key": {
+              "label": "舊版私鑰槽位"
             },
             "agent_socket": {
               "label": "Agent Socket"

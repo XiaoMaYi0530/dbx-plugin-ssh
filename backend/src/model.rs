@@ -833,6 +833,7 @@ mod tests {
             "password",
             "private_key_path",
             "private_key_passphrase",
+            "private_key",
             "agent_socket",
             "sudo_source",
             "sudo_profile",
@@ -853,7 +854,9 @@ mod tests {
         assert_eq!(keys, expected, "manifest field list drifted from parsing");
 
         // secret binding 只允许落在凭据字段；config binding 不得承载凭据语义。
-        let secret_keys = ["password", "private_key_passphrase", "sudo_password", "totp_secret"];
+        // private_key 是隐藏的兼容槽位：外部工具（如宿主迁移）写进 Secret Store
+        // 的存量条目必须被 provider 声明，否则宿主校验拒绝整个连接。
+        let secret_keys = ["password", "private_key_passphrase", "private_key", "sudo_password", "totp_secret"];
         for field in fields {
             let key = field["key"].as_str().unwrap();
             match field["binding"].as_str() {
@@ -1350,7 +1353,9 @@ mod manifest_contract_tests {
     /// from `external_config` and are consumed by the parser.
     #[test]
     fn bindings_match_parse_surfaces() {
-        let secret_keys = ["private_key_passphrase", "sudo_password", "totp_secret"];
+        // private_key 是隐藏兼容槽位：只为让宿主接受外部工具写入的存量
+        // secret，解析面故意不消费它。
+        let secret_keys = ["private_key", "private_key_passphrase", "sudo_password", "totp_secret"];
         let config_keys = [
             "authentication",
             "private_key_path",
