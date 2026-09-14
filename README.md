@@ -1,12 +1,24 @@
 # DBX SSH & SFTP
 
-[English](README.en.md) · [独立仓库迁移说明](docs/REPOSITORY_SPLIT.zh-CN.md)
+[![CI](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/jinpy666/dbx-plugin-ssh?display_name=tag)](https://github.com/jinpy666/dbx-plugin-ssh/releases)
+
+[English](README.en.md) · [产品宣传页](docs/MEDIA.zh-CN.md) · [特性与竞品对比](docs/COMPARISON.zh-CN.md) · [独立仓库迁移说明](docs/REPOSITORY_SPLIT.zh-CN.md)
 
 DBX SSH & SFTP 是面向日常服务器运维的连接工作台。它把交互式终端、远程命令、
 SFTP 文件管理和安全认证集中在一个界面中，并支持通过宿主连接与传输能力访问
 远程环境。
 
 ![DBX SSH & SFTP 工作台](docs/screenshots-a-ssh/01-toolbar-dark.png)
+
+> 终端、SFTP、MCP 自动化和受控运维操作集中在一个 DBX 工作台中。
+
+## 产品演示
+
+[观看 15 秒功能预览](docs/media/dbx-ssh-demo.mp4)
+
+![连接与终端](docs/screenshots-a-ssh/05-connection-info.png)
+![命令历史](docs/screenshots-a-ssh/03-command-history.png)
 
 ## 适合场景
 
@@ -24,6 +36,9 @@ SFTP 文件管理和安全认证集中在一个界面中，并支持通过宿主
 - 支持最多三跳 ProxyJump、连接保活、可取消远程命令、chmod 和 Quick Sudo。
 - 支持 TOTP/键盘交互式双因素认证，以及面向自动化客户端的 MCP 工具接口。
 - 界面支持简体中文、繁体中文、英语、西班牙语、意大利语、日语和葡萄牙语。
+
+完整的能力矩阵和与 OpenSSH、Tabby、Termius、FinalShell 等方案的定位对比见
+[特性与竞品对比](docs/COMPARISON.zh-CN.md)。
 
 ![快速命令与终端操作](docs/screenshots-a-ssh/02-quick-commands.png)
 
@@ -44,6 +59,12 @@ DBX_SSH_MCP_READ_ONLY=1 backend/target/release/dbx-plugin-ssh --mcp
 密码、私钥口令、TOTP 和 sudo 凭据由 DBX 宿主 secret binding 管理。插件不会把
 凭据写入配置文件、日志或导出内容。建议生产连接启用 Known Hosts 严格校验，
 并按需启用只读模式和 sudo 命令白名单。
+
+## 安装
+
+从 [GitHub Releases](https://github.com/jinpy666/dbx-plugin-ssh/releases) 下载匹配平台的
+`.dbxp` 包，在 DBX 插件中心选择本地安装。开发者也可以按照
+[迁移与发布说明](docs/REPOSITORY_SPLIT.zh-CN.md) 构建候选包。
 
 ## 开发与验证
 

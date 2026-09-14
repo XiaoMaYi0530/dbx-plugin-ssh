@@ -1,12 +1,24 @@
 # DBX SSH & SFTP
 
-[中文](README.md) · [Repository split notes](docs/REPOSITORY_SPLIT.en.md)
+[![CI](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/jinpy666/dbx-plugin-ssh/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/jinpy666/dbx-plugin-ssh?display_name=tag)](https://github.com/jinpy666/dbx-plugin-ssh/releases)
+
+[中文](README.md) · [Showcase](docs/MEDIA.en.md) · [Feature comparison](docs/COMPARISON.en.md) · [Repository split notes](docs/REPOSITORY_SPLIT.en.md)
 
 DBX SSH & SFTP is a practical workspace for server operations. It brings an
 interactive terminal, remote commands, SFTP file management, and secure
 authentication into one consistent interface.
 
 ![DBX SSH & SFTP workspace](docs/screenshots-a-ssh/01-toolbar-dark.png)
+
+> One DBX workspace for interactive terminals, SFTP, MCP automation, and guarded server operations.
+
+## Product preview
+
+[Watch the 15-second feature preview](docs/media/dbx-ssh-demo.mp4)
+
+![Connection and terminal](docs/screenshots-a-ssh/05-connection-info.png)
+![Command history](docs/screenshots-a-ssh/03-command-history.png)
 
 ## Use cases
 
@@ -29,6 +41,9 @@ authentication into one consistent interface.
 - Simplified Chinese, Traditional Chinese, English, Spanish, Italian, Japanese,
   and Portuguese UI.
 
+See the [feature and competitor comparison](docs/COMPARISON.en.md) for a capability matrix
+covering OpenSSH + sftp, Tabby, Termius, and FinalShell.
+
 ![Quick commands and terminal operations](docs/screenshots-a-ssh/02-quick-commands.png)
 
 ## MCP automation
@@ -50,6 +65,13 @@ Passwords, private-key passphrases, TOTP secrets, and sudo credentials are manag
 through DBX host secret bindings. The plugin does not write credentials to config
 files, logs, or exports. For production connections, enable strict Known Hosts
 verification and use read-only mode or a sudo command allowlist when appropriate.
+
+## Installation
+
+Download the platform-specific `.dbxp` package from
+[GitHub Releases](https://github.com/jinpy666/dbx-plugin-ssh/releases), then install it from
+the DBX plugin center. Developers can build a candidate package using the
+[repository split and release notes](docs/REPOSITORY_SPLIT.en.md).
 
 ## Development
 
