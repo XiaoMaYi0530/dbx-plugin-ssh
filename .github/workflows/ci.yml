@@ -14,6 +14,10 @@ env:
   # aws-lc-sys falls back to its bundled prebuilt NASM objects when the
   # assembler is missing on the MSVC toolchain; harmless on every other OS.
   AWS_LC_SYS_PREBUILT_NASM: "1"
+  # Windows runners default python stdout to cp1252; the smoke script prints
+  # Unicode (→, ✓) and would die on UnicodeEncodeError. UTF-8 mode is a no-op
+  # on the other platforms.
+  PYTHONUTF8: "1"
 
 jobs:
   validate:
