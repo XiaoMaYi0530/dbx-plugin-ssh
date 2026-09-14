@@ -6,8 +6,8 @@
   "version": "0.4.71",
   "publisher": "xynanan",
   "description": "A secure SSH and SFTP workspace for interactive terminals, file transfer, remote commands, and everyday server operations.",
-  "source": "https://github.com/jinpy666/dbx-plugins",
-  "homepage": "https://github.com/jinpy666/dbx-plugins/tree/main/ssh",
+  "source": "https://github.com/TODO/dbx-plugin-ssh",
+  "homepage": "https://github.com/TODO/dbx-plugin-ssh",
   "icon": "assets/plugin.svg",
   "engines": {
     "dbx": ">=0.5.77",

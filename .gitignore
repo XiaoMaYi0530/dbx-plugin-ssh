@@ -3,4 +3,6 @@
 /frontend/dist/
 /dist/
 /ui/
+!/ui/
+!/ui/.gitkeep
 .dbx-repository-signing-key.env

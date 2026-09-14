@@ -1,6 +1,6 @@
 # DBX SSH & SFTP
 
-[中文](README.md) · [Workspace contribution guide](../CONTRIBUTING.md)
+[中文](README.md) · [Repository split notes](docs/REPOSITORY_SPLIT.en.md)
 
 DBX SSH & SFTP is a practical workspace for server operations. It brings an
 interactive terminal, remote commands, SFTP file management, and secure
@@ -41,7 +41,7 @@ DBX_SSH_MCP_READ_ONLY=1 backend/target/release/dbx-plugin-ssh --mcp
 ```
 
 Useful tools include `ssh_exec`, `ssh_metrics`, `sftp_list`, `sftp_upload`, and
-`sftp_download`. See the [MCP guide](../docs/MCP_USAGE.en.md) and the
+`sftp_download`. See the [MCP guide](docs/MCP_USAGE.en.md) and the
 [SSH MCP reference](docs/MCP.zh-CN.md) for configuration and safety details.
 
 ## Security
@@ -54,11 +54,12 @@ verification and use read-only mode or a sudo command allowlist when appropriate
 ## Development
 
 ```bash
-cd frontend && pnpm install && pnpm typecheck && pnpm test && pnpm build
-cd ../backend && cargo test
-cd ..
+pnpm --dir frontend install
+pnpm --dir frontend typecheck && pnpm --dir frontend test && pnpm --dir frontend build
+cargo test --manifest-path backend/Cargo.toml
+python3 scripts/validate_repo.py && node scripts/connection-forms/verify.mjs
 scripts/test.sh --skip-host
 ```
 
 Protocol, packaging, and integration details live under `docs/`. Contributors
-should read the [workspace contribution guide](../CONTRIBUTING.md) first.
+should read the [repository split notes](docs/REPOSITORY_SPLIT.en.md) first.

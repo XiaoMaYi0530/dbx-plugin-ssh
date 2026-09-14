@@ -7,7 +7,7 @@ import {
   resolveSyntaxTag,
   syntaxTokenSpecs,
   type EditorHighlightRuntime,
-} from "../../../../shared/frontend/editorTheme";
+} from "../../../shared/frontend/editorTheme";
 
 // 最小假运行时：只记录 define 收到的 spec，供结构断言。tags 对普通成员返回
 // 可识别占位对象，对修饰器组合返回解析函数（镜像 @lezer/highlight tags 形状）。

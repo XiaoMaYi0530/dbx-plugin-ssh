@@ -9,13 +9,14 @@ description: DBX SSH/SFTP 插件的开发规范、构建、测试与安装全流
 通过 `dbx-plugin` CLI 打包为 `.dbxp` 安装进 DBX。能力面覆盖隧道/代理、连接管理、
 外观（DBX 已有能力，**整合不重复实现**）与终端/SFTP/sudo 全链路。
 
-> 仓库位于 `~/btroot/dbx-plugins/ssh-sftp`（插件族工作区，兄弟目录
-> ldap/、files/、shared/ 为 LDAP/Files 插件与公共文档，见工作区 README）。
+> 本仓库是从 `dbx-plugins/ssh` 拆出的独立仓库。SSH 所需的公共前端适配层、
+> Rust SDK 和连接表单校验器都在本仓库的 `shared/` 与 `scripts/` 下；不依赖兄弟
+> 插件目录。
 
 ## 目录结构
 
 ```
-ssh/                  # 即 ~/btroot/dbx-plugins/ssh-sftp
+dbx-plugin-ssh/       # 当前独立仓库根目录
 ├── manifest.json          # 插件契约（字段/权限/贡献点/七语）
 ├── dbx-plugin.toml        # 打包配置（include: assets, ui）
 ├── frontend/              # Vue3 工作台（单文件 App.vue 为主）
@@ -24,9 +25,8 @@ ssh/                  # 即 ~/btroot/dbx-plugins/ssh-sftp
 │   └── src/{main,ssh,exec,sudo_fs,sftp_ext,keys,mcp,model,host_key}.rs
 ├── scripts/               # 自动化（见下）
 ├── docs/FEATURE_PARITY.zh-CN.md   # 对标清单（能力×状态）
-└── ../host/               # 宿主子仓库（t8y2/dbx dev/plugin-framework-current
-                           #   + 本地二开提交；旧路径 ~/btroot/dbx-plugin-host-worktree
-                           #   为指向它的符号链接）
+├── shared/               # SSH 实际需要的公共前端层与 vendored Rust SDK
+└── docs/REPOSITORY_SPLIT.zh-CN.md
 ```
 
 ## 环境准备（一次性）
@@ -36,7 +36,8 @@ ssh/                  # 即 ~/btroot/dbx-plugins/ssh-sftp
 export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$HOME/Library/pnpm:$HOME/.cargo/bin:$PATH"
 npm install -g @dbx-app/plugin-cli @dbx-app/cli @dbx-app/mcp-server
 # 插件本地打包不需要 DBX 源码：npm CLI 自带 SDK（sdk-root）
-# 仅测试宿主/装进数据目录的集成验证才需要 ../host 子仓库（scripts/host-sync.sh init）
+# 仅测试宿主/安装进 DBX 数据目录的集成验证才需要外部 DBX host worktree；
+# 通过 DBX_HOST_WORKTREE 显式传入，不由本仓库自动猜测 sibling 路径。
 ```
 
 ## 开发规范（硬性约定）
@@ -84,35 +85,25 @@ scripts/sidecar_client.py   # stdio-framed 协议客户端库（直接驱动 sid
 scripts/install.sh                # 官方 PluginPackageInstaller 安装 + 重启 DBX
 scripts/install.sh --reinstall    # 同版本重装（开发迭代用）
 scripts/install.sh --app-data <dir> --no-restart   # 自定义存储/不重启
-scripts/install.sh --skip-host 的 test.sh   # 跳过宿主管线（无 worktree 时）
+scripts/test.sh --skip-host               # 无 host worktree 时的独立验证
 ```
 
 - 安装语义：`plugins/<id>/versions/<ver>/` + `activations/<20位序号>-<uuid>.json`
   （`{sequence, version, previousVersion, packageSha256, activatedAt}`，camelCase）。
-- **坑**：installer example 二进制有构建缓存——宿主 manifest 结构体改动后必须
-  `rm ../host/target/release/examples/install_plugin` 强制重编，
-  否则报 `unknown field` 假错误。
-- 测试宿主 DBX.app：`../host/target/debug/bundle/macos/DBX.app`
-  （框架分支构建）。正式版 /Applications/DBX.app 无插件框架，装了也没用。
-  宿主前端/Rust 改动后需 `pnpm tauri build --debug` 重建（~10min）。
+- **坑**：installer example 二进制有构建缓存；宿主 manifest 结构体改动后，
+  在 `DBX_HOST_WORKTREE` 中按 host 项目自己的构建说明清理并重编。
+- 测试宿主 DBX.app 时必须显式设置 `DBX_TEST_APP` 或使用 `/Applications/DBX.app`；
+  正式版没有插件框架时，安装验证不代表宿主集成验证。
 - 双冒烟验收：`DBX_PLUGIN_SIDECAR=<安装路径>/bin/darwin-arm64/dbx-plugin-ssh
   python3 scripts/smoke_test.py && python3 scripts/smoke_fs_test.py`（对安装副本跑，
   确认装的二进制就是测的二进制）。
 
-## 宿主子仓库（../host）
+## 可选的 DBX host 集成
 
-- 分支策略：`dev/plugin-framework-current` = origin/main + 少量本地二开提交；
-  `scripts/host-sync.sh sync` 定期合并上游（冲突默认 `-X ours` 本地补丁优先），
-  上游覆盖所需功能后再逐个移除二开提交。切勿对 host/ 跑
-  `git submodule update --force`（会把 checkout 拉回可拉取的上游提交、丢本地补丁）。
-- 本地补丁（已提交 46cac99/1a7d760，勿丢）：
-  - `pluginHostBridge.ts` structuredCloneSafe：**structuredClone 不能克隆 Vue
-    Proxy**，会 DataCloneError 导致工作台永停 connecting——JSON round-trip 兜底
-  - `plugins/host.rs` 生命周期参数带 `operationId`；`queryStore.ts` 工作台
-    context 带 `workbenchId`+connection 摘要
-  - 条件字段（visible_when/required_when）+ `list_local_ssh_keys` + 短 tab 标题
-- 宿主/插件并行开发时按目录划界（backend/ vs frontend/，宿主 worktree 独立仓），
-  main.rs 的方法注册由主会话统一接线防冲突。
+- 设置 `DBX_HOST_WORKTREE=/path/to/dbx` 后，才运行宿主安装管线；本仓库不会
+  修改、同步或 reset 该 worktree。
+- 宿主/插件并行开发时按目录划界（本仓库的 `backend/` 与 `frontend/`，host
+  worktree 独立仓）；本仓库只提交插件代码和对应文档。
 
 ## 常见故障速查
 

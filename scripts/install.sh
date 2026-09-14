@@ -11,7 +11,7 @@
 #
 # Environment:
 #   DBX_HOST_WORKTREE   host checkout used for the installer binary
-#                       (default: sibling dbx-plugin-host-worktree)
+#                       (must be supplied explicitly for host integration)
 #   DBX_TEST_APP        DBX.app bundle to relaunch (default: probe the host
 #                       worktree, then `open -a DBX`)
 set -euo pipefail
@@ -33,13 +33,8 @@ DBXP="$(ls -t dist/*.dbxp 2>/dev/null | head -1 || true)"
 [ -n "$DBXP" ] || { echo "no .dbxp in dist/ — run scripts/build.sh first" >&2; exit 1; }
 VERSION="$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")"
 
-if [ -z "${DBX_HOST_WORKTREE:-}" ]; then
-  for candidate in "$PWD/../dbx-plugin-host-worktree" "$HOME/dbx-plugin-host-worktree"; do
-    [ -d "$candidate" ] && DBX_HOST_WORKTREE="$candidate" && break
-  done
-fi
 [ -n "${DBX_HOST_WORKTREE:-}" ] && [ -d "$DBX_HOST_WORKTREE" ] || {
-  echo "DBX host worktree not found (set DBX_HOST_WORKTREE)" >&2
+  echo "DBX host worktree not found; set DBX_HOST_WORKTREE explicitly for install integration" >&2
   exit 1
 }
 export PATH="$HOME/.cargo/bin:$PATH"

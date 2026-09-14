@@ -37,11 +37,10 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from sidecar_client import McpStdioClient  # noqa: E402
 
-BINARY_DEFAULT = str(pathlib.Path(__file__).resolve().parent.parent
-                     / "backend" / "target/release/dbx-plugin-ssh")
-APP_DATA_DEFAULT = "/Users/Jinpy/btroot/dbx-plugins/shared/host-e2e/app-data"
-BUNDLE_DEFAULT = ("/Users/Jinpy/btroot/dbx-plugin-host-worktree/target"
-                  "/debug/bundle/macos/DBX.app")
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+BINARY_DEFAULT = str(REPO_ROOT / "backend" / "target/release/dbx-plugin-ssh")
+APP_DATA_DEFAULT = str(REPO_ROOT / "work" / "app-data")
+BUNDLE_DEFAULT = os.environ.get("DBX_TEST_APP", "")
 
 results: list[tuple[str, bool, str]] = []
 

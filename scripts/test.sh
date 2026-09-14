@@ -14,14 +14,14 @@ ROOT="$(pwd)"
 SKIP_HOST=0
 [ "${1:-}" = "--skip-host" ] && SKIP_HOST=1
 
-if ! command -v pnpm >/dev/null 2>&1; then
+if ! command -v node >/dev/null 2>&1 || ! command -v pnpm >/dev/null 2>&1; then
   NODE_BIN="$(ls -d "$HOME"/.nvm/versions/node/v22*/bin 2>/dev/null | sort -V | tail -1 || true)"
   export PATH="$HOME/Library/pnpm:${NODE_BIN:+$NODE_BIN:}$PATH"
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
 
 echo "==> backend unit tests"
-node ../shared/connection-forms/verify.mjs ssh
+node scripts/connection-forms/verify.mjs
 cargo test --manifest-path backend/Cargo.toml
 
 echo "==> dead-code warning gate"
@@ -49,11 +49,7 @@ unset DBX_PLUGIN_SDK_ROOT
 if command -v dbx-plugin >/dev/null 2>&1; then
   NO_COLOR=1 dbx-plugin package .
 else
-  HOST="${DBX_HOST_WORKTREE:-$PWD/../dbx-plugin-host-worktree}"
-  if [ ! -x "$HOST/plugins/sdk/cli/target/release/dbx-plugin" ]; then
-    (cd "$HOST/plugins/sdk/cli" && cargo build --release)
-  fi
-  NO_COLOR=1 "$HOST/plugins/sdk/cli/target/release/dbx-plugin" package .
+  echo "SKIP: dbx-plugin CLI unavailable; install @dbx-app/plugin-cli to run package verification"
 fi
 
 echo "==> MCP stdio smoke"
@@ -85,8 +81,8 @@ echo "==> mock UI walkthrough"
 node scripts/smoke_ui_mock.mjs
 
 if [ "$SKIP_HOST" = 0 ]; then
-  HOST="${DBX_HOST_WORKTREE:-$PWD/../dbx-plugin-host-worktree}"
-  if [ -d "$HOST" ]; then
+  HOST="${DBX_HOST_WORKTREE:-}"
+  if [ -n "$HOST" ] && [ -d "$HOST" ]; then
     echo "==> host install-pipeline integration (installer + MCP bridge)"
     PACKAGE="$ROOT/$(ls -t dist/*.dbxp | head -1)"
     # The bridge test tracks in-progress MCP plugin-tools work; if it does not
@@ -98,7 +94,7 @@ if [ "$SKIP_HOST" = 0 ]; then
       echo "SKIP: plugin_tools_bridge does not compile (MCP plugin-tools bridge WIP not integrated)"
     fi
   else
-    echo "==> host install-pipeline integration skipped (no $HOST)"
+    echo "==> host install-pipeline integration skipped (standalone checkout; set DBX_HOST_WORKTREE to opt in)"
   fi
 else
   echo "==> host install-pipeline integration skipped (--skip-host)"

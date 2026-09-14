@@ -1,0 +1,42 @@
+name: Release DBX SSH plugin
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: startsWith(github.event.release.tag_name, 'ssh-v')
+    name: Validate SSH release identity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate manifest and release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 scripts/validate_repo.py
+          python3 - "$RELEASE_TAG" <<'PY'
+          import json
+          import pathlib
+          import sys
+          version = json.loads(pathlib.Path("manifest.json").read_text())["version"]
+          expected = f"ssh-v{version}"
+          if sys.argv[1] != expected:
+              raise SystemExit(f"release tag {sys.argv[1]!r} does not match {expected!r}")
+          PY
+
+  release:
+    if: startsWith(github.event.release.tag_name, 'ssh-v')
+    needs: validate
+    uses: t8y2/dbx/.github/workflows/plugin-release-reusable.yml@plugin-sdk-v1
+    with:
+      release-tag: ${{ github.event.release.tag_name }}
+      working-directory: .
+      package-command: dbx-plugin package .
+      package-path: dist/*.dbxp
+      metadata-path: dist/*.artifact.json
+      plugin-cli-version: 0.1.3

@@ -1,6 +1,6 @@
 # DBX SSH & SFTP
 
-[English](README.en.md) · [工作区贡献指南](../CONTRIBUTING.zh-CN.md)
+[English](README.en.md) · [独立仓库迁移说明](docs/REPOSITORY_SPLIT.zh-CN.md)
 
 DBX SSH & SFTP 是面向日常服务器运维的连接工作台。它把交互式终端、远程命令、
 SFTP 文件管理和安全认证集中在一个界面中，并支持通过宿主连接与传输能力访问
@@ -37,7 +37,7 @@ DBX_SSH_MCP_READ_ONLY=1 backend/target/release/dbx-plugin-ssh --mcp
 
 常用工具包括 `ssh_exec`、`ssh_metrics`、`sftp_list`、`sftp_upload` 和
 `sftp_download`。完整配置、工具调用和安全边界见
-[MCP 使用指南](../docs/MCP_USAGE.zh-CN.md)与[SSH MCP 参考](docs/MCP.zh-CN.md)。
+[MCP 使用指南](docs/MCP_USAGE.zh-CN.md)与[SSH MCP 参考](docs/MCP.zh-CN.md)。
 
 ## 安全设计
 
@@ -48,11 +48,13 @@ DBX_SSH_MCP_READ_ONLY=1 backend/target/release/dbx-plugin-ssh --mcp
 ## 开发与验证
 
 ```bash
-cd frontend && pnpm install && pnpm typecheck && pnpm test && pnpm build
-cd ../backend && cargo test
-cd ..
+pnpm --dir frontend install
+pnpm --dir frontend typecheck && pnpm --dir frontend test && pnpm --dir frontend build
+cargo test --manifest-path backend/Cargo.toml
+python3 scripts/validate_repo.py && node scripts/connection-forms/verify.mjs
 scripts/test.sh --skip-host
 ```
 
 协议、构建和完整集成验证说明位于 `docs/`；公开贡献请先阅读
-[贡献指南](../CONTRIBUTING.zh-CN.md)。
+独立仓库的迁移边界、公共依赖和发布前置条件见
+[迁移说明](docs/REPOSITORY_SPLIT.zh-CN.md)。

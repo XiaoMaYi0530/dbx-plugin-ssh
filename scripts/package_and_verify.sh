@@ -29,8 +29,8 @@ echo "==> verifying package: $PKG"
 VERIFY_DIR="$(mktemp -d /tmp/dbx-pkg-verify.XXXXXX)"
 trap 'rm -rf "$VERIFY_DIR"' EXIT
 unzip -q "$PKG" -d "$VERIFY_DIR"
-BINARY="$VERIFY_DIR/bin/darwin-arm64/dbx-plugin-ssh"
-[ -x "$BINARY" ] || { echo "FAIL: packaged binary missing: $BINARY"; exit 1; }
+BINARY="$(find "$VERIFY_DIR/bin" -type f -name dbx-plugin-ssh -perm -111 -print -quit)"
+[ -n "$BINARY" ] || { echo "FAIL: packaged dbx-plugin-ssh binary missing under $VERIFY_DIR/bin"; exit 1; }
 echo "packaged binary sha256: $(shasum -a 256 "$BINARY" | awk '{print $1}')"
 
 export DBX_PLUGIN_SIDECAR="$BINARY"
