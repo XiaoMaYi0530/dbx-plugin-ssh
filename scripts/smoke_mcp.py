@@ -1197,23 +1197,47 @@ def permission_env_section(args: argparse.Namespace) -> None:
 
 
 def _readline_timeout(proc: subprocess.Popen, timeout: float = 20.0) -> bytes:
-    """readline with a watchdog (POSIX select on the pipe fd): a hung or
-    crashed sidecar fails the smoke instead of blocking the whole run."""
-    import select
-
+    """readline with a watchdog: a hung or crashed sidecar fails the smoke
+    instead of blocking the whole run. POSIX watches the pipe fd with
+    select; on Windows select() only accepts sockets, so the read runs in
+    a daemon thread and the deadline is enforced on the queue wait."""
     fd = proc.stdout.fileno()
     deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise AssertionError(f"sidecar produced no line within {timeout}s (hung?)")
-        ready, _, _ = select.select([fd], [], [], remaining)
-        if not ready:
-            continue
-        line = proc.stdout.readline()
-        if not line:
-            raise AssertionError("sidecar closed the stream (crashed?)")
-        return line
+
+    if os.name != "nt":
+        import select
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"sidecar produced no line within {timeout}s (hung?)")
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                raise AssertionError("sidecar closed the stream (crashed?)")
+            return line
+
+    import queue
+
+    lines: "queue.Queue[bytes]" = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            lines.put(proc.stdout.readline())
+        except (OSError, ValueError):
+            lines.put(b"")
+
+    threading.Thread(target=_reader, daemon=True).start()
+    remaining = deadline - time.monotonic()
+    try:
+        line = lines.get(timeout=max(remaining, 0.0))
+    except queue.Empty:
+        raise AssertionError(f"sidecar produced no line within {timeout}s (hung?)") from None
+    if not line:
+        raise AssertionError("sidecar closed the stream (crashed?)")
+    return line
 
 
 def _recv_id(proc: subprocess.Popen, want_id, timeout: float = 30.0) -> dict:
