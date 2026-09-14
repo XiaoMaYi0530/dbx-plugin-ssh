@@ -3,9 +3,11 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH & SFTP",
-  "version": "0.4.69",
+  "version": "0.4.71",
   "publisher": "xynanan",
-  "description": "Full SSH terminal and SFTP workbench plugin for DBX.",
+  "description": "A secure SSH and SFTP workspace for interactive terminals, file transfer, remote commands, and everyday server operations.",
+  "source": "https://github.com/jinpy666/dbx-plugins",
+  "homepage": "https://github.com/jinpy666/dbx-plugins/tree/main/ssh",
   "icon": "assets/plugin.svg",
   "engines": {
     "dbx": ">=0.5.77",
@@ -409,6 +411,10 @@
     }
   ],
   "localizations": {
+    "en": {
+      "name": "DBX SSH & SFTP",
+      "description": "A secure SSH and SFTP workspace for interactive terminals, file transfer, remote commands, and everyday server operations."
+    },
     "es": {
       "name": "DBX SSH y SFTP",
       "description": "Terminal SSH y área de trabajo SFTP completa para DBX.",
@@ -909,7 +915,7 @@
     },
     "zh-CN": {
       "name": "DBX SSH/SFTP",
-      "description": "为 DBX 提供完整的 SSH 终端和 SFTP 工作台。",
+      "description": "面向服务器运维的 SSH 与 SFTP 工作台：交互式终端、文件传输、远程命令和常用文件操作集中在一个界面。",
       "contributions": {
         "io.dbx.ssh.connection": {
           "label": "SSH 服务器",

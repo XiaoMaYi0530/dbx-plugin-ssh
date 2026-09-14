@@ -1,48 +1,58 @@
-# DBX SSH & SFTP Plugin
+# DBX SSH & SFTP
 
-DBX Host API 1.1 SSH/SFTP plugin. Version `0.2.1` restores the workbench from
-`origin/feature/ssh-sftp-workbench` as an independent Vue/Vite UI and Rust
-Sidecar; it does not import DBX internal Vue components.
+[English](README.en.md) · [工作区贡献指南](../CONTRIBUTING.zh-CN.md)
 
-## Features
+DBX SSH & SFTP 是面向日常服务器运维的连接工作台。它把交互式终端、远程命令、
+SFTP 文件管理和安全认证集中在一个界面中，并支持通过宿主连接与传输能力访问
+远程环境。
 
-- Password, private-key, private-key→password, SSH Agent and none authentication.
-- Persistent `known_hosts`, changed-key rejection, and Host-scoped fingerprint challenges before credentials are sent.
-- Independent SSH/PTTY/SFTP state per `connectionId → workbenchId → sessionId`.
-- xterm terminal with resize, replay, tab re-attach, clipboard menu, Bash/Zsh OSC 7 directory following, and multi-file `rz` upload.
-- SFTP list/sort/columns, preview, rename, create, recursive delete without following symlinks, drag/drop, and read-only enforcement.
-- 256 KiB streaming Host file handles, three transfer slots, offset/ACK recovery, cancel, progress/speed, `.part` upload and atomic replacement.
-- Dark/light appearance synchronization and English, Spanish, Italian, Japanese, Portuguese, Simplified Chinese and Traditional Chinese UI.
-- Quick Sudo: password injected over stdin for `sudo -S`, 2FA/TOTP prompts answered automatically (RFC 6238, otpauth/base32/static secrets), login-time keyboard-interactive 2FA, and in-terminal sudo auto-answer.
-- ProxyJump chains (up to 3 hops), keepalive dead-connection detection, cancellable remote commands, server metrics panel, chmod, and per-directory disk usage.
-- MCP stdio mode: run the binary with `--mcp` to expose `ssh_exec`, `ssh_exec_sudo`, `ssh_metrics` and a full `sftp_*` tool family to MCP clients (see [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)).
+![DBX SSH & SFTP 工作台](docs/screenshots-a-ssh/01-toolbar-dark.png)
 
-`0.2.1` requires the local Host API 1.1 changes on branch
-`codex/plugin-host-ssh-enablers`. It is intentionally not published until the
-Host/SDK contract is accepted.
+## 适合场景
 
-## Install & verify
+- 日常 Linux/Unix 服务器巡检、日志查看和远程命令执行。
+- 通过跳板机访问内网环境，并在终端与 SFTP 之间快速切换。
+- 在受控权限下完成配置文件、脚本和构建产物的上传下载。
 
-- `scripts/build.sh` — frontend checks + self-contained UI + `.dbxp` package into `dist/`.
-- `scripts/install.sh` — install the newest `.dbxp` into the local DBX plugin store with the official `PluginPackageInstaller` (checksum + compatibility verified), then restart DBX. Options: `--app-data <dir>` (custom store), `--reinstall` (dev: drop the same version first), `--no-restart`. Needs the sibling `dbx-plugin-host-worktree` checkout (or `DBX_HOST_WORKTREE`).
-- `scripts/test.sh` — full suite: backend unit tests, frontend typecheck/test/build, sidecar release build, `.dbxp` package, MCP stdio smoke, and the host-side install-pipeline integration test (installer + MCP bridge over a real sidecar). `--skip-host` skips that last step.
-- `scripts/smoke_mcp.py` — standalone MCP stdio smoke against `--mcp` mode.
-- `scripts/smoke_test.py` / `smoke_fs_test.py` — end-to-end sidecar smokes against a live SSH host (see script headers).
+## 核心能力
 
-## Development
+- 支持密码、私钥、SSH Agent、键盘交互和无密码认证。
+- 交互式终端支持 PTY、窗口调整、会话恢复、剪贴板、远程目录跟随和批量输入。
+- SFTP 支持浏览、排序、预览、上传、下载、重命名、新建、拖放和递归删除。
+- 大文件传输支持进度、取消、断点确认和原子替换，降低中断造成的半成品风险。
+- 支持 Known Hosts 校验、变更主机密钥拒绝、只读模式和远程目录磁盘用量查看。
+- 支持最多三跳 ProxyJump、连接保活、可取消远程命令、chmod 和 Quick Sudo。
+- 支持 TOTP/键盘交互式双因素认证，以及面向自动化客户端的 MCP 工具接口。
+- 界面支持简体中文、繁体中文、英语、西班牙语、意大利语、日语和葡萄牙语。
+
+![快速命令与终端操作](docs/screenshots-a-ssh/02-quick-commands.png)
+
+## MCP 自动化
+
+推荐通过 DBX MCP 桥调用，以复用已保存连接、审批和 sudo 白名单。独立模式可运行：
 
 ```bash
-cd frontend
-pnpm install
-pnpm typecheck
-pnpm test
-pnpm build
-cd ..
-DBX_PLUGIN_SDK_ROOT=../dbx-plugin-host-worktree dbx-plugin package .
+DBX_SSH_MCP_READ_ONLY=1 backend/target/release/dbx-plugin-ssh --mcp
 ```
 
-PowerShell uses `$env:DBX_PLUGIN_SDK_ROOT = "..\\dbx-plugin-host-worktree"`
-before running `dbx-plugin package .`.
+常用工具包括 `ssh_exec`、`ssh_metrics`、`sftp_list`、`sftp_upload` 和
+`sftp_download`。完整配置、工具调用和安全边界见
+[MCP 使用指南](../docs/MCP_USAGE.zh-CN.md)与[SSH MCP 参考](docs/MCP.zh-CN.md)。
 
-The visual fixture is available at `frontend/visual.html` when running Vite.
-It supplies deterministic SSH/SFTP data for 1440×900 and 1920×1080 UI checks.
+## 安全设计
+
+密码、私钥口令、TOTP 和 sudo 凭据由 DBX 宿主 secret binding 管理。插件不会把
+凭据写入配置文件、日志或导出内容。建议生产连接启用 Known Hosts 严格校验，
+并按需启用只读模式和 sudo 命令白名单。
+
+## 开发与验证
+
+```bash
+cd frontend && pnpm install && pnpm typecheck && pnpm test && pnpm build
+cd ../backend && cargo test
+cd ..
+scripts/test.sh --skip-host
+```
+
+协议、构建和完整集成验证说明位于 `docs/`；公开贡献请先阅读
+[贡献指南](../CONTRIBUTING.zh-CN.md)。
