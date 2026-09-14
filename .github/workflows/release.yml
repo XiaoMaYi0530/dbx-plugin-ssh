@@ -74,6 +74,10 @@ jobs:
         with:
           node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
       - run: cargo build --locked --release --manifest-path backend/Cargo.toml
       - run: npm install --global "@dbx-app/plugin-cli@${PLUGIN_CLI_VERSION}"
       - name: Package .dbxp candidate

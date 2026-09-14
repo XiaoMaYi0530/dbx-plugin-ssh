@@ -39,12 +39,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
       - uses: pnpm/action-setup@v4
         with:
           version: 11.24.0
+      # setup-node 的 pnpm 缓存需要 pnpm 已在 PATH 中，故置于 pnpm/action-setup 之后
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
       - run: pnpm --dir frontend install --frozen-lockfile
       - run: pnpm --dir frontend typecheck
       - run: pnpm --dir frontend test
@@ -65,7 +68,59 @@ jobs:
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev nasm
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
+      - run: cargo fmt --manifest-path backend/Cargo.toml --check
+      # -D warnings keeps new lints out; a stable-toolchain update that
+      # introduces a new lint fails here and is fixed like any other red CI.
+      - run: cargo clippy --locked --manifest-path backend/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --locked --manifest-path backend/Cargo.toml
+
+  ssh-smoke:
+    name: SSH container smoke
+    runs-on: ubuntu-24.04
+    needs: [validate]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev nasm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
+      # Same container recipe scripts/test.sh uses locally (linuxserver/
+      # openssh-server): password auth, NOPASSWD sudo for the sudo capability
+      # cases, TCP forwarding for tunnel semantics, AcceptEnv so the setEnv
+      # round-trip verifies end to end instead of skipping.
+      - name: Start OpenSSH test container
+        run: |
+          docker run -d --name dbx-ssh-test -p 2222:2222 \
+            -e USER_NAME=sshuser -e USER_PASSWORD=DbxTest2026 \
+            -e PASSWORD_ACCESS=true linuxserver/openssh-server
+          docker exec dbx-ssh-test sh -c \
+            'echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser && chmod 440 /etc/sudoers.d/sshuser'
+          docker exec dbx-ssh-test sh -c \
+            'sed -i "s/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/" /config/sshd/sshd_config'
+          docker exec dbx-ssh-test sh -c \
+            'grep -q "^AcceptEnv DBX_SMOKE_ENV" /config/sshd/sshd_config || echo "AcceptEnv DBX_SMOKE_ENV" >> /config/sshd/sshd_config'
+          docker restart dbx-ssh-test
+          for i in $(seq 1 60); do
+            (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null && break
+            sleep 2
+          done
+          (exec 3<>/dev/tcp/127.0.0.1/2222)
+      - run: cargo build --locked --release --manifest-path backend/Cargo.toml
+      - name: Sidecar smoke against the live container
+        env:
+          DBX_PLUGIN_SIDECAR: ${{ github.workspace }}/backend/target/release/dbx-plugin-ssh
+        run: |
+          python3 scripts/smoke_test.py
+          python3 scripts/smoke_fs_test.py
 
   candidate:
     name: Package candidate (${{ matrix.target }})
@@ -105,13 +160,21 @@ jobs:
       - name: Install native dependencies
         if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev nasm
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
       - uses: pnpm/action-setup@v4
         with:
           version: 11.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
+      # rust-cache 的 key 自动包含 job 名与 matrix 值，五个 target 各自缓存；
+      # 打包步骤的 CARGO_TARGET_DIR 也指向 backend/target，可一并复用。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
       - run: pnpm --dir frontend install --frozen-lockfile
       - run: pnpm --dir frontend build
       - run: cargo build --locked --release --manifest-path backend/Cargo.toml
