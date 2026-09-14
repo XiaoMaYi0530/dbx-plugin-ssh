@@ -14,13 +14,13 @@ mod metrics_history;
 mod model;
 mod multi_exec;
 mod quick_commands;
+mod session_recording;
 mod sftp_bookmarks;
 mod sftp_copy;
 mod sftp_ext;
-mod session_recording;
 mod ssh;
-mod sudo_fs;
 mod sudo_allowlist;
+mod sudo_fs;
 mod sudo_profiles;
 mod transfer_history;
 mod vault;
@@ -142,7 +142,7 @@ impl Plugin {
                     // Connection-level sudoers-style allowlist (mirrors the
                     // MCP gate); structured sudo_fs ops stay exempt.
                     self.runtime
-                        .block_on(self.ssh.ensure_sudo_allowed(&session_id, command))?;
+                        .block_on(self.ssh.ensure_sudo_allowed(session_id, command))?;
                 }
                 self.runtime.block_on(self.ssh.exec(
                     session_id,
@@ -183,10 +183,11 @@ impl Plugin {
                     .get("appendNewline")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                Ok(self.runtime.block_on(
-                    self.ssh
-                        .batch_terminal_input(&session_ids, command, append_newline),
-                ))
+                Ok(self.runtime.block_on(self.ssh.batch_terminal_input(
+                    &session_ids,
+                    command,
+                    append_newline,
+                )))
             }
             "ssh/terminal/directoryTracking" => {
                 let session_id = required_string(&params, "sessionId")?;
@@ -400,14 +401,14 @@ impl Plugin {
                     .get("limit")
                     .and_then(Value::as_u64)
                     .unwrap_or(720)
-                    .clamp(1, metrics_history::MAX_SAMPLES as u64) as usize;
+                    .clamp(1, metrics_history::MAX_SAMPLES as u64)
+                    as usize;
                 self.runtime
                     .block_on(self.ssh.metrics_history(session_id, limit))
             }
             "ssh/processes/list" => {
                 let session_id = required_string(&params, "sessionId")?;
-                self.runtime
-                    .block_on(self.ssh.processes_list(session_id))
+                self.runtime.block_on(self.ssh.processes_list(session_id))
             }
             "ssh/processes/kill" => {
                 let session_id = required_string(&params, "sessionId")?;
@@ -425,13 +426,11 @@ impl Plugin {
             }
             "ssh/recording/start" => {
                 let session_id = required_string(&params, "sessionId")?;
-                self.runtime
-                    .block_on(self.ssh.recording_start(session_id))
+                self.runtime.block_on(self.ssh.recording_start(session_id))
             }
             "ssh/recording/stop" => {
                 let session_id = required_string(&params, "sessionId")?;
-                self.runtime
-                    .block_on(self.ssh.recording_stop(session_id))
+                self.runtime.block_on(self.ssh.recording_stop(session_id))
             }
             "ssh/recording/list" => Ok(json!({
                 "recordings": session_recording::list_recordings(&self.ssh.data_dir())
@@ -443,7 +442,8 @@ impl Plugin {
                     .get("limit")
                     .and_then(Value::as_u64)
                     .unwrap_or(session_recording::PAGE_LIMIT as u64)
-                    .clamp(1, session_recording::PAGE_LIMIT as u64) as usize;
+                    .clamp(1, session_recording::PAGE_LIMIT as u64)
+                    as usize;
                 session_recording::read_events(&self.ssh.data_dir(), recording_id, offset, limit)
             }
             "ssh/recording/delete" => {
@@ -473,7 +473,7 @@ impl Plugin {
             }
             "ssh/alert/triage" => {
                 let payload = required_string(&params, "payload")?;
-                Ok(alert_triage::triage_view(&alert_triage::triage(&payload)))
+                Ok(alert_triage::triage_view(&alert_triage::triage(payload)))
             }
             "ssh/audit/list" => {
                 let limit = params
@@ -500,7 +500,7 @@ impl Plugin {
             "ssh/agent/mode/get" => {
                 let connection_id = required_string(&params, "connectionId")?;
                 self.runtime
-                    .block_on(self.ssh.agent_mode_get(&connection_id))
+                    .block_on(self.ssh.agent_mode_get(connection_id))
             }
             "ssh/settings/get" => {
                 let session_id = required_string(&params, "sessionId")?;
@@ -516,28 +516,28 @@ impl Plugin {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
                 self.runtime
-                    .block_on(sudo_fs::stat(&self.ssh, session_id, &path))
+                    .block_on(sudo_fs::stat(&self.ssh, session_id, path))
             }
             "sudo/exists" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
                 let exists = self
                     .runtime
-                    .block_on(sudo_fs::exists(&self.ssh, session_id, &path))?;
+                    .block_on(sudo_fs::exists(&self.ssh, session_id, path))?;
                 Ok(json!({ "exists": exists }))
             }
             "sudo/touch" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
                 self.runtime
-                    .block_on(sudo_fs::touch(&self.ssh, session_id, &path))?;
+                    .block_on(sudo_fs::touch(&self.ssh, session_id, path))?;
                 Ok(json!({ "success": true }))
             }
             "sudo/listDir" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
                 self.runtime
-                    .block_on(sudo_fs::list_dir(&self.ssh, session_id, &path))
+                    .block_on(sudo_fs::list_dir(&self.ssh, session_id, path))
             }
             "sudo/readFile" => {
                 let session_id = required_string(&params, "sessionId")?;
@@ -545,7 +545,7 @@ impl Plugin {
                 let offset = optional_u64(&params, "offset", 0);
                 let length = optional_u64(&params, "length", 0);
                 self.runtime.block_on(sudo_fs::read_file(
-                    &self.ssh, session_id, &path, offset, length,
+                    &self.ssh, session_id, path, offset, length,
                 ))
             }
             "sudo/writeFile" => {
@@ -555,7 +555,7 @@ impl Plugin {
                 self.runtime.block_on(sudo_fs::write_file(
                     &self.ssh,
                     session_id,
-                    &path,
+                    path,
                     data_base64,
                 ))?;
                 Ok(json!({ "success": true }))
@@ -564,21 +564,21 @@ impl Plugin {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
                 self.runtime
-                    .block_on(sudo_fs::mkdir(&self.ssh, session_id, &path))?;
+                    .block_on(sudo_fs::mkdir(&self.ssh, session_id, path))?;
                 Ok(json!({ "success": true }))
             }
             "sudo/remove" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
                 self.runtime
-                    .block_on(sudo_fs::remove(&self.ssh, session_id, &path))?;
+                    .block_on(sudo_fs::remove(&self.ssh, session_id, path))?;
                 Ok(json!({ "success": true }))
             }
             "sudo/removeAll" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
                 self.runtime
-                    .block_on(sudo_fs::remove_all(&self.ssh, session_id, &path))?;
+                    .block_on(sudo_fs::remove_all(&self.ssh, session_id, path))?;
                 Ok(json!({ "success": true }))
             }
             "sudo/chmod" => {
@@ -586,7 +586,7 @@ impl Plugin {
                 let path = required_string(&params, "path")?;
                 let mode = required_string(&params, "mode")?;
                 self.runtime
-                    .block_on(sudo_fs::chmod(&self.ssh, session_id, &path, &mode))?;
+                    .block_on(sudo_fs::chmod(&self.ssh, session_id, path, mode))?;
                 Ok(json!({ "success": true }))
             }
             "sudo/rename" => {
@@ -594,7 +594,7 @@ impl Plugin {
                 let source = required_string(&params, "sourcePath")?;
                 let target = required_string(&params, "targetPath")?;
                 self.runtime
-                    .block_on(sudo_fs::rename(&self.ssh, session_id, &source, &target))?;
+                    .block_on(sudo_fs::rename(&self.ssh, session_id, source, target))?;
                 Ok(json!({ "success": true }))
             }
             "sudo/profiles/list" => Ok(self.ssh.profiles_list()),
@@ -678,10 +678,13 @@ impl Plugin {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
-                self.runtime.block_on(
-                    self.ssh
-                        .start_upload(session_id, remote_path, size, resume_task_id, emitter),
-                )
+                self.runtime.block_on(self.ssh.start_upload(
+                    session_id,
+                    remote_path,
+                    size,
+                    resume_task_id,
+                    emitter,
+                ))
             }
             "sftp/upload/finish" => {
                 let task_id = required_string(&params, "taskId")?;
@@ -692,10 +695,12 @@ impl Plugin {
                 let session_id = required_string(&params, "sessionId")?;
                 let remote_path = required_string(&params, "remotePath")?;
                 let offset = optional_u64(&params, "offset", 0);
-                self.runtime.block_on(
-                    self.ssh
-                        .start_download(session_id, remote_path, offset, emitter),
-                )
+                self.runtime.block_on(self.ssh.start_download(
+                    session_id,
+                    remote_path,
+                    offset,
+                    emitter,
+                ))
             }
             "sftp/download/next" => {
                 let task_id = required_string(&params, "taskId")?;
@@ -986,9 +991,7 @@ fn to_plugin_error(error: String) -> PluginError {
 ///    `%APPDATA%`.
 /// 4. `std::env::temp_dir()` — last resort so this function never fails.
 fn resolve_plugin_data_dir(lookup: impl Fn(&str) -> Option<OsString>) -> PathBuf {
-    let env = |key: &str| {
-        lookup(key).filter(|value| !value.to_string_lossy().trim().is_empty())
-    };
+    let env = |key: &str| lookup(key).filter(|value| !value.to_string_lossy().trim().is_empty());
     if let Some(dir) = env("DBX_PLUGIN_DATA_DIR") {
         return PathBuf::from(dir);
     }
@@ -1005,10 +1008,8 @@ fn resolve_plugin_data_dir(lookup: impl Fn(&str) -> Option<OsString>) -> PathBuf
             if cfg!(target_os = "macos") {
                 home.join("Library").join("Application Support")
             } else {
-                env("XDG_DATA_HOME").map_or_else(
-                    || home.join(".local").join("share"),
-                    PathBuf::from,
-                )
+                env("XDG_DATA_HOME")
+                    .map_or_else(|| home.join(".local").join("share"), PathBuf::from)
             }
         })
     };
@@ -1145,8 +1146,7 @@ mod tests {
             with_xdg,
             PathBuf::from("/xdg/data/dbx-plugin-data/io.dbx.ssh")
         );
-        let without_xdg =
-            resolve_plugin_data_dir(lookup_from(&[("HOME", "/Users/tester")]));
+        let without_xdg = resolve_plugin_data_dir(lookup_from(&[("HOME", "/Users/tester")]));
         assert_eq!(
             without_xdg,
             PathBuf::from("/Users/tester/.local/share/dbx-plugin-data/io.dbx.ssh")
@@ -1156,7 +1156,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_falls_back_to_appdata() {
-        let dir = resolve_plugin_data_dir(lookup_from(&[("APPDATA", r"C:\Users\tester\AppData\Roaming")]));
+        let dir = resolve_plugin_data_dir(lookup_from(&[(
+            "APPDATA",
+            r"C:\Users\tester\AppData\Roaming",
+        )]));
         assert_eq!(
             dir,
             PathBuf::from(r"C:\Users\tester\AppData\Roaming")

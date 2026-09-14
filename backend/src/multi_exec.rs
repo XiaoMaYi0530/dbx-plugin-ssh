@@ -64,9 +64,9 @@ pub fn command_gate(
         );
     }
     match assess_command(command) {
-        CommandRisk::Destructive(reason) if read_only => {
-            Err(format!("Refused on read-only connection ({reason}): {command}"))
-        }
+        CommandRisk::Destructive(reason) if read_only => Err(format!(
+            "Refused on read-only connection ({reason}): {command}"
+        )),
         CommandRisk::Destructive(reason) => {
             if confirm_destructive {
                 Ok(())
@@ -118,8 +118,7 @@ mod tests {
 
     #[test]
     fn targets_dedupe_preserving_first_occurrence() {
-        let normalized =
-            normalize_targets(&raws(&["b", "a", "b", "c", "a"])).unwrap();
+        let normalized = normalize_targets(&raws(&["b", "a", "b", "c", "a"])).unwrap();
         assert_eq!(normalized, raws(&["b", "a", "c"]));
     }
 

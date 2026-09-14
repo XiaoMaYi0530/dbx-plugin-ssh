@@ -160,12 +160,25 @@ fn clamp_chars(text: &str, max: usize) -> String {
 const KEYWORDS: &[(Category, &[&str])] = &[
     (
         Category::Oom,
-        &["oom", "out of memory", "oom-kill", "killed process", "内存耗尽"],
+        &[
+            "oom",
+            "out of memory",
+            "oom-kill",
+            "killed process",
+            "内存耗尽",
+        ],
     ),
     (Category::Inode, &["inode"]),
     (
         Category::Cpu,
-        &["cpu", "processor", "load average", "loadavg", "处理器", "负载"],
+        &[
+            "cpu",
+            "processor",
+            "load average",
+            "loadavg",
+            "处理器",
+            "负载",
+        ],
     ),
     (Category::Memory, &["memory", "mem usage", "内存", "swap"]),
     (
@@ -200,8 +213,7 @@ const SCORE_ORDER: &[Category] = &[
 /// (lowercased). Highest score wins; all-zero scores yield
 /// [`Category::Generic`]; ties are resolved by [`SCORE_ORDER`].
 pub fn classify(alert: &NormalizedAlert) -> Category {
-    let text = format!("{} {} {}", alert.title, alert.message, alert.data_json)
-        .to_lowercase();
+    let text = format!("{} {} {}", alert.title, alert.message, alert.data_json).to_lowercase();
     let mut best = Category::Generic;
     let mut best_score = 0usize;
     for category in SCORE_ORDER {
@@ -332,10 +344,7 @@ pub fn playbook(category: Category, alert: &NormalizedAlert) -> Vec<Suggestion> 
         ],
         Category::Service => match extract_service(alert) {
             Some(service) => vec![
-                suggestion(
-                    &format!("systemctl status {service}"),
-                    "serviceStatus",
-                ),
+                suggestion(&format!("systemctl status {service}"), "serviceStatus"),
                 suggestion(
                     &format!("journalctl -u {service} -n 100 --no-pager"),
                     "serviceJournal",
@@ -430,8 +439,7 @@ mod tests {
 
     #[test]
     fn non_string_fields_are_missing_and_data_non_object_is_dropped() {
-        let normalized =
-            normalize(r#"{"alertId":42,"title":7,"data":"not-an-object"}"#);
+        let normalized = normalize(r#"{"alertId":42,"title":7,"data":"not-an-object"}"#);
         assert_eq!(normalized.alert_id, "");
         assert_eq!(normalized.title, "");
         assert_eq!(normalized.data_json, "");
@@ -457,7 +465,10 @@ mod tests {
     #[test]
     fn missing_severity_becomes_unknown() {
         assert_eq!(normalize(r#"{"message":"m"}"#).severity, "unknown");
-        assert_eq!(normalize(r#"{"message":"m","severity":""}"#).severity, "unknown");
+        assert_eq!(
+            normalize(r#"{"message":"m","severity":""}"#).severity,
+            "unknown"
+        );
     }
 
     #[test]
@@ -509,7 +520,10 @@ mod tests {
 
     #[test]
     fn network_alerts_are_detected() {
-        assert_eq!(classify_text("网卡 eth0 packet loss 10%, 丢包"), Category::Network);
+        assert_eq!(
+            classify_text("网卡 eth0 packet loss 10%, 丢包"),
+            Category::Network
+        );
         assert_ne!(classify_text("cpu load high"), Category::Network);
     }
 
@@ -542,7 +556,10 @@ mod tests {
 
     #[test]
     fn zero_scores_fall_back_to_generic() {
-        assert_eq!(classify_text("backup finished successfully at 03:00"), Category::Generic);
+        assert_eq!(
+            classify_text("backup finished successfully at 03:00"),
+            Category::Generic
+        );
         assert_eq!(classify(&NormalizedAlert::default()), Category::Generic);
     }
 
@@ -566,7 +583,10 @@ mod tests {
         ];
         for category in cases {
             let suggestions = playbook(category, &service_alert);
-            assert!(!suggestions.is_empty(), "{category:?} produced no suggestions");
+            assert!(
+                !suggestions.is_empty(),
+                "{category:?} produced no suggestions"
+            );
             for item in suggestions {
                 assert_eq!(
                     assess_command(&item.command),
@@ -594,13 +614,20 @@ mod tests {
         // (correctly) fall back to the generic command set.
         let named = alert("服务异常", "systemd unit cron.service restart failed");
         let keys = |category| -> Vec<&'static str> {
-            let sample = if category == Category::Service { &named } else { &empty };
+            let sample = if category == Category::Service {
+                &named
+            } else {
+                &empty
+            };
             playbook(category, sample)
                 .into_iter()
                 .map(|item| item.purpose_key)
                 .collect()
         };
-        assert_eq!(keys(Category::Cpu), ["loadSnapshot", "cpuTopProcesses", "cpuVmstat"]);
+        assert_eq!(
+            keys(Category::Cpu),
+            ["loadSnapshot", "cpuTopProcesses", "cpuVmstat"]
+        );
         assert_eq!(keys(Category::Memory), ["memFree", "memTopProcesses"]);
         assert_eq!(keys(Category::Disk), ["diskUsage", "diskDu"]);
         assert_eq!(keys(Category::Inode), ["diskInode"]);
@@ -685,7 +712,10 @@ mod tests {
         assert_eq!(normalized["message"], payload);
         assert_eq!(normalized["severity"], "critical");
         assert_eq!(normalized["source"], "");
-        assert!(normalized["dataJson"].as_str().unwrap().contains("\"v\": 1"));
+        assert!(normalized["dataJson"]
+            .as_str()
+            .unwrap()
+            .contains("\"v\": 1"));
 
         assert_eq!(view["category"], "cpu");
         assert_eq!(

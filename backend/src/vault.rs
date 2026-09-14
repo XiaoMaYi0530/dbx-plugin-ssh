@@ -81,14 +81,18 @@ pub trait KeyProvider {
     fn dek(&self) -> Result<Zeroizing<[u8; DEK_LEN]>, String>;
 }
 
+/// Memoized DEK resolution outcome: `Err(())` records "the keychain refused
+/// (dialog denied / unavailable)" so later calls reuse the degraded answer
+/// instead of re-prompting.
+type CachedDek = Result<Zeroizing<[u8; DEK_LEN]>, ()>;
+
 /// Process-wide memo of the keychain DEK resolution. The macOS keychain may
 /// raise an authorization dialog per (binary, item) access, so caching the
 /// outcome bounds the prompt to at most one per sidecar process (the
 /// workbench and the stdio `--mcp` process each get their own). Only the
 /// keychain is cached: the keyfile is a cheap per-path read and tests rely
 /// on per-path isolation.
-static KEYCHAIN_DEK: OnceLock<Mutex<Option<Result<Zeroizing<[u8; DEK_LEN]>, ()>>>> =
-    OnceLock::new();
+static KEYCHAIN_DEK: OnceLock<Mutex<Option<CachedDek>>> = OnceLock::new();
 
 /// DEK hosted in the OS keychain. First use mints a random DEK and stores it.
 /// Resolution is memoized per process (see [`KEYCHAIN_DEK`]).
@@ -102,7 +106,9 @@ impl KeyProvider for KeychainProvider {
 
     fn dek(&self) -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
         let cache = KEYCHAIN_DEK.get_or_init(|| Mutex::new(None));
-        let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cached) = guard.as_ref() {
             return cached
                 .clone()
@@ -119,8 +125,9 @@ fn resolve_keychain_dek() -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
         .map_err(|error| format!("Failed to open keychain entry: {error}"))?;
     match entry.get_password() {
-        Ok(value) => decode_dek(&value)
-            .ok_or_else(|| "Keychain vault DEK is malformed".to_string()),
+        Ok(value) => {
+            decode_dek(&value).ok_or_else(|| "Keychain vault DEK is malformed".to_string())
+        }
         // First use: mint a random DEK and hand it to the keychain.
         Err(keyring::Error::NoEntry) => {
             let dek = random_dek();
@@ -139,7 +146,10 @@ fn resolve_keychain_dek() -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
 /// the "secrets may be lost, the store must not break" policy.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn resolve_keychain_dek() -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
-    Err("OS keychain tier is unavailable on this platform; the keyfile tier is used instead".to_string())
+    Err(
+        "OS keychain tier is unavailable on this platform; the keyfile tier is used instead"
+            .to_string(),
+    )
 }
 
 /// Best-effort removal of the keychain DEK entry after a successful
@@ -173,7 +183,10 @@ impl KeyfileProvider {
         KeyfileProvider { path }
     }
 
-    fn write_key(&self, dek: &Zeroizing<[u8; DEK_LEN]>) -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
+    fn write_key(
+        &self,
+        dek: &Zeroizing<[u8; DEK_LEN]>,
+    ) -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -334,7 +347,12 @@ fn seal(
     Ok(BASE64_STANDARD.encode(envelope))
 }
 
-fn open(dek: &[u8; DEK_LEN], field: &str, profile_id: &str, envelope: &str) -> Result<String, String> {
+fn open(
+    dek: &[u8; DEK_LEN],
+    field: &str,
+    profile_id: &str,
+    envelope: &str,
+) -> Result<String, String> {
     let raw = BASE64_STANDARD
         .decode(envelope)
         .map_err(|error| format!("Failed to decode vault envelope: {error}"))?;

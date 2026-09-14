@@ -167,15 +167,20 @@ impl serde::Serialize for GateOutcome {
 impl<'de> serde::Deserialize<'de> for GateOutcome {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
-        Self::from_name(&text).ok_or_else(|| serde::de::Error::unknown_variant(&text, &[
-            "pass",
-            "write-denied",
-            "whitelist-denied",
-            "sensitive-path",
-            "destructive-unconfirmed",
-            "sudo-allowlist-denied",
-            "read-only-server",
-        ]))
+        Self::from_name(&text).ok_or_else(|| {
+            serde::de::Error::unknown_variant(
+                &text,
+                &[
+                    "pass",
+                    "write-denied",
+                    "whitelist-denied",
+                    "sensitive-path",
+                    "destructive-unconfirmed",
+                    "sudo-allowlist-denied",
+                    "read-only-server",
+                ],
+            )
+        })
     }
 }
 
@@ -191,7 +196,14 @@ impl<'de> serde::Deserialize<'de> for ApprovalTrail {
         Self::from_name(&text).ok_or_else(|| {
             serde::de::Error::unknown_variant(
                 &text,
-                &["none", "prompt", "approved", "denied", "timeout", "remembered"],
+                &[
+                    "none",
+                    "prompt",
+                    "approved",
+                    "denied",
+                    "timeout",
+                    "remembered",
+                ],
             )
         })
     }
@@ -220,8 +232,9 @@ impl serde::Serialize for ExecMode {
 impl<'de> serde::Deserialize<'de> for ExecMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
-        Self::from_name(&text)
-            .ok_or_else(|| serde::de::Error::unknown_variant(&text, &["stdio", "embedded", "terminal"]))
+        Self::from_name(&text).ok_or_else(|| {
+            serde::de::Error::unknown_variant(&text, &["stdio", "embedded", "terminal"])
+        })
     }
 }
 
@@ -475,7 +488,10 @@ mod tests {
         std::fs::write(rotated_path(&dir), b"{\"stale\":true}\n").unwrap();
         clear(&dir).unwrap();
         assert!(tail(&dir, 100, None).unwrap().is_empty());
-        assert!(!rotated_path(&dir).exists(), "rotated generation must be dropped");
+        assert!(
+            !rotated_path(&dir).exists(),
+            "rotated generation must be dropped"
+        );
         // Appends after a clear start the new generation cleanly.
         append(&dir, &sample_entry(3)).unwrap();
         assert_eq!(tools(&tail(&dir, 100, None).unwrap()), vec!["ssh_exec"]);
@@ -497,12 +513,18 @@ mod tests {
             (GateOutcome::WriteDenied, "write-denied"),
             (GateOutcome::WhitelistDenied, "whitelist-denied"),
             (GateOutcome::SensitivePath, "sensitive-path"),
-            (GateOutcome::DestructiveUnconfirmed, "destructive-unconfirmed"),
+            (
+                GateOutcome::DestructiveUnconfirmed,
+                "destructive-unconfirmed",
+            ),
             (GateOutcome::SudoAllowlistDenied, "sudo-allowlist-denied"),
             (GateOutcome::ReadOnlyServer, "read-only-server"),
         ];
         for (value, text) in cases {
-            assert_eq!(serde_json::to_value(value).unwrap(), serde_json::json!(text));
+            assert_eq!(
+                serde_json::to_value(value).unwrap(),
+                serde_json::json!(text)
+            );
         }
     }
 
@@ -517,17 +539,26 @@ mod tests {
             (ApprovalTrail::Remembered, "remembered"),
         ];
         for (value, text) in approvals {
-            assert_eq!(serde_json::to_value(value).unwrap(), serde_json::json!(text));
+            assert_eq!(
+                serde_json::to_value(value).unwrap(),
+                serde_json::json!(text)
+            );
         }
         for (value, text) in [(EntryOutcome::Ok, "ok"), (EntryOutcome::Error, "error")] {
-            assert_eq!(serde_json::to_value(value).unwrap(), serde_json::json!(text));
+            assert_eq!(
+                serde_json::to_value(value).unwrap(),
+                serde_json::json!(text)
+            );
         }
         for (value, text) in [
             (ExecMode::Stdio, "stdio"),
             (ExecMode::Embedded, "embedded"),
             (ExecMode::Terminal, "terminal"),
         ] {
-            assert_eq!(serde_json::to_value(value).unwrap(), serde_json::json!(text));
+            assert_eq!(
+                serde_json::to_value(value).unwrap(),
+                serde_json::json!(text)
+            );
         }
     }
 
@@ -658,7 +689,7 @@ mod tests {
         let path = audit_path(&dir);
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str("{not json\n");
-        text.push_str("\n");
+        text.push('\n');
         text.push_str("{\"tsMs\":2000,\"tool\":\"orphan\"}\n");
         std::fs::write(&path, text).unwrap();
         append(&dir, &sample_entry(3_000)).unwrap();
@@ -701,7 +732,10 @@ mod tests {
         let rotated = std::fs::metadata(rotated_path(&dir)).unwrap();
         assert!(rotated.len() >= ROTATE_BYTES, "old generation preserved");
         let fresh = std::fs::read_to_string(&path).unwrap();
-        assert!(fresh.contains("\"tool\":\"ssh_exec\""), "new file holds the entry");
+        assert!(
+            fresh.contains("\"tool\":\"ssh_exec\""),
+            "new file holds the entry"
+        );
         // The padding was not valid JSON, so tail sees only the new entry.
         let entries = tail(&dir, 500, None).unwrap();
         assert_eq!(entries.len(), 1);
@@ -718,9 +752,7 @@ mod tests {
             let dir = dir.clone();
             handles.push(std::thread::spawn(move || {
                 for index in 0..10u32 {
-                    let mut entry = sample_entry(
-                        1_000 + (thread_index * 100 + index) as u64,
-                    );
+                    let mut entry = sample_entry(1_000 + (thread_index * 100 + index) as u64);
                     entry.tool = format!("tool-{thread_index}-{index}");
                     append(&dir, &entry).unwrap();
                 }

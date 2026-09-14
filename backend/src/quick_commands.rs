@@ -113,11 +113,7 @@ pub fn entry_view(entry: &QuickCommandEntry) -> Value {
 
 /// Insertion order (createdAt asc) so the workbench dropdown is stable.
 pub fn list_views(store: &QuickCommandStore) -> Vec<Value> {
-    store
-        .commands
-        .iter()
-        .map(entry_view)
-        .collect()
+    store.commands.iter().map(entry_view).collect()
 }
 
 /// Creates or updates one entry from the shared camelCase parameter shape
@@ -153,12 +149,8 @@ pub fn save_entry(
         .get("id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
-    let existing = existing_id.and_then(|id| {
-        store
-            .commands
-            .iter()
-            .position(|entry| entry.id == id)
-    });
+    let existing =
+        existing_id.and_then(|id| store.commands.iter().position(|entry| entry.id == id));
     if existing.is_none() && store.commands.len() >= MAX_COMMANDS {
         return Err(format!(
             "At most {MAX_COMMANDS} quick commands are supported"
@@ -240,10 +232,11 @@ mod tests {
         assert!(save_entry(&mut store, &json!({})).is_err());
         assert!(save_entry(&mut store, &json!({ "command": "a".repeat(501) })).is_err());
         save(&mut store, "ops", "echo hi");
-        assert!(
-            save_entry(&mut store, &json!({ "command": "echo hi", "name": "n".repeat(61) }))
-                .is_err()
-        );
+        assert!(save_entry(
+            &mut store,
+            &json!({ "command": "echo hi", "name": "n".repeat(61) })
+        )
+        .is_err());
     }
 
     #[test]

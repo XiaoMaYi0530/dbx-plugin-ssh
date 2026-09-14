@@ -28,8 +28,8 @@ use crate::audit_log;
 use crate::exec::{
     self, AuthFlowMode, ExecOutcome, Hints, SudoAuth, PLAIN_EXEC_TIMEOUT, SUDO_EXEC_TIMEOUT,
 };
-use crate::host_key::{HostKeyState, HostKeyVerifier};
 use crate::highlight_rules;
+use crate::host_key::{HostKeyState, HostKeyVerifier};
 use crate::metrics;
 use crate::metrics_history;
 use crate::model::{
@@ -146,6 +146,8 @@ struct PendingPrompt {
 }
 
 impl PromptBroker {
+    // 参数就是 host-key 挑战事件的载荷字段，一一对应而非可归组的耦合。
+    #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
         host: &str,
@@ -500,9 +502,7 @@ impl DirectoryHandshakeFilter {
         if self.buffered.len() > DIRECTORY_HANDSHAKE_LIMIT {
             return self.fail_open();
         }
-        let Some(index) = find_bytes(&self.buffered, marker) else {
-            return None;
-        };
+        let index = find_bytes(&self.buffered, marker)?;
         let result = self.buffered[index + marker.len()..].to_vec();
         self.marker = None;
         self.buffered.clear();
@@ -710,6 +710,8 @@ impl ConnectionEndpoint {
 
 /// One row of `ssh/sessions/list`. Pure so tests can exercise the payload
 /// shape without a live SSH connection.
+// 参数与 JSON 行字段一一对应，是纯载荷整形函数的自然形状。
+#[allow(clippy::too_many_arguments)]
 fn session_info_payload(
     session_id: &str,
     connection_id: &str,
@@ -1485,10 +1487,7 @@ impl SshRuntime {
         };
         // Read-only auth method name per connection id for the info panel;
         // a poisoned store just means the panel shows the default method.
-        let connections = match self.connections.read() {
-            Ok(guard) => Some(guard),
-            Err(_) => None,
-        };
+        let connections = self.connections.read().ok();
         let mut list: Vec<Value> = sessions
             .iter()
             .map(|(session_id, entry)| {
@@ -2095,7 +2094,12 @@ impl SshRuntime {
         // first line of the command gates settling: without its echo the
         // recorder would settle on the login-banner prompt before the shell
         // even processed the injection (boot-restore race).
-        let echo_fragment = command.lines().next().unwrap_or_default().trim().to_string();
+        let echo_fragment = command
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         {
             let mut slot = session
                 .agent_recorder
@@ -2138,7 +2142,7 @@ impl SshRuntime {
                     *slot = None;
                 }
                 return Err(
-                    "SSH terminal is not accepting input (session unresponsive)".to_string(),
+                    "SSH terminal is not accepting input (session unresponsive)".to_string()
                 );
             }
         }
@@ -2160,7 +2164,9 @@ impl SshRuntime {
             if settled {
                 break false;
             }
-            if poll_cycles % 20 == 0 && !self.sessions.read().await.contains_key(session_id) {
+            if poll_cycles.is_multiple_of(20)
+                && !self.sessions.read().await.contains_key(session_id)
+            {
                 if let Ok(mut slot) = session.agent_recorder.lock() {
                     slot.take();
                 }
@@ -2290,7 +2296,10 @@ impl SshRuntime {
             if let Ok(mut challenges) = self.agent_challenges.lock() {
                 challenges.remove(&challenge_id);
             }
-            return Err(format!("Failed to raise the approval prompt: {}", error.message));
+            return Err(format!(
+                "Failed to raise the approval prompt: {}",
+                error.message
+            ));
         }
         let decision = match tokio::time::timeout(wait, receiver).await {
             Ok(Ok(decision)) => Some(decision),
@@ -2368,7 +2377,10 @@ impl SshRuntime {
             if let Ok(mut challenges) = self.agent_challenges.lock() {
                 challenges.remove(&challenge_id);
             }
-            return Err(format!("Failed to raise the approval prompt: {}", error.message));
+            return Err(format!(
+                "Failed to raise the approval prompt: {}",
+                error.message
+            ));
         }
         let decision = match tokio::time::timeout(wait, receiver).await {
             Ok(Ok(decision)) => Some(decision),
@@ -2790,7 +2802,8 @@ impl SshRuntime {
         let command = format!("df -kP {}", exec::shell_quote(&path));
         // Plugin-internal plumbing: no client setEnv, keeping the df output
         // parseable regardless of the connection's locale overrides.
-        let outcome = exec::exec_plain(&session.handle, &command, Duration::from_secs(20), &[]).await?;
+        let outcome =
+            exec::exec_plain(&session.handle, &command, Duration::from_secs(20), &[]).await?;
         exec::parse_disk_usage(&outcome.output)
             .ok_or_else(|| format!("Could not parse disk usage output: {}", outcome.output))
     }
@@ -2827,7 +2840,12 @@ impl SshRuntime {
 
     /// `ssh/processes/kill`: signals one remote process (pid/signal are
     /// validated in `metrics::kill_command`; pid 0/1 refused).
-    pub async fn kill_process(&self, session_id: &str, pid: u64, signal: u32) -> Result<Value, String> {
+    pub async fn kill_process(
+        &self,
+        session_id: &str,
+        pid: u64,
+        signal: u32,
+    ) -> Result<Value, String> {
         let session = self.session(session_id).await?;
         metrics::kill_process(&session.handle, pid, signal).await?;
         Ok(json!({ "success": true, "pid": pid }))
@@ -3008,7 +3026,7 @@ impl SshRuntime {
             sudo_profiles::set_binding(
                 &mut store,
                 &connection_id,
-                (!profile_id.is_empty()).then(|| profile_id.as_str()),
+                (!profile_id.is_empty()).then_some(profile_id.as_str()),
             )?;
             sudo_profiles::save_store(&self.data_dir, &store)?;
         }
@@ -3435,7 +3453,8 @@ impl SshRuntime {
         // spool file and its sidecar meta (written on the first start) hold
         // the received prefix; the caller re-streams only the missing tail.
         if let Some(task_id) = resume_task_id {
-            let (local_path, resume_offset) = self.open_resume_spool(&task_id, &remote_path, size)?;
+            let (local_path, resume_offset) =
+                self.open_resume_spool(&task_id, &remote_path, size)?;
             let file = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&local_path)
@@ -3454,7 +3473,11 @@ impl SshRuntime {
                         file,
                     },
                 );
-            let file_name = remote_path.rsplit('/').next().unwrap_or("upload").to_string();
+            let file_name = remote_path
+                .rsplit('/')
+                .next()
+                .unwrap_or("upload")
+                .to_string();
             emitter
                 .event(
                     "sftp/transfer/progress",
@@ -3536,12 +3559,10 @@ impl SshRuntime {
         let spool = self.transfer_dir.join(format!("upload-{task_id}.part"));
         let meta = read_upload_meta(&self.transfer_dir.join(format!("upload-{task_id}.json")))
             .ok_or("No resumable upload found for this task")?;
-        if meta
-            .get("remotePath")
-            .and_then(Value::as_str)
-            != Some(remote_path)
-        {
-            return Err("Resume target does not match the interrupted upload's remote path".to_string());
+        if meta.get("remotePath").and_then(Value::as_str) != Some(remote_path) {
+            return Err(
+                "Resume target does not match the interrupted upload's remote path".to_string(),
+            );
         }
         if meta.get("size").and_then(Value::as_u64) != Some(size) {
             return Err("Resume file size does not match the interrupted upload".to_string());
@@ -4667,7 +4688,10 @@ fn resumable_uploads_from(transfer_dir: &Path, live_task_ids: &[String]) -> Vec<
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(task_id) = name.strip_prefix("upload-").and_then(|rest| rest.strip_suffix(".json")) else {
+        let Some(task_id) = name
+            .strip_prefix("upload-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
             continue;
         };
         if live_task_ids.iter().any(|live| live == task_id) {
@@ -4914,8 +4938,11 @@ mod tests {
     }
 
     fn spool_fixture(dir: &Path, task_id: &str, remote_path: &str, size: u64, received: u64) {
-        std::fs::write(dir.join(format!("upload-{task_id}.part")), vec![b'x'; received as usize])
-            .unwrap();
+        std::fs::write(
+            dir.join(format!("upload-{task_id}.part")),
+            vec![b'x'; received as usize],
+        )
+        .unwrap();
         write_upload_meta(
             &dir.join(format!("upload-{task_id}.json")),
             &json!({ "remotePath": remote_path, "size": size }),
@@ -4946,15 +4973,17 @@ mod tests {
         let runtime = SshRuntime::new(dir.clone());
         spool_fixture(&transfer_dir, "t1", "/srv/a.bin", 100, 40);
         // Matching request resumes at the spooled length.
-        let (path, offset) = runtime
-            .open_resume_spool("t1", "/srv/a.bin", 100)
-            .unwrap();
+        let (path, offset) = runtime.open_resume_spool("t1", "/srv/a.bin", 100).unwrap();
         assert_eq!(offset, 40);
         assert!(path.ends_with("upload-t1.part"));
         // Mismatched size / remote path / missing meta are refused.
         assert!(runtime.open_resume_spool("t1", "/srv/a.bin", 99).is_err());
-        assert!(runtime.open_resume_spool("t1", "/srv/other.bin", 100).is_err());
-        assert!(runtime.open_resume_spool("gone", "/srv/a.bin", 100).is_err());
+        assert!(runtime
+            .open_resume_spool("t1", "/srv/other.bin", 100)
+            .is_err());
+        assert!(runtime
+            .open_resume_spool("gone", "/srv/a.bin", 100)
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4978,7 +5007,7 @@ mod tests {
         assert_eq!(tasks[0]["size"], 100);
         assert_eq!(tasks[0]["resumableBytes"], 40);
         // A missing transfer dir yields an empty list, not an error.
-        assert!(resumable_uploads_from(&Path::new("/nonexistent-dbx-ssh"), &[]).is_empty());
+        assert!(resumable_uploads_from(Path::new("/nonexistent-dbx-ssh"), &[]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5033,7 +5062,10 @@ mod tests {
 
         // 引用未知配置时回落绑定；绑定也移除后退化为无配置。
         let ghost = parse(serde_json::json!({ "sudo_source": "global", "sudo_profile": "ghost" }));
-        assert_eq!(effective_sudo_profile(&ghost, &store).unwrap().id, profile.id);
+        assert_eq!(
+            effective_sudo_profile(&ghost, &store).unwrap().id,
+            profile.id
+        );
         store.bindings.remove("conn-src");
         assert!(effective_sudo_profile(&ghost, &store).is_none());
     }
@@ -5052,7 +5084,10 @@ mod tests {
             let mut chunk = vec![b'x'; CHUNK];
             chunk[0] = b'a' + (index % 26) as u8;
             replay.push(TerminalStream::Stdout, chunk);
-            assert!(replay.bytes <= TERMINAL_REPLAY_LIMIT, "buffer exceeded the cap at push {index}");
+            assert!(
+                replay.bytes <= TERMINAL_REPLAY_LIMIT,
+                "buffer exceeded the cap at push {index}"
+            );
         }
         // The buffer holds exactly the newest 2 MiB, not the full 5 MiB.
         assert_eq!(replay.bytes, TERMINAL_REPLAY_LIMIT);
@@ -5086,7 +5121,8 @@ mod tests {
     /// sorted like the listings, and never any secret field.
     #[test]
     fn profile_options_expose_id_name_pairs_without_secrets() {
-        let dir = std::env::temp_dir().join(format!("dbx-profile-options-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("dbx-profile-options-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let runtime = SshRuntime::new(dir.clone());
         let mut store = sudo_profiles::SudoProfileStore::default();
@@ -5165,7 +5201,19 @@ mod tests {
             port: 2222,
             username: "ops".to_string(),
         };
-        let row = session_info_payload("sess-1", "conn-1", "wb-1", true, true, true, 90, 1_700_000_123, "private-key", &endpoint, false);
+        let row = session_info_payload(
+            "sess-1",
+            "conn-1",
+            "wb-1",
+            true,
+            true,
+            true,
+            90,
+            1_700_000_123,
+            "private-key",
+            &endpoint,
+            false,
+        );
         assert_eq!(row["recording"], false);
         assert_eq!(row["sessionId"], json!("sess-1"));
         assert_eq!(row["connectionId"], json!("conn-1"));
@@ -5188,8 +5236,14 @@ mod tests {
 
     #[test]
     fn batch_input_payload_normalizes_newlines_and_bounds_size() {
-        assert_eq!(SshRuntime::batch_input_payload("df -h", true), b"df -h\r".to_vec());
-        assert_eq!(SshRuntime::batch_input_payload("df -h", false), b"df -h".to_vec());
+        assert_eq!(
+            SshRuntime::batch_input_payload("df -h", true),
+            b"df -h\r".to_vec()
+        );
+        assert_eq!(
+            SshRuntime::batch_input_payload("df -h", false),
+            b"df -h".to_vec()
+        );
         // Every newline flavour becomes one Enter.
         assert_eq!(
             SshRuntime::batch_input_payload("a\nb\r\nc\rd", true),
@@ -5380,26 +5434,24 @@ mod tests {
         let runtime = SshRuntime::new(data_dir.path().to_path_buf());
 
         // Unknown / already resolved challenges are refused.
-        assert!(runtime.resolve_agent_challenge("ghost", "approve", None, false).is_err());
+        assert!(runtime
+            .resolve_agent_challenge("ghost", "approve", None, false)
+            .is_err());
 
         // Approve delivers the (possibly edited) command once, then the
         // challenge is gone. The registry guard is dropped before each
         // resolve so the std Mutex never re-enters on the same thread.
         let (sender, receiver) = oneshot::channel();
-        runtime
-            .agent_challenges
-            .lock()
-            .expect("challenges")
-            .insert(
-                "c-1".to_string(),
-                PendingChallenge {
-                    sender,
-                    connection_id: "conn-1".to_string(),
-                    tool: "ssh_exec".to_string(),
-                    command: "echo edited".to_string(),
-                    raised_at_ms: 0,
-                },
-            );
+        runtime.agent_challenges.lock().expect("challenges").insert(
+            "c-1".to_string(),
+            PendingChallenge {
+                sender,
+                connection_id: "conn-1".to_string(),
+                tool: "ssh_exec".to_string(),
+                command: "echo edited".to_string(),
+                raised_at_ms: 0,
+            },
+        );
         runtime
             .resolve_agent_challenge("c-1", "approve", Some("echo edited"), false)
             .expect("resolve");
@@ -5413,31 +5465,33 @@ mod tests {
                 command: Some("echo edited".to_string())
             }
         );
-        assert!(runtime.resolve_agent_challenge("c-1", "approve", None, false).is_err());
+        assert!(runtime
+            .resolve_agent_challenge("c-1", "approve", None, false)
+            .is_err());
 
         // Deny decisions and unknown decision names are handled too.
         let (sender, receiver) = oneshot::channel();
+        runtime.agent_challenges.lock().expect("challenges").insert(
+            "c-2".to_string(),
+            PendingChallenge {
+                sender,
+                connection_id: "conn-1".to_string(),
+                tool: "ssh_exec".to_string(),
+                command: "echo hi".to_string(),
+                raised_at_ms: 0,
+            },
+        );
         runtime
-            .agent_challenges
-            .lock()
-            .expect("challenges")
-            .insert(
-                "c-2".to_string(),
-                PendingChallenge {
-                    sender,
-                    connection_id: "conn-1".to_string(),
-                    tool: "ssh_exec".to_string(),
-                    command: "echo hi".to_string(),
-                    raised_at_ms: 0,
-                },
-            );
-        runtime.resolve_agent_challenge("c-2", "deny", None, false).expect("resolve");
+            .resolve_agent_challenge("c-2", "deny", None, false)
+            .expect("resolve");
         let decision = tokio::runtime::Runtime::new()
             .expect("tokio runtime")
             .block_on(receiver)
             .expect("decision");
         assert_eq!(decision, AgentDecision::Deny);
-        assert!(runtime.resolve_agent_challenge("c-2", "maybe", None, false).is_err());
+        assert!(runtime
+            .resolve_agent_challenge("c-2", "maybe", None, false)
+            .is_err());
     }
 
     /// Reliability round 5 (churn): 500 raise→resolve cycles must leave the
@@ -5453,40 +5507,46 @@ mod tests {
         for index in 0..CYCLES {
             let id = format!("churn-{index}");
             let (sender, mut receiver) = oneshot::channel();
-            runtime
-                .agent_challenges
-                .lock()
-                .expect("challenges")
-                .insert(
-                    id.clone(),
-                    PendingChallenge {
-                        sender,
-                        connection_id: "conn-1".to_string(),
-                        tool: "ssh_exec".to_string(),
-                        command: format!("echo {index}"),
-                        raised_at_ms: 0,
-                    },
-                );
+            runtime.agent_challenges.lock().expect("challenges").insert(
+                id.clone(),
+                PendingChallenge {
+                    sender,
+                    connection_id: "conn-1".to_string(),
+                    tool: "ssh_exec".to_string(),
+                    command: format!("echo {index}"),
+                    raised_at_ms: 0,
+                },
+            );
             // The registry never grows beyond the live challenge: raising
             // one inserts one row, resolving consumes it.
             {
                 let challenges = runtime.agent_challenges.lock().expect("challenges");
-                assert_eq!(challenges.len(), 1, "challenge registry leaked at cycle {index}");
+                assert_eq!(
+                    challenges.len(),
+                    1,
+                    "challenge registry leaked at cycle {index}"
+                );
             }
             let decision = if index % 3 == 0 {
-                runtime.resolve_agent_challenge(&id, "deny", None, false).expect("deny");
+                runtime
+                    .resolve_agent_challenge(&id, "deny", None, false)
+                    .expect("deny");
                 AgentDecision::Deny
             } else {
                 let edited = format!("echo edited-{index}");
                 runtime
                     .resolve_agent_challenge(&id, "approve", Some(&edited), false)
                     .expect("approve");
-                AgentDecision::Approve { command: Some(edited) }
+                AgentDecision::Approve {
+                    command: Some(edited),
+                }
             };
             // One-shot: the consumed id is unknown, and a wrong decision
             // name is still refused.
             assert!(
-                runtime.resolve_agent_challenge(&id, "approve", None, false).is_err(),
+                runtime
+                    .resolve_agent_challenge(&id, "approve", None, false)
+                    .is_err(),
                 "consumed challenge came back at cycle {index}"
             );
             assert_eq!(
@@ -5496,7 +5556,11 @@ mod tests {
             );
         }
         assert!(
-            runtime.agent_challenges.lock().expect("challenges").is_empty(),
+            runtime
+                .agent_challenges
+                .lock()
+                .expect("challenges")
+                .is_empty(),
             "challenge registry must be empty after churn"
         );
 
@@ -5553,20 +5617,16 @@ mod tests {
         // approve + remember persists the approved command on the
         // connection's remembered list (IMPL_PLAN §2.1).
         let (sender, _receiver) = oneshot::channel();
-        runtime
-            .agent_challenges
-            .lock()
-            .expect("challenges")
-            .insert(
-                "r-1".to_string(),
-                PendingChallenge {
-                    sender,
-                    connection_id: "conn-1".to_string(),
-                    tool: "ssh_exec".to_string(),
-                    command: "systemctl restart nginx".to_string(),
-                    raised_at_ms: 0,
-                },
-            );
+        runtime.agent_challenges.lock().expect("challenges").insert(
+            "r-1".to_string(),
+            PendingChallenge {
+                sender,
+                connection_id: "conn-1".to_string(),
+                tool: "ssh_exec".to_string(),
+                command: "systemctl restart nginx".to_string(),
+                raised_at_ms: 0,
+            },
+        );
         runtime
             .resolve_agent_challenge("r-1", "approve", Some("systemctl restart nginx"), true)
             .expect("resolve");
@@ -5578,20 +5638,16 @@ mod tests {
         // A destructive text is approved (the decision still delivers) but
         // never remembered — the D2 double lock, second half.
         let (sender, receiver) = oneshot::channel();
-        runtime
-            .agent_challenges
-            .lock()
-            .expect("challenges")
-            .insert(
-                "r-2".to_string(),
-                PendingChallenge {
-                    sender,
-                    connection_id: "conn-1".to_string(),
-                    tool: "ssh_exec".to_string(),
-                    command: "rm -rf /".to_string(),
-                    raised_at_ms: 0,
-                },
-            );
+        runtime.agent_challenges.lock().expect("challenges").insert(
+            "r-2".to_string(),
+            PendingChallenge {
+                sender,
+                connection_id: "conn-1".to_string(),
+                tool: "ssh_exec".to_string(),
+                command: "rm -rf /".to_string(),
+                raised_at_ms: 0,
+            },
+        );
         runtime
             .resolve_agent_challenge("r-2", "approve", Some("rm -rf /"), true)
             .expect("resolve");
@@ -5654,7 +5710,10 @@ mod tests {
         // Dead sessions never attach; other connections' sessions stay put.
         let dead: Vec<(String, String, String, bool)> =
             vec![("s-dead".into(), "conn-1".into(), "wb-old".into(), false)];
-        assert_eq!(SshRuntime::pick_attach_target(&dead, "conn-1", "wb-new"), None);
+        assert_eq!(
+            SshRuntime::pick_attach_target(&dead, "conn-1", "wb-new"),
+            None
+        );
         assert_eq!(
             SshRuntime::pick_attach_target(&sessions, "conn-3", "wb-new"),
             None
@@ -5668,8 +5727,7 @@ mod tests {
         let error = runtime
             .agent_exec_guard("no-such-session")
             .await
-            .err()
-            .expect("unknown session must be refused");
+            .expect_err("unknown session must be refused");
         assert!(
             error.contains("not found") || error.contains("expired"),
             "unexpected error: {error}"
@@ -5742,7 +5800,10 @@ mod tests {
         assert_eq!(tasks[2]["taskId"], "t-stale");
         assert_eq!(tasks[2]["status"], "failed");
         assert!(
-            tasks[2]["error"].as_str().unwrap().contains("sidecar restart"),
+            tasks[2]["error"]
+                .as_str()
+                .unwrap()
+                .contains("sidecar restart"),
             "unexpected error: {}",
             tasks[2]["error"]
         );

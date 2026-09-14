@@ -44,7 +44,10 @@ async fn sudo_exec(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let exit_code = response.get("exitCode").and_then(Value::as_i64).unwrap_or(0);
+    let exit_code = response
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     if exit_code != 0 {
         return Err(format!("sudo command exited {exit_code}: {output}"));
     }
@@ -127,11 +130,7 @@ fn parse_bsd_stat_line(line: &str) -> Option<StatInfo> {
 
 /// Returns file metadata via sudo `stat`, trying GNU `stat -c` first and
 /// falling back to `stat -f` on BSD-flavoured systems (tiny-rdm StatSudo).
-pub async fn stat(
-    runtime: &SshRuntime,
-    session_id: &str,
-    path: &str,
-) -> Result<Value, String> {
+pub async fn stat(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<Value, String> {
     let path = normalize_remote_path(path)?;
     let gnu = format!("stat -c '{}' -- {}", GNU_STAT_FORMAT, shell_quote(&path));
     let parsed = match sudo_exec(runtime, session_id, &gnu, TIMEOUT_QUICK_SECS).await {
@@ -163,11 +162,7 @@ pub async fn stat(
 /// Checks path existence with `test -e` (tiny-rdm Exists, sudo-elevated).
 /// The `echo` fallback keeps the shell exit code at zero so a missing path is
 /// distinguishable from a command failure.
-pub async fn exists(
-    runtime: &SshRuntime,
-    session_id: &str,
-    path: &str,
-) -> Result<bool, String> {
+pub async fn exists(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<bool, String> {
     let path = normalize_remote_path(path)?;
     let command = format!("test -e {} && echo 1 || echo 0", shell_quote(&path));
     let output = sudo_exec(runtime, session_id, &command, TIMEOUT_QUICK_SECS).await?;
@@ -175,11 +170,7 @@ pub async fn exists(
 }
 
 /// Creates an empty file or refreshes its mtime (tiny-rdm Touch).
-pub async fn touch(
-    runtime: &SshRuntime,
-    session_id: &str,
-    path: &str,
-) -> Result<(), String> {
+pub async fn touch(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<(), String> {
     let path = normalize_remote_path(path)?;
     let command = format!("touch -- {}", shell_quote(&path));
     sudo_exec(runtime, session_id, &command, TIMEOUT_QUICK_SECS)
@@ -218,7 +209,11 @@ fn mode_string_to_octal(mode: &str) -> Option<u32> {
         return None;
     }
     let mut bits = 0u32;
-    for (shift, triad) in [(6_usize, &bytes[1..4]), (3, &bytes[4..7]), (0, &bytes[7..10])] {
+    for (shift, triad) in [
+        (6_usize, &bytes[1..4]),
+        (3, &bytes[4..7]),
+        (0, &bytes[7..10]),
+    ] {
         let mut value = 0u32;
         if triad[0] != b'-' {
             value |= 0o4;
@@ -348,11 +343,7 @@ fn parse_ls_output(directory: &str, ls_output: &str) -> Vec<SftpEntry> {
 /// Lists a directory via sudo `ls -la` (tiny-rdm ListDirSudo). GNU coreutils
 /// render epoch mtimes with `--time-style=+%s`; BusyBox rejects that option,
 /// so a plain `ls -la` retry covers classic-date output (mtime omitted).
-pub async fn list_dir(
-    runtime: &SshRuntime,
-    session_id: &str,
-    path: &str,
-) -> Result<Value, String> {
+pub async fn list_dir(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<Value, String> {
     let path = normalize_remote_path(path)?;
     let gnu = format!("ls -la --time-style=+%s -- {}", shell_quote(&path));
     let output = match sudo_exec(runtime, session_id, &gnu, TIMEOUT_LIST_SECS).await {
@@ -469,11 +460,7 @@ pub async fn write_file(
 // ---------------------------------------------------------------------------
 
 /// Creates a directory (and parents) via sudo `mkdir -p` (tiny-rdm MkdirSudo).
-pub async fn mkdir(
-    runtime: &SshRuntime,
-    session_id: &str,
-    path: &str,
-) -> Result<(), String> {
+pub async fn mkdir(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<(), String> {
     let path = normalize_remote_path(path)?;
     let command = format!("mkdir -p -- {}", shell_quote(&path));
     sudo_exec(runtime, session_id, &command, TIMEOUT_QUICK_SECS)
@@ -482,11 +469,7 @@ pub async fn mkdir(
 }
 
 /// Removes a single file via sudo `rm -f` (tiny-rdm RemoveSudo).
-pub async fn remove(
-    runtime: &SshRuntime,
-    session_id: &str,
-    path: &str,
-) -> Result<(), String> {
+pub async fn remove(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<(), String> {
     let path = normalize_remote_path(path)?;
     let command = format!("rm -f -- {}", shell_quote(&path));
     sudo_exec(runtime, session_id, &command, TIMEOUT_QUICK_SECS)
@@ -497,11 +480,7 @@ pub async fn remove(
 /// Recursively removes a directory tree via sudo `rm -rf` (tiny-rdm
 /// RemoveAllSudo). `rm` never follows symlinks: a symlink operand is removed
 /// as a link, and symlinks inside a tree are unlinked, not descended into.
-pub async fn remove_all(
-    runtime: &SshRuntime,
-    session_id: &str,
-    path: &str,
-) -> Result<(), String> {
+pub async fn remove_all(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<(), String> {
     let path = normalize_remote_path(path)?;
     if path == "/" {
         return Err("Refusing to recursively delete the filesystem root".to_string());
@@ -664,8 +643,7 @@ mod tests {
 
     #[test]
     fn parses_gnu_stat_lines() {
-        let info =
-            parse_gnu_stat_line("regular file|12345|1024|1720000000|644|root|root").unwrap();
+        let info = parse_gnu_stat_line("regular file|12345|1024|1720000000|644|root|root").unwrap();
         assert_eq!(info.kind, "file");
         assert_eq!(info.size, 1024);
         assert_eq!(info.modified_at, 1720000000);
@@ -710,8 +688,7 @@ mod tests {
         assert_eq!(file.mode, "0644");
         assert_eq!(file.group, "staff");
 
-        let link =
-            parse_bsd_stat_line("Symbolic Link|98|11|1720000002|41471|root|wheel").unwrap();
+        let link = parse_bsd_stat_line("Symbolic Link|98|11|1720000002|41471|root|wheel").unwrap();
         assert_eq!(link.kind, "symlink");
         assert_eq!(link.mode, "0777");
     }

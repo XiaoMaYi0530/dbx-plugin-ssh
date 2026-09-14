@@ -123,8 +123,7 @@ pub fn append_sample(data_dir: &Path, row: &Value) -> Result<(), String> {
         .append(true)
         .open(&path)
         .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
-    writeln!(file, "{text}")
-        .map_err(|error| format!("Failed to append metrics sample: {error}"))
+    writeln!(file, "{text}").map_err(|error| format!("Failed to append metrics sample: {error}"))
 }
 
 /// Reads the raw JSONL lines (oldest first) without parsing; used by the
@@ -255,10 +254,7 @@ mod tests {
         let rows = load_history(&dir, None, usize::MAX);
         assert_eq!(rows.len(), MAX_SAMPLES);
         assert_eq!(rows[0]["ts"], 30, "the oldest rows must be trimmed");
-        assert_eq!(
-            rows.last().unwrap()["ts"],
-            json!(MAX_SAMPLES + 29)
-        );
+        assert_eq!(rows.last().unwrap()["ts"], json!(MAX_SAMPLES + 29));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

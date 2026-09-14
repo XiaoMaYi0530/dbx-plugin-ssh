@@ -56,10 +56,7 @@ pub fn bridge_port(app_data_dir: Option<&Path>) -> Option<u16> {
         None => default_app_data_dir()?,
     };
     let text = std::fs::read_to_string(dir.join(PORT_FILE_NAME)).ok()?;
-    text.trim()
-        .parse::<u16>()
-        .ok()
-        .filter(|port| *port > 0)
+    text.trim().parse::<u16>().ok().filter(|port| *port > 0)
 }
 
 /// Read budget for the connection-list route: the app only reads its
@@ -233,8 +230,11 @@ pub async fn list_plugin_connections() -> Result<Vec<Value>, String> {
 async fn bridge_port_alive() -> Option<u16> {
     let port = bridge_port(None)?;
     let target = ("127.0.0.1", port);
-    match tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(target))
-        .await
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(target),
+    )
+    .await
     {
         Ok(Ok(stream)) => {
             drop(stream);
@@ -274,8 +274,9 @@ pub async fn ensure_app_bridge(wait: Duration) -> Result<u16, String> {
 /// Best-effort app launch; failure is not fatal because the port-file poll
 /// below is the source of truth.
 fn launch_app() {
-    let launch =
-        std::env::var("DBX_APP_LAUNCH_CMD").ok().filter(|cmd| !cmd.trim().is_empty());
+    let launch = std::env::var("DBX_APP_LAUNCH_CMD")
+        .ok()
+        .filter(|cmd| !cmd.trim().is_empty());
     let mut command = match launch {
         Some(cmd) => {
             let mut command = std::process::Command::new("sh");
@@ -319,9 +320,20 @@ mod tests {
 
     #[test]
     fn request_body_carries_every_snake_case_contract_field() {
-        let body = request_body("conn-1", "ssh_exec", &json!({ "command": "uptime" }), 300_000);
+        let body = request_body(
+            "conn-1",
+            "ssh_exec",
+            &json!({ "command": "uptime" }),
+            300_000,
+        );
         let object = body.as_object().unwrap();
-        for key in ["plugin_id", "connection_id", "tool", "arguments", "timeout_ms"] {
+        for key in [
+            "plugin_id",
+            "connection_id",
+            "tool",
+            "arguments",
+            "timeout_ms",
+        ] {
             assert!(object.contains_key(key), "missing {key}");
         }
         assert_eq!(object.len(), 5);

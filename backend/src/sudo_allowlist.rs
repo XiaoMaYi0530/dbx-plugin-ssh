@@ -59,10 +59,7 @@ pub fn is_allowed(entries: &[Vec<String>], command: &str) -> bool {
 /// leading `sudo` verb dropped, sudo *flags* kept (they make the command
 /// unmatchable on purpose — run-as is not modeled).
 fn command_tokens(command: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = command
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
+    let mut tokens: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     while tokens
         .first()
         .map(|token| {
@@ -148,7 +145,10 @@ mod tests {
         let entries = entries();
         assert!(is_allowed(&entries, "FOO=1 sudo systemctl restart nginx"));
         // sudo flags (run-as etc.) are not modeled: never matchable.
-        assert!(!is_allowed(&entries, "sudo -u root systemctl restart nginx"));
+        assert!(!is_allowed(
+            &entries,
+            "sudo -u root systemctl restart nginx"
+        ));
         assert!(!is_allowed(&entries, "sudo -n docker restart api"));
     }
 
@@ -162,7 +162,10 @@ mod tests {
     #[test]
     fn render_is_round_trippable() {
         let rendered = render_entries(&entries());
-        assert_eq!(rendered, "systemctl restart nginx; docker restart *; journalctl --vacuum-size=100M");
+        assert_eq!(
+            rendered,
+            "systemctl restart nginx; docker restart *; journalctl --vacuum-size=100M"
+        );
         assert_eq!(parse_entries(&rendered).len(), 3);
     }
 }

@@ -33,13 +33,7 @@ pub fn recordings_dir(data_dir: &Path) -> PathBuf {
 /// Builds the header for a fresh recording. `width`/`height` mirror the
 /// session's PTY size when known; the plugin's replay scales to its own
 /// xterm size regardless.
-pub fn header(
-    connection_id: &str,
-    host: &str,
-    session_id: &str,
-    width: u32,
-    height: u32,
-) -> Value {
+pub fn header(connection_id: &str, host: &str, session_id: &str, width: u32, height: u32) -> Value {
     json!({
         "version": 2,
         "width": width.max(1),
@@ -100,8 +94,12 @@ impl SessionRecorder {
             .open(&path)
             .map_err(|error| format!("Failed to create recording file: {error}"))?;
         let mut file = std::io::BufWriter::new(file);
-        writeln!(file, "{}", header(connection_id, host, session_id, width, height))
-            .map_err(|error| format!("Failed to write recording header: {error}"))?;
+        writeln!(
+            file,
+            "{}",
+            header(connection_id, host, session_id, width, height)
+        )
+        .map_err(|error| format!("Failed to write recording header: {error}"))?;
         Ok(Self {
             recording_id: recording_id.to_string(),
             path,
@@ -199,7 +197,7 @@ pub fn list_recordings(data_dir: &Path) -> Vec<Value> {
             .unwrap_or(std::time::UNIX_EPOCH);
         items.push((modified, item));
     }
-    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     items.into_iter().map(|(_, item)| item).collect()
 }
 
@@ -302,7 +300,9 @@ mod tests {
         assert_eq!(head["width"], 120);
         assert_eq!(head["meta"]["host"], "web-01");
         assert_eq!(head["meta"]["sessionId"], "sess-1");
-        let events: Vec<Value> = lines.map(|line| serde_json::from_str(line).unwrap()).collect();
+        let events: Vec<Value> = lines
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["eventtype"], "o");
         assert_eq!(events[0]["eventdata"], "hello ");
@@ -314,8 +314,7 @@ mod tests {
     #[test]
     fn empty_bursts_and_huge_bursts_are_handled() {
         let dir = temp_dir();
-        let mut recorder =
-            SessionRecorder::start(&dir, "rec-2", "c", "h", "s", 80, 24).unwrap();
+        let mut recorder = SessionRecorder::start(&dir, "rec-2", "c", "h", "s", 80, 24).unwrap();
         recorder.observe(b"");
         let huge = vec![b'x'; MAX_EVENT_BYTES + 4096];
         recorder.observe(&huge);

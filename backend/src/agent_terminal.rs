@@ -104,10 +104,7 @@ pub fn decide(
         (AgentTerminalMode::Off, CommandRisk::Elevated) if explicit_run_in_terminal => {
             RoutingDecision::Prompt
         }
-        (
-            AgentTerminalMode::Off,
-            CommandRisk::Elevated,
-        ) => RoutingDecision::Deny(
+        (AgentTerminalMode::Off, CommandRisk::Elevated) => RoutingDecision::Deny(
             "Agent terminal mode is off; retry with runInTerminal: true to ask the user to \
              approve this command in the terminal, or keep it on the hidden channel",
         ),
@@ -165,7 +162,10 @@ pub fn load_modes(data_dir: &std::path::Path) -> HashMap<String, AgentTerminalMo
             map.iter()
                 .filter(|(_, mode)| mode.is_string())
                 .map(|(connection, mode)| {
-                    (connection.clone(), AgentTerminalMode::parse(mode.as_str().unwrap_or("")))
+                    (
+                        connection.clone(),
+                        AgentTerminalMode::parse(mode.as_str().unwrap_or("")),
+                    )
                 })
                 .filter(|(_, mode)| *mode != AgentTerminalMode::Off)
                 .collect()
@@ -194,7 +194,8 @@ pub fn save_modes(
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text)
         .map_err(|error| format!("Failed to write {}: {error}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|error| format!("Failed to write {}: {error}", path.display()))
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))
 }
 
 /// Decision delivered through an approval challenge's oneshot channel.
@@ -203,7 +204,9 @@ pub enum AgentDecision {
     /// Approved, optionally with the user-edited command text (the approval
     /// dialog shows the command editable, so what was approved is exactly
     /// what gets typed into the terminal).
-    Approve { command: Option<String> },
+    Approve {
+        command: Option<String>,
+    },
     Deny,
 }
 
@@ -257,7 +260,7 @@ pub fn strip_ansi(text: &str) -> String {
             Some('[') => {
                 // CSI: parameter bytes, intermediate bytes, then one final
                 // byte in 0x40..=0x7e terminates the sequence.
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if ('@'..='~').contains(&next) {
                         break;
                     }
@@ -385,7 +388,9 @@ impl TerminalRecorder {
         if exec::has_shell_prompt(&strip_ansi(&self.tail)) {
             self.prompt_seen = true;
         }
-        if !self.echo_seen && !self.echo_fragment.is_empty() && self.tail.contains(&self.echo_fragment)
+        if !self.echo_seen
+            && !self.echo_fragment.is_empty()
+            && self.tail.contains(&self.echo_fragment)
         {
             self.echo_seen = true;
         }
@@ -408,8 +413,7 @@ impl TerminalRecorder {
                 let long_silence = self
                     .last_chunk_at
                     .is_some_and(|at| at.elapsed() >= ECHO_FALLBACK_SILENCE);
-                self.prompt_seen
-                    && ((self.echo_seen && silence) || long_silence)
+                self.prompt_seen && ((self.echo_seen && silence) || long_silence)
             }
             RecorderState::Idle => false,
         }
@@ -615,15 +619,30 @@ mod tests {
             RoutingDecision::Run
         );
         assert_eq!(
-            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Elevated, false, false),
+            decide_with_memory(
+                AgentTerminalMode::Strict,
+                CommandRisk::Elevated,
+                false,
+                false
+            ),
             RoutingDecision::Prompt
         );
         assert_eq!(
-            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Elevated, false, true),
+            decide_with_memory(
+                AgentTerminalMode::Strict,
+                CommandRisk::Elevated,
+                false,
+                true
+            ),
             RoutingDecision::Run
         );
         assert_eq!(
-            decide_with_memory(AgentTerminalMode::Strict, CommandRisk::Elevated, true, false),
+            decide_with_memory(
+                AgentTerminalMode::Strict,
+                CommandRisk::Elevated,
+                true,
+                false
+            ),
             RoutingDecision::Prompt
         );
         assert_eq!(
@@ -634,10 +653,7 @@ mod tests {
 
     #[test]
     fn modes_round_trip_through_the_data_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "dbx-agent-modes-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("dbx-agent-modes-{}", uuid::Uuid::new_v4()));
         let mut modes = HashMap::new();
         modes.insert("conn-a".to_string(), AgentTerminalMode::Auto);
         modes.insert("conn-b".to_string(), AgentTerminalMode::Strict);
@@ -656,11 +672,17 @@ mod tests {
     #[test]
     fn mode_parse_degrades_and_parse_exact_refuses_unknown() {
         assert_eq!(AgentTerminalMode::parse("auto"), AgentTerminalMode::Auto);
-        assert_eq!(AgentTerminalMode::parse(" STRICT "), AgentTerminalMode::Strict);
+        assert_eq!(
+            AgentTerminalMode::parse(" STRICT "),
+            AgentTerminalMode::Strict
+        );
         assert_eq!(AgentTerminalMode::parse("bogus"), AgentTerminalMode::Off);
         assert_eq!(AgentTerminalMode::parse(""), AgentTerminalMode::Off);
 
-        assert_eq!(AgentTerminalMode::parse_exact("off"), Ok(AgentTerminalMode::Off));
+        assert_eq!(
+            AgentTerminalMode::parse_exact("off"),
+            Ok(AgentTerminalMode::Off)
+        );
         assert!(AgentTerminalMode::parse_exact("Auto").is_ok());
         assert!(AgentTerminalMode::parse_exact("bogus").is_err());
         assert!(AgentTerminalMode::parse_exact("").is_err());
@@ -709,9 +731,15 @@ mod tests {
         assert_eq!(recorder.observe("ignored"), RecorderState::Idle);
 
         recorder.arm("echo dbx-agent-marker");
-        assert_eq!(recorder.observe("echo dbx-agent-marker\r\n"), RecorderState::Capturing);
+        assert_eq!(
+            recorder.observe("echo dbx-agent-marker\r\n"),
+            RecorderState::Capturing
+        );
         assert!(!recorder.is_settled(), "no prompt seen yet");
-        assert_eq!(recorder.observe("out-a\r\nout-b\r\n"), RecorderState::Capturing);
+        assert_eq!(
+            recorder.observe("out-a\r\nout-b\r\n"),
+            RecorderState::Capturing
+        );
         // The prompt may arrive in its own chunk (and split across chunks).
         recorder.observe("user@host");
         recorder.observe(":~$ ");
@@ -720,7 +748,10 @@ mod tests {
         assert!(recorder.is_settled());
 
         let output = recorder.take_output("echo dbx-agent-marker");
-        assert_eq!(output, "out-a\nout-b", "echo and trailing prompt are stripped");
+        assert_eq!(
+            output, "out-a\nout-b",
+            "echo and trailing prompt are stripped"
+        );
     }
 
     #[test]
@@ -732,7 +763,10 @@ mod tests {
         recorder.finish();
         assert_eq!(recorder.observe("straggler"), RecorderState::Settled);
         assert!(recorder.is_settled());
-        assert_eq!(recorder.take_output("never echoed"), "partial output without any prompt");
+        assert_eq!(
+            recorder.take_output("never echoed"),
+            "partial output without any prompt"
+        );
     }
 
     #[test]

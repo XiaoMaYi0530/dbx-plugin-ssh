@@ -61,7 +61,10 @@ pub fn load_store(data_dir: &Path) -> ApprovalStore {
     let Some(value) = serde_json::from_str::<serde_json::Value>(&text).ok() else {
         return ApprovalStore::default();
     };
-    let Some(connections) = value.get("connections").and_then(serde_json::Value::as_object) else {
+    let Some(connections) = value
+        .get("connections")
+        .and_then(serde_json::Value::as_object)
+    else {
         return ApprovalStore::default();
     };
     ApprovalStore {
@@ -95,7 +98,12 @@ pub fn save_store(data_dir: &Path, store: &ApprovalStore) -> Result<(), String> 
     let connections: serde_json::Map<String, serde_json::Value> = store
         .connections
         .iter()
-        .map(|(connection, commands)| (connection.clone(), serde_json::json!({ "commands": commands })))
+        .map(|(connection, commands)| {
+            (
+                connection.clone(),
+                serde_json::json!({ "commands": commands }),
+            )
+        })
         .collect();
     let value = serde_json::json!({ "version": STORAGE_VERSION, "connections": connections });
     let text = serde_json::to_string_pretty(&value)
@@ -175,7 +183,10 @@ pub fn remember(
     {
         return Ok(false);
     }
-    let lines = store.connections.entry(connection_id.to_string()).or_default();
+    let lines = store
+        .connections
+        .entry(connection_id.to_string())
+        .or_default();
     if lines.len() >= MAX_REMEMBERED {
         return Err(format!(
             "At most {MAX_REMEMBERED} remembered commands are supported per connection"
@@ -228,9 +239,7 @@ pub fn set_lines(
         store.connections.remove(connection_id);
         return Ok(());
     }
-    store
-        .connections
-        .insert(connection_id.to_string(), cleaned);
+    store.connections.insert(connection_id.to_string(), cleaned);
     Ok(())
 }
 
@@ -239,10 +248,8 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dbx-agent-approvals-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dbx-agent-approvals-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -278,10 +285,7 @@ mod tests {
         let mut store = ApprovalStore::default();
         assert!(remember(&mut store, "conn-a", "systemctl restart nginx").unwrap());
         // Same command, surrounding whitespace: stored trimmed-equal.
-        assert_eq!(
-            remember(&mut store, "conn-a", "  systemctl restart nginx  ").unwrap(),
-            false
-        );
+        assert!(!remember(&mut store, "conn-a", "  systemctl restart nginx  ").unwrap());
         assert_eq!(list_lines(&store, "conn-a").len(), 1);
         assert_eq!(list_lines(&store, "conn-a")[0], "systemctl restart nginx");
     }
@@ -313,7 +317,10 @@ mod tests {
             assert!(remember(&mut store, "conn-a", &format!("echo cmd-{index}")).unwrap());
         }
         let error = remember(&mut store, "conn-a", "echo overflow").unwrap_err();
-        assert!(error.contains(&MAX_REMEMBERED.to_string()), "unexpected error: {error}");
+        assert!(
+            error.contains(&MAX_REMEMBERED.to_string()),
+            "unexpected error: {error}"
+        );
         assert_eq!(list_lines(&store, "conn-a").len(), MAX_REMEMBERED);
         // An existing line is still idempotent at the cap, not an error.
         assert!(!remember(&mut store, "conn-a", "echo cmd-0").unwrap());
@@ -351,10 +358,7 @@ mod tests {
             "uptime".to_string(),
         ];
         set_lines(&mut store, "conn-a", &lines).unwrap();
-        assert_eq!(
-            list_lines(&store, "conn-a"),
-            ["docker restart *", "uptime"]
-        );
+        assert_eq!(list_lines(&store, "conn-a"), ["docker restart *", "uptime"]);
 
         // Empty slice clears the connection's list entirely.
         set_lines(&mut store, "conn-a", &[]).unwrap();
@@ -372,7 +376,10 @@ mod tests {
             .map(|index| format!("echo set-{index}"))
             .collect();
         let error = set_lines(&mut store, "conn-a", &lines).unwrap_err();
-        assert!(error.contains(&MAX_REMEMBERED.to_string()), "unexpected error: {error}");
+        assert!(
+            error.contains(&MAX_REMEMBERED.to_string()),
+            "unexpected error: {error}"
+        );
         assert!(!store.connections.contains_key("conn-a"));
         // Exactly at the cap fits (dedup does not count against it twice).
         let lines: Vec<String> = (0..MAX_REMEMBERED)

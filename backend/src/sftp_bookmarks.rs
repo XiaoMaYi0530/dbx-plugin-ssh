@@ -118,7 +118,7 @@ pub fn bookmark_view(entry: &BookmarkEntry) -> Value {
 /// workbench dropdown order is stable.
 pub fn list_views(store: &BookmarkStore) -> Vec<Value> {
     let mut entries = store.bookmarks.clone();
-    entries.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    entries.sort_by_key(|a| a.label.to_lowercase());
     entries.iter().map(bookmark_view).collect()
 }
 

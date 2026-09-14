@@ -85,7 +85,7 @@ fn assess_command_depth(command: &str, depth: u8) -> CommandRisk {
 fn hidden_destructive_subcommand(text: &str, depth: u8) -> Option<&'static str> {
     for sub in substitution_spans(text) {
         for segment in split_segments(&sub) {
-            if let CommandRisk::Destructive(reason) = assess_command_depth(&segment, depth + 1) {
+            if let CommandRisk::Destructive(reason) = assess_command_depth(segment, depth + 1) {
                 return Some(reason);
             }
         }
@@ -226,7 +226,7 @@ fn neutralize_fd_dups(command: &str) -> String {
 /// the assessment more conservative.
 fn split_segments(command: &str) -> Vec<&str> {
     command
-        .split(|c: char| c == ';' || c == '|' || c == '\n' || c == '&')
+        .split([';', '|', '\n', '&'])
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .collect()
@@ -234,14 +234,87 @@ fn split_segments(command: &str) -> Vec<&str> {
 
 /// Verbs that are read-only in every argument shape.
 const READ_ONLY_VERBS: &[&str] = &[
-    "ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "df", "du", "ps", "free",
-    "uptime", "whoami", "id", "uname", "hostname", "w", "who", "last", "lastlog", "stat", "wc",
-    "file", "cksum", "md5sum", "sha1sum", "sha256sum", "sha512sum", "echo", "printf", "date",
-    "printenv", "which", "whereis", "type", "lsof", "ss", "netstat", "ping", "ping6",
-    "traceroute", "tracepath", "nslookup", "dig", "host", "vmstat", "iostat", "sar", "mpstat",
-    "dmesg", "lsblk", "lsmod", "lspci", "lsusb", "lsns", "lscpu", "nproc", "getent", "groups",
-    "true", "false", "test", "[", "sleep", "history", "arch", "cut", "sort", "uniq", "tr",
-    "column", "nl", "tac", "rev", "seq", "dirname", "basename", "readlink", "realpath", "pwd",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "df",
+    "du",
+    "ps",
+    "free",
+    "uptime",
+    "whoami",
+    "id",
+    "uname",
+    "hostname",
+    "w",
+    "who",
+    "last",
+    "lastlog",
+    "stat",
+    "wc",
+    "file",
+    "cksum",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "echo",
+    "printf",
+    "date",
+    "printenv",
+    "which",
+    "whereis",
+    "type",
+    "lsof",
+    "ss",
+    "netstat",
+    "ping",
+    "ping6",
+    "traceroute",
+    "tracepath",
+    "nslookup",
+    "dig",
+    "host",
+    "vmstat",
+    "iostat",
+    "sar",
+    "mpstat",
+    "dmesg",
+    "lsblk",
+    "lsmod",
+    "lspci",
+    "lsusb",
+    "lsns",
+    "lscpu",
+    "nproc",
+    "getent",
+    "groups",
+    "true",
+    "false",
+    "test",
+    "[",
+    "sleep",
+    "history",
+    "arch",
+    "cut",
+    "sort",
+    "uniq",
+    "tr",
+    "column",
+    "nl",
+    "tac",
+    "rev",
+    "seq",
+    "dirname",
+    "basename",
+    "readlink",
+    "realpath",
+    "pwd",
 ];
 
 /// Verbs whose read-only-ness depends on the first subcommand.
@@ -249,21 +322,64 @@ const SUBCOMMAND_VERBS: &[(&str, &[&str])] = &[
     (
         "systemctl",
         &[
-            "status", "list-units", "list-unit-files", "list-timers", "list-sockets",
-            "list-dependencies", "list-jobs", "is-active", "is-enabled", "is-failed", "show",
-            "cat", "help", "get-default",
+            "status",
+            "list-units",
+            "list-unit-files",
+            "list-timers",
+            "list-sockets",
+            "list-dependencies",
+            "list-jobs",
+            "is-active",
+            "is-enabled",
+            "is-failed",
+            "show",
+            "cat",
+            "help",
+            "get-default",
         ],
     ),
-    ("docker", &["ps", "images", "stats", "version", "info", "logs", "inspect", "top", "port", "events", "search"]),
+    (
+        "docker",
+        &[
+            "ps", "images", "stats", "version", "info", "logs", "inspect", "top", "port", "events",
+            "search",
+        ],
+    ),
     // `git` has its own shape-sensitive rules: see `git_segment_risk`.
-    ("kubectl", &["get", "describe", "top", "logs", "version", "explain", "api-resources", "api-versions"]),
-    ("ip", &["addr", "a", "address", "l", "link", "route", "r", "rule", "neigh", "n"]),
+    (
+        "kubectl",
+        &[
+            "get",
+            "describe",
+            "top",
+            "logs",
+            "version",
+            "explain",
+            "api-resources",
+            "api-versions",
+        ],
+    ),
+    (
+        "ip",
+        &[
+            "addr", "a", "address", "l", "link", "route", "r", "rule", "neigh", "n",
+        ],
+    ),
 ];
 
 /// git inspection subcommands; `branch`/`tag`/`remote`/`reflog` are further
 /// narrowed to their listing shapes by [`git_segment_risk`].
 const GIT_READ_SUBCOMMANDS: &[&str] = &[
-    "status", "log", "diff", "show", "branch", "blame", "describe", "rev-parse", "remote", "tag",
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "blame",
+    "describe",
+    "rev-parse",
+    "remote",
+    "tag",
     "reflog",
 ];
 
@@ -297,7 +413,13 @@ fn git_segment_risk(args: &[String], sensitive: bool) -> CommandRisk {
             .map(|arg| {
                 matches!(
                     arg.as_str(),
-                    "add" | "rename" | "remove" | "rm" | "set-url" | "set-head" | "prune"
+                    "add"
+                        | "rename"
+                        | "remove"
+                        | "rm"
+                        | "set-url"
+                        | "set-head"
+                        | "prune"
                         | "update"
                 )
             })
@@ -314,7 +436,9 @@ fn git_segment_risk(args: &[String], sensitive: bool) -> CommandRisk {
 
 /// Command prefixes that merely wrap an inner command; unwrapped before the
 /// real verb is assessed.
-const WRAPPER_VERBS: &[&str] = &["nohup", "timeout", "watch", "time", "nice", "ionice", "stdbuf", "env"];
+const WRAPPER_VERBS: &[&str] = &[
+    "nohup", "timeout", "watch", "time", "nice", "ionice", "stdbuf", "env",
+];
 
 /// Wrapper flags that consume the following token as their value
 /// (`nice -n 10`, `ionice -c 2`, `watch -n 1`).
@@ -322,9 +446,28 @@ const WRAPPER_VALUE_FLAGS: &[&str] = &["-n", "-c", "-p"];
 
 /// Verbs that format or wipe raw disks / power the machine off.
 const DESTRUCTIVE_VERBS: &[&str] = &[
-    "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs", "mkfs.vfat",
-    "mkfs.fat", "mkswap", "fdisk", "sfdisk", "cfdisk", "gdisk", "sgdisk", "parted", "partprobe",
-    "wipefs", "blkdiscard", "shutdown", "reboot", "halt", "poweroff",
+    "mkfs",
+    "mkfs.ext2",
+    "mkfs.ext3",
+    "mkfs.ext4",
+    "mkfs.xfs",
+    "mkfs.btrfs",
+    "mkfs.vfat",
+    "mkfs.fat",
+    "mkswap",
+    "fdisk",
+    "sfdisk",
+    "cfdisk",
+    "gdisk",
+    "sgdisk",
+    "parted",
+    "partprobe",
+    "wipefs",
+    "blkdiscard",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
 ];
 
 /// SQL interpreters whose arguments may carry a DROP statement.
@@ -332,7 +475,11 @@ const SQL_VERBS: &[&str] = &["mysql", "mariadb", "psql", "sqlite3"];
 
 /// System files whose overwrite or deletion is always catastrophic.
 const CRITICAL_FILES: &[&str] = &[
-    "/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/fstab", "/boot/",
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/fstab",
+    "/boot/",
 ];
 
 /// Directory components that hold credentials, key material, or cloud /
@@ -342,8 +489,17 @@ const SENSITIVE_COMPONENTS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube"];
 
 /// File basenames that carry credentials or leak them via history.
 const SENSITIVE_BASENAMES: &[&str] = &[
-    ".netrc", ".git-credentials", ".npmrc", ".htpasswd", ".pgpass", ".my.cnf",
-    "my.cnf", ".bash_history", ".zsh_history", ".sh_history", ".mysql_history",
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".htpasswd",
+    ".pgpass",
+    ".my.cnf",
+    "my.cnf",
+    ".bash_history",
+    ".zsh_history",
+    ".sh_history",
+    ".mysql_history",
     ".psql_history",
 ];
 
@@ -351,8 +507,7 @@ const SENSITIVE_BASENAMES: &[&str] = &[
 const SENSITIVE_EXTENSIONS: &[&str] = &[".pem", ".key", ".p12", ".pfx"];
 
 /// System credential files (prefix match, so `shadow-` backups match too).
-const SENSITIVE_SYSTEM_PREFIXES: &[&str] =
-    &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
+const SENSITIVE_SYSTEM_PREFIXES: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
 /// Assesses one chain segment (no `;`/`&&`/`|` left inside).
 fn assess_segment(segment: &str, depth: u8) -> CommandRisk {
@@ -404,7 +559,7 @@ fn assess_segment(segment: &str, depth: u8) -> CommandRisk {
         // text so `sh -c 'rm -rf /'` trips the catastrophic gate. The
         // wrapper itself never whitelists anything — anything not
         // destructive stays Unknown (unchanged from before).
-        if let Some(script) = shell_c_script(&args) {
+        if let Some(script) = shell_c_script(args) {
             if let Some(reason) = destructive_after_wrap(&script, depth) {
                 return CommandRisk::Destructive(reason);
             }
@@ -481,7 +636,10 @@ fn assess_segment(segment: &str, depth: u8) -> CommandRisk {
         return git_segment_risk(args, sensitive);
     }
     if verb == "journalctl" {
-        if args.iter().any(|arg| arg.starts_with("--vacuum") || arg.starts_with("--rotate")) {
+        if args
+            .iter()
+            .any(|arg| arg.starts_with("--vacuum") || arg.starts_with("--rotate"))
+        {
             return CommandRisk::Unknown;
         }
         return CommandRisk::ReadOnly;
@@ -489,11 +647,12 @@ fn assess_segment(segment: &str, depth: u8) -> CommandRisk {
     if verb == "crontab" {
         // `crontab -r` removes the crontab and `-e` opens an editor; only
         // the listing forms are read-only.
-        let listing = !args.is_empty()
-            && args
-                .iter()
-                .all(|arg| arg == "-l" || arg == "--list");
-        return if listing { CommandRisk::ReadOnly } else { CommandRisk::Unknown };
+        let listing = !args.is_empty() && args.iter().all(|arg| arg == "-l" || arg == "--list");
+        return if listing {
+            CommandRisk::ReadOnly
+        } else {
+            CommandRisk::Unknown
+        };
     }
     if verb == "service" {
         return if args.iter().any(|arg| arg == "status") {
@@ -532,7 +691,11 @@ fn assess_segment(segment: &str, depth: u8) -> CommandRisk {
 fn effective_tokens(segment: &str) -> Vec<String> {
     let mut tokens: Vec<String> = segment
         .split_whitespace()
-        .map(|token| token.trim_matches(|c: char| c == '"' || c == '\'').to_string())
+        .map(|token| {
+            token
+                .trim_matches(|c: char| c == '"' || c == '\'')
+                .to_string()
+        })
         .collect();
     // Assignments and wrappers are unwrapped iteratively with a depth cap so
     // pathological input cannot loop forever.
@@ -548,7 +711,11 @@ fn effective_tokens(segment: &str) -> Vec<String> {
         strip_wrapper_flags(&mut tokens);
         if verb == "timeout" {
             // `timeout` takes a duration argument before the command.
-            if tokens.first().map(|token| !token.starts_with('-')).unwrap_or(false) {
+            if tokens
+                .first()
+                .map(|token| !token.starts_with('-'))
+                .unwrap_or(false)
+            {
                 tokens.remove(0);
             }
         }
@@ -561,12 +728,17 @@ fn strip_leading_assignments(tokens: &mut Vec<String>) {
     while tokens
         .first()
         .map(|token| {
-            let Some(eq) = token.find('=') else { return false };
+            let Some(eq) = token.find('=') else {
+                return false;
+            };
             eq > 0
                 && token[..eq]
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && token[..eq].chars().next().is_some_and(|c| !c.is_ascii_digit())
+                && token[..eq]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_ascii_digit())
         })
         .unwrap_or(false)
     {
@@ -583,7 +755,12 @@ fn strip_wrapper_flags(tokens: &mut Vec<String>) {
         }
         let takes_value = WRAPPER_VALUE_FLAGS.contains(&first.as_str());
         tokens.remove(0);
-        if takes_value && tokens.first().map(|token| !token.starts_with('-')).unwrap_or(false) {
+        if takes_value
+            && tokens
+                .first()
+                .map(|token| !token.starts_with('-'))
+                .unwrap_or(false)
+        {
             tokens.remove(0);
         }
     }
@@ -615,7 +792,11 @@ fn sudo_inner_tokens(tokens: &[String]) -> Option<Vec<String>> {
         }
     }
     let inner = &tokens[index.min(tokens.len())..];
-    if inner.is_empty() { None } else { Some(inner.to_vec()) }
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_vec())
+    }
 }
 
 /// Unwraps repeated sudo prefixes (`sudo sudo …`) with a depth cap so the
@@ -628,7 +809,11 @@ fn unwrap_sudo_prefix(tokens: &[String]) -> Option<Vec<String>> {
         }
         current = sudo_inner_tokens(&current)?;
     }
-    if current.is_empty() { None } else { Some(current) }
+    if current.is_empty() {
+        None
+    } else {
+        Some(current)
+    }
 }
 
 /// The `-c` script text of a shell segment (`sh -c '…'`, `bash -lc '…'`):
@@ -664,7 +849,8 @@ fn destructive_pattern(verb: &str, args: &[String]) -> Option<&'static str> {
     }
     if verb == "rm" {
         let recursive = args.iter().any(|arg| {
-            (arg.starts_with('-') && !arg.starts_with("--")
+            (arg.starts_with('-')
+                && !arg.starts_with("--")
                 && arg.len() > 1
                 && arg[1..].chars().any(|c| c == 'r' || c == 'R'))
                 || arg == "--recursive"
@@ -679,8 +865,13 @@ fn destructive_pattern(verb: &str, args: &[String]) -> Option<&'static str> {
         }
     }
     if matches!(verb, "chmod" | "chown") {
-        let recursive = args.iter().any(|arg| arg.starts_with("-R") || arg == "--recursive");
-        for target in args.iter().filter(|arg| !arg.starts_with('-') && !arg.contains('=')) {
+        let recursive = args
+            .iter()
+            .any(|arg| arg.starts_with("-R") || arg == "--recursive");
+        for target in args
+            .iter()
+            .filter(|arg| !arg.starts_with('-') && !arg.contains('='))
+        {
             if is_critical_file(target) {
                 return Some("chmod/chown targets a critical system file");
             }
@@ -690,7 +881,9 @@ fn destructive_pattern(verb: &str, args: &[String]) -> Option<&'static str> {
         }
     }
     if verb == "truncate"
-        && args.iter().any(|arg| !arg.starts_with('-') && is_critical_file(arg))
+        && args
+            .iter()
+            .any(|arg| !arg.starts_with('-') && is_critical_file(arg))
     {
         return Some("truncate targets a critical system file");
     }
@@ -746,14 +939,20 @@ fn has_redirect(args: &[String]) -> bool {
 /// `/dev/sda`, `/dev/nvme0n1`, ... — block devices a shell must never touch
 /// directly. `/dev/null` and `/dev/zero` deliberately do not match.
 fn is_raw_device(path: &str) -> bool {
-    const PREFIXES: &[&str] = &["/dev/sd", "/dev/nvme", "/dev/vd", "/dev/mmcblk", "/dev/disk/"];
+    const PREFIXES: &[&str] = &[
+        "/dev/sd",
+        "/dev/nvme",
+        "/dev/vd",
+        "/dev/mmcblk",
+        "/dev/disk/",
+    ];
     PREFIXES.iter().any(|prefix| path.starts_with(prefix))
 }
 
 fn is_critical_file(path: &str) -> bool {
-    CRITICAL_FILES.iter().any(|critical| {
-        path == *critical || critical.ends_with('/') && path.starts_with(*critical)
-    })
+    CRITICAL_FILES
+        .iter()
+        .any(|critical| path == *critical || critical.ends_with('/') && path.starts_with(*critical))
 }
 
 /// Recursive-delete target rule: the filesystem root and everything up to
@@ -764,7 +963,10 @@ fn destructive_delete_target(target: &str) -> bool {
     if target.is_empty() {
         return true; // "/" (or "//") itself
     }
-    if matches!(target, "*" | "." | ".." | "./*" | "~" | "$HOME" | "${HOME}" | "~/*") {
+    if matches!(
+        target,
+        "*" | "." | ".." | "./*" | "~" | "$HOME" | "${HOME}" | "~/*"
+    ) {
         return true;
     }
     let Some(path) = target.strip_prefix('/') else {
@@ -869,11 +1071,19 @@ mod tests {
     use CommandRisk::{Destructive, ReadOnly, Unknown};
 
     fn read_only(command: &str) {
-        assert_eq!(assess_command(command), ReadOnly, "expected ReadOnly: {command}");
+        assert_eq!(
+            assess_command(command),
+            ReadOnly,
+            "expected ReadOnly: {command}"
+        );
     }
 
     fn unknown(command: &str) {
-        assert_eq!(assess_command(command), Unknown, "expected Unknown: {command}");
+        assert_eq!(
+            assess_command(command),
+            Unknown,
+            "expected Unknown: {command}"
+        );
     }
 
     fn destructive(command: &str) {
@@ -1189,9 +1399,9 @@ mod tests {
             "/etc/ssh/sshd_config", // config, not a host key
             "/var/log/app.log",
             "/home/u/project/shadowing.md", // basename must match exactly
-            "%2e%2e%2fnotes.txt",   // percent-encoded literals are NOT decoded…
-            "%2e%2e/x",             // …and carry no literal sensitive component
-            "id_rsa.pub",           // public half
+            "%2e%2e%2fnotes.txt",           // percent-encoded literals are NOT decoded…
+            "%2e%2e/x",                     // …and carry no literal sensitive component
+            "id_rsa.pub",                   // public half
         ] {
             assert!(
                 !is_sensitive_path(token),
@@ -1247,9 +1457,15 @@ mod tests {
         // connections, still refused as visible text on read-only ones via
         // the control-only rule).
         assert_eq!(assess_terminal_input("echo hi\r"), CommandRisk::ReadOnly);
-        assert_eq!(assess_terminal_input("df -h\recho done\r"), CommandRisk::ReadOnly);
+        assert_eq!(
+            assess_terminal_input("df -h\recho done\r"),
+            CommandRisk::ReadOnly
+        );
         // A mutating line is Unknown...
-        assert_eq!(assess_terminal_input("systemctl restart nginx\r"), CommandRisk::Unknown);
+        assert_eq!(
+            assess_terminal_input("systemctl restart nginx\r"),
+            CommandRisk::Unknown
+        );
         // ...and a catastrophic line is Destructive regardless of position.
         assert!(matches!(
             assess_terminal_input("echo start\rrm -rf /data\r"),

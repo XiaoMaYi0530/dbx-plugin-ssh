@@ -129,7 +129,7 @@ impl HostKeyVerifier {
             }
         };
         let patterns = if port == 22 {
-            [format!("{host}"), format!("[{host}]:22")]
+            [host.to_string(), format!("[{host}]:22")]
         } else {
             [format!("[{host}]:{port}"), String::new()]
         };

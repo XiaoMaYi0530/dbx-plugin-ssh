@@ -38,15 +38,51 @@ const DEFAULT_RULE_SPECS: [(&str, &str, &str, bool, bool); 22] = [
     // ---- 红：硬错误 ----
     ("default-error", "ERROR", "#ef4444", false, false),
     ("default-fatal", "FATAL", "#ef4444", false, false),
-    ("default-permission-denied", "Permission denied", "#ef4444", false, false),
-    ("default-no-such-file", "No such file or directory", "#ef4444", false, false),
-    ("default-command-not-found", "command not found", "#ef4444", false, false),
-    ("default-connection-refused", "Connection refused", "#ef4444", false, false),
-    ("default-no-space-left", "No space left on device", "#ef4444", false, false),
+    (
+        "default-permission-denied",
+        "Permission denied",
+        "#ef4444",
+        false,
+        false,
+    ),
+    (
+        "default-no-such-file",
+        "No such file or directory",
+        "#ef4444",
+        false,
+        false,
+    ),
+    (
+        "default-command-not-found",
+        "command not found",
+        "#ef4444",
+        false,
+        false,
+    ),
+    (
+        "default-connection-refused",
+        "Connection refused",
+        "#ef4444",
+        false,
+        false,
+    ),
+    (
+        "default-no-space-left",
+        "No space left on device",
+        "#ef4444",
+        false,
+        false,
+    ),
     ("default-failed-to", "Failed to", "#ef4444", false, false),
     ("default-cannot", "cannot", "#ef4444", false, false),
     ("default-exception", "Exception", "#ef4444", false, false),
-    ("default-traceback", "Traceback (most recent call last)", "#ef4444", false, false),
+    (
+        "default-traceback",
+        "Traceback (most recent call last)",
+        "#ef4444",
+        false,
+        false,
+    ),
     // ---- 琥珀：命令失败 / 受限 ----
     ("default-fail", "FAIL", "#f59e0b", false, false),
     ("default-denied", "denied", "#f59e0b", false, false),
@@ -56,27 +92,41 @@ const DEFAULT_RULE_SPECS: [(&str, &str, &str, bool, bool); 22] = [
     ("default-deprecated", "deprecated", "#facc15", false, false),
     // ---- 绿：成功 / 健康 ----
     ("default-success", "SUCCESS", "#22c55e", false, false),
-    ("default-active-running", "active (running)", "#22c55e", false, false),
+    (
+        "default-active-running",
+        "active (running)",
+        "#22c55e",
+        false,
+        false,
+    ),
     ("default-done", "done", "#22c55e", false, false),
     ("default-check", "✓", "#22c55e", false, false),
     ("default-passed", "PASSED", "#22c55e", true, false),
     // ---- 蓝：可提取信息 ----
-    ("default-ipv4", r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "#3b82f6", false, true),
+    (
+        "default-ipv4",
+        r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+        "#3b82f6",
+        false,
+        true,
+    ),
 ];
 
 fn default_rules(now: u64) -> Vec<HighlightRuleEntry> {
     DEFAULT_RULE_SPECS
         .iter()
-        .map(|(id, pattern, color, case_sensitive, is_regex)| HighlightRuleEntry {
-            id: (*id).to_string(),
-            pattern: (*pattern).to_string(),
-            is_regex: *is_regex,
-            color: (*color).to_string(),
-            case_sensitive: *case_sensitive,
-            enabled: true,
-            created_at: now,
-            updated_at: now,
-        })
+        .map(
+            |(id, pattern, color, case_sensitive, is_regex)| HighlightRuleEntry {
+                id: (*id).to_string(),
+                pattern: (*pattern).to_string(),
+                is_regex: *is_regex,
+                color: (*color).to_string(),
+                case_sensitive: *case_sensitive,
+                enabled: true,
+                created_at: now,
+                updated_at: now,
+            },
+        )
         .collect()
 }
 
@@ -174,13 +224,19 @@ fn entry_from_json(value: &Value) -> Option<HighlightRuleEntry> {
     Some(HighlightRuleEntry {
         id: string("id"),
         pattern: string("pattern"),
-        is_regex: object.get("isRegex").and_then(Value::as_bool).unwrap_or(false),
+        is_regex: object
+            .get("isRegex")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         color: string("color"),
         case_sensitive: object
             .get("caseSensitive")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        enabled: object.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        enabled: object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         created_at: object.get("createdAt").and_then(Value::as_u64).unwrap_or(0),
         updated_at: object.get("updatedAt").and_then(Value::as_u64).unwrap_or(0),
     })
@@ -208,19 +264,14 @@ pub fn entry_view(entry: &HighlightRuleEntry) -> Value {
 pub fn list_views(store: &HighlightRuleStore) -> Vec<Value> {
     let mut entries: Vec<&HighlightRuleEntry> = store.rules.iter().collect();
     entries.sort_by_key(|entry| entry.created_at);
-    entries
-        .into_iter()
-        .map(entry_view)
-        .collect()
+    entries.into_iter().map(entry_view).collect()
 }
 
 /// `true` for `#rrggbb` in any ASCII hex case.
 fn is_valid_color(color: &str) -> bool {
     color.len() == 7
         && color.starts_with('#')
-        && color[1..]
-            .chars()
-            .all(|ch| ch.is_ascii_hexdigit())
+        && color[1..].chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 /// Creates or updates one rule from the shared camelCase parameter shape
@@ -254,9 +305,7 @@ pub fn save_entry(
                 .trim()
                 .to_string();
             if !is_valid_color(&color) {
-                return Err(format!(
-                    "color must match #rrggbb (hex); got '{color}'"
-                ));
+                return Err(format!("color must match #rrggbb (hex); got '{color}'"));
             }
             color
         }
@@ -266,7 +315,10 @@ pub fn save_entry(
         .get("caseSensitive")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let enabled = params.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let enabled = params
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let existing_id = params
         .get("id")
         .and_then(Value::as_str)
@@ -278,9 +330,7 @@ pub fn save_entry(
         );
     }
     if existing.is_none() && store.rules.len() >= MAX_RULES {
-        return Err(format!(
-            "At most {MAX_RULES} highlight rules are supported"
-        ));
+        return Err(format!("At most {MAX_RULES} highlight rules are supported"));
     }
     let now = unix_now_secs();
     let entry = match existing {
@@ -326,9 +376,7 @@ mod tests {
     use super::*;
 
     fn save(store: &mut HighlightRuleStore, pattern: &str) -> HighlightRuleEntry {
-        save_entry(store, &json!({ "pattern": pattern }))
-            .unwrap()
-            .0
+        save_entry(store, &json!({ "pattern": pattern })).unwrap().0
     }
 
     #[test]
@@ -369,24 +417,25 @@ mod tests {
         assert!(save_entry(&mut store, &json!({ "pattern": "   " })).is_err());
         assert!(save_entry(&mut store, &json!({})).is_err());
         // Length cap.
-        assert!(
-            save_entry(&mut store, &json!({ "pattern": "x".repeat(201) })).is_err()
-        );
+        assert!(save_entry(&mut store, &json!({ "pattern": "x".repeat(201) })).is_err());
         // Color must be #rrggbb.
-        for bad_color in ["orange", "#12345", "#1234567", "#12h456", "f59e0b", "#ff00ff00"] {
+        for bad_color in [
+            "orange",
+            "#12345",
+            "#1234567",
+            "#12h456",
+            "f59e0b",
+            "#ff00ff00",
+        ] {
             assert!(
                 save_entry(&mut store, &json!({ "pattern": "e", "color": bad_color })).is_err(),
                 "expected color rejection for {bad_color}"
             );
         }
         // Updating a non-existent id is an error (never a silent create).
-        assert!(
-            save_entry(&mut store, &json!({ "id": "ghost", "pattern": "e" })).is_err()
-        );
+        assert!(save_entry(&mut store, &json!({ "id": "ghost", "pattern": "e" })).is_err());
         // Valid boundary: exactly 200 chars passes.
-        assert!(
-            save_entry(&mut store, &json!({ "pattern": "y".repeat(200) })).is_ok()
-        );
+        assert!(save_entry(&mut store, &json!({ "pattern": "y".repeat(200) })).is_ok());
     }
 
     #[test]
@@ -425,7 +474,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dbx-hl-rules-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = load_or_seed_store(&dir);
-        let patterns: Vec<&str> = store.rules.iter().map(|entry| entry.pattern.as_str()).collect();
+        let patterns: Vec<&str> = store
+            .rules
+            .iter()
+            .map(|entry| entry.pattern.as_str())
+            .collect();
         assert_eq!(
             patterns,
             [
@@ -488,7 +541,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(store_path(&dir)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(store_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         let _ = std::fs::remove_dir_all(&dir);

@@ -88,11 +88,7 @@ pub fn load_store_with(data_dir: &Path, provider: &dyn KeyProvider) -> SudoProfi
     load_from_value(&value, data_dir, provider)
 }
 
-fn load_from_value(
-    value: &Value,
-    data_dir: &Path,
-    provider: &dyn KeyProvider,
-) -> SudoProfileStore {
+fn load_from_value(value: &Value, data_dir: &Path, provider: &dyn KeyProvider) -> SudoProfileStore {
     let vault = Vault::new(provider);
     let store = parse_store(value, &vault);
     let recovered_secret = store
@@ -110,17 +106,13 @@ fn load_from_value(
     // being resealed with blanks.
     if !is_encrypted_file(value) && recovered_secret {
         if let Err(error) = save_store_with(data_dir, &store, provider) {
-            eprintln!(
-                "[ssh] failed to migrate quick-sudo-profiles.json to encrypted v2: {error}"
-            );
+            eprintln!("[ssh] failed to migrate quick-sudo-profiles.json to encrypted v2: {error}");
         }
     } else if storage_from_value(value) == Some(KeyStorage::Keychain) && recovered_secret {
         let keyfile = KeyfileProvider::new(keyfile_path(data_dir));
         match save_store_with(data_dir, &store, &keyfile) {
             Ok(()) => {
-                eprintln!(
-                    "[ssh] migrated quick-sudo-profiles.json DEK from keychain to keyfile"
-                );
+                eprintln!("[ssh] migrated quick-sudo-profiles.json DEK from keychain to keyfile");
                 delete_keychain_dek();
             }
             Err(error) => eprintln!(
@@ -168,11 +160,7 @@ fn storage_from_value(value: &Value) -> Option<KeyStorage> {
 /// v2 files carry `version >= 2` (anything else is treated as legacy
 /// plaintext and migrated on load when it holds secrets).
 fn is_encrypted_file(value: &Value) -> bool {
-    value
-        .get("version")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        >= STORAGE_VERSION
+    value.get("version").and_then(Value::as_u64).unwrap_or(1) >= STORAGE_VERSION
 }
 
 /// Persists atomically (tmp + rename) with 0600 permissions on Unix. The DEK
@@ -254,16 +242,15 @@ fn profile_from_json(value: &Value, vault: &Vault) -> Option<SudoProfile> {
     Some(SudoProfile {
         id: id.clone(),
         name: string("name"),
-        sudo_password: secret(
-            FIELD_SUDO_PASSWORD,
-            "sudoPasswordEnc",
-            "sudoPassword",
-        ),
+        sudo_password: secret(FIELD_SUDO_PASSWORD, "sudoPasswordEnc", "sudoPassword"),
         totp_secret: secret(FIELD_TOTP_SECRET, "totpSecretEnc", "totpSecret"),
         auth_flow_mode: string("authFlowMode"),
         password_prompt_hint: string("passwordPromptHint"),
         totp_prompt_hint: string("totpPromptHint"),
-        sudo_use_pty: object.get("sudoUsePty").and_then(Value::as_bool).unwrap_or(false),
+        sudo_use_pty: object
+            .get("sudoUsePty")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         created_at: object.get("createdAt").and_then(Value::as_u64).unwrap_or(0),
         updated_at: object.get("updatedAt").and_then(Value::as_u64).unwrap_or(0),
     })
@@ -322,7 +309,7 @@ pub fn profile_view(profile: &SudoProfile) -> Value {
 /// Sorted by name (case-insensitive) so UI and MCP listings are stable.
 pub fn list_views(store: &SudoProfileStore) -> Vec<Value> {
     let mut profiles = store.profiles.clone();
-    profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    profiles.sort_by_key(|left| left.name.to_lowercase());
     profiles.iter().map(profile_view).collect()
 }
 
@@ -370,17 +357,11 @@ pub fn save_profile(
         .get("id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
-    let existing = existing_id.and_then(|id| {
-        store
-            .profiles
-            .iter()
-            .position(|profile| profile.id == id)
-    });
+    let existing =
+        existing_id.and_then(|id| store.profiles.iter().position(|profile| profile.id == id));
     // Case-insensitive uniqueness so the name stays an unambiguous MCP reference.
     if let Some(duplicate) = store.profiles.iter().find(|profile| {
-        profile
-            .name
-            .eq_ignore_ascii_case(&name)
+        profile.name.eq_ignore_ascii_case(&name)
             && existing
                 .map(|index| store.profiles[index].id != profile.id)
                 .unwrap_or(true)
@@ -531,7 +512,11 @@ pub fn set_binding(
             store.bindings.remove(connection_id);
         }
         Some(profile_id) => {
-            if !store.profiles.iter().any(|profile| profile.id == profile_id) {
+            if !store
+                .profiles
+                .iter()
+                .any(|profile| profile.id == profile_id)
+            {
                 return Err(format!("Quick Sudo profile '{profile_id}' not found"));
             }
             store
@@ -561,7 +546,9 @@ pub fn apply_profile(auth: &mut SudoAuth, profile: &SudoProfile, login_password:
 
 /// A bound profile's PTY preference replaces the connection's.
 pub fn effective_use_pty(connection_pty: bool, profile: Option<&SudoProfile>) -> bool {
-    profile.map(|profile| profile.sudo_use_pty).unwrap_or(connection_pty)
+    profile
+        .map(|profile| profile.sudo_use_pty)
+        .unwrap_or(connection_pty)
 }
 
 /// Plain-text summary returned by the connection-form action
@@ -584,13 +571,21 @@ pub fn action_summary(store: &SudoProfileStore, connection_id: Option<&str>) -> 
             store.profiles.len()
         ));
         let mut profiles = store.profiles.clone();
-        profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        profiles.sort_by_key(|left| left.name.to_lowercase());
         for profile in profiles {
             lines.push(format!(
                 "- {}: password {}, TOTP {}, flow {}{}",
                 profile.name,
-                if profile.sudo_password.trim().is_empty() { "not set" } else { "set" },
-                if profile.totp_secret.trim().is_empty() { "not set" } else { "set" },
+                if profile.sudo_password.trim().is_empty() {
+                    "not set"
+                } else {
+                    "set"
+                },
+                if profile.totp_secret.trim().is_empty() {
+                    "not set"
+                } else {
+                    "set"
+                },
                 profile.auth_flow_mode,
                 if profile.sudo_use_pty { ", PTY" } else { "" },
             ));
@@ -638,7 +633,9 @@ mod tests {
             &json!({ "name": name, "sudoPassword": password, "totpSecret": "JBSWY3DPEHPK3PXP" }),
         )
         .unwrap();
-        store.bindings.insert("conn-1".to_string(), profile.id.clone());
+        store
+            .bindings
+            .insert("conn-1".to_string(), profile.id.clone());
         store
     }
 
@@ -706,7 +703,7 @@ mod tests {
         let mut store = store_with("ops", "x");
         let id = store.profiles[0].id.clone();
         assert!(delete_profile(&mut store, &id));
-        assert!(store.bindings.get("conn-1").is_none());
+        assert!(!store.bindings.contains_key("conn-1"));
         assert!(!delete_profile(&mut store, &id));
     }
 
@@ -792,7 +789,10 @@ mod tests {
         // Secrets survive into memory with metadata intact...
         assert_eq!(loaded.profiles[0].sudo_password, "plain-pass");
         assert_eq!(loaded.profiles[0].totp_secret, "JBSWY3DPEHPK3PXP");
-        assert_eq!(loaded.bindings.get("conn-1").map(String::as_str), Some("p1"));
+        assert_eq!(
+            loaded.bindings.get("conn-1").map(String::as_str),
+            Some("p1")
+        );
         // ...and the file is now the encrypted v2 envelope, no plaintext.
         let text = std::fs::read_to_string(store_path(&dir)).unwrap();
         assert!(!text.contains("plain-pass"));
@@ -941,28 +941,49 @@ mod tests {
         let secret = test_secret("sum");
         let store = store_with("ops", &secret);
         let summary = action_summary(&store, Some("conn-1"));
-        assert!(summary.contains("Global Quick Sudo profiles (1)"), "{summary}");
-        assert!(summary.contains("- ops: password set, TOTP set, flow password_then_otp"), "{summary}");
-        assert!(summary.contains("Bound to this connection: ops"), "{summary}");
+        assert!(
+            summary.contains("Global Quick Sudo profiles (1)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("- ops: password set, TOTP set, flow password_then_otp"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Bound to this connection: ops"),
+            "{summary}"
+        );
         assert!(!summary.contains(&secret), "summary leaked a secret");
 
         let unbound = action_summary(&store, Some("other-conn"));
-        assert!(unbound.contains("uses its own sudo configuration"), "{unbound}");
+        assert!(
+            unbound.contains("uses its own sudo configuration"),
+            "{unbound}"
+        );
         let no_id = action_summary(&store, None);
         assert!(!no_id.contains("Bound to this connection"), "{no_id}");
 
         let empty = action_summary(&SudoProfileStore::default(), None);
-        assert!(empty.contains("No global Quick Sudo profiles yet"), "{empty}");
+        assert!(
+            empty.contains("No global Quick Sudo profiles yet"),
+            "{empty}"
+        );
     }
 
     /// Writes a v2 file whose `crypto.storage` header names the keychain tier
     /// while the ciphertexts were sealed with the given provider — simulating
     /// a legacy keychain-tier file for migration tests without touching the
     /// OS keychain.
-    fn write_file_with_tier(dir: &Path, store: &SudoProfileStore, tier: &str, sealer: &dyn KeyProvider) {
+    fn write_file_with_tier(
+        dir: &Path,
+        store: &SudoProfileStore,
+        tier: &str,
+        sealer: &dyn KeyProvider,
+    ) {
         save_store_with(dir, store, sealer).unwrap();
         let path = store_path(dir);
-        let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         value["crypto"]["storage"] = json!(tier);
         std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     }
@@ -981,9 +1002,19 @@ mod tests {
         assert_eq!(reloaded.profiles[0].sudo_password, secret);
         let raw = std::fs::read_to_string(store_path(&dir)).unwrap();
         let value: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["crypto"]["storage"], json!("keyfile"), "file must migrate off the keychain tier");
-        assert!(keyfile_path(&dir).exists(), "keyfile DEK must exist after migration");
-        assert!(!raw.contains(&secret), "migrated file must stay encrypted at rest");
+        assert_eq!(
+            value["crypto"]["storage"],
+            json!("keyfile"),
+            "file must migrate off the keychain tier"
+        );
+        assert!(
+            keyfile_path(&dir).exists(),
+            "keyfile DEK must exist after migration"
+        );
+        assert!(
+            !raw.contains(&secret),
+            "migrated file must stay encrypted at rest"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1002,12 +1033,22 @@ mod tests {
         std::fs::remove_file(keyfile_path(&dir)).unwrap();
 
         let reloaded = load_store_with(&dir, &wrong);
-        assert_eq!(reloaded.profiles[0].sudo_password, "", "unrecoverable envelope degrades to empty");
+        assert_eq!(
+            reloaded.profiles[0].sudo_password, "",
+            "unrecoverable envelope degrades to empty"
+        );
 
         let raw = std::fs::read_to_string(store_path(&dir)).unwrap();
         let value: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["crypto"]["storage"], json!("keychain"), "unrecoverable file must not be rewritten");
-        assert!(!keyfile_path(&dir).exists(), "no keyfile DEK may be minted by a failed load");
+        assert_eq!(
+            value["crypto"]["storage"],
+            json!("keychain"),
+            "unrecoverable file must not be rewritten"
+        );
+        assert!(
+            !keyfile_path(&dir).exists(),
+            "no keyfile DEK may be minted by a failed load"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

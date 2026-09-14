@@ -108,7 +108,10 @@ pub async fn write_file(
     let (temporary, backup) = direct_write_paths(&path, &task_id);
     {
         let session = sftp.lock().await;
-        let mut file = session.create(temporary.clone()).await.map_err(sftp_error)?;
+        let mut file = session
+            .create(temporary.clone())
+            .await
+            .map_err(sftp_error)?;
         if let Err(error) = file.write_all(&data).await {
             drop(file);
             let _ = session.remove_file(temporary.clone()).await;
@@ -161,10 +164,9 @@ pub async fn archive(
     // overwrite).
     let session = sftp.lock().await;
     if session.metadata(target.clone()).await.is_ok() {
-        session
-            .remove_file(target.clone())
-            .await
-            .map_err(|error| format!("SFTP archive target already exists and could not be replaced: {error}"))?;
+        session.remove_file(target.clone()).await.map_err(|error| {
+            format!("SFTP archive target already exists and could not be replaced: {error}")
+        })?;
     }
     if let Err(error) = session.rename(temporary.clone(), target.clone()).await {
         let _ = session.remove_file(temporary).await;
@@ -205,7 +207,10 @@ pub async fn extract(
         )
         .await?;
     check_exec_success(&listing, "archive listing")?;
-    let members = listing.get("output").and_then(Value::as_str).unwrap_or_default();
+    let members = listing
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let top_entries = unique_top_level_entries(members);
     if top_entries.is_empty() {
         return Err("Archive is empty or could not be listed".to_string());
@@ -284,10 +289,7 @@ fn ensure_direct_write_size(size: usize) -> Result<(), String> {
 fn direct_write_paths(target: &str, task_id: &str) -> (String, String) {
     let (parent, _) = target.rsplit_once('/').unwrap_or(("/", ""));
     let parent = if parent.is_empty() { "/" } else { parent };
-    let base = format!(
-        "{}/.dbx-part-{task_id}",
-        parent.trim_end_matches('/')
-    );
+    let base = format!("{}/.dbx-part-{task_id}", parent.trim_end_matches('/'));
     (base.clone(), format!("{base}.backup"))
 }
 
@@ -354,8 +356,7 @@ fn common_parent_dir(paths: &[String]) -> String {
     let ancestors = paths
         .iter()
         .map(|path| {
-            let mut components: Vec<&str> =
-                path.trim_end_matches('/').split('/').collect();
+            let mut components: Vec<&str> = path.trim_end_matches('/').split('/').collect();
             components.pop();
             components
         })
@@ -379,9 +380,7 @@ fn common_parent_dir(paths: &[String]) -> String {
 /// [`common_parent_dir`); `"."` as a defensive fallback, like tiny-rdm.
 fn relative_to_parent(path: &str, parent: &str) -> String {
     let prefix = if parent == "/" { "" } else { parent };
-    let relative = path
-        .strip_prefix(&format!("{prefix}/"))
-        .unwrap_or(path);
+    let relative = path.strip_prefix(&format!("{prefix}/")).unwrap_or(path);
     if relative.is_empty() {
         ".".to_string()
     } else {
@@ -430,7 +429,10 @@ fn tar_z_flag(archive: &str) -> Result<bool, String> {
     } else if name.ends_with(".tar") {
         Ok(false)
     } else if name.ends_with(".zip") {
-        Err("unsupported archive type: .zip archives are not supported, re-pack as .tar.gz".to_string())
+        Err(
+            "unsupported archive type: .zip archives are not supported, re-pack as .tar.gz"
+                .to_string(),
+        )
     } else {
         Err(format!(
             "unsupported archive type '{archive}': only .tar.gz, .tgz and .tar are supported"
@@ -460,7 +462,10 @@ fn unique_top_level_entries(listing: &str) -> Vec<String> {
 /// Turns an exec outcome (`{success, output, exitCode}`) into an error when
 /// the remote command failed.
 fn check_exec_success(outcome: &Value, operation: &str) -> Result<(), String> {
-    let exit_code = outcome.get("exitCode").and_then(Value::as_i64).unwrap_or(-1);
+    let exit_code = outcome
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .unwrap_or(-1);
     if exit_code == 0 {
         Ok(())
     } else {
@@ -469,7 +474,9 @@ fn check_exec_success(outcome: &Value, operation: &str) -> Result<(), String> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .trim();
-        Err(format!("{operation} exited with status {exit_code}: {output}"))
+        Err(format!(
+            "{operation} exited with status {exit_code}: {output}"
+        ))
     }
 }
 
@@ -495,7 +502,10 @@ mod tests {
     #[test]
     fn common_parent_dir_handles_single_and_nested_paths() {
         // Single file: the file name is dropped, unlike tiny-rdm.
-        assert_eq!(common_parent_dir(&["/var/log/app.log".to_string()]), "/var/log");
+        assert_eq!(
+            common_parent_dir(&["/var/log/app.log".to_string()]),
+            "/var/log"
+        );
         // Siblings share their directory.
         assert_eq!(
             common_parent_dir(&["/a/b.txt".to_string(), "/a/c.txt".to_string()]),
@@ -520,7 +530,10 @@ mod tests {
 
     #[test]
     fn relative_to_parent_strips_the_common_directory() {
-        assert_eq!(relative_to_parent("/var/log/app.log", "/var/log"), "app.log");
+        assert_eq!(
+            relative_to_parent("/var/log/app.log", "/var/log"),
+            "app.log"
+        );
         assert_eq!(relative_to_parent("/a/b/c", "/a"), "b/c");
         assert_eq!(relative_to_parent("/etc", "/"), "etc");
     }
@@ -540,9 +553,9 @@ mod tests {
 
     #[test]
     fn tar_z_flag_dispatches_by_extension() {
-        assert_eq!(tar_z_flag("/tmp/a.tar.gz").unwrap(), true);
-        assert_eq!(tar_z_flag("/tmp/a.TGZ").unwrap(), true);
-        assert_eq!(tar_z_flag("/tmp/a.tar").unwrap(), false);
+        assert!(tar_z_flag("/tmp/a.tar.gz").unwrap());
+        assert!(tar_z_flag("/tmp/a.TGZ").unwrap());
+        assert!(!tar_z_flag("/tmp/a.tar").unwrap());
         let zip = tar_z_flag("/tmp/a.zip").unwrap_err();
         assert!(zip.contains("unsupported"), "{zip}");
         assert!(tar_z_flag("/tmp/a.rar").is_err());
@@ -611,11 +624,9 @@ mod tests {
     #[test]
     fn exec_failures_report_status_and_output() {
         assert!(check_exec_success(&json!({ "exitCode": 0 }), "extract").is_ok());
-        let error = check_exec_success(
-            &json!({ "exitCode": 2, "output": "tar: eof\n" }),
-            "archive",
-        )
-        .unwrap_err();
+        let error =
+            check_exec_success(&json!({ "exitCode": 2, "output": "tar: eof\n" }), "archive")
+                .unwrap_err();
         assert!(error.starts_with("archive exited with status 2: tar: eof"));
     }
 }
