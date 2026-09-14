@@ -10,11 +10,14 @@ mod keys;
 mod mcp;
 mod mcp_safety;
 mod metrics;
+mod metrics_history;
 mod model;
+mod multi_exec;
 mod quick_commands;
 mod sftp_bookmarks;
 mod sftp_copy;
 mod sftp_ext;
+mod session_recording;
 mod ssh;
 mod sudo_fs;
 mod sudo_allowlist;
@@ -391,6 +394,65 @@ impl Plugin {
                     .unwrap_or(false);
                 self.runtime.block_on(self.ssh.metrics(session_id, cached))
             }
+            "ssh/metrics/history" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(720)
+                    .clamp(1, metrics_history::MAX_SAMPLES as u64) as usize;
+                self.runtime
+                    .block_on(self.ssh.metrics_history(session_id, limit))
+            }
+            "ssh/processes/list" => {
+                let session_id = required_string(&params, "sessionId")?;
+                self.runtime
+                    .block_on(self.ssh.processes_list(session_id))
+            }
+            "ssh/processes/kill" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let pid = params
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .ok_or("Missing pid")?;
+                let signal = params
+                    .get("signal")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(15);
+                self.runtime
+                    .block_on(self.ssh.kill_process(session_id, pid, signal))
+            }
+            "ssh/recording/start" => {
+                let session_id = required_string(&params, "sessionId")?;
+                self.runtime
+                    .block_on(self.ssh.recording_start(session_id))
+            }
+            "ssh/recording/stop" => {
+                let session_id = required_string(&params, "sessionId")?;
+                self.runtime
+                    .block_on(self.ssh.recording_stop(session_id))
+            }
+            "ssh/recording/list" => Ok(json!({
+                "recordings": session_recording::list_recordings(&self.ssh.data_dir())
+            })),
+            "ssh/recording/get" => {
+                let recording_id = required_string(&params, "recordingId")?;
+                let offset = optional_u64(&params, "offset", 0) as usize;
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(session_recording::PAGE_LIMIT as u64)
+                    .clamp(1, session_recording::PAGE_LIMIT as u64) as usize;
+                session_recording::read_events(&self.ssh.data_dir(), recording_id, offset, limit)
+            }
+            "ssh/recording/delete" => {
+                let recording_id = required_string(&params, "recordingId")?;
+                let path = session_recording::cast_path(&self.ssh.data_dir(), recording_id)?;
+                std::fs::remove_file(&path)
+                    .map_err(|error| format!("Failed to delete recording: {error}"))?;
+                Ok(json!({ "success": true }))
+            }
             "mcp/tools" => Ok(mcp::tool_definitions()),
             "mcp/call" => self
                 .runtime
@@ -430,6 +492,10 @@ impl Plugin {
                     .map(|entry| serde_json::to_value(entry).unwrap_or(Value::Null))
                     .collect();
                 Ok(json!({ "entries": items, "truncated": truncated }))
+            }
+            "ssh/audit/clear" => {
+                audit_log::clear(&self.ssh.data_dir())?;
+                Ok(json!({ "success": true }))
             }
             "ssh/agent/mode/get" => {
                 let connection_id = required_string(&params, "connectionId")?;
@@ -607,9 +673,14 @@ impl Plugin {
                     .get("size")
                     .and_then(Value::as_u64)
                     .ok_or("Missing upload size")?;
+                let resume_task_id = params
+                    .get("resumeTaskId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
                 self.runtime.block_on(
                     self.ssh
-                        .start_upload(session_id, remote_path, size, emitter),
+                        .start_upload(session_id, remote_path, size, resume_task_id, emitter),
                 )
             }
             "sftp/upload/finish" => {
@@ -620,8 +691,11 @@ impl Plugin {
             "sftp/download/start" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let remote_path = required_string(&params, "remotePath")?;
-                self.runtime
-                    .block_on(self.ssh.start_download(session_id, remote_path, emitter))
+                let offset = optional_u64(&params, "offset", 0);
+                self.runtime.block_on(
+                    self.ssh
+                        .start_download(session_id, remote_path, offset, emitter),
+                )
             }
             "sftp/download/next" => {
                 let task_id = required_string(&params, "taskId")?;
@@ -639,6 +713,7 @@ impl Plugin {
                     .cancel_transfer(required_string(&params, "taskId")?, emitter)?;
                 Ok(json!({ "success": true }))
             }
+            "sftp/transfer/resumable" => self.ssh.resumable_uploads(),
             "sftp/transfer/list" => self
                 .ssh
                 .transfer_list(required_string(&params, "sessionId")?),

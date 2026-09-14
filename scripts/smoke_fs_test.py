@@ -1051,12 +1051,171 @@ def main() -> None:
                    case_agent_settings_restored,
                    needs="agent mode re-armed + shell state reused")
 
+        # -- F1/F2/F3 group: resume / processes / recording -----------------
+
+        resume_src = f"{home}/.dbx-smoke-resume-src"
+
+        def case_transfer_resumable_shape():
+            result = req("sftp/transfer/resumable", {})
+            tasks = result.get("tasks")
+            if not isinstance(tasks, list):
+                raise AssertionError(f"resumable -> {json.dumps(result)[:120]}, want tasks list")
+            for task in tasks:
+                for key in ("taskId", "remotePath", "fileName", "size", "resumableBytes"):
+                    if key not in task:
+                        raise AssertionError(f"resumable task missing {key}: {json.dumps(task)[:160]}")
+            print(f"    resumable tasks: {len(tasks)}")
+
+        def case_download_resume_offset():
+            raw = b"resume-smoke-payload-19"
+            payload = base64.b64encode(raw).decode()
+            req("sftp/write", {"sessionId": session_id, "remotePath": resume_src, "dataBase64": payload})
+            size = len(raw)
+            # offset == size 合法：空传输直接可 finish。
+            info = req("sftp/download/start", {"sessionId": session_id, "remotePath": resume_src, "offset": size})
+            if info.get("resumeOffset") != size:
+                raise AssertionError(f"resumeOffset={info.get('resumeOffset')!r}, want {size}")
+            req("sftp/download/finish", {"taskId": info["taskId"]})
+            # offset > size 拒绝。
+            try:
+                req("sftp/download/start", {"sessionId": session_id, "remotePath": resume_src, "offset": size + 1})
+            except SidecarError as error:
+                if "beyond" not in str(error):
+                    raise AssertionError(f"unexpected resume error: {error}")
+            else:
+                raise AssertionError("offset beyond size accepted")
+            print(f"    resume offset {size} accepted, {size + 1} refused")
+
+        def case_upload_resume_rejects_unknown_task():
+            try:
+                req("sftp/upload/start", {"sessionId": session_id, "remotePath": resume_src,
+                                          "size": 8, "resumeTaskId": "no-such-task"})
+            except SidecarError as error:
+                if "resumable" not in str(error).lower():
+                    raise AssertionError(f"unexpected resume error: {error}")
+            else:
+                raise AssertionError("resume with unknown taskId accepted")
+
+        def case_processes_list_and_kill():
+            listing = req("ssh/processes/list", {"sessionId": session_id}, timeout=30)
+            processes = listing.get("processes")
+            if not isinstance(processes, list) or not processes:
+                raise AssertionError(f"processes/list -> {json.dumps(listing)[:160]}")
+            row = processes[0]
+            for key in ("pid", "ppid", "user", "cpuPercent", "memPercent", "command"):
+                if key not in row:
+                    raise AssertionError(f"process row missing {key}: {json.dumps(row)[:160]}")
+            # pid 1 在后端校验层就被拒绝。
+            try:
+                req("ssh/processes/kill", {"sessionId": session_id, "pid": 1, "signal": 15})
+            except SidecarError as error:
+                if "Refusing" not in str(error):
+                    raise AssertionError(f"unexpected pid-1 error: {error}")
+            else:
+                raise AssertionError("kill pid 1 accepted")
+            # 起一个真实进程再终止，验证 kill 全链路。
+            spawned = req("ssh/exec", {"sessionId": session_id,
+                                       "command": "sleep 297 >/dev/null 2>&1 & echo $!"}, timeout=30)
+            pid_text = (spawned.get("output") or "").strip().splitlines()[-1].strip() if spawned.get("output") else ""
+            if not pid_text.isdigit():
+                raise SkipSignal(f"could not spawn test process: {json.dumps(spawned)[:120]}")
+            pid = int(pid_text)
+            req("ssh/processes/kill", {"sessionId": session_id, "pid": pid, "signal": 15})
+            time.sleep(0.5)
+            check = req("ssh/exec", {"sessionId": session_id,
+                                     "command": f"kill -0 {pid} 2>/dev/null; echo exit=$?"}, timeout=30)
+            if "exit=0" in (check.get("output") or ""):
+                raise AssertionError(f"pid {pid} still alive after SIGTERM")
+            print(f"    listed {len(processes)} rows; spawned+terminated pid {pid}")
+
+        def case_metrics_history():
+            req("ssh/metrics", {"sessionId": session_id}, timeout=60)
+            history = req("ssh/metrics/history", {"sessionId": session_id, "limit": 100}, timeout=30)
+            samples = history.get("samples")
+            if not isinstance(samples, list):
+                raise AssertionError(f"metrics/history -> {json.dumps(history)[:160]}")
+            if samples:
+                row = samples[-1]
+                for key in ("connectionId", "ts", "rxRate", "txRate"):
+                    if key not in row:
+                        raise AssertionError(f"sample missing {key}: {json.dumps(row)[:160]}")
+            print(f"    history samples: {len(samples)}")
+
+        def case_recording_flow():
+            marker = f"smoke-rec-{uuid.uuid4().hex[:8]}"
+            start = req("ssh/recording/start", {"sessionId": session_id})
+            recording_id = start.get("recordingId")
+            if not recording_id:
+                raise AssertionError(f"recording/start -> {json.dumps(start)[:160]}")
+            try:
+                client.send_binary(f"ssh/terminal/in/{session_id}", struct.pack(">Q", 910) + f"echo {marker}\r".encode())
+                time.sleep(2.0)
+            finally:
+                summary = req("ssh/recording/stop", {"sessionId": session_id})
+            if summary.get("recordingId") != recording_id:
+                raise AssertionError(f"stop -> {json.dumps(summary)[:160]}")
+            listing = req("ssh/recording/list", {})
+            if not any(item.get("recordingId") == recording_id for item in listing.get("recordings", [])):
+                raise AssertionError(f"recording {recording_id} not listed: {json.dumps(listing)[:160]}")
+            page = req("ssh/recording/get", {"recordingId": recording_id, "offset": 0, "limit": 500})
+            blob = json.dumps(page.get("events", []), ensure_ascii=False)
+            if marker not in blob:
+                raise AssertionError(f"marker {marker} not captured in recording ({page.get('total')} events)")
+            if page.get("hasMore"):
+                raise AssertionError("unexpected hasMore with limit 500 and cap below page size")
+            req("ssh/recording/delete", {"recordingId": recording_id})
+            after = req("ssh/recording/list", {})
+            if any(item.get("recordingId") == recording_id for item in after.get("recordings", [])):
+                raise AssertionError(f"recording {recording_id} still listed after delete")
+            print(f"    recorded {summary.get('events')} events, captured {marker}, deleted")
+
+        def case_audit_clear():
+            req("ssh/audit/clear", {})
+            result = req("ssh/audit/list", {"limit": 100})
+            if result.get("entries"):
+                raise AssertionError(f"ledger not empty after clear: {result.get('entries')[:2]!r}")
+            if result.get("truncated"):
+                raise AssertionError("unexpected truncated after clear")
+            # 新事件照常落账（clear 后新一代账本）：审计只记终端执行路径，
+            # 普通 RPC 读操作与隐藏通道不产生条目——切 auto 模式跑一次低危
+            # exec（终端直执 + 落账），验证完还原 off。
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "auto"})
+            try:
+                call_tool_embedded("ssh_exec", {"command": "echo audit-after-clear"})
+            finally:
+                req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "off"})
+            after = req("ssh/audit/list", {"limit": 10})
+            entries = after.get("entries") or []
+            if not entries:
+                raise AssertionError("audit ledger did not record after clear")
+            # 执行行 wire shape 无 command 字段（协议刻意）；tool+mode+outcome
+            # 足以证明是 clear 之后新落的执行条目。
+            if not any(entry.get("tool") == "ssh_exec" and entry.get("mode") == "embedded"
+                       and entry.get("outcome") == "ok" for entry in entries):
+                raise AssertionError(f"no post-clear execution entry: {entries[:2]!r}")
+            print("    cleared, then new entries recorded again")
+
+        print("\n--- resume / processes / recording group ---")
+        report.run("sftp/transfer/resumable shape", "sftp/transfer/resumable", case_transfer_resumable_shape)
+        report.run("sftp download resume offset accepted/refused", "sftp/download/start",
+                   case_download_resume_offset)
+        report.run("sftp upload resume unknown task refused", "sftp/upload/start",
+                   case_upload_resume_rejects_unknown_task)
+        report.run("ssh/processes list + kill round-trip", "ssh/processes/list",
+                   case_processes_list_and_kill)
+        report.run("ssh/metrics/history samples", "ssh/metrics/history", case_metrics_history)
+        report.run("ssh/recording start/stop/list/get/delete", "ssh/recording/start",
+                   case_recording_flow)
+
         print("\n--- alert triage + audit group ---")
         report.run("ssh/alert/triage normalize+classify+playbook", "ssh/alert/triage",
                    case_alert_triage)
         report.run("ssh/audit/list returns approval trail", "ssh/audit/list",
                    case_audit_list,
                    needs="agent remembered list settings + destructive refused")
+        report.run("ssh/audit/clear truncates the ledger", "ssh/audit/clear",
+                   case_audit_clear,
+                   needs="ssh/audit/list returns approval trail")
 
         step("cleanup leftovers")
         # Best-effort mode/secret restore even when a late case failed: the
@@ -1068,7 +1227,7 @@ def main() -> None:
                                                 "sudoPassword": ""})
         except SidecarError:
             pass
-        for path, recursive in ((touch_path, False), (write_path, False),
+        for path, recursive in ((touch_path, False), (write_path, False), (resume_src, False),
                                 (archive_path, False), (extract_dir, True), (sudo_dir, True)):
             try:
                 client.request("sftp/delete",

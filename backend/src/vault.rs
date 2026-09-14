@@ -156,10 +156,6 @@ impl KeyfileProvider {
         KeyfileProvider { path }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     fn write_key(&self, dek: &Zeroizing<[u8; DEK_LEN]>) -> Result<Zeroizing<[u8; DEK_LEN]>, String> {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);

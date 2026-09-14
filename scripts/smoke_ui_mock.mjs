@@ -21,7 +21,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 // No --strictPort / fixed port: vite picks a free one and prints the URL.
-const URL_BASE = `mock.html`;
+// ?render=dom：锁 DOM 渲染器（WebGL 渲染下终端文本只存在于 GPU canvas，
+// DOM 文本断言失效；WebGL 成功/回退逻辑由 terminalWebgl 单测覆盖）。
+const URL_BASE = `mock.html?render=dom`;
 const SHOT_DIR = `${ROOT}docs/screenshots-ui-mock`;
 
 function skip(reason) {
@@ -100,7 +102,9 @@ try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const pageError = [];
   page.on("pageerror", (err) => pageError.push(String(err)));
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  // ?render=dom 锁定 DOM 渲染器：WebGL 渲染下终端文本只在 GPU canvas，
+  // DOM 文本断言（下方 terminal echo 等）结构性失效。
+  await page.goto(`${baseUrl}?render=dom`, { waitUntil: "domcontentloaded", timeout: 30_000 });
   await sleep(2_500); // let the mock bridge wire the workbench
 
   console.log("==> workbench anchors");
@@ -126,21 +130,29 @@ try {
   await page.screenshot({ path: `${SHOT_DIR}/02-quick-commands.png`, fullPage: false });
   console.log(`  screenshot: docs/screenshots-ui-mock/02-quick-commands.png`);
 
-  // --- batch send: dialog, target inventory, quick pick, send -------------
-  console.log("==> batch send: dialog walkthrough");
-  await page.click('button[title="Batch send"]');
-  await expect(page, ".batch-modal", "batch send modal");
+  // --- batch send: bar, target inventory, quick pick, send ----------------
+  // 2026-09 批量发送从 modal 弹窗改为常驻 batch-bar（命令条 + 目标 popover），
+  // 本段断言已随 UI 重新对齐（旧 .batch-modal 选择器已不存在）。
+  console.log("==> batch send: bar walkthrough");
+  // batch-bar 默认展开（localStorage 未持久化 "0" 时）；仅在意外关闭时点开。
+  if (!(await page.$(".batch-bar"))) await page.click('button[title="Batch send"]');
+  await expect(page, ".batch-bar", "batch send bar");
+  await page.click(".batch-bar-targets");
+  await expect(page, ".batch-targets-popover", "batch targets popover");
   await expectText(page, ".batch-target-row", "demo@server.demo.internal", "target row user@host");
   await expectText(page, ".batch-target-row", "Current", "current-session badge");
-  await page.selectOption(".batch-quick-pick", { label: "ui-mock cmd" });
-  const draft = await page.inputValue(".batch-modal input.mono");
+  await page.selectOption(".batch-bar-quick", { label: "ui-mock cmd" });
+  const draft = await page.inputValue(".batch-bar-input");
   await check("quick pick fills the command draft", draft === "echo ui-mock-batch", `draft="${draft}"`);
   await page.screenshot({ path: `${SHOT_DIR}/03-batch-send.png`, fullPage: false });
   console.log(`  screenshot: docs/screenshots-ui-mock/03-batch-send.png`);
-  await page.click(".batch-modal footer .primary-button");
-  await expectText(page, ".batch-summary", "Sent to 1 session(s)", "batch send summary");
+  await page.click(".batch-bar-send");
+  await expectText(page, ".batch-bar-status", "Sent to 1 session(s)", "batch send summary");
   try {
     // The mock bridge echoes the command into the terminal (PTY semantics).
+    // headless 页面可能被 Chrome 判为 occluded 而暂停 rAF（xterm 渲染节流
+    // 不刷新 DOM，buffer 其实已写）；bringToFront 消除这一偶发假阴性。
+    await page.bringToFront();
     await page.waitForFunction(
       () => document.querySelector(".terminal-host")?.textContent?.includes("echo ui-mock-batch"),
       null,
@@ -151,7 +163,27 @@ try {
     failures.push('terminal echo missing ("echo ui-mock-batch")');
     console.log('  FAIL terminal echo ("echo ui-mock-batch")');
   }
-  await page.click(".batch-modal header .icon-button");
+  // 收起命令条（同一工具栏按钮 toggle）。
+  await page.click('button[title="Batch send"]');
+
+  // --- WebGL renderer smoke: default preference attaches a GPU renderer ----
+  // (or falls back to the DOM renderer when WebGL is unavailable — headless
+  // Chrome may or may not provide swiftshader). Either way the terminal must
+  // stay functional; the DOM-text assertions above ran with ?render=dom.
+  console.log("==> webgl renderer smoke");
+  const webglPage = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await webglPage.goto(`${baseUrl}`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await sleep(2_500);
+  const webglState = await webglPage.evaluate(() => ({
+    canvases: document.querySelectorAll(".terminal-host canvas").length,
+    rows: document.querySelectorAll(".terminal-host .xterm-rows").length,
+  }));
+  check(
+    "terminal has a renderer (webgl canvas or dom rows)",
+    webglState.canvases > 0 || webglState.rows > 0,
+    JSON.stringify(webglState),
+  );
+  await webglPage.close();
 
   // --- global quick commands: delete --------------------------------------
   console.log("==> quick commands: delete");

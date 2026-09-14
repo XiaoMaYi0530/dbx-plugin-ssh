@@ -24,6 +24,17 @@ echo "==> backend unit tests"
 node ../shared/connection-forms/verify.mjs ssh
 cargo test --manifest-path backend/Cargo.toml
 
+echo "==> dead-code warning gate"
+# 未接线的功能会先以 dead_code 警告形态暴露（案例：remembered 审批 /
+# ssh_terminal_input 的安全函数写完却没接进路由）。零容忍：
+# cargo build 出现任何 "never used" 警告即失败，避免新功能静默脱接。
+if cargo build --manifest-path backend/Cargo.toml 2>&1 | grep -q "never used"; then
+  echo "FAIL: dead-code warnings present (an unwired feature or leftover code?):"
+  cargo build --manifest-path backend/Cargo.toml 2>&1 | grep -B1 "never used"
+  exit 1
+fi
+echo "  no dead-code warnings"
+
 echo "==> frontend typecheck + tests + build"
 [ -d frontend/node_modules ] || pnpm --dir frontend install --frozen-lockfile
 pnpm --dir frontend typecheck

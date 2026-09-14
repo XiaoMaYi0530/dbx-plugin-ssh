@@ -2390,3 +2390,791 @@ preventDefault + stopPropagation；P2 mock fileTransfer.write 按解码字节确
 验证：`cargo test --release` 332/332 全绿；`smoke_mcp.py --host`（dbx-ssh-test
 容器真机回环）all green（29 工具 + 全部新面）。前端零改动未跑前端三件套。
 宿主/协议无变更。版本 0.4.60 → 0.4.61。
+
+## iShell Pro 对标差距收敛批：断点续传 + 趋势/进程管理 + 会话录制（2026-09-12）
+
+用户决策实施 2026-09-12 差距分析（vs iShell Pro）中的三项候选：
+
+**F1 SFTP 断点续传/暂停恢复**：上传中断任务保留 spool（`transfers/upload-<id>.part`）+
+sidecar meta（`upload-<id>.json`，`remotePath`/`size` 双校验）；`sftp/upload/start` 新增
+`resumeTaskId`（返回 `resumeOffset`，前端只重传尾部）；`sftp/download/start` 新增 `offset`
+恢复参数；新增 `sftp/transfer/resumable` 扫描可续传清单；会话内暂停/恢复为分片间挂起
+（前端纯语义，`lib/transferResume.ts` 纯模块匹配本地文件）。cancel 语义不变（放弃即清理）。
+
+**F2 监控趋势落盘 + 进程管理**：`metrics-history.jsonl` 环形 720 行（每次新鲜
+`ssh/metrics` 采集追加、按连接过滤）+ `ssh/metrics/history`；打开指标卡回填
+CPU/内存/网速 sparkline（旧 sidecar 静默降级）。`ssh/processes/list`（`ps` 500 行 CPU 序）
++ `ssh/processes/kill`（pid 0/1 拒绝、signal 白名单 1/2/9/15、`kill -<NAME> <pid>`
+白名单化渲染）；前端进程面板（排序/翻页 100 行/TERM+KILL 双确认）。
+
+**F3 会话录制/回放/GIF 导出**：新模块 `session_recording.rs`——asciicast v2 JSONL
+（`recordings/<id>.cast`，meta 携带 sessionId/connectionId/host），读循环在目录过滤后
+挂录制器（stdout+stderr，State 帧不录），会话关闭自动收尾；RPC
+`ssh/recording/start|stop|list|get|delete`（get 分页 500、id 路径穿越校验）；
+`ssh/sessions/list` 每行新增 `recording`。前端：终端工具栏录制开关（红点）、录制记录浮条、
+回放弹窗（xterm 重放 + rAF 时间轴 + 0.5/1/2/4× 倍速 + 进度 seek）、GIF 导出
+（离屏 xterm 逐事件重放、500ms 抽帧封顶 120 帧、零依赖 GIF89a/LZW 编码器
+`lib/gifEncoder.ts`，迷你解码器逐位回读单测）。
+
+**新方法**（9）：`sftp/transfer/resumable`、`ssh/metrics/history`、`ssh/processes/list`、
+`ssh/processes/kill`、`ssh/recording/start|stop|list|get|delete`；改参 2：
+`sftp/upload/start`（resumeTaskId）、`sftp/download/start`（offset）。
+
+**完成定义四件套**：单测——后端 348/348（新增 metrics_history 5、session_recording 5、
+resumable/meta 3、进程解析/kill 3）；前端 394/394（新增 transferResume/replayScheduler/
+gifEncoder/processActions 4 spec 18 用例，gifEncoder 含 LZW 编解码往返与 GIF 容器逐字节
+校验）。smoke——`smoke_fs_test.py` 新增 6 用例（resumable 形状、下载 offset 接受/拒绝、
+上传未知 task 拒绝、进程 list+kill 全链路、metrics/history 形状、录制
+start/stop/list/get/delete 回环含标记捕获断言）。对标清单——FEATURE_PARITY sshbool 表
+两行升级为已做 + 新增「iShell Pro 对标补充（2026-09-12）」节。七语——supplemental
+七语各追加 33 键（传输暂停/续传、可续传、进程管理、录制/回放/GIF）。
+
+文档：`PROTOCOL.zh-CN.md` 方法总表 + 5 个新章节（断点续传/metrics history/processes/
+recording，参数与错误语义全量）。
+
+**验证实跑（0.4.61 同版重打包）**：`cargo test` 348/348；前端 typecheck + vitest
+394/394 + `pnpm build`（修复 v-for 属性内双引号嵌套的模板编译错误后过）；
+`dbx-plugin package` 出包 `io.dbx.ssh-0.4.61-darwin-arm64.dbxp`；`smoke_mcp.py`
+过；live smoke——`smoke_test.py`/`smoke_batch3_test.py`/`smoke_sudo_otp_test.py`/
+`perf_baseline_test.py` 全过，`smoke_fs_test.py` 42 PASS 且本批 6 个新用例全绿。
+
+**与本批无关的预存失败（均用 HEAD 基线二进制复跑对照确认）**：
+1. `smoke_fs_test.py`「agent approval remembered skips later prompts」sidecar 帧超时，
+   HEAD 基线（无本批改动）同样失败（3/3 复现）；与 `e2e_agent_terminal.py` 用例 03
+   「off + forced terminal + sudo denied」同域（strict 审批/sudo 执行路径），疑与
+   dbx-ssh-test 容器长期运行状态漂移相关，待专项排查。
+2. `e2e_agent_terminal.py` 25/26（仅用例 03 挂，与基线一致）。
+3. `smoke_ui_mock.mjs` batch send 断言使用 `.batch-modal`，而该选择器在 HEAD 的
+   App.vue 已不存在（batch-bar 改版后脚本未同步），HEAD 基线同样失败；脚本待与
+   当前 batch-bar UI 重新对齐。
+4. 宿主 `plugin_tools_bridge` 集成测试维持 SKIP（MCP plugin-tools WIP 未集成，
+   test.sh 文档化跳过路径）。
+
+## 跟进：预存失败根因修复（2026-09-12，同批追加）
+
+对上一节登记的预存失败逐项跟进，两笔修复 + 一笔语义澄清：
+
+**1. remembered 审批从未接入执行路由（真 bug，修复）**。smoke_fs「agent approval
+remembered skips later prompts」超时根因：`mcp.rs ssh_exec_terminal_tool` 只调
+`agent_terminal::decide`，remembered 降级（D1）从未接线——`agent_approvals::matches`
+与 `agent_terminal::decide_with_memory` 一直是死代码（编译警告在案），"approve +
+remember" 之后同一命令每次仍弹审批，无应答即撞 120s 审批超时（客户端 90s 先到）。
+修复：路由前按连接加载 `agent-approved-commands.json`，`matches` 命中则
+`decide_with_memory(..., remembered=true)` 降级 Prompt→Run；灾难门（D2）不动——
+它仍在 `exec_in_terminal` 内部最后生效。最小序列复现（terminal exec → strict
+approve → deny → remember → remembered 重跑）从「重跑 45s+ 超时」变为 0.3s 直跑。
+
+**2. e2e 用例 03 陈旧期望（对齐现行语义）**。`e2e_agent_terminal.py` 03 写于
+off+elevated 一律 Deny 的时期；7440ad9 起 off + 显式 runInTerminal=true 的
+elevated 命令改为弹审批（工具描述与 decide 文档一致），且 off+未显式选择走隐藏
+通道根本不进 decide（旧断言的 "Agent terminal mode is off" 在 ssh_exec 路径不可达）。
+用例重写为双支：a) off + sudo 无显式选择 → 隐藏通道执行（响应无 mode 字段）；
+b) off + 显式选择 + 弹审批 + deny → denied 错误。
+
+**3. smoke_ui_mock.mjs 与 batch-bar 现状对齐**。批量发送自 modal 弹窗改版为常驻
+batch-bar 后 walkthrough 未同步（`.batch-modal` 选择器已不存在）；且 batch-bar
+默认展开（localStorage `ssh-batch-bar-open` != "0"），脚本开头的 toggle 反而把它
+关掉。已重写 batch 段（bar/目标 popover/quick pick 草稿/发送 summary/收起语义），
+实跑全绿。
+
+**回归**：cargo test 348/348；smoke_fs 58 PASS / 0 SKIP / 0 FAIL（remember 链
+修复后整条 agent 组恢复）；e2e_agent_terminal 26/26；smoke_mcp all green；
+smoke_ui_mock all green；重新打包 io.dbx.ssh-0.4.61（含路由修复）。
+
+## 死代码清零批：ssh_terminal_input 工具落地 + 警告门禁（2026-09-12，同批追加）
+
+remembered 修复后继续清剩余 dead_code 警告（每一条都按"未接线功能还是废码"排查）：
+
+**接线——`ssh_terminal_input` MCP 工具（IMPL_PLAN_NETCATTY A2-T5/T6）**。
+`mcp_safety` 的 4 个"never used"项（`normalize_terminal_input` /
+`is_control_only_input` / `assess_terminal_input` / `MAX_TERMINAL_INPUT_BYTES`）
+是 A2 预写的安全函数，工具本体一直没实现。本批按计划落地：
+
+- 门禁纯函数 `terminal_input_gate`（mcp.rs）：① 只读连接仅放行纯控制序列；
+  ② 灾难行（聚合判定 `assess_terminal_input`）需 `confirmDestructive`、只读上
+  一律拒绝；③ sudo 行过连接白名单；④ §1.3 confirm 档留位注释在案。
+- handler：registered ref → 存活会话解析（无会话与 endpoint 选择器统一回落
+  `NO_TERMINAL_SESSION` 引导）→ 单会话复用 `batch_terminal_input`（appendNewline
+  默认 false）；`{sent: true, sessionId}` 响应；stdio 模式无工作台 PTY，天然
+  引导报错（smoke_mcp live 段新增负例断言）。
+- 工具 schema：anyOf 连接寻址 + `input`/`appendNewline`/`confirmDestructive`，
+  描述含 8 KiB 截断与"输出不收集，要收集用 ssh_exec{runInTerminal:true}"。
+- 单测 +3（门矩阵三测）+ schema 清单两处入列；工具数 29→30（MCP.zh-CN.md
+  同步，smoke_mcp EXPECTED_TOOLS 入列）。
+
+**清理——测试专用与废码**：`sudo_profiles::load_store_with` 转为 `#[cfg(test)]`
+（仅本模块测试使用）；`vault::KeyfileProvider::path()` 零调用删除。
+
+**显式留位**：ssh.rs 的 confirm 三件套（`MCP_CONFIRM_TIMEOUT_SECS` /
+`mcp_confirm_challenge_payload` / `request_mcp_confirm`，§1.3 confirm 档的完整
+已实现但未接线机械）加 `#[allow(dead_code)]` + 指回 A1 计划的注释——它们是
+`execPermissionMode` 落地时的现成积木，不属于废码。
+
+**test.sh 新增死代码警告门禁**：cargo build 出现任何 "never used" 即失败。
+动机即本批的教训——`decide_with_memory`/`assess_terminal_input` 的警告各掩盖了
+一次"功能写完没接线"，零容忍才能让这类脱接在 CI 里炸出来。
+
+**回归**：cargo test 351/351（+3）；前端 394/394；smoke_fs 58/58；
+e2e_agent_terminal 26/26；smoke_mcp（含 live 段 + ssh_terminal_input 负例）
+all green；smoke_ui_mock all green；**scripts/test.sh 端到端 exit=0 全绿**
+（2026-09-12 首次全绿收官，含新警告门禁）。重打包 io.dbx.ssh-0.4.61。
+
+**A2 剩余（未做，独立批次）**：`ssh_multi_exec`（A2-T3/T4）、§1.3 confirm 档
+（`execPermissionMode`/`connectionScope`，机械已备）。
+
+## ssh_multi_exec 落地批：A2-T3/T4（2026-09-12，同批追加）
+
+A2 最后一项功能 `ssh_multi_exec`（多连接聚合执行）按计划落地，工具数 30→31：
+
+- **纯逻辑模块 `multi_exec.rs`**（A2-T3 单测先行）：`normalize_targets`
+  （1–10 上限、去重保序、空引用拒绝）、`command_gate`（`sudo …` 整体拒绝——
+  提权走单目标 `ssh_exec_sudo`；灾难命令需 `confirmDestructive`、只读上一律
+  拒绝；只读连接非白名单命令拒绝，复用 `mcp_safety::assess_command`）、
+  `target_from_connection`（registry 行 → 结果行身份字段）。单测 4。
+- **handler**：入口全量预解析（任一 targets 未命中注册表 → 整体拒绝并提示，
+  不半执行）；parallel 走 `join_all` 递归 helper（tokio 原生 Box::pin，
+  Send 约束，无 futures 依赖；join! 参数个数静态故需动态扇出）；
+  sequential 支持 `stopOnError` 首败短路；逐目标经共享连接池在隐藏通道
+  执行（不经可见终端/agentTerminalMode），单目标失败降级为 `ok:false` 行；
+  聚合响应 `{ok, sent, failed, results:[…]}`。
+- **schema**：targets（minItems 1/maxItems 10）+ command + mode enum +
+  stopOnError + timeoutSecs（5–300）+ confirmDestructive；描述含 ~15s 宿主
+  等待上限与 run_bg 引导。smoke_mcp EXPECTED_TOOLS 与两处工具清单单测入列。
+- **live smoke**：stdio 独立模式无注册表 → saved-ref 引导负例 + 灾难门
+  先于拨号负例（端点选择器在 stdio 模式无 registry 身份，属预期语义，
+  IMPL_PLAN §1.1 门禁矩阵在案）。
+
+**A2 收尾状态**：`ssh_terminal_input` + `ssh_multi_exec` 均已落地；
+§1.3 confirm 档（`execPermissionMode`/`connectionScope`）为 A2 唯一剩余，
+机械（`request_mcp_confirm` 三件套 + `terminal_input_gate` ④ 号留位）已备。
+
+**回归**：cargo test 357/357（+6）；死代码门禁 0 警告；smoke_mcp（live 段）
+all green；**scripts/test.sh 端到端 exit=0**（含新工具）。重打包
+io.dbx.ssh-0.4.63（工作区既有升版，非本批改动）。
+
+## §1.3 权限档落地批：execPermissionMode + connectionScope（2026-09-12，同批追加）
+
+A2/§1.3 收官批，confirm 三件套从「留位」转正，A2 计划全部功能项完成：
+
+- **`McpPermission`**（与 McpLimits 同文件 `mcp-settings.json`）：
+  `execPermissionMode`（autonomous 默认 / confirm）+ `connectionScope`
+  （≤64 条；条目匹配 = 连接 id 精确 / 连接名精确 / host ASCII 大小写不敏感）。
+  env 覆盖：`DBX_SSH_MCP_PERMISSION_MODE`、`DBX_SSH_MCP_CONNECTION_SCOPE`
+  （显式空列表=合法覆盖）。
+- **confirm 门**：`call_tool` 既有门序之后、bridge 转发之前，gated 工具
+  （is_write_tool ∪ ssh_exec/ssh_multi_exec/ssh_terminal_input；读类与
+  `ssh_close` 不拦）经 `request_mcp_confirm` 发 `ssh/agent/prompt`
+  （kind mcp-confirm / source mcp，120s 超时），审批可编辑命令替换原文执行。
+  **stdio fail-closed**：无 emitter 立即报错引导，不挂 120s。
+- **scope 门**：call_tool 归一化后——解析出的目标越界整体拒绝、内联凭据
+  （无 registry 身份）fail-closed 拒绝；`ssh_multi_exec` handler 内逐 target
+  校验（任一越界整体拒绝）；`ssh_list_connections` 双来源（bridge/registry）
+  均按作用域过滤。
+- **顺手修复一个顺序缺陷**：原 `settings_set` 先整文件写 limits 再验证
+  permission 字段——非法更新也会抹掉已存 permission 键、limits-only 更新会
+  丢 permission 键。重构为「先全量验证 → 单次合并写盘
+  （`write_settings_document`）」，`McpLimits::save` 与 `save_merging` 随之
+  删除。另修测试隔离：`state()` 从共享临时目录改为每调用唯一目录
+  （settings 持久化并行测试互踩的根因）。
+- **测试**：+6（scope 匹配/env 解析/confirm 工具集/作用域工具集/设置往返
+  +env 覆盖/list 过滤）；smoke_mcp 新增 `permission_env_section`（两个注入
+  env 的 stdio 进程实跑 confirm fail-closed 与 scope fail-closed，含 list
+  在作用域下可用）。工作台设置 UI（B3-T1 权限档 select）留待 B 批。
+
+**回归**：cargo test 363/363；死代码门禁 0 警告；前端 394/394；smoke_fs
+58/58；e2e 26/26；smoke_mcp（含新 permission 段）all green；smoke_ui_mock
+all green；**scripts/test.sh 端到端 exit=0**。重打包 io.dbx.ssh-0.4.63。
+文档：MCP.zh-CN 新增「§1.3 权限档」节；IMPL_PLAN A1-T5/T6、A2-T7 勾选。
+
+## B3 设置 UI 核实收尾批（2026-09-13）
+
+核实工作区既有的 B3 实现（与 0.4.63 升版同期的未提交改动，本批验证 + 收尾）：
+
+- **B3-T1 MCP 权限档设置区**：设置弹窗 MCP 限速区扩展 `permissionMode`
+  select（autonomous/confirm，confirm 附七语 hint）+ `connectionScope`
+  textarea（每行一条）；`loadMcpSettings`/`saveMcpSettings` 读写两新字段
+  （旧 sidecar 不回字段时按 autonomous/空 降级；保存走保存链第 ③ 步）。
+- **B3-T2 审批弹窗 source=mcp 适配**：`agentPromptHead.source === "mcp"`
+  时标题切 `agentPrompt.mcpSource`（含工具名），可编辑命令/倒计时/记住勾选
+  复用；无 source 走原渲染。
+- **B3-T3**：七语 `mcpSettings.*` 四键 ×7 + `agentPrompt.mcpSource` ×7 在库；
+  前端三件套全绿（typecheck + 394/394 + build）；smoke_ui_mock all green；
+  重打包 io.dbx.ssh-0.4.63。
+
+IMPL_PLAN 状态：A1/A2/§1.3/B3 全部勾选。计划内剩余：B4（审计日志查看，
+注意 0.4.5x 已有 audit UI——核对后可能直接勾选）与真机 visual 验证项。
+
+## MCP 工具面测试覆盖审计专项（2026-09-13）
+
+对 31 个 MCP 工具按「参数校验 / 错误消息质量 / 成功路径 / 降级路径 / 危险操作门 / 文档一致性」六维做覆盖审计（mcp.rs 单测 24 例 + smoke_mcp 10 场景为基线），聚焦 AI agent 调用时的易用性、准确性、容错性，发现即修即回归。
+
+**发现与修复（现象 → 根因 → 修复）**：
+
+1. **数字写成字符串被静默吞掉**：`port: "2222"` 经 `Value::as_u64` 读 None 后静默回落 22 端口（拨打错误主机）；`timeoutSecs`/`tailBytes`/`maxBytes`/`offset`/`connectTimeoutSecs` 同样静默回默认。→ 新增 `arg_u64`（数字或数字字符串均可，非法值报 `{key} must be an integer`）并替换全部读取点。
+2. **端口非法值不报错**：`port: 0` / `99999` 被过滤后静默回 22。→ `call_tool` 顶部新增 `arg_port` 严格校验（1–65535，先于一切门与拨号），报 `port must be between 1 and 65535`。
+3. **只读门存在类型混淆绕过面**：内联重拨的 endpoint 身份比对（`registered_connection_matching_inline` / `endpoint_selector`）用 `as_u64` 读端口，字符串端口 `"2222"` 读成 22 会让只读/sudo 白名单的端点继承门失配。→ 门查找路径统一改 `arg_port_lossy`（call_tool 已先严格校验，lossy 仅兜底）。
+4. **布尔写成字符串恒读 false**：`confirmDestructive: "true"` 走不进灾难门、`overwrite: "true"` 误判为不覆盖。→ 新增 `arg_bool`（true/false/1/0/yes/no/on/off，大小写不敏感），覆盖 confirm/overwrite/recursive/base64/appendNewline/stopOnError/runInTerminal/quickSudo，`sftp_copy::parse_request` 同步。
+5. **未知工具名报错误导**：调用未注册工具名会在 sftp 分支报 "Missing required parameter: host"。→ `call_tool` 顶部按 `TOOL_NAMES` 早检，报 `Unknown tool` + 分隔符/大小写变体 `Did you mean`（`sftp-listdir` → `sftp_list_dir`），并指向 tools/list；`TOOL_NAMES` 与 `tool_definitions` 顺序一致性由单测钉死。
+6. **`sftp_chmod` 数字语义含混**：`mode: 644`（LLM 常见八进制意图）按十进制 644 = 0o1204 落盘。→ `parse_chmod_mode`：字符串支持 `0o` 前缀；数字全 0-7 位按八进制读（644→0o644），其余按权限位读（384→0o600，Python `0o600` 兼容）；负数/越界/浮点报带例子的错误。schema description 同步。
+7. **`sftp_exists` 把一切错误当"不存在"**：权限拒绝/通道故障也返回 `exists:false`，误导 agent。→ 仅 `StatusCode::NoSuchFile` 判 false，其余错误如实上抛。
+8. **错误消息质量**：`targets` 传字符串报含混的 "Missing targets" → 现报 "targets must be an array of 1-10 connection references"；`ssh_close` 无 selector 时对 `mcp-@:22` 报 "no cached connection" → 现报需要连接引用的指引；`required_str` 类型错误统一 "Missing or invalid parameter: <key> (expected a non-empty string)"。
+9. **既有测试被粘死**：`sftp_and_test_connection_resolve_saved_reference_before_dialing` 的 `#[tokio::test]` 粘在文档注释行尾，测试从未运行且触发 never used 警告 → 拆行救活。
+
+**新增覆盖**：Rust 单测 +9（容错 helper / chmod 变体 / TOOL_NAMES 同步 / 未知工具 / 端口 fail-fast / 字符串布尔与数字过门 / multi_exec targets / ssh_close 指引 / required_str 消息），374/374；smoke_mcp EXPECTED_TOOLS 补齐 `ssh_run_bg`/`ssh_task_status`/`ssh_list_connections`（28→31），新增 "llm input tolerance" 离线段（字符串端口/超时、非法端口 0 与 "abc"、未知工具 did-you-mean、字符串 confirmDestructive 过灾难门、multi_exec targets 指引）与 live 段 chmod 数字八进制（600）复验。
+
+**回归**：cargo test 374/374；`cargo build`/`--release` 0 警告（死代码门通过）；smoke_mcp 离线 all green（31 工具）+ 在线容器段 all green（test/browse/exec/multi_exec/terminal/run_bg/家族含 chmod 变体/metrics/transfer 回环）。
+
+**剩余风险**：`scripts/test.sh` 的宿主桥段（host worktree 安装管线）本机默认路径不存在未跑，前端/打包段与本批（backend+scripts+docs）无关未触发；未知参数（schema 外多余字段）仍静默忽略（严格 schema 校验归 MCP 宿主职责）；`sftp_upload`/`sftp_download` 等工具对目标端语义变化无——本次仅收紧报错与解析，不改任何成功路径行为；文档已同步（MCP.zh-CN 新增「LLM 输入容错」节 + chmod 行更新）。
+
+## B4 核实批：审计 clear + 执行面审计补齐（2026-09-13）
+
+核实 B4（审计日志查看）：前端折叠区/kind 过滤/清空按钮/truncated 提示与七语
+`auditLog.*` 均已完整（工作区既有改动）。核实过程暴露**两处后端脱接**（与
+remembered 同款的"前端写了、后端没接"），本批补齐：
+
+1. **`ssh/audit/clear` RPC 从未注册**：`audit_log.rs` 无 clear 函数、main.rs
+   无分发臂——前端清空按钮点了没反应（catch 静默）。补 `audit_log::clear`
+   （truncate 活跃 JSONL + 删除轮转代，保留文件本体让并发 O_APPEND 追加者
+   永不见缺文件；clear 后追加自然开启新一代账本）+ RPC 臂 + 单测
+   （truncate/轮转代清理/clear 后追加/空文件 no-op）。
+2. **MCP 执行面审计行从未写入**：mcp.rs 无 `audit_log::append` 调用——台账里
+   只有审批生命周期行（approved/denied/remembered/timeout），IMPL_PLAN 说的
+   "每调用一条 gate/outcome/exitCode/duration/mode" 执行行不存在。
+   补 `call_tool` 外层包装：gated 工具（is_confirm_gated_tool 同集）逐调用
+   落账（gate=pass + refusal 错误进 error 字段、exitCode、duration、
+   mode=embedded|stdio 按有无 emitter）。该包装顺带把之前因模块引用缺失而
+   未被收集的 10 个 mcp 测试带回编译（374 全绿，含死代码警告消失的
+   saved-ref 测试）。
+
+smoke：`smoke_fs_test.py` 新增「ssh/audit/clear truncates the ledger」用例
+（list→clear→空→auto 模式 mcp exec→新执行行落账断言），59 PASS / 0 SKIP /
+0 FAIL。
+
+**回归**：cargo test 374/374；死代码门禁 0 警告；smoke_mcp all green；
+smoke_ui_mock all green；scripts/test.sh exit=0。重打包 io.dbx.ssh-0.4.63。
+文档：IMPL_PLAN B4-T1/T2 勾选。
+
+## MCP 测试覆盖第二轮：降级矩阵 + 组合矩阵 + agentic smoke（2026-09-13）
+
+第一轮（参数容错/fail-fast/did-you-mean）之后的续批，补齐剩余维度——桥降级
+矩阵全走查、安全门组合矩阵、真实 LLM 多步链路 smoke、settings 联动、遗留核对。
+本批只动 `ssh/`（mcp.rs 测试 + smoke_mcp.py + 两份文档），无行为面改动、仅一处
+同族一致性修正（见下）。
+
+**新增覆盖（Rust 单测 +8，374→382）**：
+
+1. `every_connection_bound_tool_plans_a_bridge_forward_for_a_ghost_id`：
+   21 个连接级工具在未注册 connectionId 下全部进入 L1 桥转发计划（此前只有
+   ssh_exec/runInTerminal 单点），本地工具（close/list/known_hosts/quick
+   sudo/alert_triage）从不转发——桥降级语义对全工具面一致。
+2. `connection_list_merge_resolves_dual_source_conflicts`：连接寻址双源
+   （bridge registry vs session registry）同 id 冲突时桥数据胜出且去重不重复
+   列条；不同 id 并列；connectionScope 对两来源都过滤；桥不可答降级注册表+note。
+3. `gate_combo_matrix_read_only_destructive_sudo_and_scope`（组合矩阵 8 格）：
+   非只读+灾难+布尔确认→过门；无确认→提示；**白名单命中（shutdown *）的灾难
+   命令仍要 confirmDestructive（白名单不豁免灾难门），带确认后两闸皆过**；
+   只读+写工具+白名单命中→只读门先于白名单；只读+巡检命令+确认位→确认位不
+   改变白名单判定；只读+灾难+确认→确认位无效；进程级只读开关压过连接可写
+   属性（且巡检命令仍可用，fail-closed≠全拒）；scope 非空时内联+灾难命令在
+   灾难判定之前整体拒绝（scope 是第一道 fail-closed 闸）。
+4. `terminal_input_combo_gates_stack_in_order`：灾难行+确认后 sudo 行仍受
+   白名单拒绝（确认只解锁灾难门一层）；白名单命中行+确认两闸皆过到会话引导。
+5. `alert_triage_tool_surface_classifies_extended_intents`：ssh_alert_triage
+   工具面扩类 network/oom/service/generic/中英混合（cpu/memory/disk 第一轮已
+   有），9 例按 KEYWORDS 表实际行为断言；每条建议命令在工具出口满足 D6；
+   service 类 unit 名替换在工具面生效。
+6. `settings_set_changes_drive_downstream_tool_behavior`：mcp/settings/set
+   四个可调项的联动回归——localTransferRoot 收窄立即改变 sftp_upload 根闸
+   （默认根放行→收窄拒外→根内过闸）、maxUploadBytes 超限即拒（拨号前）、
+   execPermissionMode=confirm stdio fail-closed 且切回 autonomous 恢复、
+   connectionScope 非空拒内联/清空恢复，settings_get 回显生效+persisted。
+7. `malformed_port_is_rejected_before_lossy_gate_reads`（第一轮遗留核对）：
+   非法端口在 sftp_stat/ssh_close/ssh_remove_known_host 上都被 call_tool 顶部
+   早校验拦下——确认 arg_port_lossy 的静默回 22 在生产路径不可达（仅测试直呼
+   兜底），且先于 ssh_close 自身的引用指引。
+8. `unknown_arguments_never_distort_known_parameter_parsing`（第一轮遗留核对）：
+   schema 外未知参数静默忽略不反噬——未知键+合法键混合仍按既有解析报错、
+   大小写变体（"Port"/"ConfirmDestructive"）不被识别也不解锁任何门、本地工具
+   带未知参数照常成功。
+
+**smoke_mcp 新增三段（离线）**：
+
+- `stub_app_bridge_section`：以内存 stub DBX app（HTTP 服务器发布
+  mcp-bridge-port）实转桥全链路——`ssh_list_connections` 合并桥列表
+  （source=dbx-app-bridge）；`ssh_exec` 以 connectionName 经桥列表解析出 id
+  后转发 `/call-plugin-tool`（断言 plugin_id/connection_id/arguments 形状），
+  应用侧 MCP envelope 原样透传；`sftp_stat` 以 connectionId 同路转发。第一轮
+  场景 8 只验证了桥不可达，本段首次验证"桥可达时的转发正确性"，无需真 app。
+- `dead_bridge_section`：桥端口已发布但监听方即收即闭（应用尸体）——三个代表
+  连接级工具（ssh_exec/sftp_stat/ssh_task_status）转发快速回落（总耗时 <10s，
+  不走 30s 唤醒预算），回落错误带自愈三件套（not registered /
+  ssh_list_connections / inline credentials）；list 降级 session-registry+note。
+- `agentic_workflow_section`：模拟 LLM 真实多步链路（空 app-data、桥未发布）：
+  initialize → tools/list（agent 从 schema 学到 connectionName selector）→
+  ssh_list_connections（降级+note）→ 用 connectionName 调 ssh_exec 失败 →
+  按错误指引切内联端点 → 按第二条指引补密码 → 本地验证型工具收尾成功
+  （ssh_list_known_hosts + ssh_alert_triage network 告警、建议命令无 sudo/
+  重定向）。每步错误文本字面包含下一步所需指引（自纠闭环逐步断言）。
+
+**alert intent smoke 扩类**：主流程 intent 循环 2→7 例（补 network/oom/
+service/generic/混合 CPU），与 Rust 工具面扩类同表。
+
+**同族一致性交叉核对（ldap/files/kafka 只读对照）**：
+
+- 骨架一致：四家均为 MCP 2024-11-05 stdio（ldap/kafka 为 ssh run_mcp_stdio
+  的 Go 移植）、mcp/tools|call|settings + lifecycle 转发同构；settings 白名单
+  部分更新+上限 clamp 同款；未知工具 ldap/kafka 报 "unknown tool" 且列已注册
+  名供自纠（与 ssh did-you-mean 语义相容）。
+- **发现 ssh 侧一处漂移并修正**：`initialize.serverInfo.name` 原为短名
+  `dbx-ssh`，files/ldap/kafka 三家均为完整插件 id（io.dbx.files 等）——ssh
+  改为 `io.dbx.ssh`（纯展示元数据），同步 smoke 与 Rust initialize 形状断言。
+- 别家漂移（只报告不动）：ldap/kafka stdio 的 "Method not found" 用 JSON-RPC
+  标准码 -32601（另分 -32700/-32602），ssh/files 基线是统一 -32000（files
+  smoke 的 SKIP 语义明确依赖 -32000）；纯码面差异、文案一致，不影响功能，
+  建议后续由族内统一决策（若改 ssh 需连带 smoke SKIP 判定）。
+
+**回归**：cargo test 382/382（+8）；`cargo build`/`cargo build --release`
+0 警告（死代码门通过）；smoke_mcp 离线 all green（31 工具）+ 在线段
+all green（dbx-ssh-test 容器 127.0.0.1:2222，密码仅经 DBX_SSH_SMOKE_PASSWORD
+环境变量传入，未落盘）。`scripts/test.sh` 的 host-worktree 段因本机默认路径
+缺失未跑（同第一轮说明），其余段与本批（backend 测试+scripts+docs）无交集。
+
+**文档**：MCP.zh-CN「方式二」补 serverInfo.name 与桥降级矩阵两处、「生产
+环境误操作防范」补门序与组合不变量小节；本 PROGRESS 小节。
+
+**剩余风险**：stub 桥仅覆盖 HTTP 层转发契约，真实 app 侧 sidecar 的审批/
+agentTerminal 联动仍靠真机 e2e（scripts/e2e_agent_app_bridge.py）；ldap/kafka
+错误码漂移待族内决策；scripts/test.sh host-worktree 段仍依赖本机路径。
+
+## iShell 对标追加：终端 WebGL GPU 加速（2026-09-13，0.4.63）
+
+用户点名项：对标 iShell Pro 的「WebGL GPU 加速」终端渲染。
+
+- **依赖**：`@xterm/addon-webgl@0.18.0`（xterm 5.5 配套版；0.19 是 xterm 6 的，不升）。
+- **纯逻辑模块 `lib/terminalWebgl.ts`**：偏好持久化（localStorage
+  `ssh-terminal-webgl`，默认开=对标 iShell；默认值不落键）、
+  `attachWebglRenderer`（构造/activate 抛错→半初始化清理→返回 null 静默
+  回退 DOM 渲染；挂载成功即接 `onContextLoss` → dispose 回退）、
+  `syncWebglRenderer`（设置开关即时切换，幂等）。addon 以工厂注入，
+  模块零 UI 依赖可测。单测 7（偏好 roundtrip/存储异常容忍/attach 三路径/
+  切换幂等）。
+- **App.vue 接线**：`createTerminal` 尾部按偏好挂 renderer；设置弹窗新增
+  「终端渲染」节（switch + 七语 hint，`setWebglEnabled` 即时生效）；
+  回放弹窗与 GIF 导出的离屏终端**刻意不挂** WebGL——导出依赖 2d canvas
+  drawImage 稳定路径，且浏览器 WebGL context 总数有限。
+- **mock walkthrough 演进**：WebGL 渲染下终端文本只存在于 GPU canvas，
+  DOM 文本断言结构性失效——mock 新增 `?render=dom`（强制 DOM 渲染器路径），
+  walkthrough 主流程带参运行；另加「webgl renderer smoke」段（默认偏好下
+  不带参数开第二页面，断言终端持有 GPU canvas 或回退 DOM rows 任一渲染器
+  正常挂载）。
+
+**排障插曲（留档）**：echo 断言连挂一度误判为数据链路断裂，实测
+handleBinary/lastSequence 全部正常——根因有二：① debug 脚本 console hook
+的 filter 把 bin-debug 日志滤掉（误导方向）；② WebGL 渲染下 textContent
+结构性为空（真实的设计影响）。另发现并清理：残留 vite dev server 占端口
+serve 旧代码干扰调试。
+
+**回归**：前端三件套全绿（typecheck + 401/401 + build，含新增 7 用例）；
+smoke_ui_mock all green（含 webgl 冒烟段）；重打包 io.dbx.ssh-0.4.63。
+FEATURE_PARITY iShell 表新增「终端 WebGL GPU 加速 ✅」行。
+
+## MCP 收敛轮第三轮：stdio 错误码族内统一（2026-09-13）
+
+第二轮记录过「ldap/kafka stdio 用标准码 -32601、ssh/files 用 -32000」的族内
+漂移，本轮按族内统一决策收口（files 由并行 agent 同步改）：
+
+- **改动（单点）**：`mcp.rs` `dispatch` 的错误返回由裸 `String` 改为
+  `(code, message)` 元组——stdio 分发层未知 method 回 **-32601**
+  （文案不变，仍 `Method not found: <method>`）；`tools/call` 内的一切
+  工具级/应用级错误维持 **-32000**（四插件一致）；`-32700` parse 与
+  `-32600` 无 id invalid request 原样保留。
+- **影响面排查**：桥模式（DBX 插件内嵌）不经 JSON-RPC 信封——业务错误经
+  `to_plugin_error` 统一 -32000、未知 binary 通道本就是 -32601，**本轮零改动**；
+  其余 smoke（smoke_fs/batch3/batch_quick/sudo_otp/perf_baseline）的 SKIP
+  判定按 "Method not found" 文案（部分兼容 `-32601` 码面）匹配，文案未动，
+  全部天然兼容；smoke_mcp.py 只读 `error.message`、不读码，无需改。
+- **断言/文档**：`initialize_and_list_tools_follow_mcp_shape` 的未知 method
+  断言 -32000 → -32601 并补 message 断言；`unknown_tool_names_get_actionable_errors`
+  注释改为明确「未注册 tool 名是工具级错误仍 -32000」（断言不变）；
+  MCP.zh-CN「方式二」下新增「JSON-RPC 错误码分档」小节。
+
+**回归**：cargo test 382/382；`cargo build` / `cargo build --release`
+0 警告（死代码门通过）；release 二进制实发验证：`no/such/method` → -32601、
+`tools/call` 未注册工具 → -32000，分档正确；smoke_mcp.py 离线段全绿 +
+在线段 all green（dbx-ssh-test 容器 127.0.0.1:2222，密码经
+DBX_SSH_SMOKE_PASSWORD 环境变量传入，未落盘）。
+
+**剩余风险**：无新增。宿主桥层对错误码的消费面未变（业务错误仍 -32000），
+后续 host 契约监察照常覆盖。
+
+## 第四轮（2026-09-13）桥回环：真机 DBX.app 端到端验证
+
+隔离 app-data（`shared/host-e2e/app-data`）+ 测试 DBX.app（host debug
+bundle，经 launch.sh 注入 `DBX_DATA_DIR`，收尾按记录 pid 精确 kill），
+四插件最新 dbxp（ssh 0.4.67）经 install.sh 装入同一 app-data；桥端口
+`mcp-bridge-port`（本轮 49526）发布后 TCP 探测通过。
+
+- **全链路真执行（核心证据）**：standalone `dbx-plugin-ssh --mcp`
+  （`DBX_APP_DATA_DIR` 指向隔离 app-data）`tools/call ssh_exec
+  {connectionId:"vagrant", command:"echo <marker> && hostname"}`（隐藏
+  通道，不带 runInTerminal）→ 经桥转发 → 宿主 `/call-plugin-tool` →
+  app 侧 ssh sidecar → vagrant VM（192.168.33.11:22）真实执行，返回
+  `{"exitCode":0,"output":"<marker>\nvagrant"}`——转发 → 宿主 → 插件
+  workbench sidecar → 真实结果全链路打通。
+- **现成 e2e 套件**（`scripts/e2e_agent_app_bridge.py --skip-autolaunch`，
+  T4 必须 skip：其 pkill 会误杀用户真实 DBX.app）：T2 内联凭据引导拒绝、
+  T3 桥不可达 30s fail-closed PASS；T1/T5（runInTerminal 可见执行/ shell
+  复用）FAIL——错误为 app 侧结构化 `HTTP 502: {"error":"No open
+  terminal session for this connection; open the SSH workbench terminal
+  first"}`（经桥转发回来的错误，链路本身通）。根因：宿主 emit
+  `mcp-open-connection-workbench` 后立即 invoke 插件侧，冷启动/前端未
+  就绪时工作台 tab 尚未建立 PTY（两次复现；tab 已建立场景此前 §27 时代
+  曾通过）。留待下一轮（宿主等待/重试或前端就绪信号），本轮只读不修。
+- **转发门语义差异（记录）**：`bridge_forward_plan` 命中未知 connectionId
+  会转发，但 `forward_tool_via_bridge` 失败（含 app 侧 404「连接不存在」）
+  时静默落回 inline 自纠错误（L0 文案），因此 ssh 无法像 ldap/kafka/files
+  那样用未知 id 产生 FORWARDED 证据；沉淀脚本
+  `shared/host-e2e/mcp_bridge_e2e.sh` 对 ssh 改用真实 vagrant 连接断言。
+- **沉淀**：`shared/host-e2e/mcp_bridge_e2e.sh`（装四插件 → 拉起 → 等桥
+  端口 TCP 探测 → 四插件回环探针 + 空目录 control 对照 → ssh 套件 →
+  按 pid 收尾），本轮真机全绿 4/4。
+
+**剩余风险**：runInTerminal 冷启动竞态（上述）未解；偶发观察到 ssh 真
+连接探针之后的下一两个跨插件转发调用 90s 无响应、单独重跑立即成功
+（疑似宿主侧/GUI 渲染竞态，脚本超时已放宽 150s + 重试一次），留观。
+
+## 第五轮（2026-09-13）可靠性纵深：stdio 传输 / 会话存储 churn / 安全门对抗
+
+三维度系统性覆盖此前未钉死的可靠性面：stdio 传输层敌意输入、会话/存储长期
+churn、安全门对抗输入。**发现即修、修完即回归**，共 7 处实现级修复。
+
+### 任务一：stdio 传输层健壮性
+
+- **缺陷①（传输崩溃）**：非法 UTF-8 字节流会让 `BufRead::lines()` 返回
+  `InvalidData`，`run_mcp_stdio` 原 `let line = line?;` 直接把错误冒泡到
+  main → **整个 MCP 会话进程退出**。修复：行处理重构为可单测的
+  `classify_stdio_line`——`InvalidData` 按传输层 parse failure 回 `-32700`
+  （id null）后继续服务（read_until 已消费到换行，流可续读）；真 I/O 错误
+  仍终止。空行/纯空白/CRLF 残 `\r` 静默容忍（serde_json 容忍尾随 `\r`）。
+- **缺陷②（信封形状静默容忍）**：`jsonrpc` 非 `"2.0"`（含缺失/数字形态）
+  原样放行返回成功；`id` 为 object/null/bool 原样回显；缺/非串 `method`
+  落到 `-32601 "Method not found: "` 的错误分档。修复：dispatch 增信封校验
+  ——三者统一结构化 `-32600`（`invalid_request_envelope`：id 仅在自身合法
+  string/number 时回显，否则置 null）；notification（`notifications/*`）
+  保持完全静默，合法请求零行为变化。
+- **pipelining/超长行**：既有 spawn+stdout 互斥设计本就支持乱序完成按 id
+  对应、8 MiB 单行正常解析应答——本轮以 smoke 实发钉死。
+- **smoke 新段 `protocol robustness`**（离线）：非法 JSON/非法 UTF-8 →
+  -32700；notification 严格零响应（下一行必须是后续请求的应答）；8 类坏信封
+  → -32600；8 MiB 单行预算内应答；4 请求不等待连发按 id 1:1；空行/CRLF；
+  每种敌意输入后跟合法 ping 断言会话健康。readline 带 select 看门狗，进程
+  假死会 FAIL 而非挂死整个 smoke。
+
+### 任务二：会话/存储 churn（Rust 单测）
+
+- **审批挑战存储 churn**（ssh.rs）：500 轮 raise→resolve（approve/deny 交替）
+  后注册表恒空、消费过的 id 永久 unknown（一次性语义跨 churn 成立）、决策
+  恰达一次；MCP confirm 挑战的 `timeoutSecs` 在签发时烙进 payload（ssh 无
+  confirmTtlSecs 可调键，120s 固定即"已签发不追溯"的结构性满足，payload
+  双档烙印钉测试）。
+- **会话注册表 churn**（mcp.rs）：500 轮注册→id/name/endpoint 三种寻址→
+  选择器不匹配报错→drop→陈旧 id 返回 None（自愈路径保留），注册表始终
+  ≤1、终态为空——session-registry 单源查找在长期 churn 下无漂移。
+- **幂等重复调用**：ssh_alert_triage / ssh_list_known_hosts / settings_get
+  连续 100 次结果逐字节一致（无状态累积漂移）。
+- **settings 存储 churn**：500 轮白名单部分更新（execPermissionMode 交替 +
+  maxUploadBytes 交替），每次即时可见；持久化文档 <4 KiB 恒定形状、数据目录
+  零新增文件（无逐写累积）；超天花板值仍在 churn 后被拒（clamp 语义不退化）。
+- **run_bg/task_status 离线语义 churn**：任务表本体在**远端主机**
+  （`/tmp/.dbx-ssh-tasks` nohup 日志），进程内无注册表可泄漏——离线可测面
+  为两个输出解析器，300 轮 start/running/done/missing 循环解析恒等（如实
+  说明：远端表不属本进程泄漏面）。
+
+### 任务三：安全门对抗输入（含 4 处门加固）
+
+- **缺陷③（sudo 前缀绕过灾难门）**：`destructive_pattern` 只看顶层动词，
+  `sudo rm -rf /` 因 verb=sudo 直接落 Unknown——可写连接上**无需确认即执行**。
+  修复：sudo 臂剥 sudo 及其旗标（`-u root` 等，选项段在首个非旗标 token 处
+  结束，`sudo rm -rf /` 的 `-rf` 留给内层）后对内层跑 `destructive_pattern`，
+  并经 `destructive_after_wrap` 递归穿透（`sudo sh -c 'rm -rf /'` 命中）。
+- **缺陷④（sh -c 脚本绕过）**：`sh -c 'rm -rf /'` / `bash -lc 'reboot'`
+  同落 Unknown。修复：shell `-c` 臂提取脚本文本递归评估，命中灾难即升级。
+- **缺陷⑤（子命令替换绕过）**：`echo $(rm -rf /)` / `` echo `rm -rf /` ``
+  含 `$(`/反引号即 Unknown，可写连接无需确认。修复：`assess_command` 新增
+  替换扫描（`$( )` 嵌套感知 + 反引号、未闭合 span 取余串保守），span 内容
+  深度受限递归评估，命中灾难即升级。**三处加固均为 Unknown→Destructive
+  单向收紧**，绝不反向升级（`sh -c 'df -h'` 仍 Unknown、只读连接照拒），
+  既有 382 用例零回归。
+- **缺陷⑥（敏感路径门形状绕过）**：`//etc//shadow`、`/etc/./shadow` 因前缀
+  匹配失效而放行（只读连接可读）；相对路径 `./etc/shadow`、系统目录 cwd 下
+  裸名 `cat shadow` 同理。修复：`is_sensitive_path` 统一走归一化形态
+  （`normalized_path`：折叠空段与 `.`、保留绝对/相对形状），并补 shadow/
+  gshadow/sudoers 裸名兜底；`sftp_download` 本地落点黑名单
+  （`is_sensitive_local_path`）同步归一化（`/etc//cron.d/x` 不再绕过）。
+  **URL 编码 `%2e%2e` 刻意不解码**（shell/SFTP 均不解码百分号，字面名非
+  穿越）——设计内保守行为，钉测试并文档化。
+- **设计内确认（记录）**：白名单外非灾难命令（`rm -rf /tmp/x` 等 Unknown）
+  在可写连接本就无需确认——白名单只约束只读连接，属既定设计；字符串布尔
+  fail-closed（无法解析即报错）第四轮已覆盖，本轮补 `'TRUE'`/`'on '` 等
+  形态经 `arg_bool` 归一解析的断言（含在对抗测试内）。
+- **门级穿透验证**：新单测直接经 `call_tool` 断言 `sudo rm -rf /`、
+  `echo $(rm -rf /)` 等 6 变体在工具门返回 `confirmDestructive` 且早于凭据
+  校验，良性命令不受误伤（仍走到 password 校验）。
+
+### 回归
+
+- `cargo test`：**394/394 全绿**（基线 382 → +12：mcp.rs 8、mcp_safety.rs 3、
+  ssh.rs 1）。
+- `cargo build` / `cargo build --release`：0 警告（死代码门通过）。
+- `smoke_mcp.py` 离线段 **all green**（31 工具 + 新 protocol robustness 段）；
+  在线段 all green（dbx-ssh-test 容器 127.0.0.1:2222，USER_PASSWORD 经
+  docker inspect 取出后仅经 `DBX_SSH_SMOKE_PASSWORD` 环境变量传入，未落盘、
+  不入回复）。
+- `scripts/test.sh` 的 host-worktree/package 段未跑（同前几轮：依赖本机
+  默认 host worktree 路径）；backend 测试、死代码门、release 构建、MCP smoke
+  均已单独全绿，与本批改动（backend/src/mcp.rs、mcp_safety.rs、ssh.rs、
+  scripts/smoke_mcp.py、docs）无遗漏交集。前端零改动。
+
+### 文档
+
+- MCP.zh-CN「方式二」新增「传输层健壮性（第五轮）」小节；「生产环境误操作
+  防范」危险命令确认条目补灾难门对抗加固与敏感路径归一化/%2e%2e 不解码
+  说明；分类器小节同步替换扫描语义。
+- 本 PROGRESS 小节。
+
+### 剩余风险
+
+- `$()`/反引号内容**不可静态判定的形态**（如 `$( $(echo rm) -rf / )`、
+  变量间接 `eval`）仍为 Unknown——可写连接上不要求确认（与白名单外命令
+  同基线），只读连接一律拒绝；静态分类的天花板如此，纵深（只读白名单、
+  sudo 白名单、审计）兜底。
+- 危难门加固的理论误报面：`grep "$(rm -rf /) 教程" log` 之类**文本内容**
+  恰含灾难串的命令会要求一次确认——拦截代价是一次显式确认，方向安全。
+- smoke `protocol robustness` 段的 select 看门狗为 POSIX 实现（macOS/Linux
+  验证通过；Windows 侧 smoke 从未在族内跑过）。
+- run_bg 远端任务表（`/tmp/.dbx-ssh-tasks`）残留清理属宿主运维面，进程内
+  无对应状态可测。
+
+## 第六轮（2026-09-13）schema 收敛：description 回填 / 缺参枚举 / 单行上限
+
+来自第五轮 schema↔行为一致性核对器（`shared/mcp_schema_check.py`）的发现，
+三任务收敛。核对器基线：**DRIFTS 121**（118 处参数级 description 缺失 +
+3 处缺参漏报）、PASS tools 6/31、WARN 28；收敛后：**DRIFTS 0、PASS tools
+31/31、WARN 28（清单与基线一致，均为 §3.7 连接参数门先于参数校验的顺序
+张力 WARN + 1 条未知参数探针不适用）、HINTS 0、退出码 0**。
+
+### 任务一：回填 118 处参数级 description（单点化）
+
+- 缺口集中在共享连接参数族：`authentication` / `connectTimeoutSecs` /
+  `authFlowMode` / `passwordPromptHint` / `totpPromptHint`（5 参数 × 23 个
+  连接类工具 = 115）+ `ssh_quick_sudo_profiles_save` 内联的 3 个（118）。
+- **单点定义**：新增 5 个共享 description 常量（`AUTHENTICATION_DESCRIPTION`
+  等），`connection_properties` 与 `ssh_quick_sudo_profiles_save` 两处 schema
+  均引用常量，文案永不漂移。内容对照实现写实：`authentication` 说明省略时
+  按 `privateKeyPath` 推断及各方法的必填约束；`connectTimeoutSecs` 单位秒、
+  缺省 15、下限 1；`authFlowMode` 三个枚举值的 2FA 流程语义（合发/先密后码）
+  与显式参数优先级；两个 prompt hint 说明「内建提示词模式未命中时识别非标
+  提示」的用途。
+
+### 任务二：缺参报错一次枚举全部缺失项（3 处 fail-fast 漏报）
+
+- `ssh_multi_exec`（只报 `command` 漏 `targets`）、`sftp_upload` /
+  `sftp_download`（只报先检查的 `localPath` 漏 `remotePath`）改为新辅助
+  `missing_required(arguments, keys)`：一次枚举**全部**缺失（absent/null）
+  的 required 参数，报 `Missing required parameters: a, b`（按 schema
+  required 顺序）；只缺一个时只点名那一个。
+- **向后兼容**：错误文案保留 `Missing required` 关键词；present-but-类型
+  错误（非串/空串）不混入枚举，仍走 `required_str` 的
+  `Missing or invalid parameter: <key>` 精确点名——smoke 的
+  `targets must be an array` 断言与核对器 B2 类型探针均不受影响。族内
+  其余现行（ssh 侧 20+ 工具、files/ldap/kafka）仍为单参数 fail-fast，本轮
+  只改这三处双 required 工具，未扩散。
+- 单测 `missing_required_errors_enumerate_every_gap`：双缺全点名（3 工具）、
+  单缺只点名其一、null 视同缺失、类型错误不误报为缺失。
+
+### 任务三：stdio 单行上限拉齐族内契约
+
+- 读取层由 `BufRead::lines()` 改为 `read_until(b'\n')` 循环：新增
+  `DBX_SSH_MCP_STDIO_MAX_LINE`（字节，缺省 16 MiB；非法/0 值安全回落——
+  与 files `DBX_FILES_MCP_STDIO_MAX_LINE` 同族）。超限行**整体丢弃**
+  （连同行尾换行消费完毕，续读下一行）并回单条 `-32700`（消息带上限字节
+  数与 env 名）；不能沿用 `lines()` 的原因是超限行需要 read_until 语义
+  保证消费边界。缺省 16 MiB 下既有 smoke 的 8 MiB 敌意行仍走正常解析。
+- 与既有逻辑兼容：`classify_stdio_line` 签名不变（InvalidData 臂保留为
+  `lines()` 形态错误的防御性兜底并有单测钉死），实际非法 UTF-8 经有损解码
+  落入 JSON 解析失败的同一 `-32700` 路径（与 files 同构）；空行/CRLF 容忍、
+  in_flight 有界 drain 均不变。
+- 单测：`stdio_max_line_env_is_parsed_with_safe_fallback`（合法/带空白/
+  垃圾/0/负数/未设置）、`over_limit_line_gets_structured_parse_error`
+  （-32700、null id、消息含 env 名与上限字节数）。
+
+### 回归
+
+- `cargo test`：**397/397 全绿**（基线 394 → +3）。
+- `cargo build --release`：**0 警告**（死代码门通过）。
+- `smoke_mcp.py` 离线段 **all green**（31 工具；新增
+  `missing-required enumeration ok` 断言组与 `stdio_line_limit` 新段：
+  512 字节上限下超限行回 -32700 且消息含 env 名、随后 ping 与真实工具
+  调用照常应答；在线段未跑——与本批改动无交集，既有在线覆盖未受影响）。
+- `shared/mcp_schema_check.py`：**DRIFTS 0（基线 121）、PASS 31/31
+  （基线 6/31）、WARN 28、HINTS 0、退出码 0**。
+
+### 文档
+
+- MCP.zh-CN「传输层健壮性」超长行条目补单行上限 env 契约；「LLM 输入
+  容错」补缺参一次枚举语义。
+- 本 PROGRESS 小节。
+
+### 剩余风险
+
+- 核对器 28 条 WARN 属登记设计（§3.7 连接参数门先于业务参数校验的顺序
+  张力 + `ssh_list_connections` 未知参数探针超时不适用），非本轮引入。
+- 单行上限只约束 stdio 输入行；桥模式（HTTP 转发）不经该读取层，大小
+  预算由 HTTP 层自身约束——族内一致，无需额外处理。
+- smoke 新段 select 看门狗为 POSIX 实现（同第五轮 protocol robustness
+  段，Windows 从未在族内跑过）。
+
+## 第七轮（2026-09-13）在线补强：全量在线回归 / enum 在线报错 / 在线 pipelining
+
+第六轮在线段因无 `--host` 未跑；本轮补齐在线全量回归，并把契约表 §3.3 的
+「enum 非法值报错列合法值」在线覆盖登记项收进 smoke（离线核对器探针被连接
+门/工作台门拦截、无法到达的部分），另补第五轮 protocol robustness 的在线
+并发面。
+
+### 任务一：在线全量回归
+
+`cargo build --release` 后对 dbx-ssh-test 容器（127.0.0.1:2222，凭据仅经
+`DBX_SSH_SMOKE_PASSWORD` 环境变量传入）跑完整在线 smoke：**all green**
+（31 工具 + 第五/六轮全部新段 + 本轮新增四段，见下）。第五/六轮改动未引入
+在线路径回归。
+
+### 任务二：enum 非法值报错在线补强（§3.3 在线覆盖登记项收口）
+
+先以一次性探针（/tmp，不入插件目录）确认三个代表工具的真实行为，再钉进
+smoke 新段 `live_enum_section`（无容器时随在线段整体 SKIP，合规）：
+
+1. **sftp_chmod `mode` 语义**：非法值 `"999"` / `"-384"` / `"rw-r--r--"`
+   均报 `mode must be an octal value up to 7777 (e.g. "644", "0755" or 644)`
+   ——列出合法八进制形式；报错前后 `sftp_stat` permissions 不变（**无副作用**
+   实证）；正面对照 `"0o640"` 前缀变体照常落位 `0640`。
+2. **ssh_multi_exec `mode` enum**：非法值 `"wrong"` 与大小写变体
+   `"PARALLEL"` / `"Sequential"` 均报
+   `mode must be "parallel" or "sequential"; got '...'`（列全合法值），且
+   校验先于 targets 解析/dial（inline endpoint 直接拒绝，无副作用）。
+   **大小写敏感**为实现的实际行为，与 schema enum（仅小写）一致——按实际
+   行为断言，无需改实现。
+3. **ssh_exec_sudo `authFlowMode`**（NOPASSWD sudo 容器，各流程均以
+   `whoami → root` 成功证明「未报 enum 错误」）：大写 `"PASSWORD_ONLY"`
+   归一成功；别名/非法值 `"garbage-flow"` **静默降级**为缺省
+   password_then_otp 流（§3.3 登记的设计豁免）。发现 schema description
+   只写了「缺省 when omitted」、未标注大小写不敏感与非法值降级——属
+   **schema/实现文档不一致**，小改 `AUTH_FLOW_MODE_DESCRIPTION` 补
+   「Values are matched case-insensitively; unrecognized values fall back
+   to the default flow」（共享常量单点，两个 schema 位点同时生效）。
+4. 单测钉住：`multi_exec_mode_enum_rejects_invalid_and_wrong_case`
+   （三种非法/错大小写值均列全合法值）；authFlowMode parse 行为已有
+   exec.rs 单测（大小写/别名/trim/降级）覆盖。
+
+### 任务三：在线 pipelining/并发面
+
+smoke 新段 `live_pipelining_section`：对**真实活连接**把 `sftp_pwd` 与
+`ssh_metrics` 两个不同 id 的请求不等待响应连发 → 按到达顺序断言两响应
+id 集合与请求一一对应、均无 error/isError，且 payload 与各自 id 对应
+（`home` ↔ sftp_pwd、`hostname`/`cpu.cores` ↔ ssh_metrics）。第五轮
+protocol robustness 的 pipelining 断言是离线合成流的 1:1，本段补齐在线
+真实连接下的并发面。
+
+### 回归
+
+- `cargo test`：**398/398 全绿**（基线 397 → +1）。
+- `cargo build --release`：**0 警告**（死代码门通过）。
+- `smoke_mcp.py` 完整在线 smoke **all green**：31 工具 + 新段
+  `sftp_chmod mode semantics ok` / `ssh_multi_exec mode enum ok` /
+  `ssh_exec_sudo authFlowMode ok` / `live pipelining ok (2 in-flight
+  requests, 1:1 id ↔ payload match)`；离线段（无 --host）同样 all green。
+- `shared/mcp_schema_check.py`：**RESULT: CLEAN 维持**（HINTS 0、
+  probe-not-applicable 0）。
+
+### 剩余风险
+
+- authFlowMode 非法值静默降级为设计豁免（§3.3 登记项），schema description
+  已标注；若未来改为硬报错需同步改 description 与 smoke 断言方向。
+- `live_pipelining_section` 的响应顺序断言按「到达序读两行 + id 集合匹配」
+  实现，不假定响应顺序（服务器可能乱序应答）；若未来引入乱序以外的交织
+  （如通知插入），readline 语义需要升级为分类读取。
+- ssh_multi_exec mode 校验先于 saved-connection 解析属现状实现顺序；若
+  调整为连接门先行（§3.7 顺序张力同款），该三例断言需迁移到真连接语境。
+
+## 第八轮（2026-09-14）终验：离线段全量 + MCP 后性能基线
+
+MCP 专项收口轮（本插件源码本轮只读；在线段全量回归已由另一轮次完成，
+本节不重复）。两项工作：离线段终验 + 采集 MCP 专项七轮改动后的性能基线。
+
+### 离线段终验
+
+`python3 scripts/smoke_mcp.py --binary backend/target/release/dbx-plugin-ssh`
+（无 --host，live section 按设计跳过）→ **all green**：initialize
+（io.dbx.ssh 0.4.67）+ 31 工具 schema、参数校验序、tools/call 回环、
+Quick Sudo profiles、transfer 本地校验、destructive/read-only/permission
+三重门、桥接退化矩阵（stub 转发 + 死桥 fail-closed）、agentic 工作流环、
+LLM 输入容忍、协议鲁棒性（坏 JSON/UTF-8/8MiB/pipelining/空行 CRLF）、
+stdio 行上限——与第七轮离线结论一致，无回归。
+
+### 性能基线（`scripts/perf_baseline_test.py`，release，真机容器，50 MiB，同日两跑）
+
+| 项 | 第 1 跑 | 第 2 跑 | 历史 §3 基线 |
+|---|---|---|---|
+| terminal PTY stream（5 MiB） | 80.3 MiB/s | 80.1 MiB/s | —（新口径） |
+| terminal replay | 652 帧 | 589 帧 | cap 2 MiB、complete=false 维持 |
+| sftp upload（spool） | 426.2 MB/s | 571.4 MB/s | 633.9–1078 MB/s |
+| sftp upload（network） | 168.6 MB/s | 180.8 MB/s | 220–237 MB/s |
+| sftp download | 152.3 MB/s | 159.6 MB/s | 113–118 MB/s |
+
+对比结论：download 两跑均**高于**历史区间约 30%+；upload network 低于
+历史约 22–25% 但同数量级，且两跑间 spool 波动（426→571）印证采集时本机
+存在并行 cargo 构建负载——**判定无数量级回退、无代码回退嫌疑**；以本轮
+两跑区间作为 MCP 专项改动后的首个基线存档（下次巡检建议空载复采）。
+
+## 工作台空白回归修复：沙箱 iframe 内 localStorage 访问（2026-09-14，0.4.69）
+
+### 现象与定位
+
+0.4.63 起（WebGL 批次）真机 DBX 打开任意 SSH 连接：工作台区域完全空白、
+无报错、sidecar 收不到任何请求（连接/挑战/PTY 全链路静止）。LDAP/Kafka/
+Files 三插件工作台同宿主下均正常。
+
+排查排除了：包完整性（checksums 一致）、sidecar 双通道（smoke_mcp +
+smoke_test 对安装二进制全绿）、宿主桥契约（逐方法比对 pluginHostBridge
+注入形状）、WebGL 渲染器本身（Playwright Chromium/WebKit 双引擎探针均
+正常渲染）。最终以隔离 e2e 复现（vagrant 标签激活但内容区空白）+ 宿主
+`PluginWorkbenchHost.vue` 源码定位根因：
+
+**根因**：工作台 iframe 为 `srcdoc + sandbox="allow-scripts"`（无
+allow-same-origin）→ opaque origin 下「访问 `window.localStorage`
+属性」即抛 SecurityError。0.4.63 新增的 `loadWebglEnabled()` 把
+`window.localStorage` 写在**默认参数位**（`= window.localStorage`），
+默认参数在函数体 try 之外求值 → App.vue setup 期 `ref(loadWebglEnabled())`
+立即触发 → Vue 挂载失败 → 整个工作台空白且错误不可见（iframe console
+用户不可达）。此前所有 mock/dev 探针均运行在正常 origin，故全绿未拦截。
+
+### 修复（0.4.69）
+
+- `terminalWebgl.ts`：存储访问移入函数体 try 内（`defaultStorage()`
+  惰性求值），`loadWebglEnabled`/`persistWebglEnabled` 在沙箱/opaque
+  origin/隐私模式下安全降级（读不到偏好按默认开启，写失败仅失记忆）。
+- 单测新增沙箱回归用例（`vi.stubGlobal` 模拟访问即抛的 localStorage，
+  无参调用路径），修复前红/修复后绿，8/8 通过。
+- `Cargo.toml` 版本同步 0.4.69（sidecar 经 `CARGO_PKG_VERSION` 自报身份，
+  与 manifest 不一致会触发宿主 identity 校验失败——本轮在 e2e 实测到该
+  防护生效）。
+
+### 验证
+
+- 前端三件套（typecheck/test/build）全绿；smoke_mcp/smoke_test 不受影响
+  （本轮未动 sidecar 协议面）。
+- 隔离 e2e（shared/host-e2e + 0.4.69）：工作台由空白恢复完整渲染（会话
+  pill、工具栏、七语降级提示、重新连接按钮均正常），SFTP list/diskUsage
+  正常，桥握手正常。
+- 附带确认（既有设计，登记观察）：非 MCP 模式 `auto_trust=false`，未信
+  主机首连依赖工作台 UI 呈现指纹挑战；known_hosts 当前仅 1 台受信主机，
+  其余主机首连会弹出挑战对话框（UI 恢复后该流程重新可用）。

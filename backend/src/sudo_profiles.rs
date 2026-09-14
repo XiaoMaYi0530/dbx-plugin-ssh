@@ -79,6 +79,7 @@ pub fn load_store(data_dir: &Path) -> SudoProfileStore {
 /// Injection variant of `load_store` with an explicit DEK provider, used by
 /// tests (Keyfile + tempdir, never the OS keychain) and callers that already
 /// resolved a provider. Same v1→v2 migration behavior as `load_store`.
+#[cfg(test)]
 pub fn load_store_with(data_dir: &Path, provider: &dyn KeyProvider) -> SudoProfileStore {
     let text = std::fs::read_to_string(store_path(data_dir)).unwrap_or_default();
     let Ok(value) = serde_json::from_str::<Value>(&text) else {

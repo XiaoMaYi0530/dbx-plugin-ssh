@@ -350,6 +350,119 @@ fn parse_percent(value: &str) -> Option<f64> {
     value.trim_end_matches('%').parse::<f64>().ok()
 }
 
+// —— Process management (ssh/processes/list, ssh/processes/kill) ———
+
+/// Row cap for the full process list so the payload stays bounded.
+pub const PROCESS_LIST_LIMIT: usize = 500;
+/// Max chars kept of one process command line.
+const PROCESS_LIST_COMMAND_MAX_CHARS: usize = 200;
+
+/// Sorted by CPU (busiest first) and capped server-side; the frontend
+/// re-sorts client-side without refetching.
+const PROCESS_LIST_SCRIPT: &str = concat!(
+    "(ps -eo pid=,ppid=,user=,pcpu=,pmem=,etime=,state=,args= 2>/dev/null || true) ",
+    "| sort -k3,3nr | head -n 500"
+);
+
+/// One row of the full process list (same `ps` dialect as the top-process
+/// section, plus ppid/etime/state for the management panel).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessListRow {
+    pub pid: u64,
+    pub ppid: u64,
+    pub user: String,
+    pub cpu_percent: f64,
+    pub mem_percent: f64,
+    pub etime: String,
+    pub state: String,
+    pub command: String,
+}
+
+/// Collects the full process list over a new exec channel. Read-only.
+pub async fn collect_process_list(handle: &Handle<SshClient>) -> Result<serde_json::Value, String> {
+    let outcome =
+        exec_plain(handle, PROCESS_LIST_SCRIPT, std::time::Duration::from_secs(15), &[]).await?;
+    Ok(serde_json::json!({ "processes": parse_process_list(&outcome.output) }))
+}
+
+/// Parses the process-list `ps` output. Pure so it can be unit-tested
+/// without a server.
+pub fn parse_process_list(text: &str) -> Vec<ProcessListRow> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.trim().split_whitespace().collect();
+        // pid ppid user cpu% mem% etime state + at least one command token.
+        if fields.len() < 8 {
+            continue;
+        }
+        let Ok(pid) = fields[0].parse::<u64>() else {
+            continue;
+        };
+        let Ok(ppid) = fields[1].parse::<u64>() else {
+            continue;
+        };
+        let Some(cpu_percent) = parse_percent(fields[3]) else {
+            continue;
+        };
+        let Some(mem_percent) = parse_percent(fields[4]) else {
+            continue;
+        };
+        rows.push(ProcessListRow {
+            pid,
+            ppid,
+            user: fields[2].to_string(),
+            cpu_percent,
+            mem_percent,
+            etime: fields[5].to_string(),
+            state: fields[6].to_string(),
+            command: truncate_chars(&fields[7..].join(" "), PROCESS_LIST_COMMAND_MAX_CHARS),
+        });
+        if rows.len() >= PROCESS_LIST_LIMIT {
+            break;
+        }
+    }
+    rows
+}
+
+/// Validates a kill request and renders the remote command. Pid 0/1 are
+/// refused outright (init / the process group escape hatch); only a small
+/// safe signal set is accepted.
+pub fn kill_command(pid: u64, signal: u32) -> Result<String, String> {
+    if pid <= 1 {
+        return Err(format!(
+            "Refusing to signal pid {pid}: init and pid 0 are protected"
+        ));
+    }
+    let name = match signal {
+        1 => "HUP",
+        2 => "INT",
+        9 => "KILL",
+        15 => "TERM",
+        _ => return Err(format!("Unsupported signal {signal}; use 1, 2, 9 or 15")),
+    };
+    Ok(format!("kill -{name} {pid}"))
+}
+
+/// Sends one signal to a remote process. Executed through the same
+/// plugin-internal exec path as the metrics collector.
+pub async fn kill_process(
+    handle: &Handle<SshClient>,
+    pid: u64,
+    signal: u32,
+) -> Result<(), String> {
+    let command = kill_command(pid, signal)?;
+    let outcome =
+        exec_plain(handle, &command, std::time::Duration::from_secs(10), &[]).await?;
+    if outcome.exit_code != 0 {
+        return Err(format!(
+            "kill failed (exit {}): {}",
+            outcome.exit_code, outcome.output
+        ));
+    }
+    Ok(())
+}
+
 /// Parses the `df -iP` inode section into `(mount, usePercent)` rows.
 /// Dialects differ in where the percent column sits (GNU prints `IUse%`
 /// fourth, busybox third), so the last `%`-suffixed token before the mount
@@ -721,5 +834,54 @@ eth0: 100    1 0 0 0 0 0 0 50 1 0 0 0 0 0 0
         let empty_section = parse_metrics_output("--os--\n");
         assert!(empty_section.get("osId").is_none());
         assert!(empty_section.get("osPretty").is_none());
+    }
+
+    // —— Process management ——————————————————————————
+
+    const PROCESS_LIST_FIXTURE: &str = "\
+  1234 1200 root        12.5  4.2 10-03:12:05 S /usr/sbin/nginx -c /etc/nginx/nginx.conf
+   567    1 alice        8.0  1.1 5-01:00:00 R /usr/bin/python3 /opt/app/server.py
+     9    1 postgres     2.3 12.8 30-12:00:00 S postgres: writer process
+bad line here
+";
+
+    #[test]
+    fn parses_full_process_list_rows() {
+        let rows = parse_process_list(PROCESS_LIST_FIXTURE);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].pid, 1234);
+        assert_eq!(rows[0].ppid, 1200);
+        assert_eq!(rows[0].user, "root");
+        assert_eq!(rows[0].cpu_percent, 12.5);
+        assert_eq!(rows[0].mem_percent, 4.2);
+        assert_eq!(rows[0].etime, "10-03:12:05");
+        assert_eq!(rows[0].state, "S");
+        assert_eq!(rows[0].command, "/usr/sbin/nginx -c /etc/nginx/nginx.conf");
+        assert_eq!(rows[2].command, "postgres: writer process");
+        // Malformed lines are skipped (bad pid, too few columns).
+        assert!(parse_process_list("not-a-pid 1 u 1.0 1.0 1-00:00:00 R cmd\n").is_empty());
+        assert!(parse_process_list("").is_empty());
+    }
+
+    #[test]
+    fn process_list_rows_serialize_camel_case() {
+        let value = serde_json::to_value(&parse_process_list(PROCESS_LIST_FIXTURE)[0]).unwrap();
+        assert_eq!(value["pid"], 1234);
+        assert_eq!(value["ppid"], 1200);
+        assert_eq!(value["cpuPercent"], 12.5);
+        assert_eq!(value["memPercent"], 4.2);
+        assert_eq!(value["command"], "/usr/sbin/nginx -c /etc/nginx/nginx.conf");
+    }
+
+    #[test]
+    fn kill_requests_are_validated_and_rendered() {
+        assert_eq!(kill_command(1234, 15).unwrap(), "kill -TERM 1234");
+        assert_eq!(kill_command(1234, 9).unwrap(), "kill -KILL 1234");
+        assert_eq!(kill_command(42, 1).unwrap(), "kill -HUP 42");
+        assert_eq!(kill_command(42, 2).unwrap(), "kill -INT 42");
+        // init / pid 0 and unsupported signals are refused.
+        assert!(kill_command(1, 15).is_err());
+        assert!(kill_command(0, 9).is_err());
+        assert!(kill_command(1234, 19).is_err());
     }
 }

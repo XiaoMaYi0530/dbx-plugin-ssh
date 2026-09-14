@@ -2,10 +2,17 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
+  Activity,
   Archive,
+  Circle,
+  Disc,
+  Film,
+  Pause,
+  Play,
   ArrowDown,
   ArrowLeftRight,
   ArrowUp,
@@ -126,6 +133,10 @@ import {
   type HighlightRuleView,
 } from "./lib/keywordHighlight";
 import { pushSample, sparklinePath, METRICS_SAMPLE_CAPACITY } from "./lib/metricsSparkline";
+import { transferPausable, matchResumableUpload, canResumeUpload, type ResumableUploadTask } from "./lib/transferResume";
+import { buildTimeline, eventIndexAtTime, gifFramePlan, mergeEventPages, replayDuration, type RecordingSummary, type ReplayEvent, type ReplayEventPage } from "./lib/replayScheduler";
+import { encodeGif } from "./lib/gifEncoder";
+import { canKillProcess, sortProcessRows, type ProcessSortKey } from "./lib/processActions";
 import { distroBadge, type DistroBadge } from "./lib/distroBadge";
 import { auditKindLabel, auditKindOptions, auditOutcomeLabel, sanitizeAuditEntries, type AuditEntry } from "./lib/auditLog";
 import { resolveSftpPaneOpen, sanitizeSftpPaneDefaultOpen, type SshWorkbenchPaneOrder } from "./lib/workbenchLayout";
@@ -137,6 +148,7 @@ import { sanitizeSftpEntries } from "./lib/sftpEntries";
 import { resolveRemotePath } from "./lib/remotePathInput";
 import { shouldCommitRename } from "./lib/sftpRename";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
+import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRendererLike } from "./lib/terminalWebgl";
 import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from "./lib/terminalClickCursor";
 import { bridgeBinaryBytes } from "../../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
@@ -251,6 +263,8 @@ interface DownloadInfo {
   fileName: string;
   size: number;
   chunkSize: number;
+  // 断点续传：start 带 offset 时回显的恢复起点。
+  resumeOffset?: number;
 }
 
 interface ExecResult {
@@ -443,6 +457,14 @@ const directoryTrackingSupported = ref<boolean | undefined>();
 const visibleColumns = ref<SftpColumn[]>(["size", "modified"]);
 const sort = ref<{ column: SftpSortColumn; direction: "asc" | "desc" }>({ column: "name", direction: "asc" });
 const transferTasks = reactive<Record<string, TransferTask>>({});
+// 断点续传（F1）：暂停中的任务（两分片之间生效）；等待恢复的回调登记表。
+const pausedTaskIds = reactive(new Set<string>());
+const pauseWaiters = new Map<string, Array<() => void>>();
+// 后端扫描出的可续传上传任务（spool 前缀仍在磁盘上）。
+const resumableTasks = ref<ResumableUploadTask[]>([]);
+const resumableLoading = ref(false);
+const resumeInput = ref<HTMLInputElement | null>(null);
+const resumeTargetTaskId = ref("");
 const transferPanelOpen = ref(false);
 // 传输历史（sftp/transfer/history，落盘+内存合并）：面板打开或活动任务清零时刷新；
 // 历史区仅无进行中任务时展示。后端未升级/读取失败仅提示加载失败（optional 特性降级）。
@@ -566,6 +588,31 @@ const connectionAuthMethod = ref("");
 // 宿主标准 read_only）。后端门禁为权威来源，前端据此禁用写操作。
 const connectionReadOnly = ref(false);
 const metricsOpen = ref(false);
+// F2：进程管理面板 + 排序键；F3：录制/回放状态。
+interface ProcessRow {
+  pid: number;
+  ppid: number;
+  user: string;
+  cpuPercent: number;
+  memPercent: number;
+  etime: string;
+  state: string;
+  command: string;
+}
+const processesOpen = ref(false);
+const processRows = ref<ProcessRow[]>([]);
+const processLoading = ref(false);
+const processSortKey = ref<ProcessSortKey>("cpu");
+const recordingActive = ref(false);
+const recordingsOpen = ref(false);
+const recordings = ref<RecordingSummary[]>([]);
+const recordingsLoading = ref(false);
+const replayState = ref<{ summary: RecordingSummary; events: ReplayEvent[] } | null>(null);
+const replayPlaying = ref(false);
+const replaySpeed = ref(1);
+const replayPlayheadMs = ref(0);
+const replayExporting = ref(false);
+const replayHost = ref<HTMLDivElement | null>(null);
 const metrics = ref<ServerMetrics>();
 const metricsLoading = ref(false);
 const metricsError = ref("");
@@ -639,6 +686,11 @@ const searchResultIndex = ref(0);
 const searchResultCount = ref(0);
 const pasteConfirm = ref<PasteConfirmation>();
 const terminalFontSize = ref(appearance.value.terminal.fontSize);
+// 终端 WebGL 渲染加速（对标 iShell GPU 加速）：localStorage 全局偏好，
+// 默认开；WebGL 不可用（headless/无 context）时静默回退 DOM 渲染。只有主
+// 终端挂 renderer——回放与 GIF 导出的离屏终端保持 2d canvas 路径。
+const webglEnabled = ref(loadWebglEnabled());
+const webglRenderer = ref<WebglRendererLike | null>(null);
 // True while attachSession sits inside its bounded backoff loop; turns the
 // status pill and overlay into the dedicated "reconnecting" phase.
 const reconnectPending = ref(false);
@@ -1058,8 +1110,19 @@ function createTerminal() {
   terminalHost.value.addEventListener("mouseup", terminalMouseUpHandler);
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value);
+  if (webglEnabled.value) {
+    webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon());
+  }
   if (highlightEnabled.value) attachHighlightRender();
   scheduleFit();
+}
+
+// 设置开关即时生效：开=挂 renderer（失败静默回退 DOM），关=dispose。
+function setWebglEnabled(next: boolean) {
+  webglEnabled.value = next;
+  persistWebglEnabled(next);
+  if (!terminal) return;
+  webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon());
 }
 
 function handleTerminalKey(event: KeyboardEvent) {
@@ -2082,7 +2145,10 @@ function sanitizeTransferHistoryTasks(raw: unknown): TransferHistoryEntry[] {
 
 // 打开传输面板或最后一个活动任务结束（进行中清零）时拉取历史：历史区仅在无进行中任务时展示。
 watch(transferPanelOpen, (open) => {
-  if (open) void refreshTransferHistory();
+  if (open) {
+    void refreshTransferHistory();
+    void refreshResumableUploads();
+  }
 });
 watch(activeTransfers, (count, previous) => {
   if (count === 0 && previous > 0 && transferPanelOpen.value) void refreshTransferHistory();
@@ -2481,7 +2547,8 @@ watch(compiledHighlightRules, () => {
 // ---------------------------------------------------------------------------
 
 // 每方向环形采样（60 帧 × 5s 轮询 ≈ 5 分钟）；跨重连（新 session）清空。
-const metricSamples = reactive({ rx: [] as number[], tx: [] as number[] });
+// F2：cpu/mem 环形同样 60 帧，打开指标卡时用落盘历史回填（跨重启可见趋势）。
+const metricSamples = reactive({ rx: [] as number[], tx: [] as number[], cpu: [] as number[], mem: [] as number[] });
 
 function recordMetricSamples() {
   let rx = 0;
@@ -2492,10 +2559,16 @@ function recordMetricSamples() {
   }
   metricSamples.rx = pushSample(metricSamples.rx, rx, METRICS_SAMPLE_CAPACITY);
   metricSamples.tx = pushSample(metricSamples.tx, tx, METRICS_SAMPLE_CAPACITY);
+  const cpuPercent = metrics.value?.cpu?.percent;
+  if (cpuPercent != null) metricSamples.cpu = pushSample(metricSamples.cpu, cpuPercent, METRICS_SAMPLE_CAPACITY);
+  const totalBytes = metrics.value?.memory?.totalBytes ?? 0;
+  if (totalBytes > 0) metricSamples.mem = pushSample(metricSamples.mem, ((metrics.value?.memory?.usedBytes ?? 0) / totalBytes) * 100, METRICS_SAMPLE_CAPACITY);
 }
 
 const metricsRxSparkline = computed(() => sparklinePath(metricSamples.rx, 60, 18));
 const metricsTxSparkline = computed(() => sparklinePath(metricSamples.tx, 60, 18));
+const metricsCpuSparkline = computed(() => sparklinePath(metricSamples.cpu, 120, 18));
+const metricsMemSparkline = computed(() => sparklinePath(metricSamples.mem, 120, 18));
 // 旧 sidecar 无 osId/osPretty 时整体缺徽标（optional 降级，§6.6）。
 const metricsDistroBadge = computed<DistroBadge | null>(() => (metrics.value ? distroBadge(metrics.value.osId, metrics.value.osPretty) : null));
 
@@ -2503,6 +2576,10 @@ watch(() => session.value?.sessionId, (next, previous) => {
   if (next !== previous) {
     metricSamples.rx = [];
     metricSamples.tx = [];
+    metricSamples.cpu = [];
+    metricSamples.mem = [];
+    // 录制挂在具体 session 上：换会话后本端标记复位（后端随旧会话自动收尾）。
+    recordingActive.value = false;
   }
 });
 
@@ -3656,17 +3733,18 @@ async function uploadLocalFiles(files: readonly File[]) {
   if (files.length) showNotice(t("uploaded", { count: files.length }));
 }
 
-async function uploadSource(name: string, size: number, readChunk: (offset: number, length: number) => Promise<Uint8Array>) {
+async function uploadSource(name: string, size: number, readChunk: (offset: number, length: number) => Promise<Uint8Array>, resume?: { taskId: string; remotePath: string }) {
   if (!session.value) return;
-  const info = await window.dbxPlugin.invoke<{ taskId: string; chunkSize: number }>("sftp/upload/start", {
-    sessionId: session.value.sessionId,
-    remotePath: joinRemote(currentPath.value, name),
-    size,
-  });
-  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: name, size, transferred: 0, status: "queued" };
+  // resume 携带原 taskId/remotePath：后端校验 spool meta 后从已传前缀续接。
+  const info = await window.dbxPlugin.invoke<{ taskId: string; chunkSize: number; resumeOffset?: number }>("sftp/upload/start", resume
+    ? { sessionId: session.value.sessionId, remotePath: resume.remotePath, size, resumeTaskId: resume.taskId }
+    : { sessionId: session.value.sessionId, remotePath: joinRemote(currentPath.value, name), size });
+  const startOffset = info.resumeOffset ?? 0;
+  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: name, size, transferred: startOffset, status: startOffset > 0 ? "running" : "queued" };
   try {
-    let offset = 0;
+    let offset = startOffset;
     while (offset < size) {
+      await waitWhilePaused(info.taskId);
       const chunk = await readChunk(offset, info.chunkSize);
       if (!chunk.byteLength) throw new Error("Local file ended before its declared size");
       const payload = new Uint8Array(8 + chunk.byteLength);
@@ -3721,6 +3799,7 @@ async function downloadEntry(entry: SftpEntry) {
     target = fileTransfer ? await fileTransfer.beginSave({ name: info.fileName, size: info.size }) : undefined;
     let offset = 0;
     while (offset < info.size) {
+      await waitWhilePaused(info.taskId);
       const chunkPromise = waitForDownloadChunk(info.taskId, offset);
       const nextPromise = window.dbxPlugin.invoke<{ length: number; eof: boolean }>("sftp/download/next", { taskId: info.taskId, offset });
       // Cancellation interrupts via the chunk waiter; swallow the rejection of the
@@ -3800,7 +3879,71 @@ function waitForDownloadChunk(taskId: string, offset: number) {
   });
 }
 
+// —— 断点续传：暂停/恢复 + 可续传上传 ———
+
+// 分片循环在每个分片之间调用；暂停时挂起，恢复后继续。
+function waitWhilePaused(taskId: string): Promise<void> | undefined {
+  if (!pausedTaskIds.has(taskId)) return undefined;
+  return new Promise((resolve) => {
+    const waiters = pauseWaiters.get(taskId) ?? [];
+    waiters.push(resolve);
+    pauseWaiters.set(taskId, waiters);
+  });
+}
+
+function releasePause(taskId: string) {
+  if (pausedTaskIds.delete(taskId)) {
+    for (const waiter of pauseWaiters.get(taskId) ?? []) waiter();
+  }
+  pauseWaiters.delete(taskId);
+}
+
+function toggleTransferPause(task: TransferTask) {
+  if (!transferPausable(task.status)) return;
+  if (pausedTaskIds.has(task.taskId)) releasePause(task.taskId);
+  else pausedTaskIds.add(task.taskId);
+}
+
+async function refreshResumableUploads() {
+  resumableLoading.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ tasks: ResumableUploadTask[] }>("sftp/transfer/resumable", {});
+    resumableTasks.value = (result.tasks ?? []).filter(canResumeUpload);
+  } catch {
+    // 旧 sidecar 无该方法：静默降级为无可续传项（optional 降级）。
+    resumableTasks.value = [];
+  } finally {
+    resumableLoading.value = false;
+  }
+}
+
+function beginResumeUpload(task: ResumableUploadTask) {
+  resumeTargetTaskId.value = task.taskId;
+  resumeInput.value?.click();
+}
+
+async function onResumeFilePicked(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  const task = resumableTasks.value.find((item) => item.taskId === resumeTargetTaskId.value);
+  resumeTargetTaskId.value = "";
+  if (!file || !task) return;
+  if (!matchResumableUpload(task, [{ name: file.name, size: file.size }])) {
+    showError(new Error(t("resumableMismatch")));
+    return;
+  }
+  try {
+    await uploadSource(file.name, file.size, async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()), { taskId: task.taskId, remotePath: task.remotePath });
+    await loadDirectory();
+    showNotice(t("resumableResumed", { name: file.name }));
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
 async function cancelTransfer(task: TransferTask) {
+  releasePause(task.taskId);
   if (task.direction === "download") {
     // Reject the pending chunk waiter so the download loop exits immediately
     // instead of waiting for its 30s timeout; the backend cancel follows below.
@@ -4487,6 +4630,7 @@ function toggleMetrics() {
     return;
   }
   metricsOpen.value = true;
+  void backfillMetricsHistory();
   void refreshMetrics();
   window.clearInterval(metricsTimer);
   metricsTimer = window.setInterval(() => {
@@ -4513,6 +4657,285 @@ function networkRateShare(net: { rxRate: number; txRate: number }) {
 }
 
 const metricsProcGridStyle = { gridTemplateColumns: "52px 76px 52px 56px minmax(0, 1fr)" };
+const procGridStyle = { gridTemplateColumns: "52px 72px 52px 56px 84px minmax(0, 1fr) 132px" };
+
+// —— F2：指标历史回填 + 进程管理 ———
+
+// 打开指标卡时拉一次落盘历史（connectionId 维度，跨重启可见趋势）；
+// 旧 sidecar 无该方法时静默降级。
+async function backfillMetricsHistory() {
+  if (!session.value) return;
+  try {
+    const result = await window.dbxPlugin.invoke<{ samples: Array<{ cpuPercent?: number; memoryPercent?: number; rxRate?: number; txRate?: number }> }>("ssh/metrics/history", { sessionId: session.value.sessionId, limit: METRICS_SAMPLE_CAPACITY });
+    for (const sample of result.samples ?? []) {
+      if (sample.cpuPercent != null) metricSamples.cpu = pushSample(metricSamples.cpu, sample.cpuPercent, METRICS_SAMPLE_CAPACITY);
+      if (sample.memoryPercent != null) metricSamples.mem = pushSample(metricSamples.mem, sample.memoryPercent, METRICS_SAMPLE_CAPACITY);
+      metricSamples.rx = pushSample(metricSamples.rx, Math.max(0, sample.rxRate ?? 0), METRICS_SAMPLE_CAPACITY);
+      metricSamples.tx = pushSample(metricSamples.tx, Math.max(0, sample.txRate ?? 0), METRICS_SAMPLE_CAPACITY);
+    }
+  } catch {
+    // optional 降级：无历史则趋势从本次打开开始累计。
+  }
+}
+
+async function toggleProcessPanel() {
+  processesOpen.value = !processesOpen.value;
+  if (processesOpen.value) await refreshProcessList();
+}
+
+async function refreshProcessList() {
+  if (!session.value) return;
+  processLoading.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ processes: ProcessRow[] }>("ssh/processes/list", { sessionId: session.value.sessionId }, { timeoutMs: 20_000 });
+    processRows.value = result.processes ?? [];
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    processLoading.value = false;
+  }
+}
+
+const sortedProcessRows = computed(() => sortProcessRows(processRows.value, processSortKey.value));
+const PROCESS_VISIBLE_LIMIT = 100;
+const visibleProcessRows = computed(() => sortedProcessRows.value.slice(0, PROCESS_VISIBLE_LIMIT));
+
+async function killProcessRow(row: ProcessRow, signal: 15 | 9) {
+  if (!session.value || !canKillProcess(row.pid)) return;
+  const confirmKey = signal === 9 ? "procKillForceConfirm" : "procKillConfirm";
+  if (!window.confirm(t(confirmKey, { pid: row.pid, command: row.command }))) return;
+  try {
+    await window.dbxPlugin.invoke("ssh/processes/kill", { sessionId: session.value.sessionId, pid: row.pid, signal });
+    showNotice(t("procKilled", { pid: row.pid }));
+    await refreshProcessList();
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
+// —— F3：终端录制 + 回放（asciicast v2）———
+
+async function toggleRecording() {
+  if (!session.value) return;
+  try {
+    if (recordingActive.value) {
+      await window.dbxPlugin.invoke("ssh/recording/stop", { sessionId: session.value.sessionId });
+      recordingActive.value = false;
+      showNotice(t("recordingStopped"));
+      if (recordingsOpen.value) await loadRecordings();
+    } else {
+      await window.dbxPlugin.invoke("ssh/recording/start", { sessionId: session.value.sessionId });
+      recordingActive.value = true;
+      showNotice(t("recordingStarted"));
+    }
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
+async function loadRecordings() {
+  recordingsLoading.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ recordings: RecordingSummary[] }>("ssh/recording/list", {});
+    recordings.value = result.recordings ?? [];
+  } catch {
+    recordings.value = [];
+  } finally {
+    recordingsLoading.value = false;
+  }
+}
+
+function toggleRecordings() {
+  recordingsOpen.value = !recordingsOpen.value;
+  if (recordingsOpen.value) void loadRecordings();
+}
+
+async function deleteRecording(item: RecordingSummary) {
+  if (!window.confirm(t("recordingDeleteConfirm", { host: item.host || item.recordingId }))) return;
+  try {
+    await window.dbxPlugin.invoke("ssh/recording/delete", { recordingId: item.recordingId });
+    await loadRecordings();
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
+// 回放：事件一次性拉全（分页合并，封顶 2 万事件），rAF 按时间轴推进。
+const REPLAY_EVENT_CAP = 20000;
+let replayTerminal: Terminal | null = null;
+let replayTimeline: number[] = [];
+let replayWriteIndex = 0;
+let replayRaf = 0;
+let replayStartWall = 0;
+let replayStartPlayhead = 0;
+const replayDurationMs = computed(() => (replayState.value ? replayDuration(replayState.value.events) * 1000 : 0));
+
+async function loadReplayEvents(recordingId: string): Promise<ReplayEvent[]> {
+  const pages: ReplayEventPage[] = [];
+  let offset = 0;
+  for (;;) {
+    const page = await window.dbxPlugin.invoke<ReplayEventPage>("ssh/recording/get", { recordingId, offset, limit: 500 });
+    pages.push(page);
+    offset += page.events.length;
+    if (!page.hasMore || offset >= page.total || offset >= REPLAY_EVENT_CAP) break;
+  }
+  return mergeEventPages(pages);
+}
+
+async function openReplay(item: RecordingSummary) {
+  try {
+    const events = await loadReplayEvents(item.recordingId);
+    closeReplay();
+    replayState.value = { summary: item, events };
+    replayTimeline = buildTimeline(events, 1);
+    replayWriteIndex = 0;
+    replayPlayheadMs.value = 0;
+    replayPlaying.value = false;
+    await nextTick();
+    if (replayHost.value) {
+      replayTerminal = new Terminal({ cols: 100, rows: 26, convertEol: false });
+      replayTerminal.open(replayHost.value);
+    }
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
+function closeReplay() {
+  cancelAnimationFrame(replayRaf);
+  replayPlaying.value = false;
+  replayTerminal?.dispose();
+  replayTerminal = null;
+  replayState.value = null;
+}
+
+function stopReplayLoop() {
+  cancelAnimationFrame(replayRaf);
+  replayPlaying.value = false;
+}
+
+function replayFrame() {
+  const state = replayState.value;
+  if (!state || !replayPlaying.value) return;
+  const elapsed = (performance.now() - replayStartWall) * replaySpeed.value;
+  replayPlayheadMs.value = Math.min(replayDurationMs.value, replayStartPlayhead + elapsed);
+  const target = eventIndexAtTime(replayTimeline, replayPlayheadMs.value);
+  while (replayWriteIndex < target) {
+    replayTerminal?.write(state.events[replayWriteIndex]!.data);
+    replayWriteIndex += 1;
+  }
+  if (replayPlayheadMs.value >= replayDurationMs.value) {
+    stopReplayLoop();
+    return;
+  }
+  replayRaf = requestAnimationFrame(replayFrame);
+}
+
+function toggleReplayPlay() {
+  if (!replayState.value) return;
+  if (replayPlaying.value) {
+    stopReplayLoop();
+    return;
+  }
+  replayStartWall = performance.now();
+  replayStartPlayhead = replayPlayheadMs.value;
+  replayPlaying.value = true;
+  replayRaf = requestAnimationFrame(replayFrame);
+}
+
+function onReplaySeek(event: Event) {
+  const value = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(value) || !replayState.value) return;
+  cancelAnimationFrame(replayRaf);
+  replayPlaying.value = false;
+  replayPlayheadMs.value = value;
+  replayStartPlayhead = value;
+  replayStartWall = performance.now();
+  replayWriteIndex = eventIndexAtTime(replayTimeline, value);
+  replayTerminal?.reset();
+  for (let index = 0; index < replayWriteIndex; index += 1) {
+    replayTerminal?.write(replayState.value.events[index]!.data);
+  }
+}
+
+// GIF 导出：离屏 xterm 逐事件重放，按 500ms 事件时间抽帧（封顶 120 帧），
+// 每帧从 xterm 画布取像素 → encodeGif。纯前端，无新依赖。
+async function exportReplayGif() {
+  const state = replayState.value;
+  if (!state || replayExporting.value || !state.events.length) return;
+  replayExporting.value = true;
+  try {
+    const COLS = 80;
+    const ROWS = 24;
+    const FRAME_INTERVAL_MS = 500;
+    const MAX_FRAMES = 120;
+    const host = document.createElement("div");
+    host.style.cssText = "position:fixed;left:-99999px;top:0;";
+    document.body.appendChild(host);
+    try {
+      const term = new Terminal({ cols: COLS, rows: ROWS });
+      term.open(host);
+      const screen = host.querySelector("canvas") as HTMLCanvasElement | null;
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+      if (!screen || !context) throw new Error(t("replayExportGif"));
+      canvas.width = screen.width;
+      canvas.height = screen.height;
+      const timeline = buildTimeline(state.events, 1);
+      const plan = gifFramePlan(timeline, FRAME_INTERVAL_MS, MAX_FRAMES);
+      const frames: Array<{ rgba: Uint8Array; delayMs: number }> = [];
+      let written = 0;
+      for (const boundary of plan) {
+        while (written < boundary) {
+          term.write(state.events[written]!.data);
+          written += 1;
+        }
+        // 等 xterm 完成两帧渲染再取像素。
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        context.drawImage(screen, 0, 0);
+        frames.push({ rgba: new Uint8Array(context.getImageData(0, 0, canvas.width, canvas.height).data), delayMs: FRAME_INTERVAL_MS });
+      }
+      term.dispose();
+      const gif = encodeGif(canvas.width, canvas.height, frames);
+      const blob = new Blob([gif as unknown as BlobPart], { type: "image/gif" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${state.summary.recordingId || "session"}.gif`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      showNotice(t("replayExported"));
+    } finally {
+      host.remove();
+    }
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    replayExporting.value = false;
+  }
+}
+
+function formatDuration(secs: number) {
+  const total = Math.max(0, Math.round(secs));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
+}
+
+function formatRecordedAt(startedAt?: number) {
+  if (!startedAt) return "";
+  return new Date(startedAt * 1000).toLocaleString();
+}
+
+onBeforeUnmount(() => {
+  cancelAnimationFrame(replayRaf);
+  replayTerminal?.dispose();
+  replayTerminal = null;
+});
 
 async function refreshDiskUsage() {
   if (!session.value) return;
@@ -5489,6 +5912,8 @@ onBeforeUnmount(() => {
           </section>
         </div>
         <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
+        <button class="icon-button" :class="{ 'is-recording': recordingActive }" :title="t('recordingTitle')" :disabled="!connected" @click="toggleRecording"><Disc /></button>
+        <button class="icon-button" :class="{ 'is-active': recordingsOpen }" :title="t('recordingsTitle')" @click="toggleRecordings"><Film /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-neutral" :title="t('connectionInfo')" @click.stop="toggleConnectionInfo"><Info /></button>
           <section v-if="connectionInfoOpen" class="popover connection-info-popover" @click.stop>
@@ -5526,9 +5951,20 @@ onBeforeUnmount(() => {
               <div class="transfer-title"><FileUp v-if="task.direction === 'upload'" /><Download v-else /><span>{{ task.fileName || task.taskId }}</span><strong>{{ transferPercent(task) }}%</strong></div>
               <progress :value="transferPercent(task)" max="100" />
               <div class="transfer-meta"><span>{{ t(`transferStatus.${task.status}`) }}</span><span>{{ formatBytes(task.transferred) }} / {{ formatBytes(task.size) }}</span><span v-if="transferSpeeds[task.taskId]">{{ formatBytes(transferSpeeds[task.taskId]) }}/s</span></div>
+              <button v-if="transferPausable(task.status)" class="link-button" @click="toggleTransferPause(task)">{{ t(pausedTaskIds.has(task.taskId) ? "transferResume" : "transferPause") }}</button>
               <button v-if="task.status === 'queued' || task.status === 'running'" class="link-button" @click="cancelTransfer(task)">{{ t("cancel") }}</button>
               <p v-if="task.error" class="task-error">{{ task.error }}</p>
             </article>
+            <!-- 可续传上传：中断任务的 spool 前缀仍在，选同名同大小文件续传 -->
+            <template v-if="resumableTasks.length">
+              <h3 class="transfer-history-title">{{ t("resumableTitle") }}</h3>
+              <p class="muted resumable-hint">{{ t("resumableHint") }}</p>
+              <article v-for="task in resumableTasks" :key="task.taskId" class="transfer-card">
+                <div class="transfer-title"><FileUp /><span :title="task.remotePath">{{ task.fileName }}</span><strong>{{ formatBytes(task.resumableBytes) }} / {{ formatBytes(task.size) }}</strong></div>
+                <button class="link-button" @click="beginResumeUpload(task)">{{ t("resumableResume") }}</button>
+              </article>
+            </template>
+            <input ref="resumeInput" type="file" class="visually-hidden-input" @change="onResumeFilePicked" />
             <!-- 历史区：无进行中任务时展示（落盘历史跨重启可查，failed 显示原因） -->
             <template v-if="!activeTransfers">
               <h3 class="transfer-history-title">{{ t("transfersHistory.title") }}</h3>
@@ -5644,6 +6080,10 @@ onBeforeUnmount(() => {
                   <small v-if="metrics.kernel">{{ metrics.kernel }}</small>
                 </div>
               </div>
+              <div v-if="metricsCpuSparkline || metricsMemSparkline" class="metrics-disks metrics-trend">
+                <div class="disk-row"><span class="mono">{{ t("metricsCpu") }}</span><svg class="metrics-sparkline metrics-trend-line" width="120" height="18" viewBox="0 0 120 18" role="img" aria-label="cpu trend"><polyline :points="metricsCpuSparkline" fill="none" style="stroke: var(--primary)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg><span class="numeric">{{ Math.round(metricSamples.cpu.at(-1) ?? 0) }}%</span></div>
+                <div class="disk-row"><span class="mono">{{ t("metricsMemory") }}</span><svg class="metrics-sparkline metrics-trend-line" width="120" height="18" viewBox="0 0 120 18" role="img" aria-label="memory trend"><polyline :points="metricsMemSparkline" fill="none" style="stroke: var(--success)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg><span class="numeric">{{ Math.round(metricSamples.mem.at(-1) ?? 0) }}%</span></div>
+              </div>
               <div v-if="metrics.disks?.length" class="metrics-disks">
                 <div v-for="disk in metrics.disks" :key="disk.mount" class="disk-row">
                   <span class="mono">{{ disk.mount }}</span>
@@ -5673,7 +6113,7 @@ onBeforeUnmount(() => {
                 </div>
               </div>
               <div v-if="metrics.processes?.length">
-                <h3 class="settings-section-title">{{ t("metricsProc") }}</h3>
+                <h3 class="settings-section-title"><span>{{ t("metricsProc") }}</span><button class="link-button" @click="toggleProcessPanel">{{ t(processesOpen ? "procCollapse" : "procManage") }}</button></h3>
                 <div class="file-header" :style="metricsProcGridStyle">
                   <span>{{ t("metricsProcPid") }}</span>
                   <span>{{ t("metricsProcUser") }}</span>
@@ -5689,10 +6129,90 @@ onBeforeUnmount(() => {
                   <span class="mono" :title="proc.command">{{ proc.command }}</span>
                 </div>
               </div>
+              <div v-if="processesOpen" class="proc-manage">
+                <div class="command-history-header">
+                  <span>{{ t("procTitle", { count: processRows.length }) }}</span>
+                  <span class="batch-target-actions">
+                    <button class="link-button" @click="refreshProcessList">{{ t("refresh") }}</button>
+                  </span>
+                </div>
+                <div class="proc-sort-row">
+                  <label v-for="key in (['cpu', 'mem', 'pid'] as const)" :key="key" class="proc-sort-option">
+                    <input type="radio" name="procSort" :value="key" v-model="processSortKey" />{{ t(`procSort.${key}`) }}
+                  </label>
+                </div>
+                <div v-if="processLoading && !visibleProcessRows.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+                <div v-else-if="!visibleProcessRows.length" class="empty compact">{{ t("procEmpty") }}</div>
+                <template v-else>
+                  <div class="file-header" :style="procGridStyle">
+                    <span>{{ t("metricsProcPid") }}</span>
+                    <span>{{ t("metricsProcUser") }}</span>
+                    <span class="numeric">{{ t("metricsProcCpu") }}</span>
+                    <span class="numeric">{{ t("metricsProcMem") }}</span>
+                    <span>{{ t("procEtime") }}</span>
+                    <span>{{ t("metricsProcCommand") }}</span>
+                    <span></span>
+                  </div>
+                  <div v-for="proc in visibleProcessRows" :key="proc.pid" class="file-row" :style="procGridStyle">
+                    <span class="mono">{{ proc.pid }}</span>
+                    <span class="mono">{{ proc.user }}</span>
+                    <span class="numeric">{{ proc.cpuPercent }}%</span>
+                    <span class="numeric">{{ proc.memPercent }}%</span>
+                    <span class="mono">{{ proc.etime }}</span>
+                    <span class="mono" :title="proc.command">{{ proc.command }}</span>
+                    <span class="proc-kill-group">
+                      <button class="link-button" @click="killProcessRow(proc, 15)">{{ t("procKill") }}</button>
+                      <button class="link-button proc-kill-force" @click="killProcessRow(proc, 9)">{{ t("procKillForce") }}</button>
+                    </span>
+                  </div>
+                  <p v-if="sortedProcessRows.length > visibleProcessRows.length" class="muted metrics-hint">{{ t("procCapped", { shown: visibleProcessRows.length, total: sortedProcessRows.length }) }}</p>
+                </template>
+              </div>
               <p class="metrics-hint muted">{{ t("metricsRefreshHint") }}</p>
             </template>
           </div>
         </section>
+        <!-- 录制记录浮条：列出 .cast 录制，可回放/删除 -->
+        <section v-if="recordingsOpen" class="metrics-float recordings-float">
+          <header>
+            <h2>{{ t("recordingsTitle") }}</h2>
+            <button class="icon-button" @click="toggleRecordings"><X /></button>
+          </header>
+          <div class="metrics-float-body">
+            <div v-if="recordingsLoading && !recordings.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+            <div v-else-if="!recordings.length" class="empty compact">{{ t("recordingsEmpty") }}</div>
+            <article v-for="item in recordings" :key="item.recordingId" class="transfer-card">
+              <div class="transfer-title"><Disc /><span>{{ item.host || item.recordingId }}</span><strong>{{ formatDuration(item.durationSecs ?? 0) }}</strong></div>
+              <div class="transfer-meta"><span>{{ formatRecordedAt(item.startedAt) }}</span><span v-if="item.bytes">{{ formatBytes(item.bytes) }}</span></div>
+              <div class="recording-actions">
+                <button class="link-button" @click="openReplay(item)">{{ t("replayOpen") }}</button>
+                <button class="link-button recording-delete" @click="deleteRecording(item)">{{ t("recordingDelete") }}</button>
+              </div>
+            </article>
+          </div>
+        </section>
+        <!-- 回放弹窗：xterm 重放 + 倍速/进度/GIF 导出 -->
+        <div v-if="replayState" class="replay-overlay" @click.self="closeReplay">
+          <section class="replay-modal">
+            <header>
+              <h2>{{ t("replayTitle") }}<span class="metrics-host"> · {{ replayState.summary.host || replayState.summary.recordingId }}</span></h2>
+              <button class="icon-button" :title="t('replayClose')" @click="closeReplay"><X /></button>
+            </header>
+            <div ref="replayHost" class="replay-terminal"></div>
+            <div class="replay-controls">
+              <button class="icon-button" :title="t(replayPlaying ? 'replayPause' : 'replayPlay')" @click="toggleReplayPlay"><Pause v-if="replayPlaying" /><Play v-else /></button>
+              <select v-model.number="replaySpeed" class="replay-speed" :title="t('replaySpeed')">
+                <option :value="0.5">0.5×</option>
+                <option :value="1">1×</option>
+                <option :value="2">2×</option>
+                <option :value="4">4×</option>
+              </select>
+              <input class="replay-seek" type="range" min="0" :max="Math.max(1, replayDurationMs)" :value="replayPlayheadMs" step="100" @input="onReplaySeek" />
+              <span class="mono replay-time">{{ formatDuration(replayPlayheadMs / 1000) }} / {{ formatDuration(replayDurationMs / 1000) }}</span>
+              <button class="link-button" :disabled="replayExporting" @click="exportReplayGif">{{ replayExporting ? t("replayExporting") : t("replayExportGif") }}</button>
+            </div>
+          </section>
+        </div>
         <!-- 批量发送结果浮条：显示在命令条上方，可手动关闭。 -->
         <div v-if="connected && batchBarOpen && (batchSummary || batchError)" class="batch-bar-status" role="status">
           <template v-if="batchSummary">
@@ -6247,6 +6767,13 @@ onBeforeUnmount(() => {
               </select>
             </label>
             <p class="muted settings-note">{{ agentTerminalModeHint }}</p>
+
+            <h3 class="settings-section-title">{{ t("webglSection") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <button class="switch-control" type="button" role="switch" :aria-checked="webglEnabled" @click="setWebglEnabled(!webglEnabled)"><span /></button>
+              <span>{{ t("webglLabel") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("webglHint") }}</p>
             <div class="settings-remembered">
               <h4 class="settings-section-title">{{ t("settingsRemembered.section") }}</h4>
               <label class="settings-field"><span>{{ t("settingsRemembered.label") }}</span></label>
@@ -6649,4 +7176,25 @@ onBeforeUnmount(() => {
 .agent-prompt-command textarea { width: 100%; resize: vertical; border: 1px solid var(--border); border-radius: 5px; padding: 6px 8px; background: var(--background); color: var(--foreground); font-family: var(--terminal-font-family); font-size: 12px; }
 .agent-prompt-command textarea:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); outline: none; }
 .agent-prompt-countdown { padding-bottom: 10px; }
+/* —— 断点续传 / 进程管理 / 会话录制（F1-F3）—— */
+.is-recording { color: var(--destructive, #e5484d); }
+.recordings-float { width: 440px; }
+.recording-actions { display: flex; gap: 14px; }
+.recording-delete { color: var(--destructive, #e5484d); }
+.resumable-hint { margin: 2px 0 6px; font-size: 12px; }
+.metrics-trend .metrics-trend-line { width: 120px; height: 18px; }
+.proc-manage { margin-top: 10px; }
+.proc-manage .settings-section-title { display: flex; justify-content: space-between; align-items: center; }
+.proc-sort-row { display: flex; gap: 16px; margin: 6px 0; font-size: 12px; color: var(--muted-foreground); }
+.proc-sort-option { display: inline-flex; align-items: center; gap: 4px; }
+.proc-kill-group { display: flex; gap: 8px; justify-content: flex-end; }
+.proc-kill-force { color: var(--destructive, #e5484d); }
+.replay-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 90; display: flex; align-items: center; justify-content: center; }
+.replay-modal { background: var(--background); color: var(--foreground); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px 14px; width: min(920px, 92vw); display: flex; flex-direction: column; gap: 10px; }
+.replay-modal header h2 { margin: 0; font-size: 14px; }
+.replay-terminal { height: 420px; }
+.replay-controls { display: flex; align-items: center; gap: 10px; }
+.replay-seek { flex: 1; }
+.replay-speed { width: 76px; }
+.replay-time { min-width: 110px; text-align: right; font-size: 12px; color: var(--muted-foreground); }
 </style>

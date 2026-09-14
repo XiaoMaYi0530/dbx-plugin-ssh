@@ -140,10 +140,9 @@ pub fn parse_request(params: &Value) -> Result<CopyMoveRequest, String> {
         .filter(|value| !value.is_empty())
         .ok_or("Missing toDir")?;
     let to_dir = normalize_remote_path(to_dir)?;
-    let overwrite = params
-        .get("overwrite")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // Boolean tolerance lives with the MCP argument helpers: a string
+    // "true" must not silently read as overwrite=false.
+    let overwrite = crate::mcp::arg_bool(params, "overwrite")?.unwrap_or(false);
     Ok(CopyMoveRequest {
         from,
         to_dir,

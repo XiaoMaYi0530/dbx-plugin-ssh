@@ -366,12 +366,27 @@ def main() -> None:
                   f"{str(result.get('output')).strip()[:50]!r}")
 
         def case_03_off_forced_terminal_sudo():
-            error = call_tool_raw("sudo whoami", extra={"runInTerminal": True})
+            # 现行语义（7440ad9 起，见 agent_terminal::decide 文档）：off 下
+            # elevated 命令仅在显式 runInTerminal=true 时改为弹审批（Prompt），
+            # 未显式选择仍是硬拒绝（Deny）。两支都验：
+            # a) off + elevated、未显式选择 → 隐藏通道直跑（off 模式即静默
+            # 通道，elevated 不改路由；远端 sudo 无 tty 会失败但仍是正常结果），
+            # 响应不携带 mode 字段。
+            result = call_tool("sudo whoami")
+            if "mode" in result:
+                raise AssertionError(f"hidden-channel run leaks mode field: {result}")
+            print(f"    hidden channel ran sudo (no opt-in): "
+                  f"{str(result.get('output')).strip()[:60]!r} exit={result.get('exitCode')}")
+            # b) off + elevated + 显式 runInTerminal=true → 弹审批；拒绝后报
+            # denied（而不是无声运行或超时）。
+            agent_events.clear()
+            error = call_tool_raw("sudo whoami", extra={"runInTerminal": True},
+                                  on_event=deny_handler())
             if not isinstance(error, SidecarError):
-                raise AssertionError("off + forced terminal + sudo unexpectedly ran")
-            if "Agent terminal mode is off" not in str(error):
-                raise AssertionError(f"unexpected error: {str(error)[:160]}")
-            print(f"    denied: {str(error)[:100]}")
+                raise AssertionError("off + explicit opt-in + sudo unexpectedly ran")
+            if "denied" not in str(error):
+                raise AssertionError(f"unexpected explicit-deny error: {str(error)[:160]}")
+            print(f"    denied after explicit opt-in prompt: {str(error)[:80]}")
 
         def case_04_auto_low_notice():
             set_mode("auto")

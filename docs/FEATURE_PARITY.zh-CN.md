@@ -153,10 +153,26 @@ React 19 独立桌面 SSH 工作台）为参照的能力借鉴（实施计划
 | sshbool 能力 | 插件状态 | 说明 |
 | --- | --- | --- |
 | 本地凭据静态加密（SQLCipher 库 + Argon2id KEK + AES-256-GCM DEK 信封） | ✅ 已有（keyfile 默认档） | `quick-sudo-profiles.json` 升 v2：密钥字段 AES-256-GCM 信封（AAD 绑定字段+档案 id）、DEK 默认存同目录 0600 keyfile，OS keychain 仅显式选入（`DBX_SSH_VAULT_STORAGE=keychain`；macOS 每次更新都会重弹授权框，见 IMPL_PLAN D2a）、遗留 keychain 档自动迁移；v1 自动迁移、解密失败按空降级；实施计划特性 A |
-| 传输任务持久化（`transfer_jobs`/`transfer_items` 表） | ✅ 已有（轻量形态） | `transfer-history.json` 环形 200 条 + `sftp/transfer/history` 持久化/live 合并查询，仅状态跃迁落盘；断点续传/逐文件 resume 不做（登记后续候选）；实施计划特性 B1 |
+| 传输任务持久化（`transfer_jobs`/`transfer_items` 表） | ✅ 已有（轻量形态 + 断点续传） | `transfer-history.json` 环形 200 条 + `sftp/transfer/history` 持久化/live 合并查询，仅状态跃迁落盘；上传断点续传（spool+meta 保留 → `resumeTaskId` 续传）与下载 `offset` 恢复 + 会话内暂停/恢复已落地（2026-09-12 iShell Pro 对标批，见下节）；实施计划特性 B1 |
 | SFTP 书签（`sftp_bookmarks` 表 + 双栏书签） | ✅ 已有 | `sftp-bookmarks.json` + `sftp/bookmarks/list` / `save` / `delete` + 路径栏星标收藏/下拉跳转（七语）；实施计划特性 B2 |
 | 主密码 Vault（解锁屏 / 自动锁定 / 生物识别 / FIDO2） | ❌ 不做 | 宿主插件形态下无人值守 sudo 自动应答要求重启免解锁；keychain 托管已覆盖“防拷贝/备份外泄”目标，主密码模型收益不成立 |
 | 端口转发（`channel_open_direct_tcpip` ProxyJump/本地转发，数据库面板经隧道连 DB） | ❌ 不做 | 沿 2026-09-07 用户决策（宿主已有 ssh 隧道实现，见 tssh 节）；sshbool 的 russh direct-tcpip 用法留作未来宿主侧通用转发 API 的参考 |
-| 监控历史趋势（`host_snapshots` + 分桶 `metric_series` 落盘 + 趋势图） | ⏸ 未做（候选） | 现有 `ssh/metrics` 单快照维度更全（inode/Top 进程/每接口速率）；快照环形落盘 + sparkline 趋势列为后续候选 |
+| 监控历史趋势（`host_snapshots` + 分桶 `metric_series` 落盘 + 趋势图） | ✅ 已有（轻量形态） | `metrics-history.jsonl` 环形 720 行按连接落盘 + `ssh/metrics/history` 查询 + 打开指标卡回填 CPU/内存/网速 sparkline（2026-09-12 落地）；无分桶聚合（环形全量即可覆盖 1h 视窗）；进程管理（`ssh/processes/list`+`kill`）同批落地 |
 | 终端 BiDi/阿拉伯语变形（`arabic-xterm.ts` 词级 reshape 保词序 + shell UTF-8 locale） | ⏸ 未做（候选） | xterm.js 原生无 BiDi/shaping；本插件 UI 七语无阿拉伯语，但终端输出内容可能含 RTL 文本，shaping 管线可放 `shared/frontend/` 公共层单点实现 |
 | 审计账 + 审计面板（`audit_log` 表 + audit-panel） | ✅ 已有（SSH 域内） | MCP/AI 执行面 JSONL 审计 + `ssh/audit/list`，见上节 openocta 对标（本批前已落地） |
+
+## iShell Pro 对标补充（2026-09-12）
+
+以 [iShell Pro](https://ishell.cc/)（六协议独立终端平台 v3.0，免费+订阅）为参照的能力差距收敛。
+产品形态不同（宿主内插件 vs 独立终端），仅取终端/SFTP/监控域内可对齐项；协议广度
+（RDP/VNC/Telnet/串口）、多标签分屏、端口转发、X11 转发、云同步/导入、隐私遮蔽等
+仍按既有决策不做（宿主承担或超出插件契约）。
+
+| iShell Pro 能力 | 插件状态 | 说明 |
+| --- | --- | --- |
+| SFTP 传输断点续传 / 暂停恢复 | ✅ 已有（同批落地） | 上传：中断任务 spool+meta 保留 → `sftp/transfer/resumable` 列出 → `sftp/upload/start resumeTaskId` 从已传前缀续传（文件名+字节数双校验）；下载：`sftp/download/start offset` 恢复（size 一致性 best-effort）；会话内暂停/恢复为分片间挂起（前端纯语义）。iShell 的传输器形态（独立客户端常驻）与之不同，语义对齐 |
+| 实时监控趋势（历史曲线 1–60s 采样） | ✅ 已有（轻量形态） | `metrics-history.jsonl` 环形 720 行 + `ssh/metrics/history` 回填 sparkline；采样间隔跟随指标卡 5s 轮询，不做独立采样线程与分桶聚合 |
+| 进程管理（列表 + SIGTERM/SIGKILL 终止需确认） | ✅ 已有 | `ssh/processes/list`（500 行 CPU 序）+ `ssh/processes/kill`（pid 0/1 拒绝、signal 白名单 1/2/9/15、前端 confirm 门禁）；iShell 的句柄数/监听端口维度未做 |
+| 会话录制回放 + GIF 导出 | ✅ 已有（同批新增） | `ssh/recording/*` 五方法：asciicast v2 `.cast` 落盘（会话关闭自动收尾）、`ssh/recording/get` 分页回放（xterm 重放、0.5–4× 倍速、进度条 seek）、GIF 导出（离屏 xterm 逐事件重放 + 500ms 抽帧 + 零依赖 GIF89a 编码器，封顶 120 帧）。iShell 的暂停/快进/水印/帧率质量参数未做 |
+| GPU 监控、大文件扫描、主机巡检报告 | ⏸ 未做（候选） | GPU 依赖远端 nvidia-smi 等工具可用性；大文件扫描与巡检报告维持"另有对标项"候选结论 |
+| 终端 WebGL GPU 加速渲染 | ✅ 已有（2026-09-13 落地） | `@xterm/addon-webgl`（0.18.0，配 xterm 5.5）：主终端默认挂 GPU renderer（localStorage 偏好 `ssh-terminal-webgl`，设置弹窗「终端渲染」开关即时切换）；WebGL 不可用（headless/无 context/驱动限制）构造即回退 DOM 渲染器，context loss（GPU 重置）自动 dispose 回退；回放弹窗与 GIF 导出的离屏终端刻意保持 2d canvas（导出依赖 drawImage 稳定路径、且浏览器 WebGL context 总数有限）。纯逻辑（偏好/挂载/回退/切换）独立模块 `terminalWebgl.ts` + 单测 7 |

@@ -425,6 +425,22 @@ pub fn tail(
     Ok(entries)
 }
 
+/// Clears the audit ledger: truncates the active JSONL to empty and drops
+/// the rotated generation. The file itself is kept (mode/mask intact) so a
+/// concurrent O_APPEND appender never sees a missing file; entries appended
+/// after the clear naturally start the new generation. Used by the
+/// workbench settings「审计日志」清空按钮 via `ssh/audit/clear`.
+pub fn clear(data_dir: &Path) -> Result<(), String> {
+    let _guard = append_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = audit_path(data_dir);
+    std::fs::write(&path, b"")
+        .map_err(|error| format!("Failed to clear {}: {error}", path.display()))?;
+    let _ = std::fs::remove_file(rotated_path(data_dir));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +464,26 @@ mod tests {
             mode: ExecMode::Embedded,
             error: None,
         }
+    }
+
+    #[test]
+    fn clear_truncates_active_and_drops_rotated_generation() {
+        let dir = temp_dir("clear");
+        append(&dir, &sample_entry(1)).unwrap();
+        append(&dir, &sample_entry(2)).unwrap();
+        // Simulate a rotated predecessor from an earlier fill.
+        std::fs::write(rotated_path(&dir), b"{\"stale\":true}\n").unwrap();
+        clear(&dir).unwrap();
+        assert!(tail(&dir, 100, None).unwrap().is_empty());
+        assert!(!rotated_path(&dir).exists(), "rotated generation must be dropped");
+        // Appends after a clear start the new generation cleanly.
+        append(&dir, &sample_entry(3)).unwrap();
+        assert_eq!(tools(&tail(&dir, 100, None).unwrap()), vec!["ssh_exec"]);
+        // Clear on a missing file is a no-op success.
+        let empty = temp_dir("clear-empty");
+        clear(&empty).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     fn tools(entries: &[AuditEntry]) -> Vec<&str> {

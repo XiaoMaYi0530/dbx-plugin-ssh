@@ -4,6 +4,12 @@ const appearanceListeners = new Set<(appearance: DbxPluginAppearance) => void>()
 const contextListeners = new Set<(context: Record<string, unknown>) => void>();
 
 const fixtureParams = new URLSearchParams(location.search);
+// ?render=dom 强制关闭终端 WebGL 加速（localStorage 偏好）：mock walkthrough
+// 的终端断言读 DOM 文本，WebGL 渲染下文本只存在于 GPU canvas，必须锁定
+// DOM 渲染器路径（WebGL 自身的成功/回退由 terminalWebgl 单测覆盖）。
+if (fixtureParams.get("render") === "dom") {
+  try { localStorage.setItem("ssh-terminal-webgl", "0"); } catch { /* noop */ }
+}
 // ?rw=1 模拟可写连接（默认只读），供拖放上传等写路径 UI 验证。
 const writable = fixtureParams.get("rw") === "1";
 // ?err=disconnect 在会话建立 4s 后模拟一次传输断开（ssh/session/state

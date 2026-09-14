@@ -186,11 +186,11 @@ fail-closed 例外：confirm 模式下 `emitter` 为 None（stdio 独立会话�
   ④ 内联拨打拒绝：作用域非空且调用无 connectionId/connectionName（带 host+username
   内联凭据）→ 直接报错带指引。确认既有 `inline_dial_is_registered_read_only`
   的端点匹配助手可复用则复用。
-- [ ] **A1-T5 单测先行**：confirm 门矩阵——写类工具在 confirm 下需要审批、读类
+- [x] **A1-T5 单测先行**：confirm 门矩阵（2026-09-12 落地：is_confirm_gated_tool 集合断言 + settings 往返/env 覆盖）——写类工具在 confirm 下需要审批、读类
   工具不受影响；emitter None 快速失败文案；审批 approve 放行 / deny 拒绝 /
   超时拒绝（oneshot 注入模拟，参照 ssh.rs `agent_challenges_resolve_once_…`
   测试模式）；灾难 `confirmDestructive` 门先于审批弹窗评估（不弹两次）。
-- [ ] **A1-T6** confirm 门实现：`call_tool` 既有门序之后、执行前插入；
+- [x] **A1-T6** confirm 门实现（2026-09-12：call_tool 既有门序后、bridge 转发前接 `request_mcp_confirm`（三件套转正）；stdio 无 emitter fail-closed 立即拒绝；确认文本可替换原文；§1.3 设置项 `execPermissionMode`/`connectionScope` 持久化 + env 覆盖 + merge 写盘（修复 limits 写入覆盖 permission 键的顺序缺陷））
   复用 ssh.rs 审批挑战（新入口 `confirm_via_challenge(emitter, tool, command) ->
   Result<(), String>`，事件 payload `{challengeId, kind:"mcp-confirm", source:"mcp",
   tool, command, timeoutSecs}`；挑战一次性、超时即拒，与既有语义同构）；
@@ -212,19 +212,19 @@ fail-closed 例外：confirm 模式下 `emitter` 为 None（stdio 独立会话�
 - [ ] **A2-T3 单测先行**（mcp.rs）：targets 归一化/去重保序、>10 拒绝、
   sequential+stopOnError 首败短路语义（用可注入的 per-target 执行闭包单测，
   不连 SSH）、results 聚合结构。
-- [ ] **A2-T4** 实现 `ssh_multi_exec` handler：targets 全量归一化 → 作用域门 →
+- [x] **A2-T4** 实现 `ssh_multi_exec` handler（2026-09-12：targets 全量归一化/去重保序/上限 10 + 保存连接全量预解析（任一未解析整体拒绝）→ 并发 `join_all` 递归 helper（tokio 原生，无 futures 依赖）/ sequential stopOnError 短路 → 聚合响应 `{ok, sent, failed, results:[{target, connectionId, host, port, username, ok, output, exitCode, error?}]}`；命令门 `multi_exec::command_gate` 纯函数（sudo 整体拒绝、灾难确认、只读白名单）；单测 4（A2-T3）+ schema/工具清单入列；smoke_mcp live 段 saved-ref 引导 + 灾难门负例：targets 全量归一化 → 作用域门 →
   parallel（`tokio::join!`/spawn 集合，复用隐藏通道 exec 内部路径，与
   `ssh_exec` off-模式同一条代码路径）/ sequential（逐个 await）→ 聚合响应；
   schema 定义（targets items string、mode enum、描述含 15s 上限与 run_bg 引导、
   不含 sudo）。
-- [ ] **A2-T5 单测先行**（mcp.rs）：`ssh_terminal_input` 门矩阵——只读+可见文本
+- [x] **A2-T5 单测先行**（mcp.rs）：`ssh_terminal_input` 门矩阵（2026-09-12 落地：只读+可见文本拒 / 只读+纯控制放、灾难行无确认拒+只读必拒、白名单 sudo 行拦截、schema anyOf 寻址断言）——只读+可见文本
   拒 / 只读+纯控制放、灾难行无确认拒、白名单连接 sudo 行拦截（复用 A1 期
   sudo allowlist 测试夹具）、appendNewline 归一化、无存活会话错误文案。
-- [ ] **A2-T6** 实现 `ssh_terminal_input` handler：连接引用 → 存活终端会话解析
+- [x] **A2-T6** 实现 `ssh_terminal_input` handler（2026-09-12：registered ref → 存活会话解析（无会话/endpoint 选择器统一回落 NO_TERMINAL_SESSION 引导）→ 门禁 → 单会话 batch_terminal_input 复用；smoke_mcp live 段新增 no-session 引导负例）：连接引用 → 存活终端会话解析
   （复用 `sftp/copy` 的 connectionId 会话解析路径）→ 门禁 → 单会话版
   `batch_terminal_input`（ssh.rs 加薄封装 `terminal_input_to_session` 或
   batch 复用 `vec![session]`，取侵入最小者）→ `{sent:true, sessionId}`。
-- [ ] **A2-T7** 两工具的 confirm 门名单接入（A1-T6 留位收口）；
+- [x] **A2-T7** confirm 门名单接入（2026-09-12：is_confirm_gated_tool = is_write_tool ∪ ssh_exec/ssh_multi_exec/ssh_terminal_input；`terminal_input_gate` ④ 号留位由同一 confirm 门覆盖；schema anyOf 断言已在 connection_tools_declare_connection_id + 清单测试）
   `smoke` 之外先补 `connection_tools_declare_connection_id` 式 schema 单测
   （anyOf 寻址、confirmDestructive 声明）。
 - [ ] **A2-T8** `cargo test` 全绿 + clippy。
@@ -367,16 +367,16 @@ save_entry/delete_entry` + `#[cfg(test)]` 全套）、`backend/src/ssh.rs`
 **Files**：`frontend/src/App.vue`（MCP 设置区，锚点 :4169 `saveMcpSettings` 与
 :4189 保存链）、`frontend/src/lib/i18n.ts`（`mcpSettings.*` 4 键 ×7）。
 
-- [ ] **B3-T1** MCP 设置区新增：权限档 select（autonomous/confirm，
+- [x] **B3-T1** MCP 设置区新增：权限档 select（autonomous/confirm，
   confirm 附 hint：写操作与远程命令执行需在工作台人工审批；无工作台时快速拒绝）+
   作用域 textarea（每行一条：连接 id / 连接名 / 主机名；空 = 不限）；
   读写走既有 `mcp/settings/get|set`；保存链（① profile ② 连接设置 ③ MCP）
   中 `saveMcpSettings` 一并提交两新字段（非法 mode 后端报错经既有
   `mcpError` 容错展示）。
-- [ ] **B3-T2** 审批弹窗 source=mcp 适配：`agentPromptQueue` 挑战 payload 带
+- [x] **B3-T2** 审批弹窗 source=mcp 适配：`agentPromptQueue` 挑战 payload 带
   `source:"mcp"` 时标题改 `agentPrompt.mcpSource`（含工具名），命令可编辑
   与倒计时逻辑复用；无 source 走原渲染（兼容旧 sidecar）。
-- [ ] **B3-T3** 七语全补 + typecheck/test/build 全绿；visual.html 验证
+- [x] **B3-T3** 七语全补 + typecheck/test/build 全绿（2026-09-13 核实收尾：394/394 + build + smoke_ui_mock all green；mcpSettings.* 四键 ×7 与 agentPrompt.mcpSource 在库）；visual.html 验证
   （select 切换、textarea 回显、confirm hint 文案）。
 
 ### B4. 审计日志查看
@@ -384,13 +384,13 @@ save_entry/delete_entry` + `#[cfg(test)]` 全套）、`backend/src/ssh.rs`
 **Files**：`frontend/src/App.vue`（设置弹窗新折叠 section，对照
 `profilesInlineOpen` 模式）、`frontend/src/lib/i18n.ts`（`auditLog.*` ×7）。
 
-- [ ] **B4-T1** 设置弹窗「审计日志」折叠区：kind 过滤 select（全部/五类）、
+- [x] **B4-T1** 设置弹窗「审计日志」折叠区：kind 过滤 select（全部/五类）、
   条目列表（时间格式化、kind 徽标、connection、command 展示 redacted 原文、
   outcome/exitCode、gate 名）、刷新按钮、清空按钮（confirm 后调
   `ssh/audit/clear`）、truncated 提示（`auditLog.truncated`）；打开时拉取
   `ssh/audit/list`，失败静默空态。列表只读、无分页（limit 200 默认够用，
   遗留 §7 注记）。
-- [ ] **B4-T2** 七语全补 + typecheck/test/build 全绿；visual.html 验证
+- [x] **B4-T2** 七语全补 + typecheck/test/build 全绿（2026-09-13 核实收尾；并补齐后端脱接：`ssh/audit/clear` RPC 从未注册 + MCP 执行面审计行从未写入——`call_tool` 外层包装对 gated 工具逐调用落账 verdict/exitCode/duration/mode，`audit_log::clear` 带单测与 smoke 用例）；visual.html 验证
   （mock 镜像 `ssh/audit/list|clear`：注入若干条 fixture，过滤/清空/空态三态）。
 
 ## 4. 工作包 C（主会话收口）

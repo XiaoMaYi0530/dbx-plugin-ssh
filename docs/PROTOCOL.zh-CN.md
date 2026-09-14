@@ -20,7 +20,10 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/alert/triage` | 告警分诊：异构告警 JSON/纯文本 → 结构化 + 分类 + 只读诊断命令清单（无需连接，从不执行；见「告警分诊」节） |
 | `ssh/audit/list` | 执行审计台账只读回放：`{limit?, beforeTs?}` → `{entries, truncated}`（见「执行审计」节） |
 | `ssh/agent/mode/get` | 连接级 AI 终端模式探针（供宿主 MCP 桥转发前判定路由）：`{connectionId}` → `{agentTerminalMode: "off"\|"auto"\|"strict", hasTerminalSession: bool}`；未知连接降级为 `off` + `false` 而非报错，宿主侧任何失败同样回落静默路径 |
-| `ssh/metrics` | 采集服务器指标（CPU/内存/负载/磁盘（含 inode 使用率）+ 网络接口速率 + Top CPU/内存进程，只读命令；`cached: true` 返回上次快照） |
+| `ssh/metrics` | 采集服务器指标（CPU/内存/负载/磁盘（含 inode 使用率）+ 网络接口速率 + Top CPU/内存进程，只读命令；`cached: true` 返回上次快照；每次新鲜采集顺带落一行趋势历史） |
+| `ssh/metrics/history` | 趋势历史查询（`metrics-history.jsonl` 环形 720 行，按连接维度过滤，见下文） |
+| `ssh/processes/list`、`ssh/processes/kill` | 全量进程表（CPU 序，上限 500 行）与进程信号（pid/signal 校验，pid 0/1 拒绝），见下文 |
+| `ssh/recording/start`、`stop`、`list`、`get`、`delete` | 会话录制（asciicast v2 `.cast` 落盘、回放分页读取、列表/删除，见下文） |
 | `ssh/host-key/check` | 连接维度主机密钥预检（探针三态：已知 / 变更 / 未知，不发认证） |
 | `ssh/settings/get`、`ssh/settings/set` | 读取/运行时更新 Quick Sudo 编排设置 |
 | `mcp/tools`、`mcp/call` | MCP 工具发现与执行（供 DBX MCP 桥 `dbx_call_plugin_tool` 调用；连接凭据以标准 lifecycle payload 转发，按 `connectionId` 池化，payload 新增 `name` 字段携带连接名）。连接类工具新增可选 `connectionName`（与 `connectionId` 二选一，注册表按名匹配，重名报错并列出候选）；stdio 独立模式对未注册 `connectionId` 的调用自动经宿主桥 `POST /list-plugin-connections` 转发到运行中的 DBX 应用执行——请求 `{"plugin_id":"io.dbx.ssh"}`、响应 `{"connections":[{id,name,host,port,username,authentication,readOnly}]}`（仅元数据，密钥只出布尔标志位），桥不可用回落内联凭据；新增 `ssh_list_connections` 工具即消费该路由，降级时仅回本会话注册表并附 `note` |
@@ -29,8 +32,8 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/diskUsage` | 路径所在挂载的磁盘用量 |
 | `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/read` 支持可选 `offset` 分片续读，见下文） |
 | `sftp/createDirectory`、`sftp/rename`、`sftp/delete` | SFTP 写操作 |
-| `sftp/upload/start`、`finish` | 上传事务生命周期 |
-| `sftp/download/start`、`next`、`finish` | 下载事务生命周期 |
+| `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传，见下文） |
+| `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文） |
 | `sftp/stat`、`sftp/exists`、`sftp/touch`、`sftp/write` | 扩展文件操作：元信息单查、存在性检查、空文件创建、小文件直写 |
 | `sftp/archive`、`sftp/extract` | 远端 tar.gz 打包与解压 |
 | `sftp/copy`、`sftp/move` | 服务器内复制 / 剪切（逐项执行，目标存在需 `overwrite`） |
@@ -38,6 +41,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/transfer/cancel` | 取消并清理临时状态 |
 | `sftp/transfer/list`、`sftp/transfer/status` | 查询会话传输任务列表 / 单任务状态（含历史，会话维度过滤） |
 | `sftp/transfer/history` | 跨重启传输历史查询（持久化 + 内存 live 合并，见下文） |
+| `sftp/transfer/resumable` | 可续传上传扫描（中断任务的 spool 前缀仍在磁盘上的清单，见下文） |
 | `sudo/stat`、`sudo/exists`、`sudo/touch` | sudo 元信息查询与空文件创建 |
 | `sudo/listDir`、`sudo/readFile`、`sudo/writeFile` | sudo 目录浏览与文件读写 |
 | `sudo/mkdir`、`sudo/remove`、`sudo/removeAll`、`sudo/chmod`、`sudo/rename` | sudo 写操作 |
@@ -549,3 +553,56 @@ SFTP 路径书签：用户收藏的命名远端路径（label + path），持久
 | `appendNewline` | bool | 否 | 默认 `true`，末尾追加回车即执行 |
 
 返回 `{ results: [{ sessionId, success, error? }], sent, failed }`：会话不存在、输入队列满/关闭记为该目标 `failed`（带 `error` 文本），不影响其他目标。发送语义等同用户键盘输入，命令原文不做 shell 转义；只读连接不拦截（与终端手敲一致）。
+
+### 断点续传（sftp/upload/start resumeTaskId、sftp/download/start offset、sftp/transfer/resumable）
+
+上传**恢复**：`sftp/upload/start` 新增可选 `resumeTaskId` —— 指向一次此前中断的上传任务。后端校验
+`<data_dir>/transfers/upload-<taskId>.json` sidecar meta（`remotePath`/`size` 必须与本次请求一致）与
+`upload-<taskId>.part` spool 文件后，以追加模式复用该 spool，返回 `{ taskId, chunkSize, maxBytes, resumeOffset }`
+（`resumeOffset` = 已 spool 字节数；新任务恒为 0）。调用方只重传 `resumeOffset` 之后的分片（二进制通道
+offset 语义不变）。中断来源不限：前端中止、sidecar 重启、会话断开（meta+spool 保留即列为可续传）。
+任务取消仍删除 spool 与 meta（显式放弃）；`finish_upload` 不完整分支保留它们供续传。历史上限
+`resumeOffset <= size`，非法组合报错。`sftp/transfer/resumable` 无参，返回
+`{ tasks: [{ taskId, direction: "upload", remotePath, fileName, size, resumableBytes }] }`
+（按 taskId 倒序≈最新优先；live 任务与 meta/spool 缺失者不在列）。不进 MCP 工具面。
+
+下载**恢复**：`sftp/download/start` 新增可选 `offset`（默认 0）——调用方本地已持有前 `offset` 字节，
+后端把 `nextOffset` 置为该值继续分片；`offset > size` 报错。身份校验仅为 best-effort 的 size 一致
+（同尺寸改写会拼接错内容，文档明示）；返回体新增 `resumeOffset` 回显。会话内暂停/恢复为纯前端语义
+（分片循环在两分片之间挂起），不涉及新方法。
+
+### ssh/metrics/history
+
+参数 `{ sessionId, limit? }`（默认/上限 720）。返回 `{ connectionId, samples: [...] }`，样本旧→新排列，
+每行 `{ connectionId, ts, cpuPercent?, memoryPercent?, load1?, rxRate, txRate }`（时间戳 Unix 毫秒）。
+落盘为 `<data_dir>/metrics-history.jsonl`，每次**新鲜** `ssh/metrics` 采集追加一行（缓存命中不落），
+环形上限 720 行（≈5s 轮询 × 1h）；行按连接 id 维度过滤读取，跨 sidecar 重启保留；坏行跳过。
+`cpuPercent`/`memoryPercent` 快照缺失时整键省略（非 null 占位）。
+
+### ssh/processes/list、ssh/processes/kill
+
+`ssh/processes/list`：参数 `{ sessionId }`。单条只读命令
+`ps -eo pid=,ppid=,user=,pcpu=,pmem=,etime=,state=,args= | sort -k3,3nr | head -n 500` 采集，
+返回 `{ processes: [{ pid, ppid, user, cpuPercent, memPercent, etime, state, command }] }`
+（CPU 降序、服务端封顶 500 行、`command` 截断 200 字符；前端可本地重排）。不进 MCP 工具面。
+
+`ssh/processes/kill`：参数 `{ sessionId, pid, signal? }`（默认 15）。后端校验：pid 为正整数且
+`> 1`（init/pid 0 直接拒绝），signal 仅接受 `1/2/9/15`；渲染为 `kill -<NAME> <pid>`（数值全部白名单化，
+无注入面）。返回 `{ success: true, pid }`；远端退出码非 0 报错（如进程不存在）。
+
+### ssh/recording/start、stop、list、get、delete
+
+会话级录制：`ssh/recording/start`（参数 `{ sessionId }`）在会话读循环安装录制器，输出
+（stdout+stderr、目录跟随过滤后、不含 State 帧）以 asciicast v2 JSONL 写入
+`<data_dir>/recordings/<recordingId>.cast`——首行为 v2 头（`version/width/height/timestamp/env/meta`，
+`meta` 携带 `sessionId/connectionId/host`），其后每行 `{"time": <秒>, "eventtype": "o", "eventdata": "…"}`
+（单事件截断 256 KiB）。每会话同时最多一段录制，重复 start 报错；会话关闭（读循环退出）自动
+finish，无需显式 stop。`stop` 返回摘要
+`{ recordingId, sessionId, connectionId, host, path, startedAt, durationSecs, events, bytes }`。
+
+`ssh/recording/list` 无参 → `{ recordings: [{ recordingId, sessionId, connectionId, host, startedAt,
+durationSecs, bytes }] }`（文件 mtime 新→旧；坏文件跳过）。`ssh/recording/get` 参数
+`{ recordingId, offset?, limit? }`（limit 上限 500）→ `{ recordingId, offset, total, hasMore,
+events: [{ time, type, data }] }`（旧→新分页）。`ssh/recording/delete` 参数 `{ recordingId }`
+删除文件；id 走路径穿越校验（含 `/`、`\`、`..` 拒绝）。录制属工作台能力，不进 MCP 工具面；
+`ssh/sessions/list` 每行新增 `recording: bool` 反映该会话是否录制中。

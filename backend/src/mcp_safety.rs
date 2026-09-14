@@ -34,16 +34,106 @@ pub enum CommandRisk {
 
 /// Classifies a full command line (which may chain several commands).
 pub fn assess_command(command: &str) -> CommandRisk {
+    assess_command_depth(command, 0)
+}
+
+/// Depth cap for nested substitution scanning so pathological input cannot
+/// recurse unboundedly (`$( $( $( …`.
+const MAX_ASSESS_DEPTH: u8 = 4;
+
+/// Escalates to Destructive when the inner command of a wrapper (`sudo …`,
+/// `sh -c '…'`) classifies as destructive at the next recursion depth.
+/// Escalation only: anything else keeps the caller's own verdict.
+fn destructive_after_wrap(inner: &str, depth: u8) -> Option<&'static str> {
+    let next = depth + 1;
+    if next >= MAX_ASSESS_DEPTH {
+        return None;
+    }
+    match assess_command_depth(inner, next) {
+        CommandRisk::Destructive(reason) => Some(reason),
+        _ => None,
+    }
+}
+
+fn assess_command_depth(command: &str, depth: u8) -> CommandRisk {
     let neutralized = neutralize_fd_dups(command);
+    // Reliability round 5 (adversarial sweep): a catastrophic payload
+    // hidden inside `$(...)` / backticks must still trip the destructive
+    // gate even though the surrounding command looks benign —
+    // `echo $(rm -rf /)` used to classify as a plain `Unknown` and run
+    // unconfirmed on writable connections. The sweep only ever escalates
+    // Unknown → Destructive; it can never whitelist anything.
+    if depth < MAX_ASSESS_DEPTH {
+        if let Some(reason) = hidden_destructive_subcommand(&neutralized, depth) {
+            return CommandRisk::Destructive(reason);
+        }
+    }
     let mut overall = CommandRisk::ReadOnly;
     for segment in split_segments(&neutralized) {
-        match assess_segment(segment) {
+        match assess_segment(segment, depth) {
             CommandRisk::Destructive(reason) => return CommandRisk::Destructive(reason),
             CommandRisk::Unknown => overall = CommandRisk::Unknown,
             CommandRisk::ReadOnly => {}
         }
     }
     overall
+}
+
+/// Assesses the texts of every `$( ... )` / `` ` ... ` `` span: when any
+/// span's content classifies as destructive, the whole command is
+/// destructive.
+fn hidden_destructive_subcommand(text: &str, depth: u8) -> Option<&'static str> {
+    for sub in substitution_spans(text) {
+        for segment in split_segments(&sub) {
+            if let CommandRisk::Destructive(reason) = assess_command_depth(&segment, depth + 1) {
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
+/// Collects the texts of `$( … )` spans (nesting-aware) and `` ` … ` ``
+/// spans. Unterminated spans keep their remainder (fail closed: an
+/// unterminated `` `rm -rf /`` still trips the sweep).
+fn substitution_spans(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                let mut parens = 1usize;
+                let mut cursor = index + 2;
+                while cursor < bytes.len() && parens > 0 {
+                    match bytes[cursor] {
+                        b'(' => parens += 1,
+                        b')' => parens -= 1,
+                        _ => {}
+                    }
+                    cursor += 1;
+                }
+                let end = if parens == 0 { cursor - 1 } else { cursor };
+                spans.push(text[index + 2..end].to_string());
+                index = cursor;
+            }
+            b'`' => {
+                let start = index + 1;
+                match text[start..].find('`') {
+                    Some(offset) => {
+                        spans.push(text[start..start + offset].to_string());
+                        index = start + offset + 1;
+                    }
+                    None => {
+                        spans.push(text[start..].to_string());
+                        index = bytes.len();
+                    }
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    spans
 }
 
 /// True when any top-level command segment runs under `sudo` (after the same
@@ -265,7 +355,7 @@ const SENSITIVE_SYSTEM_PREFIXES: &[&str] =
     &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
 /// Assesses one chain segment (no `;`/`&&`/`|` left inside).
-fn assess_segment(segment: &str) -> CommandRisk {
+fn assess_segment(segment: &str, depth: u8) -> CommandRisk {
     if segment.contains(":(){") {
         return CommandRisk::Destructive("fork bomb");
     }
@@ -288,8 +378,37 @@ fn assess_segment(segment: &str) -> CommandRisk {
         return CommandRisk::Unknown;
     }
     if verb == "sudo" {
-        // Privileged commands never count as whitelisted reads; only their
-        // destructive shape matters (checked inside destructive_pattern).
+        // Privileged commands never count as whitelisted reads. Their
+        // destructive shape still matters: unwrap the sudo prefix (flags
+        // included) so `sudo rm -rf /` / `sudo -u root mkfs.ext4 …` trip
+        // the catastrophic gate instead of slipping through as a plain
+        // Unknown. Everything not destructive stays Unknown as before.
+        if let Some(inner) = unwrap_sudo_prefix(&tokens) {
+            let inner_text = inner.join(" ");
+            let unwrapped = effective_tokens(&inner_text);
+            if let Some((inner_verb, inner_args)) = unwrapped.split_first() {
+                if let Some(reason) = destructive_pattern(inner_verb, inner_args) {
+                    return CommandRisk::Destructive(reason);
+                }
+            }
+            // `sudo sh -c 'rm -rf /'`: the inner command may itself be a
+            // wrapper hiding the payload — recurse (destructive-only).
+            if let Some(reason) = destructive_after_wrap(&inner_text, depth) {
+                return CommandRisk::Destructive(reason);
+            }
+        }
+        return CommandRisk::Unknown;
+    }
+    if matches!(verb, "sh" | "bash" | "dash" | "zsh" | "ksh") {
+        // A `-c` script hides its payload in one string: assess the script
+        // text so `sh -c 'rm -rf /'` trips the catastrophic gate. The
+        // wrapper itself never whitelists anything — anything not
+        // destructive stays Unknown (unchanged from before).
+        if let Some(script) = shell_c_script(&args) {
+            if let Some(reason) = destructive_after_wrap(&script, depth) {
+                return CommandRisk::Destructive(reason);
+            }
+        }
         return CommandRisk::Unknown;
     }
     let sensitive = touches_sensitive_path(args);
@@ -470,6 +589,62 @@ fn strip_wrapper_flags(tokens: &mut Vec<String>) {
     }
 }
 
+/// sudo flags whose following token is their value (`-u user`, `-g group`).
+const SUDO_VALUE_FLAGS: &[&str] = &["-u", "-g", "-p", "-C", "-R", "-T", "-D", "-h"];
+
+/// Strips one leading `sudo` (and its flags) from a token list, returning
+/// the inner command tokens. Like real sudo, the option section ends at the
+/// first non-flag token — everything from there on is the inner command
+/// (`sudo rm -rf /` must keep `-rf` with the command, not eat it as a sudo
+/// flag). `None` when nothing remains.
+fn sudo_inner_tokens(tokens: &[String]) -> Option<Vec<String>> {
+    let mut index = 1; // tokens[0] is "sudo"
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if !(token.starts_with('-') && token.len() > 1) {
+            break; // inner command starts here
+        }
+        index += 1;
+        if SUDO_VALUE_FLAGS.contains(&token.as_str())
+            && tokens
+                .get(index)
+                .map(|next| !next.starts_with('-'))
+                .unwrap_or(false)
+        {
+            index += 1; // the flag's value
+        }
+    }
+    let inner = &tokens[index.min(tokens.len())..];
+    if inner.is_empty() { None } else { Some(inner.to_vec()) }
+}
+
+/// Unwraps repeated sudo prefixes (`sudo sudo …`) with a depth cap so the
+/// destructive-pattern check sees the real inner command.
+fn unwrap_sudo_prefix(tokens: &[String]) -> Option<Vec<String>> {
+    let mut current: Vec<String> = tokens.to_vec();
+    for _ in 0..4 {
+        if current.first().map(String::as_str) != Some("sudo") {
+            break;
+        }
+        current = sudo_inner_tokens(&current)?;
+    }
+    if current.is_empty() { None } else { Some(current) }
+}
+
+/// The `-c` script text of a shell segment (`sh -c '…'`, `bash -lc '…'`):
+/// the tokens after the `-c`-bearing flag joined back into a command line.
+/// `None` when the segment is not a `-c` invocation.
+fn shell_c_script(args: &[String]) -> Option<String> {
+    let position = args.iter().position(|arg| {
+        arg == "-c" || (arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c'))
+    })?;
+    let script = &args[position + 1..];
+    if script.is_empty() {
+        return None;
+    }
+    Some(script.join(" "))
+}
+
 /// Recognized catastrophic patterns for one (verb, args) pair. Raw-device
 /// and critical-file redirection is checked here (not in `has_redirect`)
 /// because it must stay `Destructive` rather than merely `Unknown`.
@@ -631,7 +806,11 @@ pub fn is_sensitive_path(token: &str) -> bool {
     if lower.ends_with(".pub") {
         return false;
     }
-    let file_name = std::path::Path::new(&lower)
+    // Match on a collapsed form so `//etc//shadow`, `/etc/./shadow` and
+    // friends cannot dodge the component / prefix rules (reliability
+    // round 5 adversarial pass).
+    let normalized = normalized_path(&lower);
+    let file_name = std::path::Path::new(&normalized)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("")
@@ -646,11 +825,16 @@ pub fn is_sensitive_path(token: &str) -> bool {
     {
         return true;
     }
+    // System credential files keep their secrets under relative paths too
+    // (`cat shadow` from a `/etc` cwd is the same exfiltration).
+    if matches!(file_name, "shadow" | "gshadow" | "sudoers") {
+        return true;
+    }
     // Extension check runs on the whole token so globs (`*.pem`) match too.
     if SENSITIVE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
         return true;
     }
-    if lower
+    if normalized
         .split('/')
         .any(|component| SENSITIVE_COMPONENTS.contains(&component))
     {
@@ -658,7 +842,25 @@ pub fn is_sensitive_path(token: &str) -> bool {
     }
     SENSITIVE_SYSTEM_PREFIXES
         .iter()
-        .any(|prefix| lower.starts_with(prefix))
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
+/// Collapses a path for matching: drops empty components (double slashes)
+/// and `.` self-references, preserving absolute vs relative shape. `..`
+/// components are kept — resolving them needs a base directory, and
+/// keeping them is the conservative choice.
+pub(crate) fn normalized_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 #[cfg(test)]
@@ -871,6 +1073,131 @@ mod tests {
         destructive("timeout 10 rm -rf /data");
         destructive("FOO=bar rm -rf /data");
         unknown("timeout 10 systemctl restart nginx");
+    }
+
+    // —— 第五轮对抗面：灾难门的绕过尝试 ————————————————
+
+    /// Reliability round 5: the catastrophic gate must hold across the
+    /// classic evasion shapes — quoting, leading whitespace, combined
+    /// commands, sudo prefixes, `sh -c` scripts, and `$()`/backtick
+    /// substitution payloads (`echo $(rm -rf /)` used to classify as a
+    /// plain Unknown and run unconfirmed on writable connections).
+    #[test]
+    fn destructive_gate_survives_evasion_variants() {
+        // Quoting and whitespace.
+        destructive("\"rm\" -rf /");
+        destructive("'rm' -fr /etc");
+        destructive("rm -rf \"/\"");
+        destructive("  \t rm  -rf  /");
+        // Combined commands / chains.
+        destructive("cd /tmp && rm -rf /");
+        destructive("cd /tmp; echo hi; rm -rf /");
+        destructive("rm -rf / || echo done");
+        destructive("echo start && mkfs.ext4 /dev/vdb");
+        // sudo prefix variants (inner command must be unwrapped).
+        destructive("sudo rm -rf /");
+        destructive("sudo rm -rf /etc/nginx");
+        destructive("sudo -u root rm -rf /etc");
+        destructive("sudo sudo rm -rf /");
+        destructive("sudo -- mkfs.ext4 /dev/sda");
+        destructive("env sudo rm -rf /");
+        destructive("FOO=1 sudo rm -rf /");
+        destructive("nohup sudo shutdown -h now");
+        destructive("timeout 5 sudo dd if=/dev/zero of=/dev/sda");
+        // Shell -c scripts.
+        destructive("sh -c 'rm -rf /'");
+        destructive("bash -c \"mkfs.ext4 /dev/sda1\"");
+        destructive("bash -lc 'reboot'");
+        destructive("sudo sh -c 'rm -rf /'");
+        destructive("sh -c 'echo start; rm -rf /'");
+        // Substitution payloads.
+        destructive("echo $(rm -rf /)");
+        destructive("echo `rm -rf /`");
+        destructive("echo $(date; rm -rf /)");
+        destructive("echo $(echo $(rm -rf /))");
+        destructive("echo \"$(shutdown -h now)\"");
+        destructive("run=$(reboot)");
+        // Variable-expansion targets stay covered (existing shapes, plus
+        // quoted variants the trim step normalizes).
+        destructive("rm -rf \"$HOME\"");
+        destructive("rm -rf '${HOME}'");
+    }
+
+    /// The flip side of the evasion sweep: substitution, wrappers and shell
+    /// -c invocations must never UPGRADE anything to ReadOnly — the
+    /// whitelist is only reachable by a directly-recognized inspection
+    /// command. Anything not destructive inside them stays Unknown.
+    #[test]
+    fn substitution_and_wrappers_never_upgrade_to_read_only() {
+        unknown("$(df -h)");
+        unknown("echo $(df -h)");
+        unknown("`df -h`");
+        unknown("echo `date`");
+        unknown("echo $(whoami)");
+        unknown("grep \"$(date)\" /var/log/app.log");
+        unknown("sudo systemctl restart nginx");
+        unknown("sudo cat /var/log/auth.log");
+        unknown("sudo -u postgres psql -l");
+        unknown("sh -c 'df -h'");
+        unknown("bash -c 'echo hi'");
+        unknown("sh");
+        unknown("bash --norc");
+        // The read-only whitelist itself is untouched by the sweep.
+        read_only("df -h");
+        read_only("ls -la /var/log");
+        read_only("ps aux | grep mysqld");
+    }
+
+    /// Reliability round 5: the sensitive-path denylist must hold across
+    /// path-shape aliasing — `~` expansions, `./` segments, double slashes,
+    /// and bare system basenames from a relative cwd. URL-encoded tokens
+    /// are intentionally NOT decoded: neither the shell nor SFTP decode
+    /// percent escapes, so `%2e%2e/x` is a literal filename, not a
+    /// traversal — while `%2e%2e/.ssh` is flagged only because it still
+    /// contains a literal `.ssh` component. Pinned so a future decoder
+    /// cannot silently change this behavior.
+    #[test]
+    fn sensitive_path_detection_survives_path_shape_evasion() {
+        for token in [
+            "~/.ssh/id_rsa",
+            "./.ssh/id_rsa",
+            ".//.ssh/id_ed25519",
+            "//root//.ssh//id_rsa",
+            "~root/.ssh/id_rsa",
+            "~/../root/.ssh/id_rsa",
+            "/root/./.aws/credentials",
+            "//etc//shadow",
+            "/etc/./shadow",
+            "/etc//gshadow",
+            "./etc/shadow", // relative from a system cwd
+            "shadow",       // bare basename (`cat shadow` in /etc)
+            "/etc/sudoers.d/override",
+            "/etc/./sudoers",
+            "./id_rsa",
+            "sub/../.netrc",
+            "/srv/app/./.env.production",
+            "/etc/ssl/private//server.pem",
+            "%2e%2e/.ssh", // literal `.ssh` component, not percent decoding
+        ] {
+            assert!(
+                is_sensitive_path(token),
+                "expected '{token}' to be flagged sensitive"
+            );
+        }
+        for token in [
+            "/etc/hostname",
+            "/etc/ssh/sshd_config", // config, not a host key
+            "/var/log/app.log",
+            "/home/u/project/shadowing.md", // basename must match exactly
+            "%2e%2e%2fnotes.txt",   // percent-encoded literals are NOT decoded…
+            "%2e%2e/x",             // …and carry no literal sensitive component
+            "id_rsa.pub",           // public half
+        ] {
+            assert!(
+                !is_sensitive_path(token),
+                "expected '{token}' NOT to be flagged sensitive"
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -30,12 +30,15 @@ use crate::exec::{
 };
 use crate::host_key::{HostKeyState, HostKeyVerifier};
 use crate::highlight_rules;
+use crate::metrics;
+use crate::metrics_history;
 use crate::model::{
     normalize_remote_path, path_from_sftp_uri, sftp_uri, AuthenticationMethod, SftpEntry,
     StoredConnection, SudoSource, TerminalFrame, TerminalStream, MAX_TRANSFER_SIZE,
     TERMINAL_REPLAY_LIMIT, TRANSFER_CHUNK_SIZE,
 };
 use crate::quick_commands;
+use crate::session_recording;
 use crate::sudo_profiles;
 use crate::transfer_history;
 
@@ -601,6 +604,11 @@ struct SessionEntry {
     /// session's PTY (`exec_in_terminal`); `None` outside such a run. Fed
     /// by the read loop at the same point as the auto-sudo observer.
     agent_recorder: Arc<Mutex<Option<TerminalRecorder>>>,
+    /// Session recording (`ssh/recording/start`): captures the terminal
+    /// output stream into an asciicast v2 file while active. Fed by the
+    /// read loop at the same point as the agent recorder; auto-stopped
+    /// when the session's read loop ends.
+    session_recorder: Arc<Mutex<Option<session_recording::SessionRecorder>>>,
     /// Serializes agent-terminal executions on this session: two concurrent
     /// MCP commands must not interleave keystrokes on the same PTY or
     /// overwrite each other's recorder. Deliberately per-session (runs on
@@ -713,6 +721,7 @@ fn session_info_payload(
     created_at_secs: u64,
     auth_method: &str,
     endpoint: &ConnectionEndpoint,
+    recording: bool,
 ) -> Value {
     json!({
         "sessionId": session_id,
@@ -720,6 +729,7 @@ fn session_info_payload(
         "workbenchId": workbench_id,
         "readOnly": read_only,
         "connected": connected,
+        "recording": recording,
         "sudoKeepalive": sudo_keepalive,
         "terminalKeepaliveSecs": terminal_keepalive_secs,
         "createdAt": created_at_secs,
@@ -916,6 +926,7 @@ impl SshRuntime {
             replay: replay.clone(),
             sftp: AsyncMutex::new(None),
             agent_recorder: Arc::new(Mutex::new(None)),
+            session_recorder: Arc::new(Mutex::new(None)),
             agent_exec_lock: Arc::new(AsyncMutex::new(())),
         });
         Self::sync_auto_sudo(&entry, &connection);
@@ -1056,6 +1067,16 @@ impl SshRuntime {
                             }
                         }
                         let Some(data) = directory_filter.filter(&data) else { continue; };
+                        // Session recording capture: everything the terminal
+                        // shows (stdout + stderr, post-filter) lands in the
+                        // cast file when a recording is active.
+                        if stream != TerminalStream::State {
+                            if let Ok(mut slot) = entry.session_recorder.lock() {
+                                if let Some(recorder) = slot.as_mut() {
+                                    recorder.observe(&data);
+                                }
+                            }
+                        }
                         publish_terminal(&task_id, stream, data, &replay, &emitter).await;
                         if directory_filter.take_failed() {
                             directory_tracking_enabled = false;
@@ -1071,6 +1092,15 @@ impl SshRuntime {
                 }
             }
             entry.connected.store(false, Ordering::Release);
+            // Auto-stop an active session recording: the file is finalized
+            // even when the workbench never sent `ssh/recording/stop`.
+            if let Ok(mut slot) = entry.session_recorder.lock() {
+                if let Some(recorder) = slot.take() {
+                    if let Err(error) = recorder.finish() {
+                        eprintln!("[ssh-trace] recording auto-stop failed: {error}");
+                    }
+                }
+            }
             publish_terminal(
                 &task_id,
                 TerminalStream::State,
@@ -1491,6 +1521,11 @@ impl SshRuntime {
                     entry.created_at_secs,
                     auth_method,
                     &endpoint,
+                    entry
+                        .session_recorder
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .is_some(),
                 )
             })
             .collect();
@@ -2774,7 +2809,88 @@ impl SshRuntime {
         let session = self.session(session_id).await?;
         let snapshot = exec::collect_metrics(&session.handle).await?;
         self.store_metrics_snapshot(session_id, &snapshot);
+        // Trend-history ring: one row per fresh collection, keyed by
+        // connection. Best-effort — a failed append never fails metrics.
+        let sample = metrics_history::sample_from_snapshot(&session.connection_id, &snapshot);
+        if let Err(error) = metrics_history::append_sample(&self.data_dir, &sample) {
+            eprintln!("[ssh-trace] failed to append metrics history: {error}");
+        }
         Ok(snapshot)
+    }
+
+    /// `ssh/processes/list`: full sortable process table (CPU-sorted,
+    /// server-capped). Read-only commands only.
+    pub async fn processes_list(&self, session_id: &str) -> Result<Value, String> {
+        let session = self.session(session_id).await?;
+        metrics::collect_process_list(&session.handle).await
+    }
+
+    /// `ssh/processes/kill`: signals one remote process (pid/signal are
+    /// validated in `metrics::kill_command`; pid 0/1 refused).
+    pub async fn kill_process(&self, session_id: &str, pid: u64, signal: u32) -> Result<Value, String> {
+        let session = self.session(session_id).await?;
+        metrics::kill_process(&session.handle, pid, signal).await?;
+        Ok(json!({ "success": true, "pid": pid }))
+    }
+
+    /// `ssh/metrics/history`: persisted trend samples for the session's
+    /// connection, oldest first. Pure local data — answers without a
+    /// live connection.
+    pub async fn metrics_history(&self, session_id: &str, limit: usize) -> Result<Value, String> {
+        let connection_id = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .map(|session| session.connection_id.clone())
+                .ok_or("Session was not found")?
+        };
+        let samples = metrics_history::load_history(&self.data_dir, Some(&connection_id), limit);
+        Ok(json!({ "connectionId": connection_id, "samples": samples }))
+    }
+
+    /// `ssh/recording/start`: attaches a cast recorder to the session's
+    /// output stream. One recording per session at a time.
+    pub async fn recording_start(&self, session_id: &str) -> Result<Value, String> {
+        let session = self.session(session_id).await?;
+        let host = self
+            .connections
+            .read()
+            .map_err(|_| "Connection registry is poisoned".to_string())?
+            .get(&session.connection_id)
+            .map(|connection| connection.host.clone())
+            .unwrap_or_default();
+        let mut slot = session
+            .session_recorder
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot.is_some() {
+            return Err("This session is already being recorded".to_string());
+        }
+        let recording_id = Uuid::new_v4().to_string();
+        let recorder = session_recording::SessionRecorder::start(
+            &self.data_dir,
+            &recording_id,
+            &session.connection_id,
+            &host,
+            session_id,
+            80,
+            24,
+        )?;
+        *slot = Some(recorder);
+        Ok(json!({ "recordingId": recording_id, "recording": true }))
+    }
+
+    /// `ssh/recording/stop`: finalizes the active recording (if any) and
+    /// returns its summary.
+    pub async fn recording_stop(&self, session_id: &str) -> Result<Value, String> {
+        let session = self.session(session_id).await?;
+        let recorder = session
+            .session_recorder
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .ok_or("This session has no active recording")?;
+        recorder.finish()
     }
 
     /// Returns the cached snapshot for a session with its `cachedAt` marker,
@@ -3302,6 +3418,7 @@ impl SshRuntime {
         session_id: String,
         remote_path: String,
         size: u64,
+        resume_task_id: Option<String>,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         self.ensure_writable(&session_id).await?;
@@ -3313,6 +3430,50 @@ impl SshRuntime {
         if self.active_transfer_count(&session_id)? >= 3 {
             return Err("This SSH session already has three active transfers".to_string());
         }
+        let remote_path = normalize_remote_path(&remote_path)?;
+        // Resume path: re-register a previously interrupted upload job. The
+        // spool file and its sidecar meta (written on the first start) hold
+        // the received prefix; the caller re-streams only the missing tail.
+        if let Some(task_id) = resume_task_id {
+            let (local_path, resume_offset) = self.open_resume_spool(&task_id, &remote_path, size)?;
+            let file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&local_path)
+                .map_err(|error| format!("Failed to open upload spool file: {error}"))?;
+            self.uploads
+                .lock()
+                .map_err(|_| "Upload registry is poisoned".to_string())?
+                .insert(
+                    task_id.clone(),
+                    UploadState {
+                        session_id: session_id.clone(),
+                        remote_path: remote_path.clone(),
+                        expected_size: size,
+                        received: resume_offset,
+                        local_path,
+                        file,
+                    },
+                );
+            let file_name = remote_path.rsplit('/').next().unwrap_or("upload").to_string();
+            emitter
+                .event(
+                    "sftp/transfer/progress",
+                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": file_name, "transferred": resume_offset, "size": size, "status": "running" }),
+                )
+                .map_err(plugin_error)?;
+            let connection_id = self.session_connection_id(&session_id).await;
+            self.record_transfer_start(
+                &task_id,
+                &session_id,
+                &connection_id,
+                "upload",
+                &file_name,
+                size,
+            );
+            return Ok(
+                json!({ "taskId": task_id, "chunkSize": TRANSFER_CHUNK_SIZE, "maxBytes": MAX_TRANSFER_SIZE, "resumeOffset": resume_offset }),
+            );
+        }
         let task_id = Uuid::new_v4().to_string();
         let local_path = self.transfer_dir.join(format!("upload-{task_id}.part"));
         let file = std::fs::OpenOptions::new()
@@ -3320,6 +3481,13 @@ impl SshRuntime {
             .write(true)
             .open(&local_path)
             .map_err(|error| format!("Failed to create upload spool file: {error}"))?;
+        // Sidecar meta: lets `sftp/transfer/resumable` and a later resume
+        // validate the file identity (remote path + size) without trusting
+        // caller-supplied values.
+        write_upload_meta(
+            &self.transfer_dir.join(format!("upload-{task_id}.json")),
+            &json!({ "remotePath": remote_path, "size": size }),
+        )?;
         self.uploads
             .lock()
             .map_err(|_| "Upload registry is poisoned".to_string())?
@@ -3327,7 +3495,7 @@ impl SshRuntime {
                 task_id.clone(),
                 UploadState {
                     session_id: session_id.clone(),
-                    remote_path: normalize_remote_path(&remote_path)?,
+                    remote_path: remote_path.clone(),
                     expected_size: size,
                     received: 0,
                     local_path,
@@ -3351,8 +3519,55 @@ impl SshRuntime {
             size,
         );
         Ok(
-            json!({ "taskId": task_id, "chunkSize": TRANSFER_CHUNK_SIZE, "maxBytes": MAX_TRANSFER_SIZE }),
+            json!({ "taskId": task_id, "chunkSize": TRANSFER_CHUNK_SIZE, "maxBytes": MAX_TRANSFER_SIZE, "resumeOffset": 0_u64 }),
         )
+    }
+
+    /// Reopens an interrupted upload's spool file for appending, validating
+    /// the resume request against the persisted sidecar meta so a stale or
+    /// mismatched resumeTaskId cannot splice the wrong file tail onto the
+    /// spooled prefix.
+    fn open_resume_spool(
+        &self,
+        task_id: &str,
+        remote_path: &str,
+        size: u64,
+    ) -> Result<(PathBuf, u64), String> {
+        let spool = self.transfer_dir.join(format!("upload-{task_id}.part"));
+        let meta = read_upload_meta(&self.transfer_dir.join(format!("upload-{task_id}.json")))
+            .ok_or("No resumable upload found for this task")?;
+        if meta
+            .get("remotePath")
+            .and_then(Value::as_str)
+            != Some(remote_path)
+        {
+            return Err("Resume target does not match the interrupted upload's remote path".to_string());
+        }
+        if meta.get("size").and_then(Value::as_u64) != Some(size) {
+            return Err("Resume file size does not match the interrupted upload".to_string());
+        }
+        let spool_len = std::fs::metadata(&spool)
+            .map_err(|error| format!("Upload spool file is gone: {error}"))?
+            .len();
+        if spool_len > size {
+            return Err("Spooled data exceeds the declared file size".to_string());
+        }
+        Ok((spool, spool_len))
+    }
+
+    /// `sftp/transfer/resumable`: interrupted uploads (spool + meta still on
+    /// disk, job no longer live) the workbench can offer to resume. Pure
+    /// scan over local state, so it answers without any active connection.
+    pub fn resumable_uploads(&self) -> Result<Value, String> {
+        let live: Vec<String> = self
+            .uploads
+            .lock()
+            .map_err(|_| "Upload registry is poisoned".to_string())?
+            .keys()
+            .cloned()
+            .collect();
+        let tasks = resumable_uploads_from(&self.transfer_dir, &live);
+        Ok(json!({ "tasks": tasks }))
     }
 
     pub fn append_upload(
@@ -3420,7 +3635,8 @@ impl SshRuntime {
             .remove(task_id)
             .ok_or("Upload task was not found")?;
         if upload.received != upload.expected_size {
-            let _ = std::fs::remove_file(&upload.local_path);
+            // Keep the spool + meta: the received prefix stays resumable via
+            // `sftp/upload/start` with `resumeTaskId`.
             let error = format!(
                 "Upload is incomplete: expected {}, received {}",
                 upload.expected_size, upload.received
@@ -3509,6 +3725,7 @@ impl SshRuntime {
             .map_err(|_| "Finishing upload registry is poisoned".to_string())?
             .remove(task_id);
         let _ = tokio::fs::remove_file(&local_path).await;
+        remove_upload_meta(&self.transfer_dir, task_id);
         match result {
             Ok(()) => {
                 let task = json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": remote_path.rsplit('/').next().unwrap_or("upload"), "transferred": expected_size, "size": expected_size, "status": "completed" });
@@ -3536,6 +3753,7 @@ impl SshRuntime {
         &self,
         session_id: &str,
         remote_path: &str,
+        offset: u64,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         let remote_path = normalize_remote_path(remote_path)?;
@@ -3556,6 +3774,15 @@ impl SshRuntime {
                 "Transfers are limited to {MAX_TRANSFER_SIZE} bytes"
             ));
         }
+        // Resume support: the caller already holds the first `offset` bytes
+        // locally and re-attaches mid-stream. Size-only identity check (a
+        // changed file with the same size would splice mismatched content);
+        // documented as best-effort.
+        if offset > size {
+            return Err(format!(
+                "Resume offset {offset} is beyond the remote file size {size}"
+            ));
+        }
         let file_name = remote_path
             .rsplit('/')
             .next()
@@ -3573,13 +3800,13 @@ impl SshRuntime {
                     remote_path,
                     file_name: file_name.clone(),
                     size,
-                    next_offset: 0,
+                    next_offset: offset,
                 },
             );
         emitter
             .event(
                 "sftp/transfer/progress",
-                json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "transferred": 0, "size": size, "status": "queued" }),
+                json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "transferred": offset, "size": size, "status": if offset > 0 { "running" } else { "queued" } }),
             )
             .map_err(plugin_error)?;
         let connection_id = self.session_connection_id(session_id).await;
@@ -3592,7 +3819,7 @@ impl SshRuntime {
             size,
         );
         Ok(
-            json!({ "taskId": task_id, "fileName": file_name, "size": size, "chunkSize": TRANSFER_CHUNK_SIZE }),
+            json!({ "taskId": task_id, "fileName": file_name, "size": size, "chunkSize": TRANSFER_CHUNK_SIZE, "resumeOffset": offset }),
         )
     }
 
@@ -3688,6 +3915,7 @@ impl SshRuntime {
             });
         if let Some(upload) = upload.as_ref() {
             let _ = std::fs::remove_file(&upload.local_path);
+            remove_upload_meta(&self.transfer_dir, task_id);
         }
         if upload.is_none() && download.is_none() && finishing.is_none() {
             return Err("Transfer task was not found".to_string());
@@ -4397,6 +4625,90 @@ async fn delete_directory_tree(
     Ok(())
 }
 
+/// Reads an upload spool meta file (`upload-<taskId>.json`). Corrupt or
+/// missing files yield `None` — a resume request against them is rejected.
+fn read_upload_meta(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Value>(&text).ok()
+}
+
+/// Writes an upload spool meta file atomically (tmp + rename, 0600).
+fn write_upload_meta(path: &Path, meta: &Value) -> Result<(), String> {
+    let text = serde_json::to_string(meta)
+        .map_err(|error| format!("Failed to encode upload meta: {error}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)
+        .map_err(|error| format!("Failed to write {}: {error}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))
+}
+
+/// Removes the upload spool meta file when it is no longer resumable.
+fn remove_upload_meta(transfer_dir: &Path, task_id: &str) {
+    let _ = std::fs::remove_file(transfer_dir.join(format!("upload-{task_id}.json")));
+}
+
+/// Scans the transfer directory for interrupted uploads that can still be
+/// resumed: a spool file plus its sidecar meta, whose task is not live and
+/// whose persisted history row is not terminal-success/cancelled. Pure over
+/// (transfer_dir, live task ids) so it is unit-testable without a runtime.
+fn resumable_uploads_from(transfer_dir: &Path, live_task_ids: &[String]) -> Vec<Value> {
+    let mut tasks = Vec::new();
+    let Ok(entries) = std::fs::read_dir(transfer_dir) else {
+        return tasks;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(task_id) = name.strip_prefix("upload-").and_then(|rest| rest.strip_suffix(".json")) else {
+            continue;
+        };
+        if live_task_ids.iter().any(|live| live == task_id) {
+            continue;
+        }
+        let Some(meta) = read_upload_meta(&path) else {
+            continue;
+        };
+        let (Some(remote_path), Some(size)) = (
+            meta.get("remotePath").and_then(Value::as_str),
+            meta.get("size").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        let Ok(spool_len) = std::fs::metadata(transfer_dir.join(format!("upload-{task_id}.part")))
+            .map(|meta| meta.len())
+        else {
+            continue;
+        };
+        if spool_len == 0 || spool_len > size {
+            continue;
+        }
+        tasks.push(json!({
+            "taskId": task_id,
+            "direction": "upload",
+            "remotePath": remote_path,
+            "fileName": remote_path.rsplit('/').next().unwrap_or("upload"),
+            "size": size,
+            "resumableBytes": spool_len,
+        }));
+    }
+    // Newest meta file first so the picker surfaces the freshest attempt.
+    tasks.sort_by(|a, b| {
+        b["taskId"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(a["taskId"].as_str().unwrap_or_default())
+    });
+    tasks
+}
+
 fn remote_transfer_paths(target: &str, task_id: &str) -> Result<(String, String), String> {
     let (parent, _) = target
         .rsplit_once('/')
@@ -4593,6 +4905,83 @@ mod tests {
         assert_eq!(frames[0].sequence, 2);
     }
 
+    // —— F1: 断点续传（spool meta / resume 校验 / resumable 扫描）———
+
+    fn temp_transfer_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dbx-ssh-resume-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn spool_fixture(dir: &Path, task_id: &str, remote_path: &str, size: u64, received: u64) {
+        std::fs::write(dir.join(format!("upload-{task_id}.part")), vec![b'x'; received as usize])
+            .unwrap();
+        write_upload_meta(
+            &dir.join(format!("upload-{task_id}.json")),
+            &json!({ "remotePath": remote_path, "size": size }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn upload_meta_roundtrips_and_rejects_corruption() {
+        let dir = temp_transfer_dir();
+        let path = dir.join("upload-t1.json");
+        write_upload_meta(&path, &json!({ "remotePath": "/srv/a.bin", "size": 9 })).unwrap();
+        let meta = read_upload_meta(&path).unwrap();
+        assert_eq!(meta["remotePath"], "/srv/a.bin");
+        assert_eq!(meta["size"], 9);
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(read_upload_meta(&path).is_none());
+        assert!(read_upload_meta(&dir.join("missing.json")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_spool_validation_matches_meta() {
+        let dir = temp_transfer_dir();
+        // SshRuntime's transfer spool lives under <data_dir>/transfers.
+        let transfer_dir = dir.join("transfers");
+        std::fs::create_dir_all(&transfer_dir).unwrap();
+        let runtime = SshRuntime::new(dir.clone());
+        spool_fixture(&transfer_dir, "t1", "/srv/a.bin", 100, 40);
+        // Matching request resumes at the spooled length.
+        let (path, offset) = runtime
+            .open_resume_spool("t1", "/srv/a.bin", 100)
+            .unwrap();
+        assert_eq!(offset, 40);
+        assert!(path.ends_with("upload-t1.part"));
+        // Mismatched size / remote path / missing meta are refused.
+        assert!(runtime.open_resume_spool("t1", "/srv/a.bin", 99).is_err());
+        assert!(runtime.open_resume_spool("t1", "/srv/other.bin", 100).is_err());
+        assert!(runtime.open_resume_spool("gone", "/srv/a.bin", 100).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resumable_scan_lists_only_live_pending_uploads() {
+        let dir = temp_transfer_dir();
+        let transfer_dir = dir.join("transfers");
+        std::fs::create_dir_all(&transfer_dir).unwrap();
+        spool_fixture(&transfer_dir, "t-resume", "/srv/a.bin", 100, 40);
+        spool_fixture(&transfer_dir, "t-live", "/srv/b.bin", 100, 10);
+        // Empty spool, oversized spool, and meta-less files are skipped.
+        spool_fixture(&transfer_dir, "t-empty", "/srv/c.bin", 100, 0);
+        spool_fixture(&transfer_dir, "t-over", "/srv/d.bin", 10, 40);
+        std::fs::write(transfer_dir.join("upload-t-nometa.part"), b"data").unwrap();
+        std::fs::write(transfer_dir.join("upload-t-nospool.json"), "{}").unwrap();
+        let tasks = resumable_uploads_from(&transfer_dir, &["t-live".to_string()]);
+        assert_eq!(tasks.len(), 1, "only t-resume qualifies: {tasks:?}");
+        assert_eq!(tasks[0]["taskId"], "t-resume");
+        assert_eq!(tasks[0]["remotePath"], "/srv/a.bin");
+        assert_eq!(tasks[0]["fileName"], "a.bin");
+        assert_eq!(tasks[0]["size"], 100);
+        assert_eq!(tasks[0]["resumableBytes"], 40);
+        // A missing transfer dir yields an empty list, not an error.
+        assert!(resumable_uploads_from(&Path::new("/nonexistent-dbx-ssh"), &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 连接表单的 sudo_source 三选一决定生效的全局配置：off 从不提升；
     /// custom 只沿用工作台绑定（0.4.x 兼容）；global 先按表单引用解析，
     /// 再回落绑定；引用无法解析时退化为无配置而不是失败连接。
@@ -4776,7 +5165,8 @@ mod tests {
             port: 2222,
             username: "ops".to_string(),
         };
-        let row = session_info_payload("sess-1", "conn-1", "wb-1", true, true, true, 90, 1_700_000_123, "private-key", &endpoint);
+        let row = session_info_payload("sess-1", "conn-1", "wb-1", true, true, true, 90, 1_700_000_123, "private-key", &endpoint, false);
+        assert_eq!(row["recording"], false);
         assert_eq!(row["sessionId"], json!("sess-1"));
         assert_eq!(row["connectionId"], json!("conn-1"));
         assert_eq!(row["workbenchId"], json!("wb-1"));
@@ -5048,6 +5438,75 @@ mod tests {
             .expect("decision");
         assert_eq!(decision, AgentDecision::Deny);
         assert!(runtime.resolve_agent_challenge("c-2", "maybe", None, false).is_err());
+    }
+
+    /// Reliability round 5 (churn): 500 raise→resolve cycles must leave the
+    /// challenge registry empty (no leak), every consumed id must stay
+    /// unknown afterwards (one-shot semantics survive churn), and each
+    /// decision must reach its waiter exactly once.
+    #[test]
+    fn agent_challenges_survive_high_volume_resolve_churn() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+        const CYCLES: usize = 500;
+
+        for index in 0..CYCLES {
+            let id = format!("churn-{index}");
+            let (sender, mut receiver) = oneshot::channel();
+            runtime
+                .agent_challenges
+                .lock()
+                .expect("challenges")
+                .insert(
+                    id.clone(),
+                    PendingChallenge {
+                        sender,
+                        connection_id: "conn-1".to_string(),
+                        tool: "ssh_exec".to_string(),
+                        command: format!("echo {index}"),
+                        raised_at_ms: 0,
+                    },
+                );
+            // The registry never grows beyond the live challenge: raising
+            // one inserts one row, resolving consumes it.
+            {
+                let challenges = runtime.agent_challenges.lock().expect("challenges");
+                assert_eq!(challenges.len(), 1, "challenge registry leaked at cycle {index}");
+            }
+            let decision = if index % 3 == 0 {
+                runtime.resolve_agent_challenge(&id, "deny", None, false).expect("deny");
+                AgentDecision::Deny
+            } else {
+                let edited = format!("echo edited-{index}");
+                runtime
+                    .resolve_agent_challenge(&id, "approve", Some(&edited), false)
+                    .expect("approve");
+                AgentDecision::Approve { command: Some(edited) }
+            };
+            // One-shot: the consumed id is unknown, and a wrong decision
+            // name is still refused.
+            assert!(
+                runtime.resolve_agent_challenge(&id, "approve", None, false).is_err(),
+                "consumed challenge came back at cycle {index}"
+            );
+            assert_eq!(
+                receiver.try_recv().ok(),
+                Some(decision),
+                "decision must reach its waiter exactly once (cycle {index})"
+            );
+        }
+        assert!(
+            runtime.agent_challenges.lock().expect("challenges").is_empty(),
+            "challenge registry must be empty after churn"
+        );
+
+        // The MCP confirm payload bakes its own timeout at issue time: two
+        // challenges raised with different budgets each carry theirs (the
+        // "不追溯" contract — later changes never rewrite live payloads).
+        let short = SshRuntime::mcp_confirm_challenge_payload("s", "ssh_exec", "x", None, 10);
+        let long = SshRuntime::mcp_confirm_challenge_payload("l", "ssh_exec", "x", None, 600);
+        assert_eq!(short["timeoutSecs"], 10);
+        assert_eq!(long["timeoutSecs"], 600);
     }
 
     #[test]
