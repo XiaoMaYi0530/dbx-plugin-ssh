@@ -41,6 +41,8 @@ def main() -> int:
                         help="directory holding .dbxp and .artifact.json files (default: dist)")
     parser.add_argument("--expect", default="",
                         help="comma-separated target list that must all be present")
+    parser.add_argument("--write-release-candidates", default="",
+                        help="write the merged release-candidates.json to this path after all checks pass")
     args = parser.parse_args()
 
     root = pathlib.Path(args.directory)
@@ -141,6 +143,19 @@ def main() -> int:
         for message in errors:
             print(f"FAIL {message}", file=sys.stderr)
         return 1
+
+    if args.write_release_candidates:
+        # Same schema the official plugin release pipeline uploads alongside
+        # the packages: shared manifest identity plus per-target metadata
+        # sorted by target.
+        identity_key = next(iter(identities))
+        payload = {
+            "plugin": json.loads(identity_key),
+            "artifacts": sorted(artifacts, key=lambda item: item["target"]),
+        }
+        output = pathlib.Path(args.write_release_candidates)
+        output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        print(f"Wrote {output}")
     print("OK all candidate checks passed")
     return 0
 
