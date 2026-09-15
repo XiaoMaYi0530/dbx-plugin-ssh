@@ -401,6 +401,7 @@ const SFTP_PANE_OPEN_KEY = "ssh-sftp-pane-open";
 // 侧栏形态偏好：tree/quick tab（默认 tree）与收起状态，localStorage 全局持久化。
 const SFTP_SIDE_TAB_KEY = "ssh-sftp-side-tab";
 const SFTP_SIDE_COLLAPSED_KEY = "ssh-sftp-side-collapsed";
+const DOWNLOAD_DIR_KEY = "ssh-download-directory";
 // 终端交互：选中复制 + 右键粘贴（localStorage 全局偏好，默认开，"false" 关闭）。
 const SELECT_COPY_KEY = "ssh-terminal-select-copy";
 // 关键词高亮总开关（IMPL_PLAN_NETCATTY_PARITY §3-B1）：localStorage 全局持久化，
@@ -469,16 +470,16 @@ const transferTasks = reactive<Record<string, TransferTask>>({});
 const pausedTaskIds = reactive(new Set<string>());
 const pauseWaiters = new Map<string, Array<() => void>>();
 // 后端扫描出的可续传上传任务（spool 前缀仍在磁盘上）。
-const resumableTasks = ref<ResumableUploadTask[]>([]);
-const resumableLoading = ref(false);
-const resumeInput = ref<HTMLInputElement | null>(null);
-const resumeTargetTaskId = ref("");
 const transferPanelOpen = ref(false);
 // 传输历史（sftp/transfer/history，落盘+内存合并）：面板打开或活动任务清零时刷新；
 // 历史区仅无进行中任务时展示。后端未升级/读取失败仅提示加载失败（optional 特性降级）。
 const transferHistory = ref<TransferHistoryEntry[]>([]);
 const transferHistoryLoading = ref(false);
 const transferHistoryFailed = ref(false);
+const resumableTasks = ref<ResumableUploadTask[]>([]);
+const resumableLoading = ref(false);
+const resumeInput = ref<HTMLInputElement | null>(null);
+const resumeTargetTaskId = ref("");
 const columnsOpen = ref(false);
 const transferSpeeds = reactive<Record<string, number>>({});
 const previewOpen = ref(false);
@@ -518,6 +519,8 @@ const fileMenu = ref<{ x: number; y: number; entry: SftpEntry; selection: string
 const blankMenu = ref<{ x: number; y: number }>();
 // 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩。
 const sideMenu = ref<{ x: number; y: number; path: string }>();
+// 下载历史项右键：只为已有本机落盘路径提供定位/打开操作。
+const transferHistoryMenu = ref<{ x: number; y: number; path: string }>();
 const zmodemState = ref<"idle" | "waiting" | "uploading">("idle");
 const zmodemFileName = ref("");
 const zmodemTransferred = ref(0);
@@ -632,6 +635,7 @@ const metrics = ref<ServerMetrics>();
 const metricsLoading = ref(false);
 const metricsError = ref("");
 const settingsOpen = ref(false);
+const auditOpen = ref(false);
 const settingsLoading = ref(false);
 const settingsLoadFailed = ref(false);
 const settingsSaving = ref(false);
@@ -653,6 +657,7 @@ const settingsDraft = reactive({
   agentTerminalMode: "off",
   rememberedCommands: [] as string[],
 });
+const downloadDirDraft = ref("");
 // 全局 quick sudo 配置集中管理：列表与编辑弹窗状态（密钥只在提交时发送）。
 const sudoProfiles = ref<SudoProfileView[]>([]);
 const sudoProfilesLoading = ref(false);
@@ -2175,9 +2180,22 @@ function sanitizeTransferHistoryTasks(raw: unknown): TransferHistoryEntry[] {
       startedAt: typeof record.startedAt === "number" ? record.startedAt : undefined,
       finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : undefined,
       error: typeof record.error === "string" && record.error ? record.error : undefined,
+      localPath: typeof record.localPath === "string" && record.localPath ? record.localPath : undefined,
     });
   }
   return out;
+}
+
+async function clearTransferHistory() {
+  if (!window.confirm(t("transfersHistory.clearConfirm"))) return;
+  try {
+    await window.dbxPlugin.invoke("sftp/transfer/history/clear", {});
+    transferHistory.value = [];
+    transferHistoryFailed.value = false;
+    showNotice(t("transfersHistory.cleared"));
+  } catch (cause) {
+    showError(cause);
+  }
 }
 
 // 打开传输面板或最后一个活动任务结束（进行中清零）时拉取历史：历史区仅在无进行中任务时展示。
@@ -2190,6 +2208,45 @@ watch(transferPanelOpen, (open) => {
 watch(activeTransfers, (count, previous) => {
   if (count === 0 && previous > 0 && transferPanelOpen.value) void refreshTransferHistory();
 });
+
+async function refreshResumableUploads() {
+  resumableLoading.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ tasks: ResumableUploadTask[] }>("sftp/transfer/resumable", {});
+    resumableTasks.value = (result.tasks ?? []).filter(canResumeUpload);
+  } catch {
+    resumableTasks.value = [];
+  } finally {
+    resumableLoading.value = false;
+  }
+}
+
+function beginResumeUpload(task: ResumableUploadTask) {
+  resumeTargetTaskId.value = task.taskId;
+  resumeInput.value?.click();
+}
+
+async function onResumeFilePicked(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  const task = resumableTasks.value.find((item) => item.taskId === resumeTargetTaskId.value);
+  resumeTargetTaskId.value = "";
+  if (!file || !task) return;
+  if (!matchResumableUpload(task, [{ name: file.name, size: file.size }])) {
+    showError(new Error(t("resumableMismatch")));
+    return;
+  }
+  try {
+    await uploadSource(file.name, file.size, async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()), { taskId: task.taskId, remotePath: task.remotePath });
+    await loadDirectory();
+    showNotice(t("resumableResumed", { name: file.name }));
+    void refreshTransferHistory();
+    void refreshResumableUploads();
+  } catch (cause) {
+    showError(cause);
+  }
+}
 
 async function resolveHostKey(accept: boolean) {
   const prompt = hostKeyPrompt.value;
@@ -2621,10 +2678,9 @@ watch(() => session.value?.sessionId, (next, previous) => {
 });
 
 // ---------------------------------------------------------------------------
-// 审计日志查看（IMPL_PLAN_NETCATTY_PARITY §3-B4）：设置弹窗折叠 section，
+// 审计日志查看（IMPL_PLAN_NETCATTY_PARITY §3-B4）：独立工具栏入口，
 // 只读最近 200 条；打开/过滤变化/刷新时拉取，失败静默空态。
 // ---------------------------------------------------------------------------
-const auditInlineOpen = ref(false);
 const auditEntries = ref<AuditEntry[]>([]);
 const auditLoading = ref(false);
 const auditLoadFailed = ref(false);
@@ -2651,9 +2707,10 @@ async function loadAuditEntries() {
   }
 }
 
-function toggleAuditInline() {
-  auditInlineOpen.value = !auditInlineOpen.value;
-  if (auditInlineOpen.value) void loadAuditEntries();
+function openAuditLog() {
+  auditOpen.value = true;
+  auditKindFilter.value = "";
+  void loadAuditEntries();
 }
 
 const visibleAuditEntries = computed(() => {
@@ -2923,6 +2980,24 @@ function loadSftpPaneDefaultOpen(): boolean {
     return sanitizeSftpPaneDefaultOpen(window.localStorage.getItem(SFTP_PANE_OPEN_KEY));
   } catch {
     return false;
+  }
+}
+
+function loadDownloadDir(): string {
+  try {
+    return window.localStorage.getItem(DOWNLOAD_DIR_KEY)?.trim() || "";
+  } catch {
+    return "";
+  }
+}
+
+function persistDownloadDir(value: string) {
+  try {
+    const normalized = value.trim();
+    if (normalized) window.localStorage.setItem(DOWNLOAD_DIR_KEY, normalized);
+    else window.localStorage.removeItem(DOWNLOAD_DIR_KEY);
+  } catch {
+    // localStorage 不可用时偏好仅对当前会话生效。
   }
 }
 
@@ -3823,9 +3898,14 @@ function waitForUploadAck(taskId: string, nextOffset: number) {
 // 桌面端 sidecar 可直接把下载写进本机下载目录；web/docker 模式探测失败或
 // canSaveLocal=false 时回退浏览器 <a download>。结果按工作台生命周期缓存。
 let localCapabilities: Promise<{ canSaveLocal: boolean; downloadsDir: string } | undefined> | undefined;
+const localDownloadDir = ref("");
 function probeLocalCapabilities() {
   localCapabilities ??= window.dbxPlugin
     .invoke<{ canSaveLocal: boolean; downloadsDir: string }>("local/capabilities")
+    .then((result) => {
+      localDownloadDir.value = result.downloadsDir || "";
+      return result;
+    })
     .catch(() => undefined);
   return localCapabilities;
 }
@@ -3834,9 +3914,13 @@ async function downloadEntry(entry: SftpEntry) {
   fileMenu.value = undefined;
   openTransferPanel();
   if (!session.value || entry.kind !== "file") return;
-  const fileTransfer = window.dbxPlugin.fileTransfer;
-  const local = fileTransfer ? undefined : await probeLocalCapabilities();
+  // Prefer the sidecar local sink on desktop so completed downloads retain a
+  // validated localPath for the reveal/open actions in the transfer panel and
+  // persisted history. Fall back to the host file-transfer bridge when a
+  // local filesystem is unavailable (web/docker).
+  const local = await probeLocalCapabilities();
   const saveToLocal = !!local?.canSaveLocal;
+  const fileTransfer = saveToLocal ? undefined : window.dbxPlugin.fileTransfer;
   // Web/Docker mode has no local sink and no host save dialog; the whole file
   // is buffered in browser memory before saving, so warn before large ones.
   if (!fileTransfer && !saveToLocal && (entry.size || 0) > WEB_DOWNLOAD_WARNING_BYTES && !window.confirm(t("webDownload.largeWarning", { name: entry.name, size: formatBytes(entry.size || 0) }))) return;
@@ -3848,6 +3932,7 @@ async function downloadEntry(entry: SftpEntry) {
       sessionId: session.value.sessionId,
       remotePath: pathFromUri(entry.uri),
       saveToLocal,
+      downloadDir: loadDownloadDir() || undefined,
     });
     transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued" };
     target = fileTransfer ? await fileTransfer.beginSave({ name: info.fileName, size: info.size }) : undefined;
@@ -3989,44 +4074,6 @@ function toggleTransferPause(task: TransferTask) {
   if (!transferPausable(task.status)) return;
   if (pausedTaskIds.has(task.taskId)) releasePause(task.taskId);
   else pausedTaskIds.add(task.taskId);
-}
-
-async function refreshResumableUploads() {
-  resumableLoading.value = true;
-  try {
-    const result = await window.dbxPlugin.invoke<{ tasks: ResumableUploadTask[] }>("sftp/transfer/resumable", {});
-    resumableTasks.value = (result.tasks ?? []).filter(canResumeUpload);
-  } catch {
-    // 旧 sidecar 无该方法：静默降级为无可续传项（optional 降级）。
-    resumableTasks.value = [];
-  } finally {
-    resumableLoading.value = false;
-  }
-}
-
-function beginResumeUpload(task: ResumableUploadTask) {
-  resumeTargetTaskId.value = task.taskId;
-  resumeInput.value?.click();
-}
-
-async function onResumeFilePicked(event: Event) {
-  const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
-  input.value = "";
-  const task = resumableTasks.value.find((item) => item.taskId === resumeTargetTaskId.value);
-  resumeTargetTaskId.value = "";
-  if (!file || !task) return;
-  if (!matchResumableUpload(task, [{ name: file.name, size: file.size }])) {
-    showError(new Error(t("resumableMismatch")));
-    return;
-  }
-  try {
-    await uploadSource(file.name, file.size, async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()), { taskId: task.taskId, remotePath: task.remotePath });
-    await loadDirectory();
-    showNotice(t("resumableResumed", { name: file.name }));
-  } catch (cause) {
-    showError(cause);
-  }
 }
 
 async function cancelTransfer(task: TransferTask) {
@@ -5033,6 +5080,22 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
   const ROWS = 24;
   const FRAME_INTERVAL_MS = 500;
   const MAX_FRAMES = 120;
+  const fileName = `${summary.recordingId || "session"}.gif`;
+  // Open the native save picker before the first await so browsers that require
+  // a user gesture keep the permission to choose both directory and filename.
+  // DBX hosts without File System Access continue through fileTransfer below.
+  let nativeSave: DbxGifSaveFileHandle | undefined;
+  if (window.showSaveFilePicker) {
+    try {
+      nativeSave = await window.showSaveFilePicker({
+        suggestedName: fileName,
+        types: [{ description: "GIF image", accept: { "image/gif": [".gif"] } }],
+      });
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") return;
+      throw cause;
+    }
+  }
   const host = document.createElement("div");
   host.style.cssText = "position:fixed;left:-99999px;top:0;";
   document.body.appendChild(host);
@@ -5078,13 +5141,15 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
     term.dispose();
     term = null;
     const gif = encodeGif(canvas.width, canvas.height, frames);
-    const fileName = `${summary.recordingId || "session"}.gif`;
-    // 落盘走宿主 fileTransfer（与 SFTP 下载同通道）：宿主沙箱里 <a download>
-    // 点击常被拦截或落点不可见，那正是“导出报错/没有文件”的来源。web/docker
-    // 模式缺失 fileTransfer 时才退回浏览器下载。
-    const fileTransfer = window.dbxPlugin.fileTransfer;
-    if (fileTransfer) {
-      const target = await fileTransfer.beginSave({ name: fileName, size: gif.byteLength });
+    if (nativeSave) {
+      const writable = await nativeSave.createWritable();
+      await writable.write(gif);
+      await writable.close();
+    } else if (window.dbxPlugin.fileTransfer) {
+      // DBX hosts own the native save dialog here, so the user can choose the
+      // destination instead of silently losing the file in an unknown folder.
+      const fileTransfer = window.dbxPlugin.fileTransfer;
+      const target = await fileTransfer.beginSave({ name: fileName, contentType: "image/gif", size: gif.byteLength });
       try {
         await fileTransfer.write(target.handleId, 0, gif);
         await fileTransfer.finish(target.handleId);
@@ -5093,6 +5158,8 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
         throw cause;
       }
     } else {
+      // Old web/docker hosts have no native picker; retain the browser's
+      // download behavior as the last-resort compatibility path.
       saveBrowserDownload([gif], fileName);
     }
     showNotice(t("replayExported"));
@@ -5206,6 +5273,8 @@ function beginChmod(entry: SftpEntry) {
 
 async function openSettings() {
   settingsOpen.value = true;
+  downloadDirDraft.value = loadDownloadDir();
+  void probeLocalCapabilities();
   if (settingsLoading.value || settingsSaving.value) return;
   settingsLoading.value = true;
   settingsLoadFailed.value = false;
@@ -5214,7 +5283,6 @@ async function openSettings() {
   // 主「保存」会串行提交未保存的 profile 编辑，不能把陈旧草稿静默入库。
   profilesInlineOpen.value = false;
   cancelProfileEdit();
-  auditInlineOpen.value = false;
   void loadKnownHosts();
   void loadLocalKeys();
   void loadMcpSettings();
@@ -5483,6 +5551,7 @@ async function saveSettings() {
   if (!session.value || settingsSaving.value || settingsLoading.value || settingsLoadFailed.value || !settingsMeta.value) return;
   settingsSaving.value = true;
   try {
+    persistDownloadDir(downloadDirDraft.value);
     if (profileEditing.value) await saveProfileDraft();
     const updates: Record<string, unknown> = {
       quickSudo: settingsDraft.quickSudo,
@@ -5595,6 +5664,27 @@ function showFileMenu(event: MouseEvent, entry: SftpEntry) {
   terminalMenu.value = undefined;
   blankMenu.value = undefined;
   sideMenu.value = undefined;
+  transferHistoryMenu.value = undefined;
+}
+
+function showTransferHistoryMenu(event: MouseEvent, entry: TransferHistoryEntry) {
+  event.preventDefault();
+  event.stopPropagation();
+  // 浏览器下载、上传及旧记录都可能没有可验证的本机路径：拦截系统菜单，
+  // 但不展示无效操作。
+  if (!entry.localPath) {
+    transferHistoryMenu.value = undefined;
+    return;
+  }
+  transferHistoryMenu.value = {
+    x: Math.min(event.clientX, window.innerWidth - 190),
+    y: Math.min(event.clientY, window.innerHeight - 100),
+    path: entry.localPath,
+  };
+  terminalMenu.value = undefined;
+  fileMenu.value = undefined;
+  blankMenu.value = undefined;
+  sideMenu.value = undefined;
 }
 
 /**
@@ -5610,6 +5700,7 @@ function showFileMenu(event: MouseEvent, entry: SftpEntry) {
 function closeToolbarPopovers() {
   fileMenu.value = undefined;
   terminalMenu.value = undefined;
+  transferHistoryMenu.value = undefined;
   transferPanelOpen.value = false;
   columnsOpen.value = false;
   pathHistoryOpen.value = false;
@@ -5626,6 +5717,7 @@ function closeMenus() {
   fileMenu.value = undefined;
   blankMenu.value = undefined;
   sideMenu.value = undefined;
+  transferHistoryMenu.value = undefined;
   closeToolbarPopovers();
 }
 
@@ -5701,6 +5793,7 @@ const modalOpenStates = computed(() => [
   operationDialog.value,
   commandOpen.value,
   profilesOpen.value,
+  auditOpen.value,
   settingsOpen.value,
   alertTriageOpen.value,
   hostKeyPrompt.value,
@@ -5821,6 +5914,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
     profilesOpen.value = false;
     return;
   }
+  if (auditOpen.value) {
+    auditOpen.value = false;
+    return;
+  }
   if (settingsOpen.value) {
     // 内联 profile 管理（设置弹窗内）沿用 profilesOpen→settingsOpen 的逐层
     // 退出语义：先关编辑表单，再收起配置档 section，最后关弹窗。
@@ -5832,19 +5929,16 @@ function onDocumentKeydown(event: KeyboardEvent) {
       profilesInlineOpen.value = false;
       return;
     }
-    if (auditInlineOpen.value) {
-      auditInlineOpen.value = false;
-      return;
-    }
     settingsOpen.value = false;
     return;
   }
-  // ---- 右键菜单（fileMenu/terminalMenu/侧栏菜单/空白菜单互斥，一次全清）----
-  if (fileMenu.value || terminalMenu.value || sideMenu.value || blankMenu.value) {
+  // ---- 右键菜单（文件/终端/侧栏/空白/传输历史互斥，一次全清）----
+  if (fileMenu.value || terminalMenu.value || sideMenu.value || blankMenu.value || transferHistoryMenu.value) {
     fileMenu.value = undefined;
     terminalMenu.value = undefined;
     sideMenu.value = undefined;
     blankMenu.value = undefined;
+    transferHistoryMenu.value = undefined;
     return;
   }
   // ---- 工具栏弹出层（含指标浮层，R5-P2-1：同列 popover 一并进 Esc 链；
@@ -6197,6 +6291,7 @@ onBeforeUnmount(() => {
           </section>
         </div>
         <button class="icon-button icon-violet" :title="t('settings')" :disabled="!connected" @click="openSettings"><Settings /></button>
+        <button class="icon-button icon-amber" :title="t('auditLog.title')" @click="openAuditLog"><FileText /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-violet" :title="t('customizeColumns')" @click.stop="toggleColumnsMenu"><Columns3 /></button>
           <div v-if="columnsOpen" class="popover columns-popover" @click.stop>
@@ -6207,7 +6302,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="menu-anchor">
           <button class="icon-button icon-blue" :title="t('transfers')" @click.stop="toggleTransferPanel"><ArrowUpDown /><span v-if="activeTransfers" class="activity-dot" /></button>
-          <section v-if="transferPanelOpen" class="popover transfer-popover" @click.stop>
+          <section v-if="transferPanelOpen" class="popover transfer-popover" @click.stop @contextmenu.prevent.stop>
             <h3>{{ t("transfers") }}</h3>
             <div v-if="!transferList.length" class="empty compact">{{ t("noTransfers") }}</div>
             <article v-for="task in transferList" :key="task.taskId" class="transfer-card">
@@ -6215,37 +6310,43 @@ onBeforeUnmount(() => {
               <progress :value="transferPercent(task)" max="100" />
               <div class="transfer-meta"><span>{{ t(`transferStatus.${task.status}`) }}</span><span>{{ formatBytes(task.transferred) }} / {{ formatBytes(task.size) }}</span><span v-if="transferSpeeds[task.taskId]">{{ formatBytes(transferSpeeds[task.taskId]) }}/s</span></div>
               <p v-if="task.localPath" class="transfer-path mono" :title="task.localPath">{{ task.localPath }}</p>
-              <button v-if="transferPausable(task.status)" class="link-button" @click="toggleTransferPause(task)">{{ t(pausedTaskIds.has(task.taskId) ? "transferResume" : "transferPause") }}</button>
-              <button v-if="task.status === 'queued' || task.status === 'running'" class="link-button" @click="cancelTransfer(task)">{{ t("cancel") }}</button>
-              <button v-if="task.localPath" class="link-button" @click="revealTransferTarget(task.localPath)">{{ t("revealInFolder") }}</button>
-              <button v-if="task.localPath" class="link-button" @click="openTransferTarget(task.localPath)">{{ t("openDownloadedFile") }}</button>
+              <div v-if="transferPausable(task.status) || task.status === 'queued' || task.status === 'running' || task.localPath" class="transfer-actions">
+                <button v-if="transferPausable(task.status)" class="icon-button" :title="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" :aria-label="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" @click="toggleTransferPause(task)"><Play v-if="pausedTaskIds.has(task.taskId)" /><Pause v-else /></button>
+                <button v-if="task.status === 'queued' || task.status === 'running'" class="icon-button" :title="t('cancel')" :aria-label="t('cancel')" @click="cancelTransfer(task)"><X /></button>
+                <button v-if="task.localPath" class="icon-button" :title="t('revealInFolder')" :aria-label="t('revealInFolder')" @click="revealTransferTarget(task.localPath)"><FolderOpen /></button>
+                <button v-if="task.localPath" class="icon-button" :title="t('openDownloadedFile')" :aria-label="t('openDownloadedFile')" @click="openTransferTarget(task.localPath)"><FileText /></button>
+              </div>
               <p v-if="task.error" class="task-error">{{ task.error }}</p>
             </article>
-            <!-- 可续传上传：中断任务的 spool 前缀仍在，选同名同大小文件续传 -->
+            <!-- 保留上传断点续传入口；文件选择器本身始终隐藏，仅由 Resume 按钮唤起。 -->
             <template v-if="resumableTasks.length">
               <h3 class="transfer-history-title">{{ t("resumableTitle") }}</h3>
-              <p class="muted resumable-hint">{{ t("resumableHint") }}</p>
               <article v-for="task in resumableTasks" :key="task.taskId" class="transfer-card">
-                <div class="transfer-title"><FileUp /><span :title="task.remotePath">{{ task.fileName }}</span><strong>{{ formatBytes(task.resumableBytes) }} / {{ formatBytes(task.size) }}</strong></div>
-                <button class="link-button" @click="beginResumeUpload(task)">{{ t("resumableResume") }}</button>
+                <div class="transfer-title"><FileUp /><span :title="task.remotePath">{{ task.fileName }}</span></div>
+                <div class="transfer-meta"><span>{{ formatBytes(task.resumableBytes) }} / {{ formatBytes(task.size) }}</span></div>
+                <div class="transfer-actions"><button class="icon-button" :title="t('resumableResume')" :aria-label="t('resumableResume')" @click="beginResumeUpload(task)"><Play /></button></div>
               </article>
             </template>
-            <input ref="resumeInput" type="file" class="visually-hidden-input" @change="onResumeFilePicked" />
+            <input ref="resumeInput" type="file" class="hidden" @change="onResumeFilePicked" />
             <!-- 历史区：无进行中任务时展示（落盘历史跨重启可查，failed 显示原因） -->
             <template v-if="!activeTransfers">
-              <h3 class="transfer-history-title">{{ t("transfersHistory.title") }}</h3>
+              <div class="transfer-history-head">
+                <h3 class="transfer-history-title">{{ t("transfersHistory.title") }}</h3>
+                <span class="transfer-history-actions">
+                  <button class="icon-button" :title="t('refresh')" :disabled="transferHistoryLoading" @click="refreshTransferHistory"><RefreshCw :class="{ spinning: transferHistoryLoading }" /></button>
+                  <button class="icon-button" :title="t('transfersHistory.clear')" :disabled="!transferHistory.length" @click="clearTransferHistory"><Trash2 /></button>
+                </span>
+              </div>
               <div v-if="transferHistoryFailed" class="empty compact">
                 <span>{{ t("transfersHistory.loadFailed") }}</span>
                 <button class="link-button" @click="refreshTransferHistory">{{ t("refresh") }}</button>
               </div>
               <div v-else-if="transferHistoryLoading && !transferHistory.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
               <div v-else-if="!transferHistory.length" class="empty compact">{{ t("transfersHistory.empty") }}</div>
-              <article v-for="entry in transferHistory" :key="entry.taskId" class="transfer-card transfer-history-card">
-                <div class="transfer-title"><FileUp v-if="entry.direction === 'upload'" /><Download v-else /><span :title="entry.fileName">{{ entry.fileName || entry.taskId }}</span><strong>{{ formatBytes(entry.size) }}</strong></div>
-                <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span v-if="entry.transferred">{{ formatBytes(entry.transferred) }}</span></div>
+              <article v-for="entry in transferHistory" :key="entry.taskId" class="transfer-card transfer-history-card" @contextmenu="showTransferHistoryMenu($event, entry)">
+                <div class="transfer-title"><FileUp v-if="entry.direction === 'upload'" /><Download v-else /><span :title="entry.fileName">{{ entry.fileName || entry.taskId }}</span></div>
+                <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span>{{ formatBytes(entry.size) }}</span></div>
                 <p v-if="entry.localPath" class="transfer-path mono" :title="entry.localPath">{{ entry.localPath }}</p>
-                <button v-if="entry.localPath" class="link-button" @click="revealTransferTarget(entry.localPath)">{{ t("revealInFolder") }}</button>
-                <button v-if="entry.localPath" class="link-button" @click="openTransferTarget(entry.localPath)">{{ t("openDownloadedFile") }}</button>
                 <p v-if="entry.error" class="task-error">{{ entry.error }}</p>
               </article>
             </template>
@@ -6750,6 +6851,11 @@ onBeforeUnmount(() => {
       </template>
     </nav>
 
+    <nav v-if="transferHistoryMenu" class="context-menu" :style="{ left: transferHistoryMenu.x + 'px', top: transferHistoryMenu.y + 'px' }" @click.stop>
+      <button @click="revealTransferTarget(transferHistoryMenu.path); transferHistoryMenu = undefined"><FolderOpen />{{ t("revealInFolder") }}</button>
+      <button @click="openTransferTarget(transferHistoryMenu.path); transferHistoryMenu = undefined"><FileText />{{ t("openDownloadedFile") }}</button>
+    </nav>
+
     <!-- 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩 -->
     <nav v-if="sideMenu" class="context-menu" :style="{ left: sideMenu.x + 'px', top: sideMenu.y + 'px' }" @click.stop>
       <button @click="sideMenuAction('open')"><Folder />{{ t("openFolder") }}</button>
@@ -7067,6 +7173,13 @@ onBeforeUnmount(() => {
             </label>
             <p class="muted settings-note">{{ agentTerminalModeHint }}</p>
 
+            <h3 class="settings-section-title">{{ t("downloadSettings.title") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("downloadSettings.directory") }}</span>
+              <input v-model="downloadDirDraft" class="mono" spellcheck="false" :placeholder="localDownloadDir || t('downloadSettings.default')" />
+            </label>
+            <p class="muted settings-note">{{ t("downloadSettings.hint") }}</p>
+
             <h3 class="settings-section-title">{{ t("webglSection") }}</h3>
             <label class="settings-field settings-switch-row">
               <button class="switch-control" type="button" role="switch" :aria-checked="webglEnabled" @click="setWebglEnabled(!webglEnabled)"><span /></button>
@@ -7157,49 +7270,52 @@ onBeforeUnmount(() => {
             <!-- 独立「保存」链接已并入底部主「保存」串行链（saveSettings）。 -->
           </template>
 
-          <div class="audit-section-head">
-            <h3 class="settings-section-title">{{ t("auditLog.title") }}</h3>
-            <button class="link-button" :aria-expanded="auditInlineOpen" @click="toggleAuditInline">{{ t("auditLog.toggle") }}</button>
-          </div>
-          <section v-if="auditInlineOpen">
-            <div class="audit-toolbar">
-              <label class="highlight-editor-flag">
-                <span>{{ t("auditLog.kindFilter") }}</span>
-                <select v-model="auditKindFilter">
-                  <option value="">{{ t("auditLog.kindAll") }}</option>
-                  <option v-for="kind in auditKindOptions(auditEntries)" :key="kind" :value="kind">{{ auditKindLabel(kind, t) }}</option>
-                </select>
-              </label>
-              <button class="icon-button" :title="t('refresh')" :disabled="auditLoading" @click="loadAuditEntries"><RefreshCw :class="{ spinning: auditLoading }" /></button>
-              <button class="icon-button" :title="t('auditLog.clear')" @click="clearAuditLog"><Trash2 /></button>
-            </div>
-            <div v-if="auditLoading && !auditEntries.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
-            <div v-else-if="auditLoadFailed" class="empty compact">
-              <span>{{ t("auditLog.loadFailed") }}</span>
-              <button class="link-button" @click="loadAuditEntries">{{ t("refresh") }}</button>
-            </div>
-            <div v-else-if="!visibleAuditEntries.length" class="empty compact">{{ t("auditLog.empty") }}</div>
-            <template v-else>
-              <ul class="audit-list">
-                <li v-for="(entry, index) in visibleAuditEntries" :key="`${entry.ts}-${entry.kind}-${index}`" class="audit-row">
-                  <span class="audit-time mono">{{ auditTime(entry.ts) }}</span>
-                  <span class="audit-kind-badge" :class="auditRowKindClass(entry.kind)">{{ auditKindLabel(entry.kind, t) }}</span>
-                  <span v-if="entry.connection || entry.sessionId" class="audit-connection mono" :title="entry.connection || entry.sessionId">{{ entry.connection || entry.sessionId }}</span>
-                  <span v-if="entry.command" class="audit-command mono" :title="entry.command">{{ entry.command }}</span>
-                  <span v-if="entry.gate" class="audit-gate mono">{{ entry.gate }}</span>
-                  <span v-if="auditOutcomeLabel(entry, t)" class="audit-outcome" :class="{ error: entry.outcome === 'error' || entry.decision === 'denied' || entry.decision === 'timeout', ok: entry.outcome === 'ok' || entry.decision === 'approved' }">{{ auditOutcomeLabel(entry, t) }}</span>
-                  <span v-if="entry.exitCode != null" class="audit-time">{{ t("auditLog.exitCode", { code: entry.exitCode }) }}</span>
-                </li>
-              </ul>
-              <p v-if="auditTruncated" class="muted audit-truncated">{{ t("auditLog.truncated") }}</p>
-            </template>
-          </section>
         </div>
         <footer>
           <button :disabled="settingsLoading || settingsLoadFailed || settingsSaving || (!settingsMeta?.sudoPasswordSet && !settingsMeta?.totpConfigured)" @click="clearStoredSecrets"><Trash2 />{{ t("settingsClearSecrets") }}</button>
           <button @click="settingsOpen = false">{{ t("close") }}</button>
           <button class="primary-button" :disabled="settingsLoading || settingsLoadFailed || settingsSaving || !settingsMeta" @click="saveSettings"><Loader2 v-if="settingsSaving" class="spinning" />{{ t("settingsSave") }}</button>
         </footer>
+      </article>
+    </section>
+
+    <section v-if="auditOpen" class="modal-backdrop" @mousedown.self="auditOpen = false">
+      <article class="modal settings-modal audit-modal">
+        <header><h2>{{ t("auditLog.title") }}</h2><button class="icon-button" @click="auditOpen = false"><X /></button></header>
+        <div class="settings-body">
+          <div class="audit-toolbar">
+            <label class="highlight-editor-flag">
+              <span>{{ t("auditLog.kindFilter") }}</span>
+              <select v-model="auditKindFilter">
+                <option value="">{{ t("auditLog.kindAll") }}</option>
+                <option v-for="kind in auditKindOptions(auditEntries)" :key="kind" :value="kind">{{ auditKindLabel(kind, t) }}</option>
+              </select>
+            </label>
+            <button class="icon-button" :title="t('refresh')" :disabled="auditLoading" @click="loadAuditEntries"><RefreshCw :class="{ spinning: auditLoading }" /></button>
+            <button class="icon-button" :title="t('auditLog.clear')" @click="clearAuditLog"><Trash2 /></button>
+          </div>
+          <div v-if="auditLoading && !auditEntries.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+          <div v-else-if="auditLoadFailed" class="empty compact">
+            <span>{{ t("auditLog.loadFailed") }}</span>
+            <button class="link-button" @click="loadAuditEntries">{{ t("refresh") }}</button>
+          </div>
+          <div v-else-if="!visibleAuditEntries.length" class="empty compact">{{ t("auditLog.empty") }}</div>
+          <template v-else>
+            <ul class="audit-list">
+              <li v-for="(entry, index) in visibleAuditEntries" :key="`${entry.ts}-${entry.kind}-${index}`" class="audit-row">
+                <span class="audit-time mono">{{ auditTime(entry.ts) }}</span>
+                <span class="audit-kind-badge" :class="auditRowKindClass(entry.kind)">{{ auditKindLabel(entry.kind, t) }}</span>
+                <span v-if="entry.connection || entry.sessionId" class="audit-connection mono" :title="entry.connection || entry.sessionId">{{ entry.connection || entry.sessionId }}</span>
+                <span v-if="entry.command" class="audit-command mono" :title="entry.command">{{ entry.command }}</span>
+                <span v-if="entry.gate" class="audit-gate mono">{{ entry.gate }}</span>
+                <span v-if="auditOutcomeLabel(entry, t)" class="audit-outcome" :class="{ error: entry.outcome === 'error' || entry.decision === 'denied' || entry.decision === 'timeout', ok: entry.outcome === 'ok' || entry.decision === 'approved' }">{{ auditOutcomeLabel(entry, t) }}</span>
+                <span v-if="entry.exitCode != null" class="audit-time">{{ t("auditLog.exitCode", { code: entry.exitCode }) }}</span>
+              </li>
+            </ul>
+            <p v-if="auditTruncated" class="muted audit-truncated">{{ t("auditLog.truncated") }}</p>
+          </template>
+        </div>
+        <footer><button @click="auditOpen = false">{{ t("close") }}</button></footer>
       </article>
     </section>
 
@@ -7442,7 +7558,9 @@ onBeforeUnmount(() => {
 .bookmark-save-actions { display: flex; justify-content: flex-end; gap: 4px; }
 .bookmark-save-actions .icon-button { width: 26px; height: 26px; flex: 0 0 26px; }
 /* 传输历史区标题：与任务卡片间的分隔线 */
-.transfer-history-title { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.transfer-history-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; border-top: 1px solid var(--border); margin-top: 10px; }
+.transfer-history-title { margin: 0; padding-top: 8px; }
+.transfer-history-actions { display: flex; gap: 2px; padding-top: 6px; }
 .attrs-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 12px; }
 .attrs-grid dt { color: var(--muted-foreground); white-space: nowrap; }
 .attrs-grid dd { margin: 0; overflow-wrap: anywhere; }

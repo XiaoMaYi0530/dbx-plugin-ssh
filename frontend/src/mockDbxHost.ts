@@ -409,6 +409,8 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     ];
     result = { tasks: entries.slice(0, limit) };
   }
+  else if (method === "sftp/transfer/history/clear") result = { success: true };
+  else if (method === "local/capabilities") result = { canSaveLocal: false, downloadsDir: "" };
   else if (method === "sftp/upload/start") result = { taskId: `visual-upload-${++fixtureUploadCount.value}`, chunkSize: 262144 };
   else if (method === "sftp/upload/finish") result = { success: true };
   else if (method === "sftp/transfer/cancel") result = { success: true };

@@ -633,7 +633,7 @@ impl Plugin {
                 Ok(json!({ "broadcast": true }))
             }
             "connection/action" => {
-                let action = required_string(&params, "action")?;
+                let action = connection_action_id(&params)?;
                 match action {
                     "quick-sudo-profiles" => {
                         let connection_id = params.get("id").and_then(Value::as_str);
@@ -705,11 +705,16 @@ impl Plugin {
                     .get("saveToLocal")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let download_dir = params
+                    .get("downloadDir")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 self.runtime.block_on(self.ssh.start_download(
                     session_id,
                     remote_path,
                     offset,
                     save_to_local,
+                    download_dir.as_deref(),
                     emitter,
                 ))
             }
@@ -775,6 +780,10 @@ impl Plugin {
                     .clamp(1, 200) as usize;
                 self.runtime
                     .block_on(self.ssh.transfer_history_query(session_id, limit))
+            }
+            "sftp/transfer/history/clear" => {
+                self.ssh.clear_transfer_history()?;
+                Ok(json!({ "success": true }))
             }
             "sftp/bookmarks/list" => sftp_bookmarks::list(&self.ssh.data_dir()),
             "sftp/bookmarks/save" => sftp_bookmarks::save(&self.ssh.data_dir(), &params),
@@ -955,6 +964,21 @@ fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> 
         .ok_or_else(|| format!("Missing {key}"))
 }
 
+/// DBX Host sends connection actions as `{ "action": { "id": "..." } }`.
+/// Accept the pre-Host-API-1.1 string form as well so older callers remain
+/// compatible while the plugin follows the current host contract.
+fn connection_action_id(params: &Value) -> Result<&str, String> {
+    let action = params
+        .get("action")
+        .ok_or_else(|| "Missing action".to_string())?;
+    action
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| action.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Missing action id".to_string())
+}
+
 /// Host API 1.1 passes `operationId` to correlate connection lifecycle calls;
 /// on Host API 1.0 it is absent, so a locally generated id is used instead.
 /// The id only needs to stay stable between a challenge prompt and its resolve.
@@ -1098,6 +1122,24 @@ mod tests {
         assert_eq!(
             bounded_bytes(&json!({ "maxBytes": 99_999_999 }), "maxBytes", 12),
             1024 * 1024
+        );
+    }
+
+    #[test]
+    fn connection_action_id_accepts_host_object_and_legacy_string_forms() {
+        assert_eq!(
+            connection_action_id(&json!({
+                "action": { "id": "quick-sudo-profiles" }
+            })),
+            Ok("quick-sudo-profiles")
+        );
+        assert_eq!(
+            connection_action_id(&json!({ "action": "quick-sudo-profiles" })),
+            Ok("quick-sudo-profiles")
+        );
+        assert_eq!(
+            connection_action_id(&json!({ "action": {} })),
+            Err("Missing action id".to_string())
         );
     }
 

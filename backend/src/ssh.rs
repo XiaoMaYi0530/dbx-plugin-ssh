@@ -760,6 +760,7 @@ struct UploadState {
 /// Downloads folder once every byte arrived.
 struct DownloadSink {
     part_path: PathBuf,
+    final_dir: PathBuf,
     file: AsyncMutex<tokio::fs::File>,
 }
 
@@ -4030,6 +4031,7 @@ impl SshRuntime {
         remote_path: &str,
         offset: u64,
         save_to_local: bool,
+        download_dir: Option<&str>,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         let remote_path = normalize_remote_path(remote_path)?;
@@ -4076,6 +4078,22 @@ impl SshRuntime {
             std::fs::create_dir_all(&staging)
                 .map_err(|error| format!("Failed to create download staging directory: {error}"))?;
             let part_path = staging.join(format!("download-{task_id}.part"));
+            let final_dir = download_dir
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    local_downloads::downloads_base_dir(|key| std::env::var_os(key), &self.data_dir)
+                });
+            if !final_dir.is_absolute() {
+                return Err("Download directory must be an absolute path".to_string());
+            }
+            std::fs::create_dir_all(&final_dir).map_err(|error| {
+                format!(
+                    "Failed to create download directory '{}': {error}",
+                    final_dir.display()
+                )
+            })?;
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -4089,6 +4107,7 @@ impl SshRuntime {
                 })?;
             Some(Arc::new(DownloadSink {
                 part_path,
+                final_dir,
                 file: AsyncMutex::new(file),
             }))
         } else {
@@ -4317,8 +4336,7 @@ impl SshRuntime {
                 .await
                 .map_err(|error| format!("Failed to flush local download file: {error}"))?;
         }
-        let base = local_downloads::downloads_base_dir(|key| std::env::var_os(key), &self.data_dir);
-        let final_path = local_downloads::pick_download_path(&base, file_name);
+        let final_path = local_downloads::pick_download_path(&sink.final_dir, file_name);
         if std::fs::rename(&sink.part_path, &final_path).is_ok() {
             return Ok(final_path);
         }
@@ -4441,6 +4459,14 @@ impl SshRuntime {
                 .unwrap_or_default()
         };
         self.build_transfer_history(session_id, limit, &connection_id_for)
+    }
+
+    pub fn clear_transfer_history(&self) -> Result<(), String> {
+        self.transfer_history
+            .lock()
+            .map_err(|_| "Transfer history is poisoned".to_string())?
+            .clear();
+        transfer_history::clear_history(&self.data_dir)
     }
 
     /// Synchronous core of `transfer_history_query`; `connection_id_for`

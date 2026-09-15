@@ -54,7 +54,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
      xterm 内部层（关键词高亮装饰 .xterm-decoration z=6、.xterm-helpers z=5）
      与指标/录制浮动卡（.metrics-float z=6），否则弹窗下探部分会被这些层
      盖住；仍低于 context-menu(50)/modal(80)/回放(90)。 */
-  z-index: 20;
+  z-index: 40;
   display: flex;
   height: 36px;
   min-height: 36px;
@@ -242,15 +242,20 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .columns-popover label { display: flex; height: 28px; align-items: center; gap: 8px; border-radius: 4px; padding: 0 7px; cursor: pointer; }
 .columns-popover label:hover { background: var(--accent); }
 .columns-popover-separator { width: 100%; height: 1px; margin: 4px 0; border: 0; background: var(--border); }
-.transfer-popover { width: min(390px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 60px)); padding: 8px; overflow: auto; }
+.transfer-popover { z-index: 60; width: min(340px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 52px)); padding: 8px; overflow: auto; }
 .transfer-popover h3 { margin: 2px 4px 8px; font-size: 12px; }
-.transfer-card { position: relative; display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--border); padding: 8px 4px; }
-.transfer-title { gap: 6px; }
+.transfer-card { display: grid; grid-template: "title actions" auto "progress progress" auto "meta meta" auto "path path" auto "error error" auto / minmax(0, 1fr) auto; position: relative; column-gap: 6px; row-gap: 4px; border-top: 1px solid var(--border); padding: 7px 4px; }
+.transfer-title { grid-area: title; min-width: 0; gap: 6px; }
 .transfer-title span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .transfer-title strong { font-size: 11px; font-variant-numeric: tabular-nums; }
-.transfer-card progress { width: 100%; height: 4px; border: 0; accent-color: var(--primary); }
-.transfer-meta { justify-content: space-between; gap: 8px; color: var(--muted-foreground); font-size: 10px; font-variant-numeric: tabular-nums; }
-.transfer-path { margin: 0; color: var(--muted-foreground); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+.transfer-card progress { grid-area: progress; width: 100%; height: 4px; border: 0; accent-color: var(--primary); }
+.transfer-meta { grid-area: meta; min-width: 0; gap: 7px; overflow: hidden; color: var(--muted-foreground); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.transfer-meta span { overflow: hidden; text-overflow: ellipsis; }
+.transfer-meta span + span::before { content: "·"; margin-right: 7px; color: var(--border); }
+.transfer-path { grid-area: path; min-width: 0; margin: 0; color: var(--muted-foreground); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+.transfer-actions { grid-area: actions; display: flex; align-self: start; justify-content: flex-end; gap: 3px; }
+.transfer-actions .icon-button { width: 24px; height: 24px; min-width: 24px; padding: 3px; }
+.transfer-card .task-error { grid-area: error; }
 .link-button { align-self: flex-end; padding: 2px 0; color: var(--primary); font-size: 11px; }
 .task-error { margin: 0; color: var(--destructive); font-size: 10px; overflow-wrap: anywhere; }
 .activity-dot { position: absolute; top: 4px; right: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 0 1px var(--background); }
@@ -529,9 +534,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .distro-badge { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; flex: 0 0 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 700; line-height: 1; vertical-align: middle; }
 .metrics-float .distro-badge { width: 18px; height: 18px; flex-basis: 18px; font-size: 11px; }
 
-/* ---- 审计日志（IMPL_PLAN_NETCATTY_PARITY §3-B4，设置弹窗折叠区）---- */
-.audit-section-head { display: flex; align-items: center; gap: 8px; }
-.audit-section-head .settings-section-title { margin: 0; }
+/* ---- 审计日志（IMPL_PLAN_NETCATTY_PARITY §3-B4，独立弹窗）---- */
 .audit-toolbar { display: flex; align-items: center; gap: 8px; }
 .audit-toolbar select { min-width: 150px; }
 .audit-truncated { font-size: 10px; }

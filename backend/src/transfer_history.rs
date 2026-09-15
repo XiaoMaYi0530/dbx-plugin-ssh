@@ -82,6 +82,17 @@ pub fn load_history(data_dir: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// Removes the persisted transfer history. In-flight rows are not touched;
+/// the live registry will repopulate them on the next history refresh.
+pub fn clear_history(data_dir: &Path) -> Result<(), String> {
+    let path = store_path(data_dir);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to clear transfer history: {error}")),
+    }
+}
+
 /// Persists one status transition (start / complete / cancel / fail). The
 /// row is merged into the store keyed by taskId — an existing row is
 /// replaced in place (keeping its `startedAt`/`connectionId` when the new

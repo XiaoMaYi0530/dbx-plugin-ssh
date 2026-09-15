@@ -33,7 +33,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/read` 支持可选 `offset` 分片续读，见下文） |
 | `sftp/createDirectory`、`sftp/rename`、`sftp/delete` | SFTP 写操作 |
 | `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传，见下文） |
-| `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文） |
+| `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文；桌面端可选 `downloadDir` 指定本机绝对保存目录） |
 | `sftp/stat`、`sftp/exists`、`sftp/touch`、`sftp/write` | 扩展文件操作：元信息单查、存在性检查、空文件创建、小文件直写 |
 | `sftp/archive`、`sftp/extract` | 远端 tar.gz 打包与解压 |
 | `sftp/copy`、`sftp/move` | 服务器内复制 / 剪切（逐项执行，目标存在需 `overwrite`） |
@@ -41,6 +41,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/transfer/cancel` | 取消并清理临时状态 |
 | `sftp/transfer/list`、`sftp/transfer/status` | 查询会话传输任务列表 / 单任务状态（含历史，会话维度过滤） |
 | `sftp/transfer/history` | 跨重启传输历史查询（持久化 + 内存 live 合并，见下文） |
+| `sftp/transfer/history/clear` | 清空已持久化及当前进程中的传输历史 |
 | `sftp/transfer/resumable` | 可续传上传扫描（中断任务的 spool 前缀仍在磁盘上的清单，见下文） |
 | `sudo/stat`、`sudo/exists`、`sudo/touch` | sudo 元信息查询与空文件创建 |
 | `sudo/listDir`、`sudo/readFile`、`sudo/writeFile` | sudo 目录浏览与文件读写 |

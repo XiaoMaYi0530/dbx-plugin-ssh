@@ -8,6 +8,7 @@
 #   scripts/install.sh --app-data <dir>   # target a custom DBX data directory
 #   scripts/install.sh --reinstall        # dev only: drop the installed version first
 #   scripts/install.sh --no-restart       # do not relaunch DBX afterwards
+#   scripts/install.sh --keep-old         # keep older io.dbx.ssh versions for rollback
 #
 # Environment:
 #   DBX_HOST_WORKTREE   host checkout used for the installer binary
@@ -20,11 +21,13 @@ cd "$(dirname "$0")/.."
 APP_DATA="${DBX_APP_DATA:-$HOME/Library/Application Support/com.dbx.app}"
 REINSTALL=0
 RESTART=1
+KEEP_OLD=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --app-data) APP_DATA="$2"; shift 2 ;;
     --reinstall) REINSTALL=1; shift ;;
     --no-restart) RESTART=0; shift ;;
+    --keep-old) KEEP_OLD=1; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -81,6 +84,46 @@ fi
 
 echo "==> installing $(basename "$DBXP") (v$VERSION) into $PLUGIN_STORE"
 "$INSTALLER" "$PLUGIN_STORE" "$DBXP" "$APP_VERSION"
+
+if [ "$KEEP_OLD" = 0 ]; then
+  echo "==> cleaning old io.dbx.ssh versions (keeping v$VERSION)"
+  python3 - "$PLUGIN_STORE" "$VERSION" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+plugin_store = pathlib.Path(sys.argv[1])
+current_version = sys.argv[2]
+versions_dir = plugin_store / "io.dbx.ssh" / "versions"
+activations_dir = plugin_store / "io.dbx.ssh" / "activations"
+
+removed_versions = []
+if versions_dir.is_dir():
+    for version_dir in sorted(versions_dir.iterdir()):
+        if version_dir.name == current_version:
+            continue
+        if version_dir.is_dir() or version_dir.is_symlink():
+            shutil.rmtree(version_dir)
+            removed_versions.append(version_dir.name)
+
+removed_activations = []
+if activations_dir.is_dir():
+    for record in sorted(activations_dir.glob("*.json")):
+        try:
+            record_version = json.loads(record.read_text()).get("version")
+        except (OSError, ValueError, TypeError):
+            continue
+        if record_version != current_version:
+            record.unlink()
+            removed_activations.append(record.name)
+
+print(f"  removed versions: {', '.join(removed_versions) or 'none'}")
+print(f"  removed activations: {len(removed_activations)}")
+PY
+else
+  echo "==> keeping old io.dbx.ssh versions (--keep-old)"
+fi
 
 if [ "$RESTART" = 1 ] && [ "$WAS_RUNNING" = 1 ]; then
   echo "==> restarting DBX"

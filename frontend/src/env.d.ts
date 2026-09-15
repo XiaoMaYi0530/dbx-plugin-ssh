@@ -65,6 +65,18 @@ interface DbxPluginApi {
   readonly clipboard?: { readText(): Promise<string>; writeText(text: string): Promise<void> };
 }
 
+interface DbxGifSaveFileHandle {
+  createWritable(): Promise<{
+    write(data: Uint8Array): Promise<void>;
+    close(): Promise<void>;
+  }>;
+}
+
 interface Window {
   dbxPlugin: DbxPluginApi;
+  /** File System Access API: lets desktop webviews choose both folder and filename. */
+  showSaveFilePicker?: (options: {
+    suggestedName?: string;
+    types?: Array<{ description?: string; accept: Record<string, string[]> }>;
+  }) => Promise<DbxGifSaveFileHandle>;
 }

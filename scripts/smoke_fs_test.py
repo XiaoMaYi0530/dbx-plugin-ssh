@@ -482,7 +482,7 @@ def main() -> None:
 
         def case_connection_action_profiles():
             result = req("connection/action",
-                         {"action": "quick-sudo-profiles", "id": connection_id})
+                         {"action": {"id": "quick-sudo-profiles"}, "id": connection_id})
             message = result.get("message") or ""
             if "smoke-ops" not in message:
                 raise AssertionError(f"action message missing profile: {message[:200]}")
@@ -490,7 +490,7 @@ def main() -> None:
                 raise AssertionError(f"action message missing binding line: {message[:200]}")
             unknown = None
             try:
-                req("connection/action", {"action": "no-such-action"})
+                req("connection/action", {"action": {"id": "no-such-action"}})
             except SidecarError as raised:
                 unknown = str(raised)
                 if missing_method(raised) is not None:
