@@ -102,12 +102,16 @@ jobs:
           docker run -d --name dbx-ssh-test -p 2222:2222 \
             -e USER_NAME=sshuser -e USER_PASSWORD=DbxTest2026 \
             -e PASSWORD_ACCESS=true linuxserver/openssh-server
+          # s6 init materializes /config/sshd/sshd_config on first boot;
+          # fresh runners exec within ~0.3s, so wait for the file first.
+          for i in $(seq 1 30); do
+            docker exec dbx-ssh-test test -f /config/sshd/sshd_config 2>/dev/null && break
+            sleep 2
+          done
+          docker exec dbx-ssh-test test -f /config/sshd/sshd_config
           docker exec dbx-ssh-test sh -c \
             'echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser && chmod 440 /etc/sudoers.d/sshuser'
-          docker exec dbx-ssh-test sh -c \
-            'sed -i "s/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/" /config/sshd/sshd_config'
-          docker exec dbx-ssh-test sh -c \
-            'grep -q "^AcceptEnv DBX_SMOKE_ENV" /config/sshd/sshd_config || echo "AcceptEnv DBX_SMOKE_ENV" >> /config/sshd/sshd_config'
+          docker exec dbx-ssh-test sh -c 'sed -i "s/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/" /config/sshd/sshd_config; grep -q "^AllowTcpForwarding yes" /config/sshd/sshd_config || echo "AllowTcpForwarding yes" >> /config/sshd/sshd_config; grep -q "^AcceptEnv DBX_SMOKE_ENV" /config/sshd/sshd_config || echo "AcceptEnv DBX_SMOKE_ENV" >> /config/sshd/sshd_config'
           docker restart dbx-ssh-test
           for i in $(seq 1 60); do
             (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null && break
