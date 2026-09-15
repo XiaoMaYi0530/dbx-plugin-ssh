@@ -68,6 +68,8 @@ if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/n
   python3 scripts/smoke_batch3_test.py
   echo "==> live smoke: smoke_sudo_otp_test.py"
   python3 scripts/smoke_sudo_otp_test.py
+  echo "==> live smoke: smoke_trigger_test.py"
+  python3 scripts/smoke_trigger_test.py
   echo "==> perf baseline (P-SSH §3; ±20% thresholds documented in TEST_MATRIX)"
   python3 scripts/perf_baseline_test.py
 else

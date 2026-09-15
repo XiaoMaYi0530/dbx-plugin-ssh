@@ -3729,7 +3729,14 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         }
     };
     if matches!(authentication, AuthenticationMethod::Password) && password.is_empty() {
-        return Err("Password authentication requires a password".to_string());
+        let password_command = arguments
+            .get("passwordCommand")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if password_command.is_empty() {
+            return Err("Password authentication requires a password".to_string());
+        }
     }
     if matches!(
         authentication,
@@ -3740,6 +3747,23 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
             "Private-key authentication requires privateKeyPath or privateKeyContent".to_string(),
         );
     }
+    // Expect 式触发器（JSON 字符串形态，同 §2.1 schema）与外部密码管理器
+    // 命令：解析/校验与存储路径同一套代码（triggers::parse_triggers），非法
+    // 即拨号报错。内联拨号没有 secret binding，sendSecretKey 引用的槽位
+    // 无法填充，引用即报错。
+    let triggers = crate::triggers::parse_triggers(arguments.get("triggers"), &|_key| None)?;
+    let password_command = arguments
+        .get("passwordCommand")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let passphrase_command = arguments
+        .get("passphraseCommand")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     Ok(StoredConnection {
         sudo_whitelist: Vec::new(),
         id: connection_pool_id(arguments),
@@ -3814,6 +3838,9 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         set_env: Vec::new(),
         remote_command: String::new(),
         ssh_algorithm_profile: "modern".to_string(),
+        triggers,
+        password_command,
+        passphrase_command,
         jump_hosts,
     })
 }
@@ -3923,6 +3950,9 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
         "passwordPromptHint": { "type": "string", "description": PASSWORD_PROMPT_HINT_DESCRIPTION },
         "totpPromptHint": { "type": "string", "description": TOTP_PROMPT_HINT_DESCRIPTION },
         "jumpHosts": { "type": "array", "description": "ProxyJump chain (up to 3): [{\"host\":\"bastion\",\"port\":22,\"username\":\"ops\",\"password\":\"…\"}] with snake_case fields; replaces direct dialing" },
+        "triggers": { "type": "string", "description": "Expect-style terminal triggers as a JSON string, e.g. {\"stages\":[{\"pattern\":\"(?i)code\",\"sendText\":\"654321\\\\r\"}]}; each stage answers sendText, sendSecretKey (trigger_answer_1/2, unavailable on inline dials) or sendCommand (local command) when its ordered regex matches the PTY output. Invalid JSON, limits (max 16 stages) or an uncompileable regex fails the dial. A malicious server can fake a matching prompt to harvest the configured reply" },
+        "passwordCommand": { "type": "string", "description": "Local command run only when no explicit password is set; its stdout minus one trailing newline is the login password. Placeholders: %h host, %u username, %p port, %% a literal %. Explicit credentials win" },
+        "passphraseCommand": { "type": "string", "description": "Local command run only when an encrypted private key cannot be decoded without a passphrase; its stdout minus one trailing newline is the passphrase. Placeholders: %h host, %u username, %p port, %% a literal %" },
     });
     if let Some(map) = properties.as_object_mut() {
         for (key, kind, description) in extra {

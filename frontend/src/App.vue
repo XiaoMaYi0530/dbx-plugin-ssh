@@ -1883,6 +1883,15 @@ function handleEvent(event: DbxPluginEvent) {
     showNotice(t(payload.status === "denied" ? "agentDenied" : "agentFinished"));
     return;
   }
+  // Trigger engine feedback (expect-style auto interaction): the payload never
+  // carries the answered content (sidecar contract), only stage/kind. Events
+  // for sessions other than the open one are dropped silently.
+  if (event.method === "ssh/trigger" && event.params.sessionId === session.value?.sessionId) {
+    const payload = event.params as { sessionId?: string; stage?: number; kind?: string };
+    const stage = Math.max(1, Number(payload.stage) || 1);
+    showNotice(t(payload.kind === "timeout" ? "triggerTimeout" : "triggerAnswered", { stage }));
+    return;
+  }
   if (event.method === "sftp/upload/ack") {
     const taskId = String(event.params.taskId || "");
     const waiter = uploadAckWaiters.get(taskId);

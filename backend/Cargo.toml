@@ -14,6 +14,8 @@ data-encoding = "2"
 dbx-plugin-sdk = "0.1.0"
 hmac = "0.12"
 rand = "0.8"
+# Terminal trigger (expect) stage patterns — see src/triggers.rs.
+regex = "1"
 russh = { version = "0.60", features = ["des"] }
 russh-sftp = "2.3.0"
 serde = { version = "1", features = ["derive"] }

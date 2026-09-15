@@ -159,6 +159,19 @@ pub struct StoredConnection {
     /// keeps modern algorithms first and appends old-but-implemented
     /// algorithms for appliances that cannot negotiate newer suites.
     pub ssh_algorithm_profile: String,
+    /// Expect-style terminal triggers (tssh parity, contract §2.1): parsed and
+    /// validated eagerly from `external_config.triggers`, so a malformed rule
+    /// (bad JSON, uncompileable regex, broken three-way answer choice) fails
+    /// the connection instead of silently never firing. `None` = disabled.
+    /// Secret answers are resolved from `connection_secrets` at parse time.
+    pub triggers: Option<crate::triggers::TriggersConfig>,
+    /// Local command fetching the login password when none is stored
+    /// (`external_config.password_command`; tssh PasswordCommand parity).
+    /// Runs only when `password` is empty — explicit credentials win.
+    pub password_command: String,
+    /// Local command fetching the private-key passphrase when none is stored
+    /// (`external_config.passphrase_command`; tssh PassphraseCommand parity).
+    pub passphrase_command: String,
     /// ProxyJump chain: each entry is dialed before the target, the final hop
     /// reaching `host:port` directly (the runtime tunnel endpoint is skipped).
     pub jump_hosts: Vec<JumpHost>,
@@ -301,6 +314,11 @@ impl JumpHost {
             set_env: Vec::new(),
             remote_command: String::new(),
             ssh_algorithm_profile: ssh_algorithm_profile.to_string(),
+            // Jump hops fetch no credentials locally: their inline credential
+            // fields are the whole story.
+            triggers: None,
+            password_command: String::new(),
+            passphrase_command: String::new(),
             jump_hosts: Vec::new(),
         }
     }
@@ -395,6 +413,33 @@ impl StoredConnection {
                 ssh_algorithm_profile
             ));
         };
+        // Expect 式终端触发器（camelCase/snake_case 均为 manifest 原生 key，
+        // triggers 本身无别名）。值可以是 JSON 对象（宿主 lifecycle / MCP 桥
+        // 转发）或 JSON 字符串（连接表单 textarea）；密文槽位从
+        // connection_secrets 解析。非法配置让连接直接失败（D7）。
+        let triggers = crate::triggers::parse_triggers(
+            external_config.and_then(|config| config.get("triggers")),
+            &|key| {
+                connection_secrets
+                    .and_then(|secrets| secrets.get(key))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            },
+        )?;
+        // 外部密码管理器（tssh PasswordCommand/PassphraseCommand 对标）：
+        // trim 后非空才生效；既有显式凭据优先（D9）。
+        let password_command =
+            config_text(external_config, &["password_command", "passwordCommand"])
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+        let passphrase_command = config_text(
+            external_config,
+            &["passphrase_command", "passphraseCommand"],
+        )
+        .unwrap_or_default()
+        .trim()
+        .to_string();
         // Legacy 0.4.x flag: only consulted when `sudo_source` is absent, so
         // a re-saved connection (stale `quick_sudo` left behind) follows the
         // explicit source chosen on the form.
@@ -425,12 +470,17 @@ impl StoredConnection {
         } else {
             runtime_host
         };
+        // password_command 让「密码留空、连接时本地取回」成为合法形态：
+        // 仅当命令也未配置时才拒绝密码类认证方法。
         if matches!(
             authentication,
             AuthenticationMethod::Password | AuthenticationMethod::PrivateKeyPassword
         ) && password.is_empty()
+            && password_command.is_empty()
         {
-            return Err("Password authentication requires a password".to_string());
+            return Err(
+                "Password authentication requires a password or a password_command".to_string(),
+            );
         }
         if matches!(
             authentication,
@@ -491,6 +541,9 @@ impl StoredConnection {
             set_env,
             remote_command,
             ssh_algorithm_profile,
+            triggers,
+            password_command,
+            passphrase_command,
             jump_hosts,
         })
     }
@@ -901,6 +954,11 @@ mod tests {
             "ssh_algorithm_policy",
             "terminal_keepalive_secs",
             "set_env",
+            "triggers",
+            "trigger_answer_1",
+            "trigger_answer_2",
+            "password_command",
+            "passphrase_command",
             "remote_command",
             "ssh_algorithm_profile",
             "read_only",
@@ -910,12 +968,15 @@ mod tests {
         // secret binding 只允许落在凭据字段；config binding 不得承载凭据语义。
         // private_key 承载表单粘贴的私钥内容（外部工具写入的存量 secret 也
         // 从这里生效），必须被 provider 声明，否则宿主校验拒绝整个连接。
+        // trigger_answer_1/2 是触发器密文槽位（sendSecretKey 引用）。
         let secret_keys = [
             "password",
             "private_key_passphrase",
             "private_key",
             "sudo_password",
             "totp_secret",
+            "trigger_answer_1",
+            "trigger_answer_2",
         ];
         for field in fields {
             let key = field["key"].as_str().unwrap();
@@ -925,7 +986,9 @@ mod tests {
                     "unexpected secret binding: {key}"
                 ),
                 Some("config") => assert!(
-                    !key.contains("password") || key == "password_prompt_hint",
+                    !key.contains("password")
+                        || key == "password_prompt_hint"
+                        || key == "password_command",
                     "config binding must not carry credential material: {key}"
                 ),
                 _ => {}
@@ -1254,14 +1317,13 @@ mod tests {
         assert_eq!(connection.jump_hosts[0].port, 2202);
         assert_eq!(connection.jump_hosts[0].password, "jump-pw");
         assert_eq!(connection.jump_hosts[1].authentication, "private-key");
-        let synthesized =
-            connection.jump_hosts[1].to_connection(
-                "jump-2",
-                20,
-                30,
-                connection.algorithm_policy,
-                "modern",
-            );
+        let synthesized = connection.jump_hosts[1].to_connection(
+            "jump-2",
+            20,
+            30,
+            connection.algorithm_policy,
+            "modern",
+        );
         assert_eq!(synthesized.host, "inner.example.com");
         assert_eq!(synthesized.runtime_port, 22);
         assert_eq!(synthesized.authentication, AuthenticationMethod::PrivateKey);
@@ -1764,6 +1826,145 @@ mod manifest_contract_tests {
         );
     }
 
+    /// 触发器（Expect）与外部密码管理器配置的解析面：external_config 的
+    /// triggers（对象/字符串两形态）、密文槽位解析、非法配置整连接失败
+    /// （D7）、password_command 让密码类认证允许留空（显式密码优先）。
+    #[test]
+    fn triggers_and_credential_commands_parse_strictly() {
+        let lifecycle = |external_config: Value, secrets: Value| {
+            let mut connection = serde_json::json!({
+                "id": "triggers",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": "pw",
+                "external_config": external_config,
+            });
+            if !secrets.is_null() {
+                connection["connection_secrets"] = secrets;
+            }
+            StoredConnection::from_lifecycle_params(&serde_json::json!({
+                "connection": connection
+            }))
+        };
+
+        // ① 对象形态（宿主 lifecycle / MCP 桥转发）：密文槽位解析成功。
+        let parsed = lifecycle(
+            serde_json::json!({
+                "authentication": "password",
+                "triggers": {
+                    "timeoutSecs": 45,
+                    "sleepMs": 200,
+                    "passSleep": "enter",
+                    "stages": [
+                        { "pattern": "code:", "sendSecretKey": "trigger_answer_1" },
+                        { "pattern": "proceed", "sendText": "yes\\r",
+                          "casePattern": "\\(y/n\\)", "caseSendText": "y" }
+                    ]
+                },
+                "password_command": "op read vault",
+                "passphrase_command": "security find-password -w"
+            }),
+            serde_json::json!({ "trigger_answer_1": "one" }),
+        )
+        .unwrap();
+        let triggers = parsed.triggers.expect("triggers must parse");
+        assert_eq!(triggers.timeout_secs, 45);
+        assert_eq!(triggers.sleep_ms, 200);
+        assert_eq!(triggers.stages.len(), 2);
+        assert_eq!(triggers.stages[0].answer.kind(), "secret");
+        assert!(triggers.stages[1].case.is_some());
+        assert_eq!(parsed.password_command, "op read vault");
+        assert_eq!(parsed.passphrase_command, "security find-password -w");
+
+        // ② 字符串形态（连接表单 textarea）同样解析。
+        let parsed = lifecycle(
+            serde_json::json!({
+                "authentication": "password",
+                "triggers": r#"{"stages":[{"pattern":"code","sendText":"1\r"}]}"#
+            }),
+            Value::Null,
+        )
+        .unwrap();
+        assert_eq!(parsed.triggers.expect("string form parses").stages.len(), 1);
+
+        // ③ 缺省/空 = 功能关闭。
+        for raw in [
+            Value::Null,
+            Value::from(""),
+            serde_json::json!({ "stages": [] }),
+        ] {
+            let mut external = serde_json::json!({
+                "authentication": "password"
+            });
+            if !raw.is_null() {
+                external["triggers"] = raw;
+            }
+            let parsed = lifecycle(external, Value::Null).unwrap();
+            assert!(parsed.triggers.is_none(), "expected disabled");
+        }
+
+        // ④ 非法 JSON / 未知密文槽位 → 连接失败并给出可定位的错误（D7）。
+        let error = lifecycle(
+            serde_json::json!({
+                "authentication": "password",
+                "triggers": "{not json"
+            }),
+            Value::Null,
+        )
+        .unwrap_err();
+        assert!(error.contains("triggers"), "{error}");
+        let error = lifecycle(
+            serde_json::json!({
+                "authentication": "password",
+                "triggers": { "stages": [{ "pattern": "p", "sendSecretKey": "nope" }] }
+            }),
+            Value::Null,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown secret slot"), "{error}");
+        // 引用的槽位未填充同样失败（静默发空行比失败更难排查）。
+        let error = lifecycle(
+            serde_json::json!({
+                "authentication": "password",
+                "triggers": { "stages": [{ "pattern": "p", "sendSecretKey": "trigger_answer_1" }] }
+            }),
+            Value::Null,
+        )
+        .unwrap_err();
+        assert!(error.contains("is empty"), "{error}");
+
+        // ⑤ password_command 允许密码类认证留空密码（命令在连接期取回）。
+        // 顶层 connection 无 password 字段、仅配置命令时解析成功。
+        let parsed = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "triggers",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "external_config": {
+                    "authentication": "password",
+                    "password_command": "op read vault"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(parsed.password.is_empty());
+        assert_eq!(parsed.password_command, "op read vault");
+        // 两者都没有才拒绝。
+        let error = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "triggers",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "external_config": { "authentication": "password" }
+            }
+        }))
+        .unwrap_err();
+        assert!(error.contains("password_command"), "{error}");
+    }
+
     /// Every manifest field must land in the store the model reads it from:
     /// `secret` bindings come from `connection_secrets`, `config` bindings
     /// from `external_config` and are consumed by the parser.
@@ -1771,11 +1972,14 @@ mod manifest_contract_tests {
     fn bindings_match_parse_surfaces() {
         // private_key 现在被解析面消费（表单粘贴的私钥内容 / 外部工具写入的
         // 存量 secret），从 connection_secrets 读取。
+        // trigger_answer_1/2 是触发器密文槽位，经 triggers 解析面消费（sendSecretKey 解析）。
         let secret_keys = [
             "private_key",
             "private_key_passphrase",
             "sudo_password",
             "totp_secret",
+            "trigger_answer_1",
+            "trigger_answer_2",
         ];
         let config_keys = [
             "authentication",
@@ -1786,6 +1990,9 @@ mod manifest_contract_tests {
             "ssh_algorithm_policy",
             "terminal_keepalive_secs",
             "set_env",
+            "triggers",
+            "password_command",
+            "passphrase_command",
             "remote_command",
             "ssh_algorithm_profile",
             "sudo_source",
@@ -1909,6 +2116,9 @@ mod manifest_contract_tests {
             ("sudo_source", Value::from("custom")),
             ("sudo_use_pty", Value::from(false)),
             ("set_env", Value::from("")),
+            ("triggers", Value::from("")),
+            ("password_command", Value::from("")),
+            ("passphrase_command", Value::from("")),
             ("remote_command", Value::from("")),
             ("auth_flow_mode", Value::from("password_then_otp")),
             ("read_only", Value::from(false)),

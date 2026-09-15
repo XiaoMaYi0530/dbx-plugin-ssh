@@ -25,6 +25,7 @@ mod sudo_allowlist;
 mod sudo_fs;
 mod sudo_profiles;
 mod transfer_history;
+mod triggers;
 mod vault;
 
 use std::ffi::OsString;

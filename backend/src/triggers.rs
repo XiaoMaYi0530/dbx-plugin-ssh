@@ -1,0 +1,1429 @@
+//! Expect-style terminal trigger engine (tssh「自动交互」对标，0.4.74)。
+//!
+//! 用户在连接上配置有序阶段规则（对齐 tssh `ExpectPattern1..N`）：PTY 输出
+//! 经 `normalize_auth_prompt_text` 归一化后进入 ≤8 KiB 滚动缓冲，按序匹配
+//! 正则，命中后生成应答发送计划（`TriggerDecision.segments`），由终端读
+//! 循环负责分段 `tokio::sleep` 写回 channel。每阶段应答三选一：
+//! - 明文 `sendText`（`\r`/`\n`/`\t` 转义、`\|` 分段停顿 `sleepMs`）；
+//! - 密文引用 `sendSecretKey`（解析宿主 secret binding 槽位，自动补 `\r`）；
+//! - 本地命令 `sendCommand`（shell 执行取 stdout，自动补 `\r`）。
+//!
+//! 复位语义（契约 D3）：行尾 `$`/`#` 的 shell 提示（复用 `exec::has_shell_prompt`）
+//! 即阶段游标归零；阶段超时（秒级，`now` 由调用方注入便于测试）同样归零并
+//! 产出 `timeout` 决策，会话继续不断连。超时只在**序列中途**生效（已命中
+//! 前序阶段、在等第 2..N 阶段）：空闲等待第一阶段是事件驱动的无限期等待，
+//! 不设超时，否则闲置会话会周期性刷 timeout。case 预匹配（`casePattern`）
+//! 命中不推进游标，答完继续等本阶段 pattern。
+//!
+//! 安全红线：应答内容只存在于发送计划里，绝不进日志、事件或错误信息；
+//! `TriggersConfig` 的 `Debug` 实现对密文应答脱敏。
+
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::process::Output;
+use std::time::Duration;
+
+use regex::Regex;
+use zeroize::Zeroizing;
+
+use crate::exec::{has_shell_prompt, normalize_auth_prompt_text};
+
+/// Stage-count ceiling (contract D8): guards against config abuse.
+pub const MAX_STAGES: usize = 16;
+/// Pattern length ceiling, aligned with `exec::MAX_PROMPT_HINT_LEN` (D8).
+pub const MAX_PATTERN_LEN: usize = 512;
+/// `timeoutSecs` range: 1..=600 (D8); absent means the default.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+pub const MAX_TIMEOUT_SECS: u64 = 600;
+/// `sleepMs` range: 0..=5000 (D8); absent means the default.
+pub const DEFAULT_SLEEP_MS: u64 = 100;
+pub const MAX_SLEEP_MS: u64 = 5000;
+/// Send-text cap: the `\|` split and the per-char `passSleep = each` shape
+/// both multiply the answer into segments, so an unbounded answer could stall
+/// the terminal read loop on a misconfigured rule.
+pub const MAX_SEND_TEXT_LEN: usize = 4096;
+/// Command-line cap for `sendCommand`/`password_command`/`passphrase_command`.
+pub const MAX_COMMAND_LEN: usize = 1024;
+/// Runtime cap on captured stdout of a trigger/credential command: these
+/// commands answer prompts (passwords, OTPs), so multi-KB output is a bug.
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 4096;
+/// Fixed command timeout (contract D4).
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// The only secret slots a `sendSecretKey` may reference (contract D5); the
+/// manifest provides one password field per slot bound to `connection_secrets`.
+pub const SECRET_SLOT_KEYS: &[&str] = &["trigger_answer_1", "trigger_answer_2"];
+/// Rolling match buffer ceiling (contract D2).
+const MAX_BUFFER_BYTES: usize = 8 * 1024;
+
+/// How secret/command answers are paced onto the wire (tssh `ExpectPassSleep`).
+/// Plain `sendText` answers are never paced by this knob (contract §2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PassSleep {
+    /// Whole answer plus Enter in one write (default).
+    #[default]
+    None,
+    /// One character per write, `sleep_ms` between characters.
+    Each,
+    /// Answer first, then Enter after `sleep_ms`.
+    Enter,
+}
+
+impl PassSleep {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "each" => Some(Self::Each),
+            "enter" => Some(Self::Enter),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Each => "each",
+            Self::Enter => "enter",
+        }
+    }
+}
+
+/// One stage's answer, with secret slots already resolved to their values.
+/// Variants other than `Secret` carry user-authored configuration (plaintext
+/// by definition); `Secret` holds the fetched slot value and is redacted in
+/// `Debug` so a connection dump can never leak it.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StageAnswer {
+    Text(String),
+    Secret(String),
+    Command(String),
+}
+
+impl StageAnswer {
+    /// Wire kind name (same vocabulary as `TriggerKind::name`); exercised by
+    /// the parser tests, kept public for diagnostics.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::Secret(_) => "secret",
+            Self::Command(_) => "command",
+        }
+    }
+}
+
+impl fmt::Debug for StageAnswer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => write!(formatter, "Text({text:?})"),
+            Self::Secret(_) => formatter.write_str("Secret(\"<redacted>\")"),
+            Self::Command(command) => write!(formatter, "Command({command:?})"),
+        }
+    }
+}
+
+/// Optional pre-match rule: fires the answer when `pattern` appears while the
+/// stage is pending, without advancing the stage cursor. Only text/secret
+/// answers are allowed here (validated at parse time).
+#[derive(Clone, Debug)]
+pub struct CaseRule {
+    pub pattern: Regex,
+    pub answer: StageAnswer,
+}
+
+/// One ordered expect stage: `pattern` hit → answer (three-way), with an
+/// optional case pre-match.
+#[derive(Clone, Debug)]
+pub struct TriggerStage {
+    pub pattern: Regex,
+    pub answer: StageAnswer,
+    pub case: Option<CaseRule>,
+}
+
+/// Parsed and validated `external_config.triggers` (contract §2.1). Invalid
+/// shapes fail the connection (D7) instead of degrading silently.
+#[derive(Clone)]
+pub struct TriggersConfig {
+    /// Seconds a pending stage may wait for its pattern before resetting.
+    pub timeout_secs: u64,
+    /// Pause between `\|` text segments (and between paced secret chars).
+    pub sleep_ms: u64,
+    /// Pacing mode for secret/command answers.
+    pub pass_sleep: PassSleep,
+    /// Ordered stages, 1..=MAX_STAGES.
+    pub stages: Vec<TriggerStage>,
+}
+
+impl fmt::Debug for TriggersConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TriggersConfig")
+            .field("timeout_secs", &self.timeout_secs)
+            .field("sleep_ms", &self.sleep_ms)
+            .field("pass_sleep", &self.pass_sleep.name())
+            .field("stages", &self.stages)
+            .finish()
+    }
+}
+
+/// What the engine decided to type back after one output chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerDecision {
+    /// 1-based stage number the decision belongs to (timeout reports the
+    /// stage that gave up).
+    pub stage: usize,
+    pub kind: TriggerKind,
+    /// Segment send plan: `(payload, delay_ms)` — the delay elapses before
+    /// the payload is written (0 for the first segment). The read loop owns
+    /// the actual pacing via `tokio::time::sleep`.
+    pub segments: Vec<(Vec<u8>, u64)>,
+    /// Only for `TriggerKind::Command`: the placeholder-substituted command
+    /// the caller must run locally before sending its (trimmed) stdout.
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerKind {
+    Text,
+    Secret,
+    Command,
+    Timeout,
+}
+
+impl TriggerKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Secret => "secret",
+            Self::Command => "command",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// `%h`/`%u`/`%p`/`%n` placeholder context for local command execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPlaceholders {
+    pub host: String,
+    pub username: String,
+    pub port: u16,
+    /// Connection display name, falling back to the connection id.
+    pub name: String,
+}
+
+impl CommandPlaceholders {
+    pub fn new(host: &str, username: &str, port: u16, name: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            username: username.to_string(),
+            port,
+            name: name.to_string(),
+        }
+    }
+}
+
+/// Substitutes `%h` host, `%u` username, `%p` port, `%n` connection name and
+/// `%%` literal `%`; any other `%x` sequence passes through untouched.
+pub fn apply_command_placeholders(command: &str, placeholders: &CommandPlaceholders) -> String {
+    let mut output = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '%' {
+            output.push(character);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('%') => {
+                chars.next();
+                output.push('%');
+            }
+            Some('h') => {
+                chars.next();
+                output.push_str(&placeholders.host);
+            }
+            Some('u') => {
+                chars.next();
+                output.push_str(&placeholders.username);
+            }
+            Some('p') => {
+                chars.next();
+                output.push_str(&placeholders.port.to_string());
+            }
+            Some('n') => {
+                chars.next();
+                output.push_str(&placeholders.name);
+            }
+            _ => output.push('%'),
+        }
+    }
+    output
+}
+
+/// Spawns the substituted command through the platform shell and waits for
+/// completion. Injectable so command execution is unit-testable without a
+/// real shell (the production implementation is [`ShellExecutor`]).
+pub trait CommandExecutor: Send + Sync {
+    fn run(
+        &self,
+        command: &str,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Output>> + Send + '_>>;
+}
+
+/// Production executor: unix `sh -c` / windows `cmd /C` (contract D4).
+pub struct ShellExecutor;
+
+impl CommandExecutor for ShellExecutor {
+    fn run(
+        &self,
+        command: &str,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Output>> + Send + '_>> {
+        let command = command.to_string();
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .output()
+                    .await
+            }
+            #[cfg(windows)]
+            {
+                tokio::process::Command::new("cmd")
+                    .args(["/C"])
+                    .arg(&command)
+                    .output()
+                    .await
+            }
+        })
+    }
+}
+
+/// Runs one local command (placeholders substituted, fixed timeout, exit-code
+/// check) and returns its stdout with a single trailing newline stripped,
+/// zeroize-wrapped so the credential buffer is wiped when dropped. Errors
+/// carry only the failure mode (timeout / spawn error / exit code) — never
+/// the command output.
+pub fn execute_command<'a>(
+    executor: &'a dyn CommandExecutor,
+    command: &str,
+    placeholders: &CommandPlaceholders,
+    timeout: Duration,
+) -> Pin<Box<dyn Future<Output = Result<Zeroizing<String>, String>> + Send + 'a>> {
+    let substituted = apply_command_placeholders(command, placeholders);
+    Box::pin(async move {
+        let output = tokio::time::timeout(timeout, executor.run(&substituted))
+            .await
+            .map_err(|_| {
+                format!(
+                    "local command timed out after {}s",
+                    timeout.as_secs().max(1)
+                )
+            })?
+            .map_err(|error| format!("local command could not be spawned: {error}"))?;
+        if !output.status.success() {
+            return Err(match output.status.code() {
+                Some(code) => format!("local command exited with code {code}"),
+                None => "local command was terminated by a signal".to_string(),
+            });
+        }
+        let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        // Strip exactly one trailing newline: `echo pw` emits "pw\n", a
+        // password genuinely ending in "\n" would emit "pw\n\n" and keep it.
+        if stdout.ends_with('\n') {
+            stdout.pop();
+            if stdout.ends_with('\r') {
+                stdout.pop();
+            }
+        }
+        if stdout.len() > MAX_COMMAND_OUTPUT_BYTES {
+            return Err(format!(
+                "local command produced more than {MAX_COMMAND_OUTPUT_BYTES} bytes of output"
+            ));
+        }
+        Ok(Zeroizing::new(stdout))
+    })
+}
+
+/// Convenience wrapper used by the SSH auth/trigger paths: production shell
+/// executor plus the fixed 10s timeout (contract D4).
+pub fn run_credential_command<'a>(
+    command: &'a str,
+    placeholders: &'a CommandPlaceholders,
+) -> Pin<Box<dyn Future<Output = Result<Zeroizing<String>, String>> + Send + 'a>> {
+    execute_command(&ShellExecutor, command, placeholders, COMMAND_TIMEOUT)
+}
+
+/// Parses `external_config.triggers` into a validated [`TriggersConfig`].
+/// Accepts the raw JSON object (host lifecycle payloads, smoke tests) and the
+/// JSON-string form (connection-form textarea). Missing/empty/`stages: []`
+/// means the feature is off (`Ok(None)`); everything invalid is a hard error
+/// (contract D7).
+pub fn parse_triggers(
+    raw: Option<&serde_json::Value>,
+    secrets: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<TriggersConfig>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let object: serde_json::Map<String, serde_json::Value> = match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            serde_json::from_str(text)
+                .map_err(|error| format!("triggers: invalid JSON: {error}"))?
+        }
+        serde_json::Value::Object(object) => object.clone(),
+        other => {
+            return Err(format!(
+                "triggers: expected a JSON object or JSON string, got {}",
+                json_type_name(other)
+            ))
+        }
+    };
+    let stages = match object.get("stages") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Array(stages)) => stages,
+        Some(other) => {
+            return Err(format!(
+                "triggers.stages: expected a JSON array, got {}",
+                json_type_name(other)
+            ))
+        }
+    };
+    if stages.is_empty() {
+        return Ok(None);
+    }
+    if stages.len() > MAX_STAGES {
+        return Err(format!(
+            "triggers.stages: at most {MAX_STAGES} stages are supported, got {}",
+            stages.len()
+        ));
+    }
+    let timeout_secs = match object.get("timeoutSecs") {
+        None | Some(serde_json::Value::Null) => DEFAULT_TIMEOUT_SECS,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=MAX_TIMEOUT_SECS).contains(value))
+            .ok_or_else(|| {
+                format!("triggers.timeoutSecs: must be an integer between 1 and {MAX_TIMEOUT_SECS}")
+            })?,
+    };
+    let sleep_ms = match object.get("sleepMs") {
+        None | Some(serde_json::Value::Null) => DEFAULT_SLEEP_MS,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value <= MAX_SLEEP_MS)
+            .ok_or_else(|| {
+                format!("triggers.sleepMs: must be an integer between 0 and {MAX_SLEEP_MS}")
+            })?,
+    };
+    let pass_sleep = match object.get("passSleep") {
+        None | Some(serde_json::Value::Null) => PassSleep::None,
+        Some(serde_json::Value::String(name)) => PassSleep::parse(name).ok_or_else(|| {
+            format!("triggers.passSleep: must be none, each or enter, got '{name}'")
+        })?,
+        Some(other) => {
+            return Err(format!(
+                "triggers.passSleep: expected a string, got {}",
+                json_type_name(other)
+            ))
+        }
+    };
+    let mut parsed = Vec::with_capacity(stages.len());
+    for (index, stage) in stages.iter().enumerate() {
+        let stage = stage.as_object().ok_or_else(|| {
+            format!(
+                "triggers.stages[{}]: expected a JSON object, got {}",
+                index + 1,
+                json_type_name(stage)
+            )
+        })?;
+        parsed.push(parse_stage(stage, index, secrets)?);
+    }
+    Ok(Some(TriggersConfig {
+        timeout_secs,
+        sleep_ms,
+        pass_sleep,
+        stages: parsed,
+    }))
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Reads a required non-empty string field; `null` counts as absent.
+fn required_text<'a>(
+    stage: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'a str,
+) -> Result<Option<&'a str>, String> {
+    match stage.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if !text.is_empty() => Ok(Some(text)),
+        Some(serde_json::Value::String(_)) => Err(format!("{field}: must not be empty")),
+        Some(other) => Err(format!(
+            "{field}: expected a string, got {}",
+            json_type_name(other)
+        )),
+    }
+}
+
+fn compile_pattern(text: &str, error_prefix: &str) -> Result<Regex, String> {
+    if text.len() > MAX_PATTERN_LEN {
+        return Err(format!(
+            "{error_prefix}: pattern exceeds {MAX_PATTERN_LEN} characters"
+        ));
+    }
+    Regex::new(text).map_err(|error| format!("{error_prefix}: {error}"))
+}
+
+/// Resolves a `sendSecretKey`/`caseSendSecretKey` reference against the
+/// connection's secret slots (contract D5: exactly two known slots; an
+/// unfilled slot is a configuration error, D7).
+fn resolve_secret(
+    key: &str,
+    error_prefix: &str,
+    secrets: &dyn Fn(&str) -> Option<String>,
+) -> Result<StageAnswer, String> {
+    if !SECRET_SLOT_KEYS.contains(&key) {
+        return Err(format!(
+            "{error_prefix}: unknown secret slot '{key}' (expected trigger_answer_1 or trigger_answer_2)"
+        ));
+    }
+    let value = secrets(key).unwrap_or_default();
+    if value.is_empty() {
+        return Err(format!(
+            "{error_prefix}: secret slot '{key}' is empty; fill the trigger secret field on the connection or drop the sendSecretKey reference"
+        ));
+    }
+    Ok(StageAnswer::Secret(value))
+}
+
+fn parse_stage(
+    stage: &serde_json::Map<String, serde_json::Value>,
+    index: usize,
+    secrets: &dyn Fn(&str) -> Option<String>,
+) -> Result<TriggerStage, String> {
+    let prefix = move |field: &str| format!("triggers.stages[{}].{field}", index + 1);
+    let pattern_text = required_text(stage, "pattern")?
+        .ok_or_else(|| prefix("pattern") + ": is required")?
+        .to_string();
+    let pattern = compile_pattern(&pattern_text, &prefix("pattern"))?;
+
+    // Answer three-choose-one (contract §2.1).
+    let send_text = required_text(stage, "sendText")?;
+    let send_secret_key = required_text(stage, "sendSecretKey")?;
+    let send_command = required_text(stage, "sendCommand")?;
+    let answer_count = usize::from(send_text.is_some())
+        + usize::from(send_secret_key.is_some())
+        + usize::from(send_command.is_some());
+    if answer_count == 0 {
+        return Err(format!(
+            "{}: exactly one of sendText, sendSecretKey or sendCommand is required",
+            prefix("answer")
+        ));
+    }
+    if answer_count > 1 {
+        return Err(format!(
+            "{}: sendText, sendSecretKey and sendCommand are mutually exclusive",
+            prefix("answer")
+        ));
+    }
+    let answer = if let Some(text) = send_text {
+        if text.len() > MAX_SEND_TEXT_LEN {
+            return Err(format!(
+                "{}: answer exceeds {MAX_SEND_TEXT_LEN} characters",
+                prefix("sendText")
+            ));
+        }
+        StageAnswer::Text(text.to_string())
+    } else if let Some(key) = send_secret_key {
+        resolve_secret(key, &prefix("sendSecretKey"), secrets)?
+    } else {
+        let command = send_command.expect("answer_count == 1 guarantees one variant");
+        if command.len() > MAX_COMMAND_LEN {
+            return Err(format!(
+                "{}: command exceeds {MAX_COMMAND_LEN} characters",
+                prefix("sendCommand")
+            ));
+        }
+        StageAnswer::Command(command.to_string())
+    };
+
+    // Optional case pre-match: casePattern + exactly one caseSend* (contract §2.1).
+    let case_pattern_text = required_text(stage, "casePattern")?;
+    let case_send_text = required_text(stage, "caseSendText")?;
+    let case_send_secret_key = required_text(stage, "caseSendSecretKey")?;
+    let case_answer_count =
+        usize::from(case_send_text.is_some()) + usize::from(case_send_secret_key.is_some());
+    if case_answer_count > 0 && case_pattern_text.is_none() {
+        return Err(format!(
+            "{}: caseSendText/caseSendSecretKey require casePattern",
+            prefix("caseAnswer")
+        ));
+    }
+    if case_pattern_text.is_some() && case_answer_count != 1 {
+        return Err(format!(
+            "{}: exactly one of caseSendText or caseSendSecretKey is required alongside casePattern",
+            prefix("caseAnswer")
+        ));
+    }
+    let case = match (case_pattern_text, case_send_text, case_send_secret_key) {
+        (Some(pattern), Some(text), None) => {
+            if text.len() > MAX_SEND_TEXT_LEN {
+                return Err(format!(
+                    "{}: answer exceeds {MAX_SEND_TEXT_LEN} characters",
+                    prefix("caseSendText")
+                ));
+            }
+            Some(CaseRule {
+                pattern: compile_pattern(pattern, &prefix("casePattern"))?,
+                answer: StageAnswer::Text(text.to_string()),
+            })
+        }
+        (Some(pattern), None, Some(key)) => Some(CaseRule {
+            pattern: compile_pattern(pattern, &prefix("casePattern"))?,
+            answer: resolve_secret(key, &prefix("caseSendSecretKey"), secrets)?,
+        }),
+        _ => None,
+    };
+
+    Ok(TriggerStage {
+        pattern,
+        answer,
+        case,
+    })
+}
+
+/// Parses a `sendText` answer: `\r` `\n` `\t` become control characters, `\|`
+/// starts a new segment (the read loop pauses `sleepMs` between segments),
+/// any other backslash stays literal.
+pub fn parse_send_text(text: &str) -> Vec<String> {
+    let mut segments: Vec<String> = vec![String::new()];
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            match chars.peek().copied() {
+                Some('r') => {
+                    chars.next();
+                    segments
+                        .last_mut()
+                        .expect("segments never empty")
+                        .push('\r');
+                }
+                Some('n') => {
+                    chars.next();
+                    segments
+                        .last_mut()
+                        .expect("segments never empty")
+                        .push('\n');
+                }
+                Some('t') => {
+                    chars.next();
+                    segments
+                        .last_mut()
+                        .expect("segments never empty")
+                        .push('\t');
+                }
+                Some('|') => {
+                    chars.next();
+                    segments.push(String::new());
+                }
+                _ => segments
+                    .last_mut()
+                    .expect("segments never empty")
+                    .push('\\'),
+            }
+        } else {
+            segments
+                .last_mut()
+                .expect("segments never empty")
+                .push(character);
+        }
+    }
+    segments
+}
+
+/// Builds the send plan for a text answer: `\|` segments with `sleep_ms`
+/// pauses before every segment but the first.
+fn text_segments(text: &str, sleep_ms: u64) -> Vec<(Vec<u8>, u64)> {
+    parse_send_text(text)
+        .into_iter()
+        .enumerate()
+        .map(|(index, segment)| (segment.into_bytes(), u64::from(index > 0) * sleep_ms))
+        .collect()
+}
+
+/// Builds the send plan for a secret/command answer: Enter is appended, and
+/// `passSleep` controls the pacing (`none` single write, `each` char-by-char,
+/// `enter` answer-then-pause-then-Enter).
+pub fn pass_sleep_segments(
+    answer: &str,
+    sleep_ms: u64,
+    pass_sleep: PassSleep,
+) -> Vec<(Vec<u8>, u64)> {
+    match pass_sleep {
+        PassSleep::None => vec![(format!("{answer}\r").into_bytes(), 0)],
+        PassSleep::Each => {
+            let total = answer.chars().count();
+            if total == 0 {
+                return vec![(b"\r".to_vec(), 0)];
+            }
+            answer
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    let mut bytes = character.to_string().into_bytes();
+                    if index + 1 == total {
+                        bytes.push(b'\r');
+                    }
+                    (bytes, u64::from(index > 0) * sleep_ms)
+                })
+                .collect()
+        }
+        PassSleep::Enter => {
+            let mut segments = Vec::new();
+            if !answer.is_empty() {
+                segments.push((answer.as_bytes().to_vec(), 0));
+            }
+            segments.push((b"\r".to_vec(), sleep_ms));
+            segments
+        }
+    }
+}
+
+/// A resolved answer's send plan: decision kind, the `(payload, delay_ms)`
+/// segments, and the unresolved command line for `sendCommand` answers.
+type AnswerPlan = (TriggerKind, Vec<(Vec<u8>, u64)>, Option<String>);
+
+/// Builds the send plan plus decision kind for a resolved stage answer.
+fn answer_segments(answer: &StageAnswer, sleep_ms: u64, pass_sleep: PassSleep) -> AnswerPlan {
+    match answer {
+        StageAnswer::Text(text) => (TriggerKind::Text, text_segments(text, sleep_ms), None),
+        StageAnswer::Secret(value) => (
+            TriggerKind::Secret,
+            pass_sleep_segments(value, sleep_ms, pass_sleep),
+            None,
+        ),
+        StageAnswer::Command(command) => {
+            // The caller runs the command locally and turns the (trimmed)
+            // stdout into a passSleep-shaped plan; segments stay empty until
+            // then so no unresolved placeholder ever reaches the wire.
+            (TriggerKind::Command, Vec::new(), Some(command.clone()))
+        }
+    }
+}
+
+/// Per-session trigger state machine: rolling normalized buffer (D2), stage
+/// cursor, per-stage timer (seconds, `now` injected), prompt reset (D3).
+pub struct TriggerEngine {
+    config: TriggersConfig,
+    placeholders: CommandPlaceholders,
+    buffer: String,
+    /// 0-based index of the stage currently being waited for.
+    stage_cursor: usize,
+    /// Millisecond timestamp (caller-injected) when the current stage wait
+    /// started; `None` until the first chunk arms the timer.
+    stage_since_ms: Option<u64>,
+}
+
+impl TriggerEngine {
+    pub fn new(config: TriggersConfig, placeholders: CommandPlaceholders) -> Self {
+        Self {
+            config,
+            placeholders,
+            buffer: String::new(),
+            stage_cursor: 0,
+            stage_since_ms: None,
+        }
+    }
+
+    pub fn placeholders(&self) -> &CommandPlaceholders {
+        &self.placeholders
+    }
+
+    /// Pacing knobs for command answers: their stdout is resolved by the
+    /// caller (after `observe` returned), so the caller needs the config's
+    /// `sleepMs`/`passSleep` to build the final segment plan via
+    /// [`pass_sleep_segments`]. Returned as `(sleep_ms, pass_sleep)`.
+    pub fn pacing(&self) -> (u64, PassSleep) {
+        (self.config.sleep_ms, self.config.pass_sleep)
+    }
+
+    /// Feeds one terminal output chunk (`now_ms` = Unix milliseconds). Returns
+    /// the decision to act on: a stage/case answer (with its segment plan), a
+    /// command to run locally, or a timeout reset. Shell prompts reset the
+    /// stage cursor to stage 1 (D3) and produce no decision.
+    pub fn observe(&mut self, chunk: &str, now_ms: u64) -> Option<TriggerDecision> {
+        if self.config.stages.is_empty() {
+            return None;
+        }
+        let normalized = normalize_auth_prompt_text(chunk);
+        if !normalized.is_empty() {
+            self.append_to_buffer(&normalized);
+        }
+        if self.stage_since_ms.is_none() {
+            self.stage_since_ms = Some(now_ms);
+        }
+        // D3: a shell prompt means the previous round finished; re-arm at
+        // stage 1 (tssh "expect re-arms after the login sequence").
+        if has_shell_prompt(&self.buffer) {
+            self.reset_stage(now_ms);
+            return None;
+        }
+        // Case pre-match answers without advancing the cursor (contract §0).
+        if let Some(decision) = self.try_case_match() {
+            return Some(decision);
+        }
+        if let Some(decision) = self.try_stage_match(now_ms) {
+            return Some(decision);
+        }
+        self.check_timeout(now_ms)
+    }
+
+    fn append_to_buffer(&mut self, normalized: &str) {
+        self.buffer.push_str(normalized);
+        let overflow = self.buffer.len().saturating_sub(MAX_BUFFER_BYTES);
+        if overflow > 0 {
+            let mut cut = overflow;
+            while !self.buffer.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.buffer.drain(..cut);
+        }
+    }
+
+    fn consume_buffer(&mut self, through: usize) {
+        self.buffer.drain(..through.min(self.buffer.len()));
+    }
+
+    fn reset_stage(&mut self, now_ms: u64) {
+        self.stage_cursor = 0;
+        self.stage_since_ms = Some(now_ms);
+    }
+
+    fn try_case_match(&mut self) -> Option<TriggerDecision> {
+        let case = self.config.stages[self.stage_cursor].case.as_ref()?;
+        let matched = case.pattern.find(&self.buffer)?;
+        let (kind, segments, command) =
+            answer_segments(&case.answer, self.config.sleep_ms, self.config.pass_sleep);
+        // Consume the matched text so the same case text cannot answer twice;
+        // the stage cursor intentionally stays put.
+        self.consume_buffer(matched.end());
+        Some(TriggerDecision {
+            stage: self.stage_cursor + 1,
+            kind,
+            segments,
+            command,
+        })
+    }
+
+    fn try_stage_match(&mut self, now_ms: u64) -> Option<TriggerDecision> {
+        // Copy the match span and answer out first: `consume_buffer` mutates
+        // the buffer the regex match borrows.
+        let (match_end, answer) = {
+            let stage = &self.config.stages[self.stage_cursor];
+            let matched = stage.pattern.find(&self.buffer)?;
+            (matched.end(), stage.answer.clone())
+        };
+        // D2: consume the matched text so later chunks continue past it.
+        self.consume_buffer(match_end);
+        let (kind, segments, command) =
+            answer_segments(&answer, self.config.sleep_ms, self.config.pass_sleep);
+        let stage_number = self.stage_cursor + 1;
+        // Advance (wrapping so a completed sequence can run again without a
+        // shell prompt in between) and restart the next stage's timer.
+        self.stage_cursor = (self.stage_cursor + 1) % self.config.stages.len();
+        self.stage_since_ms = Some(now_ms);
+        Some(TriggerDecision {
+            stage: stage_number,
+            kind,
+            segments,
+            command,
+        })
+    }
+
+    fn check_timeout(&mut self, now_ms: u64) -> Option<TriggerDecision> {
+        // Timeout only applies mid-sequence: once a stage has been answered
+        // and the engine waits for the next one. Waiting for stage 1 is an
+        // event-driven, open-ended wait — an idle session must not spam
+        // timeout decisions every `timeoutSecs`.
+        if self.stage_cursor == 0 {
+            return None;
+        }
+        let since = self.stage_since_ms?;
+        if now_ms.saturating_sub(since) < self.config.timeout_secs.saturating_mul(1000) {
+            return None;
+        }
+        let stage = self.stage_cursor + 1;
+        // D3: a timeout zeroes the cursor and reports; the session keeps
+        // running and the next window starts from stage 1.
+        self.stage_cursor = 0;
+        self.stage_since_ms = Some(now_ms);
+        Some(TriggerDecision {
+            stage,
+            kind: TriggerKind::Timeout,
+            segments: Vec::new(),
+            command: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn no_secrets(_key: &str) -> Option<String> {
+        None
+    }
+
+    fn slot_secrets(key: &str) -> Option<String> {
+        match key {
+            "trigger_answer_1" => Some("s3cret-one".to_string()),
+            "trigger_answer_2" => Some("s3cret-two".to_string()),
+            _ => None,
+        }
+    }
+
+    fn parse_config(value: serde_json::Value) -> TriggersConfig {
+        parse_triggers(Some(&value), &slot_secrets)
+            .expect("config must parse")
+            .expect("config must be enabled")
+    }
+
+    fn parse_err(value: serde_json::Value) -> String {
+        parse_triggers(Some(&value), &slot_secrets).expect_err("config must be rejected")
+    }
+
+    // —— 解析与校验（D7/D8）———————————————————————————
+
+    #[test]
+    fn parse_minimal_object_config_with_defaults() {
+        let config = parse_config(json!({
+            "stages": [{ "pattern": "code", "sendText": "1\\r" }]
+        }));
+        assert_eq!(config.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(config.sleep_ms, DEFAULT_SLEEP_MS);
+        assert_eq!(config.pass_sleep, PassSleep::None);
+        assert_eq!(config.stages.len(), 1);
+        assert!(config.stages[0].case.is_none());
+    }
+
+    #[test]
+    fn parse_accepts_json_string_form() {
+        // 连接表单 textarea 送达的是字符串形态。
+        let config = parse_triggers(
+            Some(&json!(
+                r#"{"stages":[{"pattern":"code","sendText":"1\r"}]}"#
+            )),
+            &no_secrets,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.stages.len(), 1);
+    }
+
+    #[test]
+    fn parse_empty_or_stageless_config_disables_feature() {
+        for value in [
+            json!(null),
+            json!(""),
+            json!("   "),
+            json!({}),
+            json!({ "timeoutSecs": 30 }),
+            json!({ "stages": [] }),
+        ] {
+            assert!(
+                parse_triggers(Some(&value), &no_secrets).unwrap().is_none(),
+                "expected disabled for {value}"
+            );
+        }
+        assert!(parse_triggers(None, &no_secrets).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_json_string() {
+        let error = parse_triggers(Some(&json!("{not json")), &no_secrets).unwrap_err();
+        assert!(error.contains("invalid JSON"), "{error}");
+        // 非 JSON 对象/字符串形态同样拒绝。
+        let error = parse_triggers(Some(&json!(42)), &no_secrets).unwrap_err();
+        assert!(error.contains("expected a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn parse_enforces_answer_three_way_choice() {
+        let error = parse_err(json!({ "stages": [{ "pattern": "code" }] }));
+        assert!(error.contains("exactly one of sendText"), "{error}");
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "code", "sendText": "1\\r", "sendCommand": "echo hi" }]
+        }));
+        assert!(error.contains("mutually exclusive"), "{error}");
+    }
+
+    #[test]
+    fn parse_enforces_case_group_rules() {
+        // case 应答缺 casePattern。
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "code", "sendText": "1\\r", "caseSendText": "y" }]
+        }));
+        assert!(error.contains("require casePattern"), "{error}");
+        // casePattern 缺 case 应答。
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "code", "sendText": "1\\r", "casePattern": "y/n" }]
+        }));
+        assert!(error.contains("exactly one of caseSendText"), "{error}");
+        // case 应答二选一。
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "code", "sendText": "1\\r",
+                "casePattern": "y/n", "caseSendText": "y", "caseSendSecretKey": "trigger_answer_2" }]
+        }));
+        assert!(error.contains("exactly one of caseSendText"), "{error}");
+        // 合法 case 组解析成功。
+        let config = parse_config(json!({
+            "stages": [{ "pattern": "code", "sendText": "1\\r",
+                "casePattern": "\\(y/n\\)", "caseSendText": "y" }]
+        }));
+        assert!(config.stages[0].case.is_some());
+    }
+
+    #[test]
+    fn parse_enforces_limits() {
+        // 阶段数上限 16（D8）。
+        let stages: Vec<_> = (0..17)
+            .map(|index| json!({ "pattern": format!("p{index}"), "sendText": "1\\r" }))
+            .collect();
+        let error = parse_err(json!({ "stages": stages }));
+        assert!(error.contains("at most 16"), "{error}");
+        // pattern 长度上限 512（对齐 MAX_PROMPT_HINT_LEN）。
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "a".repeat(513), "sendText": "1\\r" }]
+        }));
+        assert!(error.contains("exceeds 512"), "{error}");
+        // timeoutSecs 1..=600。
+        for timeout in [0u64, 601] {
+            let error = parse_err(json!({
+                "stages": [{ "pattern": "p", "sendText": "1\\r" }], "timeoutSecs": timeout
+            }));
+            assert!(error.contains("timeoutSecs"), "{error}");
+        }
+        // sleepMs 0..=5000。
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "p", "sendText": "1\\r" }], "sleepMs": 5001
+        }));
+        assert!(error.contains("sleepMs"), "{error}");
+        // passSleep 枚举。
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "p", "sendText": "1\\r" }], "passSleep": "sometimes"
+        }));
+        assert!(error.contains("none, each or enter"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_uncompilable_regex() {
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "code(", "sendText": "1\\r" }]
+        }));
+        assert!(error.contains("stages[1].pattern"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_unknown_secret_slot() {
+        // 未知槽位拒绝（D5：只有两个固定槽位）。
+        let error = parse_err(json!({
+            "stages": [{ "pattern": "code", "sendSecretKey": "my_own_key" }]
+        }));
+        assert!(error.contains("unknown secret slot"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_empty_secret_slot() {
+        let error = parse_triggers(
+            Some(&json!({
+                "stages": [{ "pattern": "code", "sendSecretKey": "trigger_answer_1" }]
+            })),
+            &no_secrets,
+        )
+        .unwrap_err();
+        assert!(error.contains("is empty"), "{error}");
+        // 已填充槽位解析为密文应答。
+        let config = parse_config(json!({
+            "stages": [{ "pattern": "code", "sendSecretKey": "trigger_answer_1" }]
+        }));
+        assert_eq!(config.stages[0].answer.kind(), "secret");
+    }
+
+    #[test]
+    fn debug_redacts_secret_answers() {
+        let config = parse_config(json!({
+            "stages": [{ "pattern": "code", "sendSecretKey": "trigger_answer_1" }]
+        }));
+        let dump = format!("{config:?}");
+        assert!(!dump.contains("s3cret-one"), "debug leaked secret: {dump}");
+        assert!(dump.contains("<redacted>"), "{dump}");
+    }
+
+    // —— sendText 转义与分段 ——————————————————————————
+
+    #[test]
+    fn parse_send_text_escapes_and_splits() {
+        assert_eq!(parse_send_text("abc"), vec!["abc"]);
+        // \r \n \t 解释为控制字符。
+        assert_eq!(parse_send_text(r"a\rb\nc\td"), vec!["a\rb\nc\td"]);
+        // \| 为分段停顿符。
+        assert_eq!(parse_send_text(r"first\|second"), vec!["first", "second"]);
+        // 其余反斜杠原样。
+        assert_eq!(parse_send_text(r"a\qb"), vec![r"a\qb"]);
+        assert_eq!(parse_send_text(r"trail\"), vec![r"trail\"]);
+        // 空段（\|\|）保留为停顿。
+        assert_eq!(parse_send_text(r"a\|\|b"), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn text_segments_carry_sleep_delays() {
+        let segments = text_segments(r"go\|slow", 250);
+        assert_eq!(
+            segments,
+            vec![(b"go".to_vec(), 0), (b"slow".to_vec(), 250),]
+        );
+    }
+
+    #[test]
+    fn pass_sleep_shapes_secret_segments() {
+        // none：整段 + \r 一次写入。
+        assert_eq!(
+            pass_sleep_segments("pw", 100, PassSleep::None),
+            vec![(b"pw\r".to_vec(), 0)]
+        );
+        // each：逐字符 + sleep，Enter 拼在最后一个字符后。
+        assert_eq!(
+            pass_sleep_segments("ab", 40, PassSleep::Each),
+            vec![(b"a".to_vec(), 0), (b"b\r".to_vec(), 40)]
+        );
+        // 空应答 only Enter。
+        assert_eq!(
+            pass_sleep_segments("", 40, PassSleep::Each),
+            vec![(b"\r".to_vec(), 0)]
+        );
+        // enter：应答、停顿、Enter。
+        assert_eq!(
+            pass_sleep_segments("ab", 60, PassSleep::Enter),
+            vec![(b"ab".to_vec(), 0), (b"\r".to_vec(), 60)]
+        );
+    }
+
+    // —— 引擎行为 ——————————————————————————————————
+
+    fn text_engine(pattern: &str, text: &str) -> TriggerEngine {
+        TriggerEngine::new(
+            parse_config(
+                json!({ "stages": [{ "pattern": format!("(?i){pattern}"), "sendText": text }] }),
+            ),
+            CommandPlaceholders::new("host", "user", 22, "name"),
+        )
+    }
+
+    #[test]
+    fn engine_matches_and_advances_cursor() {
+        let config = parse_config(json!({
+            "stages": [
+                { "pattern": "login:", "sendText": "user\\r" },
+                { "pattern": "code:", "sendText": "42\\r" }
+            ]
+        }));
+        let mut engine = TriggerEngine::new(config, CommandPlaceholders::new("h", "u", 22, "n"));
+        let first = engine
+            .observe("Welcome. login:", 1_000)
+            .expect("stage 1 fires");
+        assert_eq!(first.stage, 1);
+        assert_eq!(first.kind, TriggerKind::Text);
+        assert_eq!(first.segments, vec![(b"user\r".to_vec(), 0)]);
+        let second = engine
+            .observe("verification code:", 1_100)
+            .expect("stage 2 fires");
+        assert_eq!(second.stage, 2);
+        assert_eq!(second.segments, vec![(b"42\r".to_vec(), 0)]);
+        // 游标已回卷：stage 1 的 pattern 再次命中可重新触发。
+        let third = engine.observe("login:", 1_200).expect("wraps to stage 1");
+        assert_eq!(third.stage, 1);
+    }
+
+    #[test]
+    fn engine_matches_across_chunks() {
+        let mut engine = text_engine("verification code", "1234\r");
+        assert!(
+            engine.observe("Verifica", 1_000).is_none(),
+            "partial chunk must not fire"
+        );
+        let decision = engine
+            .observe("tion code:", 1_050)
+            .expect("cross-chunk match");
+        assert_eq!(decision.stage, 1);
+        assert_eq!(decision.segments, vec![(b"1234\r".to_vec(), 0)]);
+    }
+
+    #[test]
+    fn engine_case_pre_match_does_not_advance_cursor() {
+        let config = parse_config(json!({
+            "stages": [
+                { "pattern": "server ready", "sendText": "go\\r",
+                  "casePattern": "continue\\? \\(y/n\\)", "caseSendText": "y" },
+                { "pattern": "done", "sendText": "ok\\r" }
+            ]
+        }));
+        let mut engine = TriggerEngine::new(config, CommandPlaceholders::new("h", "u", 22, "n"));
+        let case = engine
+            .observe("continue? (y/n)", 1_000)
+            .expect("case rule fires");
+        assert_eq!(case.stage, 1);
+        assert_eq!(case.segments, vec![(b"y".to_vec(), 0)]);
+        // case 命中不推进游标：随后本阶段 pattern 命中仍是 stage 1。
+        let stage = engine.observe("server ready", 1_100).expect("stage fires");
+        assert_eq!(stage.stage, 1);
+        assert_eq!(stage.segments, vec![(b"go\r".to_vec(), 0)]);
+        // 游标此刻在 stage 2。
+        let second = engine.observe("done", 1_200).expect("stage 2 fires");
+        assert_eq!(second.stage, 2);
+    }
+
+    #[test]
+    fn engine_shell_prompt_resets_cursor() {
+        let config = parse_config(json!({
+            "stages": [
+                { "pattern": "login:", "sendText": "user\\r" },
+                { "pattern": "password:", "sendText": "pw\\r" }
+            ]
+        }));
+        let mut engine = TriggerEngine::new(config, CommandPlaceholders::new("h", "u", 22, "n"));
+        assert!(engine.observe("login:", 1_000).is_some());
+        // 登录序列被 shell 提示打断：游标归零（D3），下一轮从 stage 1 开始。
+        assert!(engine.observe("user@host:~$ ", 1_100).is_none());
+        let again = engine
+            .observe("login:", 1_200)
+            .expect("re-armed at stage 1");
+        assert_eq!(again.stage, 1);
+    }
+
+    #[test]
+    fn engine_timeout_resets_and_reports() {
+        let mut engine = TriggerEngine::new(
+            parse_config(json!({
+                "timeoutSecs": 1,
+                "stages": [
+                    { "pattern": "login:", "sendText": "user\\r" },
+                    { "pattern": "password:", "sendText": "pw\\r" }
+                ]
+            })),
+            CommandPlaceholders::new("h", "u", 22, "n"),
+        );
+        assert!(
+            engine.observe("login:", 1_000).is_some(),
+            "stage 1 answered"
+        );
+        assert!(engine.observe("still waiting", 1_500).is_none());
+        let timeout = engine
+            .observe("still waiting", 2_001)
+            .expect("timeout fires");
+        assert_eq!(timeout.stage, 2, "timeout reports the pending stage");
+        assert_eq!(timeout.kind, TriggerKind::Timeout);
+        assert!(timeout.segments.is_empty());
+        // 超时后游标归零：stage 1 的 pattern 可以直接再次命中。
+        let again = engine.observe("login:", 2_100).expect("re-armed");
+        assert_eq!(again.stage, 1);
+    }
+
+    #[test]
+    fn engine_idle_wait_does_not_time_out() {
+        // 空闲等 stage 1 是事件驱动的无限期等待：超时只在序列中途生效，
+        // 否则闲置会话每 timeoutSecs 刷一次 timeout 事件。
+        let mut engine = TriggerEngine::new(
+            parse_config(json!({
+                "timeoutSecs": 1,
+                "stages": [
+                    { "pattern": "login:", "sendText": "user\\r" },
+                    { "pattern": "password:", "sendText": "pw\\r" }
+                ]
+            })),
+            CommandPlaceholders::new("h", "u", 22, "n"),
+        );
+        for now_ms in [1_000u64, 5_000, 60_000, 600_000] {
+            assert!(
+                engine.observe("unrelated output", now_ms).is_none(),
+                "idle stage-1 wait must not report timeout"
+            );
+        }
+        assert_eq!(engine.stage_cursor, 0, "cursor stays armed at stage 1");
+        // 空闲后照样能直接命中 stage 1。
+        let first = engine.observe("login:", 610_000).expect("stage 1 fires");
+        assert_eq!(first.stage, 1);
+        // 进入序列中途后，超时语义恢复正常。
+        let timeout = engine
+            .observe("unrelated output", 611_100)
+            .expect("mid-sequence timeout fires");
+        assert_eq!(timeout.kind, TriggerKind::Timeout);
+    }
+
+    #[test]
+    fn engine_strips_ansi_before_matching() {
+        let mut engine = text_engine("verification code", "1\\r");
+        let decision = engine
+            .observe("\x1b[1mVerification CODE:\x1b[0m", 1_000)
+            .expect("ansi-wrapped prompt matches");
+        assert_eq!(decision.stage, 1);
+    }
+
+    #[test]
+    fn engine_command_answer_defers_execution() {
+        let mut engine = TriggerEngine::new(
+            parse_config(json!({
+                "stages": [{ "pattern": "code:", "sendCommand": "oathtool --totp -b %h" }]
+            })),
+            CommandPlaceholders::new("host1", "u", 22, "n"),
+        );
+        let decision = engine.observe("code:", 1_000).expect("command stage fires");
+        assert_eq!(decision.kind, TriggerKind::Command);
+        // 占位符替换发生在 execute_command（读循环调用侧），决策携带原命令。
+        assert_eq!(decision.command.as_deref(), Some("oathtool --totp -b %h"));
+        assert!(
+            decision.segments.is_empty(),
+            "command output is resolved by the caller"
+        );
+    }
+
+    // —— 占位符与命令执行（D4）———————————————————————
+
+    #[test]
+    fn placeholders_substitution() {
+        let placeholders = CommandPlaceholders::new("example.com", "deploy", 2222, "prod-box");
+        assert_eq!(
+            apply_command_placeholders("%u@%h:%p (%n) 100%%", &placeholders),
+            "deploy@example.com:2222 (prod-box) 100%"
+        );
+        // 未知 %x 原样保留。
+        assert_eq!(apply_command_placeholders("%s%z", &placeholders), "%s%z");
+        assert_eq!(apply_command_placeholders("100%", &placeholders), "100%");
+    }
+
+    #[tokio::test]
+    async fn execute_command_echo_positive_case() {
+        let placeholders = CommandPlaceholders::new("example.com", "deploy", 2222, "prod-box");
+        // 占位符替换 + stdout 去单个结尾换行。
+        let answer = execute_command(
+            &ShellExecutor,
+            "echo '%u@%h:%p'",
+            &placeholders,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("echo must succeed");
+        assert_eq!(answer.as_str(), "deploy@example.com:2222");
+    }
+
+    #[tokio::test]
+    async fn execute_command_strips_single_trailing_newline() {
+        let placeholders = CommandPlaceholders::new("h", "u", 22, "n");
+        let answer = execute_command(
+            &ShellExecutor,
+            "printf 'pw\\n\\n'",
+            &placeholders,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("printf must succeed");
+        assert_eq!(
+            answer.as_str(),
+            "pw\n",
+            "exactly one trailing newline is stripped"
+        );
+        let answer = execute_command(
+            &ShellExecutor,
+            "printf 'pw\\r\\n'",
+            &placeholders,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("printf must succeed");
+        assert_eq!(answer.as_str(), "pw");
+    }
+
+    #[tokio::test]
+    async fn execute_command_timeout_negative_case() {
+        let placeholders = CommandPlaceholders::new("h", "u", 22, "n");
+        let error = execute_command(
+            &ShellExecutor,
+            "sleep 5",
+            &placeholders,
+            Duration::from_millis(150),
+        )
+        .await
+        .expect_err("sleep must time out");
+        assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_command_reports_exit_code_without_output() {
+        use std::os::unix::process::ExitStatusExt;
+
+        struct FailingExecutor;
+        impl CommandExecutor for FailingExecutor {
+            fn run(
+                &self,
+                _command: &str,
+            ) -> Pin<Box<dyn Future<Output = std::io::Result<Output>> + Send + '_>> {
+                Box::pin(async {
+                    let output = Output {
+                        status: std::process::ExitStatus::from_raw(3 << 8),
+                        stdout: b"TOP SECRET OUTPUT".to_vec(),
+                        stderr: Vec::new(),
+                    };
+                    Ok(output)
+                })
+            }
+        }
+        let placeholders = CommandPlaceholders::new("h", "u", 22, "n");
+        let error = execute_command(
+            &FailingExecutor,
+            "false",
+            &placeholders,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("non-zero exit must error");
+        assert!(error.contains("exited with code 3"), "{error}");
+        assert!(
+            !error.contains("TOP SECRET"),
+            "command output must never surface in errors: {error}"
+        );
+    }
+
+    // —— 密文应答的发送计划（读循环消费）—————————————————
+
+    #[test]
+    fn secret_answer_segments_follow_pass_sleep() {
+        let config = parse_config(json!({
+            "sleepMs": 500,
+            "passSleep": "enter",
+            "stages": [{ "pattern": "code:", "sendSecretKey": "trigger_answer_1" }]
+        }));
+        let mut engine = TriggerEngine::new(config, CommandPlaceholders::new("h", "u", 22, "n"));
+        let decision = engine.observe("code:", 1_000).expect("secret stage fires");
+        assert_eq!(decision.kind, TriggerKind::Secret);
+        // enter 形态：密文一次写入，停顿 500ms 后补 Enter（密文内容不出现在
+        // 事件里，只进入发送计划）。
+        assert_eq!(
+            decision.segments,
+            vec![(b"s3cret-one".to_vec(), 0), (b"\r".to_vec(), 500),]
+        );
+    }
+}

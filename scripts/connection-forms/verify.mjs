@@ -101,4 +101,50 @@ for (const authentication of options("authentication")) {
 }
 
 assert.equal(byKey.sudo_whitelist.type, "textarea");
+
+// Package B: ssh/trigger + external password manager fields (manifest §2.2).
+// Key names, types and bindings are frozen by the implementation contract.
+const TRIGGER_FIELDS = ["triggers", "trigger_answer_1", "trigger_answer_2", "password_command", "passphrase_command"];
+const TRIGGER_TYPES = {
+  triggers: "textarea",
+  trigger_answer_1: "password",
+  trigger_answer_2: "password",
+  password_command: "text",
+  passphrase_command: "text",
+};
+const TRIGGER_BINDINGS = {
+  triggers: "config",
+  trigger_answer_1: "secret",
+  trigger_answer_2: "secret",
+  password_command: "config",
+  passphrase_command: "config",
+};
+for (const key of TRIGGER_FIELDS) {
+  const field = byKey[key];
+  assert(field, `missing ssh/trigger field ${key}`);
+  assert.equal(field.type, TRIGGER_TYPES[key], `${key}: type changed`);
+  assert.equal(field.binding, TRIGGER_BINDINGS[key], `${key}: binding changed`);
+  assert.equal(field.visible_when, undefined, `${key}: must stay unconditional (no visible_when)`);
+  assert(field.description?.trim(), `${key}: base description required`);
+  assert(byKey.triggers && fields.indexOf(field) < fields.indexOf(byKey.remote_command),
+    `${key}: must sit near set_env (before remote_command)`);
+}
+// The triggers placeholder must be valid JSON with a minimal usable stage
+// example (one stage: pattern + sendText) so copy-paste just works.
+const placeholderExample = JSON.parse(byKey.triggers.placeholder);
+assert(Array.isArray(placeholderExample.stages) && placeholderExample.stages.length === 1,
+  "triggers.placeholder: expected a one-stage example");
+assert(typeof placeholderExample.stages[0].pattern === "string", "triggers.placeholder: pattern missing");
+assert(typeof placeholderExample.stages[0].sendText === "string", "triggers.placeholder: sendText missing");
+// Descriptions (risk + placeholder docs) must be provided in all seven locales.
+for (const key of TRIGGER_FIELDS) {
+  for (const locale of locales) {
+    const localized = manifest.localizations[locale]?.contributions?.[provider.id]?.fields?.[key]
+      ?? (locale === "en" ? byKey[key] : undefined);
+    assert(localized?.description?.trim(), `${locale}/${key}: missing description`);
+  }
+}
+// The new fields carry no visible_when: they stay visible in every option
+// combination (any authentication / sudo_source / auth_flow_mode choice).
+for (const key of TRIGGER_FIELDS) state({}).visible(key, true);
 console.log(`PASS SSH connection form: ${scenarios} combinations; field ordering and seven-language labels/options`);

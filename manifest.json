@@ -382,6 +382,45 @@
           "description": "One KEY=VALUE entry per line (semicolons also separate entries), sent to the server on the terminal, exec and sudo channels. Duplicate keys: the last entry wins. Invalid entries fail the connection; values come from this configuration only - the local environment is never transmitted."
         },
         {
+          "key": "triggers",
+          "label": "Auto interaction triggers",
+          "type": "textarea",
+          "binding": "config",
+          "default": "",
+          "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}",
+          "description": "Expect-style auto interaction: ordered stage regexes match terminal output in sequence and each hit auto-sends a reply - sendText (\\r = Enter), sendSecretKey (a trigger secret slot key below, Enter appended), or sendCommand (stdout of a local command). The placeholder shows a minimal one-stage example; empty disables. Risk: a malicious server can fake a matching prompt to trick the terminal into sending the configured reply, including secret-slot contents. Invalid JSON, limits exceeded (max 16 stages), or an uncompileable regex fails the connection."
+        },
+        {
+          "key": "trigger_answer_1",
+          "label": "Trigger secret slot 1",
+          "type": "password",
+          "binding": "secret",
+          "description": "Secret for trigger slot 1: reference it from a stage's sendSecretKey (value: trigger_answer_1). Sent to the server automatically with Enter appended when the matching pattern hits; a malicious server could fake that prompt to harvest it."
+        },
+        {
+          "key": "trigger_answer_2",
+          "label": "Trigger secret slot 2",
+          "type": "password",
+          "binding": "secret",
+          "description": "Secret for trigger slot 2: reference it from a stage's sendSecretKey (value: trigger_answer_2). Sent to the server automatically with Enter appended when the matching pattern hits; a malicious server could fake that prompt to harvest it."
+        },
+        {
+          "key": "password_command",
+          "label": "Password command",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Run locally when the login password is missing to fetch it from an external manager (gopass, 1Password CLI, oathtool, ...); stdout minus one trailing newline is the password. Placeholders: %h host, %u username, %p port, %n connection name, %% a literal %. Explicit credentials win over the command. Risk: the command executes locally with your user privileges."
+        },
+        {
+          "key": "passphrase_command",
+          "label": "Passphrase command",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Run locally when the private key passphrase is missing; stdout minus one trailing newline is the passphrase. Placeholders: %h host, %u username, %p port, %n connection name, %% a literal %. Risk: the command executes locally with your user privileges."
+        },
+        {
           "key": "remote_command",
           "label": "Remote command",
           "type": "text",
@@ -540,6 +579,27 @@
               "description": "Una entrada CLAVE=VALOR por línea (los punto y coma también separan entradas); se envían al servidor en los canales de terminal, exec y sudo. Claves duplicadas: gana la última entrada. Las entradas no válidas hacen fallar la conexión; los valores provienen solo de esta configuración, nunca del entorno local.",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
+            "triggers": {
+              "label": "Disparadores de interacción automática",
+              "description": "Interacción automática estilo expect: los patrones de cada etapa se comparan en orden con la salida del terminal y cada acierto envía automáticamente una respuesta: sendText (\\r = Enter), sendSecretKey (clave de una ranura secreta de disparador, Enter añadido) o sendCommand (stdout de un comando local). El marcador de posición muestra un ejemplo mínimo de una etapa; vacío desactiva. Riesgo: un servidor malicioso puede falsificar el aviso para que el terminal envíe la respuesta configurada, incluidas las ranuras secretas. JSON no válido, límites excedidos (máx. 16 etapas) o una expresión regular inválida hacen fallar la conexión.",
+              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+            },
+            "trigger_answer_1": {
+              "label": "Ranura secreta de disparo 1",
+              "description": "Secreto para la ranura de disparo 1: referéncielo desde el sendSecretKey de una etapa (valor: trigger_answer_1). Se envía automáticamente al servidor con Enter añadido cuando el patrón coincide; un servidor malicioso podría falsificar ese aviso para capturarlo."
+            },
+            "trigger_answer_2": {
+              "label": "Ranura secreta de disparo 2",
+              "description": "Secreto para la ranura de disparo 2: referéncielo desde el sendSecretKey de una etapa (valor: trigger_answer_2). Se envía automáticamente al servidor con Enter añadido cuando el patrón coincide; un servidor malicioso podría falsificar ese aviso para capturarlo."
+            },
+            "password_command": {
+              "label": "Comando de contraseña",
+              "description": "Si falta la contraseña de acceso, ejecuta este comando localmente para obtenerla de un gestor externo (gopass, 1Password CLI, oathtool, ...); el stdout sin un salto de línea final es la contraseña. Marcadores: %h host, %u usuario, %p puerto, %n nombre de conexión, %% un % literal. Las credenciales explícitas tienen prioridad. Riesgo: el comando se ejecuta localmente con tus privilegios de usuario."
+            },
+            "passphrase_command": {
+              "label": "Comando de frase de clave",
+              "description": "Si falta la frase de la clave privada, ejecuta este comando localmente para obtenerla; el stdout sin un salto de línea final es la frase. Marcadores: %h host, %u usuario, %p puerto, %n nombre de conexión, %% un % literal. Riesgo: el comando se ejecuta localmente con tus privilegios de usuario."
+            },
             "remote_command": {
               "label": "Comando remoto (RemoteCommand)",
               "description": "Se ejecuta en lugar de un shell al abrir una sesión de terminal (el PTY se solicita igual). Déjelo vacío para un shell interactivo normal; al reconectar se vuelve a ejecutar el comando."
@@ -674,6 +734,27 @@
               "label": "Variabili d'ambiente (SetEnv)",
               "description": "Una voce CHIAVE=VALORE per riga (il punto e virgola separa le voci); inviate al server sui canali terminale, exec e sudo. Chiavi duplicate: vince l'ultima voce. Le voci non valide fanno fallire la connessione; i valori provengono solo da questa configurazione, mai dall'ambiente locale.",
               "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "Trigger di interazione automatica",
+              "description": "Interazione automatica in stile expect: le espressioni regolari delle fasi confrontano in ordine l'output del terminale e a ogni corrispondenza viene inviata automaticamente una risposta: sendText (\\r = Invio), sendSecretKey (chiave di uno slot segreto trigger, Invio aggiunto) o sendCommand (stdout di un comando locale). Il segnaposto mostra un esempio minimo a una fase; vuoto disattiva. Rischio: un server maligno può falsificare il prompt per indurre il terminale a inviare la risposta configurata, inclusi i contenuti degli slot segreti. JSON non valido, limiti superati (max 16 fasi) o espressione regolare errata fanno fallire la connessione.",
+              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+            },
+            "trigger_answer_1": {
+              "label": "Slot segreto trigger 1",
+              "description": "Segreto per lo slot trigger 1: farvi riferimento dal sendSecretKey di una fase (valore: trigger_answer_1). Inviato automaticamente al server con Invio aggiunto quando il pattern corrisponde; un server maligno potrebbe falsificare quel prompt per raccoglierlo."
+            },
+            "trigger_answer_2": {
+              "label": "Slot segreto trigger 2",
+              "description": "Segreto per lo slot trigger 2: farvi riferimento dal sendSecretKey di una fase (valore: trigger_answer_2). Inviato automaticamente al server con Invio aggiunto quando il pattern corrisponde; un server maligno potrebbe falsificare quel prompt per raccoglierlo."
+            },
+            "password_command": {
+              "label": "Comando password",
+              "description": "Se manca la password di accesso, esegue localmente questo comando per recuperarla da un gestore esterno (gopass, 1Password CLI, oathtool, ...); lo stdout senza l'ultimo ritorno a capo è la password. Segnaposto: %h host, %u utente, %p porta, %n nome connessione, %% un % letterale. Le credenziali esplicite hanno la precedenza. Rischio: il comando viene eseguito localmente con i tuoi privilegi utente."
+            },
+            "passphrase_command": {
+              "label": "Comando passphrase",
+              "description": "Se manca la passphrase della chiave privata, esegue localmente questo comando per recuperarla; lo stdout senza l'ultimo ritorno a capo è la passphrase. Segnaposto: %h host, %u utente, %p porta, %n nome connessione, %% un % letterale. Rischio: il comando viene eseguito localmente con i tuoi privilegi utente."
             },
             "remote_command": {
               "label": "Comando remoto (RemoteCommand)",
@@ -844,6 +925,27 @@
               "description": "1 行に KEY=VALUE を 1 件（セミコロン区切りも可）。ターミナル・exec・sudo の各チャネルでサーバーへ送信します。同じキーが重複した場合は最後の指定が優先され、不正なエントリがあると接続は失敗します。値はこの設定からのみ取得され、ローカルの環境変数は送信されません。",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
+            "triggers": {
+              "label": "自動インタラクション トリガー",
+              "description": "expect 風の自動インタラクション: 各ステージの正規表現を順にターミナル出力へ照合し、一致すると自動で応答を送信します。sendText（\\r = Enter）、sendSecretKey（下のトリガー用シークレットスロットのキー名、Enter を自動付加）、sendCommand（ローカルコマンドの標準出力）。プレースホルダーは最小の 1 ステージ例。空欄で無効。リスク: 悪意あるサーバーが一致するプロンプトを偽装し、設定済みの応答（シークレットスロットを含む）を送り込ませるおそれがあります。JSON 不正・上限超過（最大 16 ステージ）・正規表現エラーでは接続が失敗します。",
+              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+            },
+            "trigger_answer_1": {
+              "label": "トリガー用シークレットスロット 1",
+              "description": "トリガー用シークレットスロット 1：ステージの sendSecretKey から参照します（値: trigger_answer_1）。対応するパターンが一致すると Enter を付けて自動送信されます。悪意あるサーバーがそのプロンプトを偽装して取得するおそれがあります。"
+            },
+            "trigger_answer_2": {
+              "label": "トリガー用シークレットスロット 2",
+              "description": "トリガー用シークレットスロット 2：ステージの sendSecretKey から参照します（値: trigger_answer_2）。対応するパターンが一致すると Enter を付けて自動送信されます。悪意あるサーバーがそのプロンプトを偽装して取得するおそれがあります。"
+            },
+            "password_command": {
+              "label": "パスワードコマンド",
+              "description": "ログインパスワードが未設定のとき、ローカルでこのコマンドを実行して外部パスワードマネージャー（gopass、1Password CLI、oathtool など）から取得します。末尾の改行 1 つを除いた標準出力がパスワードになります。プレースホルダー: %h ホスト、%u ユーザー名、%p ポート、%n 接続名、%% は % 文字そのもの。明示的な認証情報が優先されます。リスク: コマンドはローカルであなたのユーザー権限で実行されます。"
+            },
+            "passphrase_command": {
+              "label": "パスフレーズコマンド",
+              "description": "秘密鍵のパスフレーズが未設定のとき、ローカルでこのコマンドを実行して取得します。末尾の改行 1 つを除いた標準出力がパスフレーズになります。プレースホルダー: %h ホスト、%u ユーザー名、%p ポート、%n 接続名、%% は % 文字そのもの。リスク: コマンドはローカルであなたのユーザー権限で実行されます。"
+            },
             "remote_command": {
               "label": "リモートコマンド（RemoteCommand）",
               "description": "ターミナルセッション確立時にシェルの代わりに実行するコマンド（PTY は従来どおり要求）。空欄なら通常の対話シェルになります。再接続時は同じコマンドを再実行します。"
@@ -978,6 +1080,27 @@
               "label": "Variáveis de ambiente (SetEnv)",
               "description": "Uma entrada CHAVE=VALOR por linha (ponto e vírgula também separa entradas); enviadas ao servidor nos canais de terminal, exec e sudo. Chaves duplicadas: a última entrada vence. Entradas inválidas fazem a conexão falhar; os valores vêm apenas desta configuração — o ambiente local nunca é transmitido.",
               "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "Gatilhos de interação automática",
+              "description": "Interação automática estilo expect: os padrões das etapas são comparados em ordem com a saída do terminal e cada acerto envia automaticamente uma resposta — sendText (\\r = Enter), sendSecretKey (chave de um slot secreto de gatilho abaixo, Enter adicionado) ou sendCommand (stdout de um comando local). O marcador de posição mostra um exemplo mínimo de uma etapa; vazio desativa. Risco: um servidor malicioso pode forjar o prompt para induzir o terminal a enviar a resposta configurada, incluindo o conteúdo dos slots secretos. JSON inválido, limites excedidos (máx. 16 etapas) ou regex inválida fazem a conexão falhar.",
+              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+            },
+            "trigger_answer_1": {
+              "label": "Slot secreto de gatilho 1",
+              "description": "Segredo para o slot de gatilho 1: referencie-o pelo sendSecretKey de uma etapa (valor: trigger_answer_1). Enviado automaticamente ao servidor com Enter adicionado quando o padrão corresponde; um servidor malicioso pode forjar esse prompt para capturá-lo."
+            },
+            "trigger_answer_2": {
+              "label": "Slot secreto de gatilho 2",
+              "description": "Segredo para o slot de gatilho 2: referencie-o pelo sendSecretKey de uma etapa (valor: trigger_answer_2). Enviado automaticamente ao servidor com Enter adicionado quando o padrão corresponde; um servidor malicioso pode forjar esse prompt para capturá-lo."
+            },
+            "password_command": {
+              "label": "Comando de senha",
+              "description": "Se a senha de acesso estiver ausente, executa este comando localmente para obtê-la de um gerenciador externo (gopass, 1Password CLI, oathtool, ...); o stdout sem uma quebra de linha final é a senha. Marcadores: %h host, %u usuário, %p porta, %n nome da conexão, %% um % literal. Credenciais explícitas têm prioridade. Risco: o comando é executado localmente com seus privilégios de usuário."
+            },
+            "passphrase_command": {
+              "label": "Comando de frase secreta",
+              "description": "Se a frase secreta da chave privada estiver ausente, executa este comando localmente para obtê-la; o stdout sem uma quebra de linha final é a frase secreta. Marcadores: %h host, %u usuário, %p porta, %n nome da conexão, %% um % literal. Risco: o comando é executado localmente com seus privilégios de usuário."
             },
             "remote_command": {
               "label": "Comando remoto (RemoteCommand)",
@@ -1148,6 +1271,27 @@
               "description": "每行一条 KEY=VALUE（也可用分号分隔），在终端、exec 与 sudo 通道上发送给服务器。重复的键以最后一条为准；条目非法时连接直接失败。取值仅来自本配置，不会透传本地环境变量。",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
+            "triggers": {
+              "label": "自动交互触发器",
+              "description": "expect 式自动交互：各阶段正则按序匹配终端输出，命中即自动回发——sendText（\\r 代表回车）、sendSecretKey（下方触发器密文槽的键名，自动补回车）或 sendCommand（本地命令的标准输出）。占位符为最小单阶段示例；留空关闭。风险：恶意服务器可伪造匹配提示，骗取终端回发配置的内容（含密文槽）。JSON 非法、超过上限（最多 16 阶段）或正则无法编译时连接直接失败。",
+              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+            },
+            "trigger_answer_1": {
+              "label": "触发器密文槽 1",
+              "description": "触发器密文槽 1：在阶段的 sendSecretKey 里引用（值为 trigger_answer_1）。对应 pattern 命中时自动回发给服务器并补回车；恶意服务器可能伪造该提示骗取此内容。"
+            },
+            "trigger_answer_2": {
+              "label": "触发器密文槽 2",
+              "description": "触发器密文槽 2：在阶段的 sendSecretKey 里引用（值为 trigger_answer_2）。对应 pattern 命中时自动回发给服务器并补回车；恶意服务器可能伪造该提示骗取此内容。"
+            },
+            "password_command": {
+              "label": "密码命令",
+              "description": "登录密码缺失时在本地运行该命令，从外部密码管理器（gopass、1Password CLI、oathtool 等）取回；stdout 去掉单个结尾换行即为密码。占位符：%h 主机、%u 用户名、%p 端口、%n 连接名、%% 字面 %。显式凭据优先于命令。风险：命令在本地以你的用户权限执行。"
+            },
+            "passphrase_command": {
+              "label": "私钥口令命令",
+              "description": "私钥口令缺失时在本地运行该命令取回；stdout 去掉单个结尾换行即为口令。占位符：%h 主机、%u 用户名、%p 端口、%n 连接名、%% 字面 %。风险：命令在本地以你的用户权限执行。"
+            },
             "remote_command": {
               "label": "远程命令（RemoteCommand）",
               "description": "终端会话建立时执行该命令替代 shell（PTY 照常申请）。留空则为普通交互 shell；重连会重新执行同一条命令。"
@@ -1299,6 +1443,27 @@
               "label": "環境變數（SetEnv）",
               "description": "每行一條 KEY=VALUE（也可以分號分隔），在終端、exec 與 sudo 通道上傳送給伺服器。重複的鍵以最後一條為準；條目非法時連線直接失敗。取值僅來自本設定，不會傳送本地環境變數。",
               "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "自動互動觸發器",
+              "description": "expect 式自動互動：各階段正規表示式按序比對終端輸出，命中即自動回傳——sendText（\\r 代表 Enter）、sendSecretKey（下方觸發器密文槽的鍵名，自動補 Enter）或 sendCommand（本地命令的標準輸出）。佔位符為最小單階段範例；留空關閉。風險：惡意伺服器可偽造比對提示，騙取終端回傳設定的內容（含密文槽）。JSON 非法、超過上限（最多 16 階段）或正規表示式無法編譯時連線直接失敗。",
+              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+            },
+            "trigger_answer_1": {
+              "label": "觸發器密文槽 1",
+              "description": "觸發器密文槽 1：在階段的 sendSecretKey 裡引用（值為 trigger_answer_1）。對應 pattern 命中時自動回傳給伺服器並補 Enter；惡意伺服器可能偽造該提示騙取此內容。"
+            },
+            "trigger_answer_2": {
+              "label": "觸發器密文槽 2",
+              "description": "觸發器密文槽 2：在階段的 sendSecretKey 裡引用（值為 trigger_answer_2）。對應 pattern 命中時自動回傳給伺服器並補 Enter；惡意伺服器可能偽造該提示騙取此內容。"
+            },
+            "password_command": {
+              "label": "密碼命令",
+              "description": "登入密碼缺失時在本地執行該命令，從外部密碼管理器（gopass、1Password CLI、oathtool 等）取回；stdout 去掉單個結尾換行即為密碼。佔位符：%h 主機、%u 使用者名稱、%p 連接埠、%n 連線名稱、%% 字面 %。明確憑據優先於命令。風險：命令在本地以你的使用者權限執行。"
+            },
+            "passphrase_command": {
+              "label": "私鑰通關密語命令",
+              "description": "私鑰通關密語缺失時在本地執行該命令取回；stdout 去掉單個結尾換行即為通關密語。佔位符：%h 主機、%u 使用者名稱、%p 連接埠、%n 連線名稱、%% 字面 %。風險：命令在本地以你的使用者權限執行。"
             },
             "remote_command": {
               "label": "遠端命令（RemoteCommand）",

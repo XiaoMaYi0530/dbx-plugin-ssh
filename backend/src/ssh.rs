@@ -44,6 +44,7 @@ use crate::session_recording;
 use crate::ssh_algorithms;
 use crate::sudo_profiles;
 use crate::transfer_history;
+use crate::triggers;
 
 /// Resolves the Quick Sudo / 2FA orchestration settings for a connection.
 fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
@@ -121,6 +122,77 @@ pub(crate) fn resolved_sudo_auth(
         sudo_profiles::apply_profile(&mut auth, profile, &connection.password);
     }
     auth
+}
+
+/// Placeholder context for a connection's local credential commands
+/// (`%h` host, `%u` username, `%p` port, `%n` connection name or id).
+fn credential_placeholders(connection: &StoredConnection) -> triggers::CommandPlaceholders {
+    triggers::CommandPlaceholders::new(
+        &connection.host,
+        &connection.username,
+        connection.port,
+        connection.name.as_deref().unwrap_or(&connection.id),
+    )
+}
+
+/// D9: resolves `password_command` when the connection stores no explicit
+/// login password (explicit credentials always win). The command runs once
+/// per dial; the log records only execution success/failure — never the
+/// command or its output. Failure falls back to the empty password so the
+/// auth chain can proceed (and fail) normally.
+async fn resolve_password_command(connection: &StoredConnection) -> StoredConnection {
+    if !connection.password.is_empty() || connection.password_command.is_empty() {
+        return connection.clone();
+    }
+    match triggers::run_credential_command(
+        &connection.password_command,
+        &credential_placeholders(connection),
+    )
+    .await
+    {
+        Ok(answer) => {
+            eprintln!(
+                "[ssh] password command executed for connection {}",
+                connection.id
+            );
+            let mut resolved = connection.clone();
+            resolved.password = answer.to_string();
+            resolved
+        }
+        Err(error) => {
+            eprintln!(
+                "[ssh] password command failed for connection {}: {error}",
+                connection.id
+            );
+            connection.clone()
+        }
+    }
+}
+
+/// D9: runs `passphrase_command` for an encrypted private key that could not
+/// be decoded without a passphrase; `None` on failure (logged, output never).
+async fn resolve_passphrase_command(connection: &StoredConnection) -> Option<String> {
+    match triggers::run_credential_command(
+        &connection.passphrase_command,
+        &credential_placeholders(connection),
+    )
+    .await
+    {
+        Ok(answer) => {
+            eprintln!(
+                "[ssh] passphrase command executed for connection {}",
+                connection.id
+            );
+            Some(answer.to_string())
+        }
+        Err(error) => {
+            eprintln!(
+                "[ssh] passphrase command failed for connection {}: {error}",
+                connection.id
+            );
+            None
+        }
+    }
 }
 
 /// The Quick Sudo profile in effect under the connection's declared source
@@ -646,6 +718,11 @@ struct SessionEntry {
     /// opened, or the Quick Sudo toggle, must apply without reconnecting);
     /// the read loop re-locks it on every output chunk.
     auto_sudo: Arc<Mutex<Option<exec::TerminalAutoSudo>>>,
+    /// Expect-style trigger engine (tssh parity). Attached when the
+    /// connection carries a `triggers` configuration; the read loop feeds it
+    /// BEFORE the auto-sudo watcher (contract D1: a chunk answered by one of
+    /// the two must never be answered by both).
+    triggers: Arc<Mutex<Option<triggers::TriggerEngine>>>,
     terminal_tx: mpsc::Sender<TerminalCommand>,
     replay: Arc<AsyncMutex<ReplayBuffer>>,
     sftp: AsyncMutex<Option<Arc<AsyncMutex<SftpSession>>>>,
@@ -921,6 +998,10 @@ impl SshRuntime {
             "[ssh-trace] open_session connection_id={connection_id} workbench_id={workbench_id} -> {}:{} auth={:?}",
             connection.host, connection.port, connection.authentication
         );
+        // D9: 拨号前解析 password_command，使取回的凭据同时作用于登录链与
+        // 本会话的 sudo 编排（下游 dial_and_authenticate 看到非空密码即不再
+        // 重复执行——单次执行语义）。
+        let connection = resolve_password_command(&connection).await;
         let (handle, jump_chain) = self
             .connect_authenticated(&connection, operation_id, Some(emitter.clone()))
             .await?;
@@ -983,6 +1064,7 @@ impl SshRuntime {
             jump_chain,
             orchestration: orchestration.clone(),
             auto_sudo: Arc::new(Mutex::new(None)),
+            triggers: Arc::new(Mutex::new(None)),
             terminal_tx,
             replay: replay.clone(),
             sftp: AsyncMutex::new(None),
@@ -991,6 +1073,7 @@ impl SshRuntime {
             agent_exec_lock: Arc::new(AsyncMutex::new(())),
         });
         Self::sync_auto_sudo(&entry, &connection);
+        Self::sync_triggers(&entry, &connection);
         self.sessions
             .write()
             .await
@@ -1102,14 +1185,101 @@ impl SshRuntime {
                             _ => continue,
                         };
                         if stream == TerminalStream::Stdout {
-                            let auto_answer = entry
-                                .auto_sudo
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .as_mut()
-                                .and_then(|auto| auto.observe(&String::from_utf8_lossy(&data)));
-                            if let Some((kind, answer)) = auto_answer
+                            let chunk_text = String::from_utf8_lossy(&data).into_owned();
+                            // Expect 式触发器先于终端 auto-sudo 观察（契约 D1
+                            // 互斥防双答）：本 chunk 被触发器应答则跳过
+                            // auto-sudo，反之亦然。锁在 .await 前释放。
+                            let trigger_hit = {
+                                let mut slot = entry
+                                    .triggers
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner());
+                                slot.as_mut().and_then(|engine| {
+                                    engine.observe(&chunk_text, unix_now_ms()).map(|decision| {
+                                        (
+                                            decision,
+                                            engine.placeholders().clone(),
+                                            engine.pacing(),
+                                        )
+                                    })
+                                })
+                            };
+                            let auto_answer = if trigger_hit.is_none() {
+                                entry
+                                    .auto_sudo
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .as_mut()
+                                    .and_then(|auto| auto.observe(&chunk_text))
+                            } else {
+                                None
+                            };
+                            if let Some((decision, placeholders, (sleep_ms, pass_sleep))) =
+                                trigger_hit
                             {
+                                // command 应答在本地先执行（10s 超时、退出码
+                                // 校验；日志只记失败原因，绝不落命令输出）。
+                                let segments = match decision.kind {
+                                    triggers::TriggerKind::Command => {
+                                        match decision.command.as_deref().map(|command| {
+                                            triggers::run_credential_command(
+                                                command,
+                                                &placeholders,
+                                            )
+                                        }) {
+                                            Some(runner) => match runner.await {
+                                                Ok(answer) => triggers::pass_sleep_segments(
+                                                    &answer,
+                                                    sleep_ms,
+                                                    pass_sleep,
+                                                ),
+                                                Err(error) => {
+                                                    eprintln!(
+                                                        "[ssh] trigger stage {}: {error}",
+                                                        decision.stage
+                                                    );
+                                                    Vec::new()
+                                                }
+                                            },
+                                            None => Vec::new(),
+                                        }
+                                    }
+                                    _ => decision.segments,
+                                };
+                                // 分段写回：段间按 sleepMs 停顿（契约 §2.1）。
+                                // timeout 决策没有可发送段但视为已处理；命令
+                                // 执行失败则什么都没发。
+                                let mut answered =
+                                    matches!(decision.kind, triggers::TriggerKind::Timeout);
+                                let mut channel_dead = false;
+                                for (payload, delay_ms) in &segments {
+                                    if *delay_ms > 0 {
+                                        tokio::time::sleep(Duration::from_millis(*delay_ms))
+                                            .await;
+                                    }
+                                    if channel.data(&payload[..]).await.is_err() {
+                                        channel_dead = true;
+                                        break;
+                                    }
+                                    answered = true;
+                                }
+                                if channel_dead {
+                                    break;
+                                }
+                                // D6：事件只带 {sessionId, stage, kind}，永不
+                                // 携带应答内容。命令执行失败时不发事件（不能
+                                // 让宿主提示一次不存在的应答）。
+                                if answered {
+                                    let _ = emitter.event(
+                                        "ssh/trigger",
+                                        json!({
+                                            "sessionId": task_id,
+                                            "stage": decision.stage,
+                                            "kind": decision.kind.name(),
+                                        }),
+                                    );
+                                }
+                            } else if let Some((kind, answer)) = auto_answer {
                                 let mut payload = answer.into_bytes();
                                 payload.push(b'\r');
                                 if channel.data(&payload[..]).await.is_err() { break; }
@@ -1123,7 +1293,7 @@ impl SshRuntime {
                             // what the terminal shows.
                             if let Ok(mut slot) = entry.agent_recorder.lock() {
                                 if let Some(recorder) = slot.as_mut() {
-                                    recorder.observe(&String::from_utf8_lossy(&data));
+                                    recorder.observe(&chunk_text);
                                 }
                             }
                         }
@@ -1433,6 +1603,10 @@ impl SshRuntime {
             return Err("SSH server rejected unauthenticated access".to_string());
         }
 
+        // D9: password_command 在 orchestration 构建前一次性解析——结果回填
+        // 后供密码链（try_password / keyboard-interactive）与 sudo 编排共用，
+        // 避免多处执行命令。既有显式密码优先（契约优先级）。
+        let connection = &resolve_password_command(connection).await;
         let orchestration = sudo_auth_for(connection);
 
         match connection.authentication {
@@ -3230,6 +3404,7 @@ impl SshRuntime {
         {
             for entry in &session_entries {
                 Self::sync_auto_sudo(entry, &connection);
+                Self::sync_triggers(entry, &connection);
             }
         }
         // A binding change owns the live sessions' credential source: rebuild
@@ -3440,6 +3615,35 @@ impl SshRuntime {
         }
     }
 
+    /// Attaches or detaches a session's expect-style trigger engine from the
+    /// connection's `triggers` configuration (contract §3.1: mirrors
+    /// `sync_auto_sudo`). Runs at session open and after every runtime
+    /// settings/profile update, so a configuration that lands on the
+    /// connection later still arms without a reconnect.
+    fn sync_triggers(entry: &SessionEntry, connection: &StoredConnection) {
+        let mut engine = entry
+            .triggers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match (&connection.triggers, engine.is_some()) {
+            (Some(config), false) => {
+                *engine = Some(triggers::TriggerEngine::new(
+                    config.clone(),
+                    triggers::CommandPlaceholders::new(
+                        &connection.host,
+                        &connection.username,
+                        connection.port,
+                        connection.name.as_deref().unwrap_or(&connection.id),
+                    ),
+                ));
+            }
+            (None, true) => {
+                *engine = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Rebuilds the Quick Sudo auth of every live session of the given
     /// connections from the current registry state plus each connection's
     /// bound profile. Field-by-field assignment keeps each auth's OTP usage
@@ -3477,6 +3681,7 @@ impl SshRuntime {
             }
             // A binding switch can arm or disarm the terminal watcher too.
             Self::sync_auto_sudo(entry, &connection);
+            Self::sync_triggers(entry, &connection);
         }
     }
 
@@ -4611,10 +4816,27 @@ async fn authenticate_private_key_result(
     connection: &StoredConnection,
 ) -> Result<AuthResult, String> {
     let key_text = resolve_private_key_text(connection).await?;
-    let passphrase = (!connection.private_key_passphrase.is_empty())
+    // D9: passphrase_command 接入点——先用既有口令（或无口令）尝试解码；
+    // 仅当密钥确实需要口令且命令已配置时，本地执行命令取回并重试一次。
+    // 未加密密钥永远不会触发命令执行。
+    let stored_passphrase = (!connection.private_key_passphrase.is_empty())
         .then_some(connection.private_key_passphrase.as_str());
-    let private_key = decode_secret_key(&key_text, passphrase)
-        .map_err(|error| format!("Failed to decode SSH private key: {error}"))?;
+    let decoded = match decode_secret_key(&key_text, stored_passphrase) {
+        Ok(private_key) => Ok(private_key),
+        Err(stored_error) => {
+            if stored_passphrase.is_none() && !connection.passphrase_command.is_empty() {
+                match resolve_passphrase_command(connection).await {
+                    Some(passphrase) => decode_secret_key(&key_text, Some(&passphrase)),
+                    // 命令失败：保留原始解码错误，认证链照常报错。
+                    None => Err(stored_error),
+                }
+            } else {
+                Err(stored_error)
+            }
+        }
+    };
+    let private_key =
+        decoded.map_err(|error| format!("Failed to decode SSH private key: {error}"))?;
     let hash = session
         .best_supported_rsa_hash()
         .await

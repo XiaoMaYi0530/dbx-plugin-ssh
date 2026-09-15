@@ -3178,3 +3178,53 @@ allow-same-origin）→ opaque origin 下「访问 `window.localStorage`
 - 附带确认（既有设计，登记观察）：非 MCP 模式 `auto_trust=false`，未信
   主机首连依赖工作台 UI 呈现指纹挑战；known_hosts 当前仅 1 台受信主机，
   其余主机首连会弹出挑战对话框（UI 恢复后该流程重新可用）。
+
+## tssh 对标收尾：自动交互 Expect + 外部密码管理器（0.4.74，2026-09-15）
+
+> 分支 `feat/ssh-trigger-auth`（worktree `.worktrees/feat-ssh-trigger-auth`，
+> 对标参照 [trzsz-ssh](https://github.com/trzsz/trzsz-ssh)）。并发双工作包
+> （文件所有权不相交：包 A 后端 Rust + 协议文档，包 B manifest/前端/scripts）
+> + 主会话集中收口。契约文档 `IMPL_PLAN_SSH_TRIGGER_AUTHPROVIDER.zh-CN.md`
+> （决策 D1–D9）为双包唯一依据。至此 FEATURE_PARITY「tssh 对标补充」表全部
+> 条目收敛（除 2026-09-07 用户决策否掉的转发类/mosh 等之外）。
+
+**特性 A：自动交互 Expect（终端触发器，包 A + 包 B）**。连接配置 `triggers`
+（有序阶段规则，对齐 tssh `ExpectPattern1..N`）：sidecar 终端读循环内新增
+`TriggerEngine`（`triggers.rs`，注册在 `TerminalAutoSudo` 之前、同 chunk
+互斥防双答），PTY 输出归一化后进 ≤8 KiB 滚动缓冲按序匹配正则，命中按
+`sendText`（明文，`\r`/`\n`/`\t` 转义、`\|` 分段停顿 `sleepMs`）/
+`sendSecretKey`（宿主 secret binding 槽位 `trigger_answer_1/2`，对齐
+`ExpectSendPass`，替代其 `--enc-secret` 自有加密）/
+`sendCommand`（本地 shell 执行取 stdout，对齐 `ExpectSendOtp`，10s 超时 +
+zeroize）三选一回发；`casePattern` 预匹配（对齐 `ExpectCase*`，不推进游标）、
+`passSleep`（none/each/enter）、阶段超时、shell 提示复位、末阶段回卷。
+命中发 `ssh/trigger {sessionId, stage, kind}` 事件（永不携带应答内容），
+工作台 toast 提示（七语）。**收口裁决**：超时只在序列中途生效（已命中前序
+阶段、在等第 2..N 阶段）——包 A 初版在空闲等 stage 1 时也按 `timeoutSecs`
+周期性发 timeout 事件，闲置会话会刷 toast，主会话改为游标为 0 不设超时
+（事件驱动的无限期等待），并补回归用例。
+
+**特性 B：外部密码管理器（包 A）**。`password_command` /
+`passphrase_command`（对齐 tssh 同名配置）：登录密码 / 私钥口令缺失时本地
+执行命令取回（占位符 `%h %u %p %n %%`，`sh -c` / `cmd /C`，10s 超时，
+输出 4 KiB 上限、用后 zeroize），优先级显式凭据 > 命令；解析点在拨号认证
+orchestration 构建前一次执行，密码链与 sudo 编排共用。配置了
+`password_command` 时密码类认证允许不存密码。
+
+**契约面**：external_config 新键 `triggers` / `password_command` /
+`passphrase_command`；connection_secrets 新键 `trigger_answer_1/2`；MCP 内联
+拨号新参数 `triggers`（JSON 字符串）/ `passwordCommand` / `passphraseCommand`；
+manifest 新增 5 个表单字段（triggers textarea + 两个密文槽 password +
+两个命令 text，七语齐全，含恶意服务器伪提示与本地命令执行面风险声明）。
+校验失败一律连接报错不静默降级（对齐 set_env 先例）。新增依赖 `regex = "1"`
+（后端首个正则依赖，lockfile path patch 已验证保留）。
+
+### 验证
+
+- 包 A：cargo fmt/clippy 零告警，cargo test 434 通过（+27 triggers 单测、
+  +1 model lifecycle 集成、+1 收口超时回归），release 构建就绪。
+- 包 B：pnpm test 402 通过、typecheck 零错误、connection-forms verify 95
+  场景通过、smoke 脚本 py_compile 通过且缺容器门控实测 SKIP。
+- 主会话收口：scripts/test.sh 全套 + 打包安装 + 双冒烟（结果见提交信息/下节）。
+- 合并注意：主检出区另有未提交的私钥录入改动（15 文件，key/model/mcp/
+  manifest/App.vue/i18n 均重叠），两分支合并顺序由用户决定，冲突面局部。
