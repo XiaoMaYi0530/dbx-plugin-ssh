@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Write as _;
@@ -11,7 +12,7 @@ use russh::client::{self, AuthResult, Handle};
 use russh::keys::agent::{client::AgentClient, AgentIdentity};
 use russh::keys::ssh_key::HashAlg;
 use russh::keys::{decode_secret_key, key::PrivateKeyWithHashAlg};
-use russh::{ChannelMsg, Disconnect, MethodKind};
+use russh::{cipher, kex, mac, ChannelMsg, Disconnect, MethodKind, Preferred};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
 use serde_json::{json, Value};
@@ -59,6 +60,50 @@ fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
     auth.otp_ledger_scope =
         exec::otp_ledger_scope_for(&connection.username, &connection.host, connection.port);
     auth
+}
+
+/// Builds the client negotiation config for one connection. Modern suites
+/// remain the default. The opt-in legacy profile only appends algorithms that
+/// russh implements, preserving modern preference order while allowing older
+/// appliances to negotiate hmac-sha1, SHA-1 DH groups, CBC, or 3DES.
+fn ssh_client_config(connection: &StoredConnection) -> client::Config {
+    let mut config = client::Config {
+        nodelay: true,
+        keepalive_interval: (connection.keepalive_interval_secs > 0)
+            .then(|| Duration::from_secs(connection.keepalive_interval_secs)),
+        keepalive_max: 3,
+        ..Default::default()
+    };
+    if connection.ssh_algorithm_profile == "legacy" {
+        let mut preferred = Preferred::DEFAULT.clone();
+        let mut kex_algorithms = preferred.kex.to_vec();
+        for algorithm in [kex::DH_GEX_SHA1, kex::DH_G14_SHA1, kex::DH_G1_SHA1] {
+            if !kex_algorithms.contains(&algorithm) {
+                kex_algorithms.push(algorithm);
+            }
+        }
+        preferred.kex = Cow::Owned(kex_algorithms);
+
+        let mut ciphers = preferred.cipher.to_vec();
+        for cipher_name in [cipher::AES_128_CBC, cipher::TRIPLE_DES_CBC] {
+            if !ciphers.contains(&cipher_name) {
+                ciphers.push(cipher_name);
+            }
+        }
+        preferred.cipher = Cow::Owned(ciphers);
+
+        // russh 0.60 already implements SHA-1 MACs, but keep the explicit
+        // append here as a contract guard in case its modern defaults change.
+        let mut macs = preferred.mac.to_vec();
+        for mac_name in [mac::HMAC_SHA1_ETM, mac::HMAC_SHA1] {
+            if !macs.contains(&mac_name) {
+                macs.push(mac_name);
+            }
+        }
+        preferred.mac = Cow::Owned(macs);
+        config.preferred = preferred;
+    }
+    config
 }
 
 /// Resolved Quick Sudo source for one connection: the connection's own
@@ -1191,13 +1236,7 @@ impl SshRuntime {
             .ok_or_else(|| {
                 format!("Connection {connection_id} is not active; reopen it from DBX")
             })?;
-        let config = Arc::new(client::Config {
-            nodelay: true,
-            keepalive_interval: (connection.keepalive_interval_secs > 0)
-                .then(|| Duration::from_secs(connection.keepalive_interval_secs)),
-            keepalive_max: 3,
-            ..Default::default()
-        });
+        let config = Arc::new(ssh_client_config(&connection));
         let probe = HostKeyProbe {
             verifier: Arc::new(HostKeyVerifier::new(self.known_hosts_path.clone())),
             host: connection.host.clone(),
@@ -1271,6 +1310,7 @@ impl SshRuntime {
                 &format!("jump-{}-{}", position + 1, connection.id),
                 connection.connect_timeout_secs,
                 connection.keepalive_interval_secs,
+                &connection.ssh_algorithm_profile,
             );
             let handle = self
                 .dial_and_authenticate(&jump_connection, dial, operation_id, emitter.clone())
@@ -1307,15 +1347,9 @@ impl SshRuntime {
         operation_id: &str,
         emitter: Option<PluginEmitter>,
     ) -> Result<Handle<SshClient>, String> {
-        let config = Arc::new(client::Config {
-            nodelay: true,
-            keepalive_interval: (connection.keepalive_interval_secs > 0)
-                .then(|| Duration::from_secs(connection.keepalive_interval_secs)),
-            // Match tiny-rdm: after 3 unanswered keepalive probes the
-            // connection is declared dead so the workbench can reconnect.
-            keepalive_max: 3,
-            ..Default::default()
-        });
+        // Match tiny-rdm: after 3 unanswered keepalive probes the connection
+        // is declared dead so the workbench can reconnect.
+        let config = Arc::new(ssh_client_config(connection));
         let verifier = Arc::new(HostKeyVerifier::new(self.known_hosts_path.clone()));
         let timeout = Duration::from_secs(connection.connect_timeout_secs);
         let dial_deadline = DialDeadline::start(timeout);
@@ -5063,6 +5097,27 @@ mod tests {
         let frames = replay.after(1);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].sequence, 2);
+    }
+
+    #[test]
+    fn legacy_profile_appends_old_algorithms_without_reordering_modern_ones() {
+        let connection = StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "legacy-algos",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": "secret",
+                "external_config": { "ssh_algorithm_profile": "legacy" }
+            }
+        }))
+        .unwrap();
+        let config = ssh_client_config(&connection);
+        assert_eq!(config.preferred.mac.first(), Some(&mac::HMAC_SHA512_ETM));
+        assert!(config.preferred.mac.contains(&mac::HMAC_SHA1));
+        assert!(config.preferred.kex.contains(&kex::DH_G1_SHA1));
+        assert!(config.preferred.cipher.contains(&cipher::AES_128_CBC));
+        assert!(config.preferred.cipher.contains(&cipher::TRIPLE_DES_CBC));
     }
 
     // —— 私钥来源解析：粘贴内容优先于路径（connection_secrets.private_key）———

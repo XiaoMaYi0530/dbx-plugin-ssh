@@ -4041,6 +4041,17 @@ function onUploadInput(event: Event) {
   if (files.length) void uploadLocalFiles(files).catch(showError);
 }
 
+// File-manager copy/paste lands as ClipboardEvent.files in desktop webviews
+// that expose native file clipboard data. Text paste remains untouched so the
+// path/search inputs and terminal keep their normal clipboard semantics.
+function onSftpPaste(event: ClipboardEvent) {
+  if (!connected.value || !canWrite.value) return;
+  const files = Array.from(event.clipboardData?.files || []);
+  if (!files.length) return;
+  event.preventDefault();
+  void uploadLocalFiles(files).catch(showError);
+}
+
 function onDrop(event: DragEvent) {
   dragActive.value = false;
   if (!canWrite.value) return;
@@ -6524,7 +6535,7 @@ onBeforeUnmount(() => {
 
       <div v-if="sftpPaneOpen" class="divider" @pointerdown="startDividerDrag" />
 
-      <section v-if="sftpPaneOpen" class="sftp-pane" :class="{ 'drag-active': dragActive }" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop">
+      <section v-if="sftpPaneOpen" class="sftp-pane" :class="{ 'drag-active': dragActive }" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop" @paste="onSftpPaste">
         <div class="path-toolbar">
           <button class="icon-button" :title="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
           <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>

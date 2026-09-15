@@ -150,6 +150,10 @@ pub struct StoredConnection {
     /// `ssh RemoteCommand`: exec this command instead of a shell on the
     /// interactive terminal session (PTY stays on). Empty = normal shell.
     pub remote_command: String,
+    /// SSH negotiation profile. `modern` is the secure default; `legacy`
+    /// keeps modern algorithms first and appends old-but-implemented
+    /// algorithms for appliances that cannot negotiate newer suites.
+    pub ssh_algorithm_profile: String,
     /// ProxyJump chain: each entry is dialed before the target, the final hop
     /// reaching `host:port` directly (the runtime tunnel endpoint is skipped).
     pub jump_hosts: Vec<JumpHost>,
@@ -251,6 +255,7 @@ impl JumpHost {
         id: &str,
         timeout_secs: u64,
         keepalive_secs: u64,
+        ssh_algorithm_profile: &str,
     ) -> StoredConnection {
         StoredConnection {
             id: id.to_string(),
@@ -288,6 +293,7 @@ impl JumpHost {
             // simplification, see StoredConnection docs).
             set_env: Vec::new(),
             remote_command: String::new(),
+            ssh_algorithm_profile: ssh_algorithm_profile.to_string(),
             jump_hosts: Vec::new(),
         }
     }
@@ -366,6 +372,17 @@ impl StoredConnection {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let ssh_algorithm_profile = optional_string(external_config, "ssh_algorithm_profile");
+        let ssh_algorithm_profile = if ssh_algorithm_profile.is_empty() {
+            "modern".to_string()
+        } else if matches!(ssh_algorithm_profile.as_str(), "modern" | "legacy") {
+            ssh_algorithm_profile
+        } else {
+            return Err(format!(
+                "Unsupported SSH algorithm profile '{}'; expected modern or legacy",
+                ssh_algorithm_profile
+            ));
+        };
         // Legacy 0.4.x flag: only consulted when `sudo_source` is absent, so
         // a re-saved connection (stale `quick_sudo` left behind) follows the
         // explicit source chosen on the form.
@@ -460,6 +477,7 @@ impl StoredConnection {
             auth_flow_mode,
             set_env,
             remote_command,
+            ssh_algorithm_profile,
             jump_hosts,
         })
     }
@@ -870,6 +888,7 @@ mod tests {
             "terminal_keepalive_secs",
             "set_env",
             "remote_command",
+            "ssh_algorithm_profile",
             "read_only",
         ];
         assert_eq!(keys, expected, "manifest field list drifted from parsing");
@@ -1155,6 +1174,50 @@ mod tests {
     }
 
     #[test]
+    fn defaults_to_modern_ssh_algorithms_and_accepts_legacy_profile() {
+        let modern = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "modern",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": "secret"
+            }
+        }))
+        .unwrap();
+        assert_eq!(modern.ssh_algorithm_profile, "modern");
+
+        let legacy = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "legacy",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": "secret",
+                "external_config": { "ssh_algorithm_profile": "legacy" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(legacy.ssh_algorithm_profile, "legacy");
+    }
+
+    #[test]
+    fn rejects_unknown_ssh_algorithm_profile() {
+        let error = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "bad-profile",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "password": "secret",
+                "external_config": { "ssh_algorithm_profile": "insecure" }
+            }
+        }))
+        .unwrap_err();
+        assert!(error.contains("modern or legacy"), "{error}");
+    }
+
+    #[test]
     fn parses_jump_host_chains() {
         let connection = StoredConnection::from_lifecycle_params(&serde_json::json!({
             "connection": {
@@ -1177,7 +1240,7 @@ mod tests {
         assert_eq!(connection.jump_hosts[0].port, 2202);
         assert_eq!(connection.jump_hosts[0].password, "jump-pw");
         assert_eq!(connection.jump_hosts[1].authentication, "private-key");
-        let synthesized = connection.jump_hosts[1].to_connection("jump-2", 20, 30);
+        let synthesized = connection.jump_hosts[1].to_connection("jump-2", 20, 30, "modern");
         assert_eq!(synthesized.host, "inner.example.com");
         assert_eq!(synthesized.runtime_port, 22);
         assert_eq!(synthesized.authentication, AuthenticationMethod::PrivateKey);
@@ -1702,6 +1765,7 @@ mod manifest_contract_tests {
             "terminal_keepalive_secs",
             "set_env",
             "remote_command",
+            "ssh_algorithm_profile",
             "sudo_source",
             "sudo_profile",
             "sudo_use_pty",

@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-plugin-ssh"
-version = "0.4.73"
+version = "0.4.74"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64",
@@ -607,6 +607,15 @@ dependencies = [
  "const-oid 0.10.2",
  "pem-rfc7468 1.0.0",
  "zeroize",
+]
+
+[[package]]
+name = "des"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+dependencies = [
+ "cipher 0.4.4",
 ]
 
 [[package]]
@@ -1688,6 +1697,7 @@ dependencies = [
  "data-encoding",
  "delegate",
  "der",
+ "des",
  "digest 0.10.7",
  "ecdsa",
  "ed25519-dalek",

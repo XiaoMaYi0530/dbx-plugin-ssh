@@ -85,7 +85,9 @@ for (const authentication of options("authentication")) {
         const password = ["password", "private-key-password"].includes(authentication);
         const privateKey = ["private-key", "private-key-password"].includes(authentication);
         current.visible("password", password); current.required("password", password);
-        current.visible("private_key_path", privateKey); current.required("private_key_path", privateKey);
+        // The path is optional because the private_key secret field can carry
+        // pasted OpenSSH/PEM/PPK content and takes precedence over the path.
+        current.visible("private_key_path", privateKey); current.required("private_key_path", false);
         current.visible("private_key_passphrase", privateKey); current.required("private_key_passphrase", false);
         current.visible("agent_socket", authentication === "agent");
         current.visible("sudo_password", sudo_source === "custom");
