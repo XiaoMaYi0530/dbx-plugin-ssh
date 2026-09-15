@@ -9,17 +9,12 @@ use russh::{cipher, kex, mac, Preferred};
 /// russh's secure KEX/cipher defaults unchanged and only appends the two
 /// SHA-1 MAC variants.  `Legacy` is an explicit opt-in for older servers that
 /// also require SHA-1 Diffie-Hellman or CBC ciphers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SshAlgorithmPolicy {
     Secure,
+    #[default]
     Compatible,
     Legacy,
-}
-
-impl Default for SshAlgorithmPolicy {
-    fn default() -> Self {
-        Self::Compatible
-    }
 }
 
 impl SshAlgorithmPolicy {

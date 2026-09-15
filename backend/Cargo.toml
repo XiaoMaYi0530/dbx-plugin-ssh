@@ -1,6 +1,6 @@
 [package]
 name = "dbx-plugin-ssh"
-version = "0.4.74"
+version = "0.4.75"
 edition = "2021"
 license = "MIT"
 authors = ["jinpy"]
