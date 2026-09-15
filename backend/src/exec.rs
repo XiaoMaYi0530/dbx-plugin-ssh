@@ -1176,9 +1176,9 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Server metrics collected with read-only commands: /proc readers, two
-/// /proc/stat samples for CPU utilization, `df -kP` for mounts, plus the
-/// network-rate and top-process extensions. Thin delegation to
+/// Server metrics collected with read-only commands: /proc readers on Linux
+/// with sysctl/`vm_stat`/`iostat` fallbacks on macOS, `df -kP` for mounts,
+/// plus the network-rate and top-process extensions. Thin delegation to
 /// [`crate::metrics`], which owns the extended collector and parsers.
 pub async fn collect_metrics(handle: &Handle<SshClient>) -> Result<serde_json::Value, String> {
     crate::metrics::collect_metrics(handle).await

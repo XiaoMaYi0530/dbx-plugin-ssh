@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH Terminal",
-  "version": "0.4.73",
+  "version": "0.4.74",
   "publisher": "jinpy",
   "description": "A secure SSH terminal for interactive sessions, SFTP file transfer, remote commands, and guarded server operations.",
   "source": "https://github.com/jinpy666/dbx-plugin-ssh",
@@ -98,7 +98,7 @@
               "value": "none"
             }
           ],
-          "description": "SSH always encrypts the connection. A private key passphrase unlocks the key; it is separate from the account password."
+          "description": "Choose how to sign in to the server: password, private key, SSH agent, or none."
         },
         {
           "key": "password",
@@ -125,15 +125,9 @@
           "label": "Private key path",
           "type": "text",
           "binding": "config",
-          "description": "Desktop: local path. Web/Docker: path on the DBX server or container.",
+          "options_action": "keys/discover/options",
+          "description": "Desktop: local path. Web/Docker: path on the DBX server or container. When the host supports dynamic options, a dropdown lists private keys discovered under ~/.ssh (path, algorithm, fingerprint); otherwise type the path manually.",
           "visible_when": {
-            "field": "authentication",
-            "one_of": [
-              "private-key",
-              "private-key-password"
-            ]
-          },
-          "required_when": {
             "field": "authentication",
             "one_of": [
               "private-key",
@@ -146,6 +140,7 @@
           "label": "Private key passphrase",
           "type": "password",
           "binding": "secret",
+          "description": "Passphrase that unlocks the private key file; it is separate from the account password.",
           "visible_when": {
             "field": "authentication",
             "one_of": [
@@ -156,15 +151,16 @@
         },
         {
           "key": "private_key",
-          "label": "Legacy private key slot",
-          "type": "password",
+          "label": "Private key content",
+          "type": "textarea",
           "binding": "secret",
           "required": false,
-          "description": "Compatibility slot for secrets recorded by external tooling. Never shown and never read by the sidecar.",
+          "description": "Paste the private key contents (OpenSSH, PEM, or PPK format) instead of a file path. A non-empty key content takes precedence over the key path; it is kept in the secret store and never displayed again.",
           "visible_when": {
-            "field": "private_key_path",
+            "field": "authentication",
             "one_of": [
-              "__never_legacy_private_key__"
+              "private-key",
+              "private-key-password"
             ]
           }
         },
@@ -335,8 +331,8 @@
           "label": "Connect timeout (seconds)",
           "type": "number",
           "binding": "config",
-          "default": 15,
-          "description": "SSH handshake and authentication timeout."
+          "default": 30,
+          "description": "SSH handshake and authentication timeout. Raise this for slow Windows/macOS or high-latency hosts."
         },
         {
           "key": "keepalive_interval_secs",
@@ -370,6 +366,24 @@
           "binding": "config",
           "default": "",
           "description": "Executed instead of a shell when a terminal session opens (a PTY is still requested). Leave empty for a normal interactive shell; reconnecting re-runs the command."
+        },
+        {
+          "key": "ssh_algorithm_profile",
+          "label": "SSH algorithm compatibility",
+          "type": "select",
+          "binding": "config",
+          "default": "modern",
+          "options": [
+            {
+              "label": "Modern (recommended)",
+              "value": "modern"
+            },
+            {
+              "label": "Legacy-compatible",
+              "value": "legacy"
+            }
+          ],
+          "description": "Modern keeps secure algorithms first. Legacy-compatible appends hmac-sha1, SHA-1 DH groups, CBC, and 3DES only for older SSH appliances."
         },
         {
           "key": "read_only",
@@ -461,28 +475,34 @@
                 "agent": "Agente SSH",
                 "none": "Sin autenticación"
               },
-              "description": "SSH siempre cifra la conexión. La frase de la clave privada la desbloquea; es distinta de la contraseña de la cuenta."
+              "description": "Cómo iniciar sesión en el servidor: contraseña, clave privada, agente SSH o sin autenticación."
             },
             "password": {
               "label": "Contraseña"
             },
             "private_key_path": {
-              "label": "Ruta de clave privada"
+              "label": "Ruta de clave privada",
+              "description": "Escritorio: ruta local. Web/Docker: ruta en el servidor o contenedor de DBX. Si el host admite opciones dinámicas, un desplegable lista las claves privadas halladas en ~/.ssh (ruta, algoritmo, huella); si no, escribe la ruta a mano."
             },
             "private_key_passphrase": {
-              "label": "Frase de contraseña de la clave"
+              "label": "Frase de contraseña de la clave",
+              "description": "Frase que desbloquea el archivo de la clave privada; es distinta de la contraseña de la cuenta."
             },
             "private_key": {
-              "label": "Ranura heredada de clave privada"
+              "label": "Contenido de la clave privada",
+              "description": "Pega el contenido de la clave privada (formato OpenSSH, PEM o PPK) en lugar de una ruta de archivo. Un contenido no vacío tiene prioridad sobre la ruta; se guarda en el almacén de secretos y no se vuelve a mostrar."
             },
             "agent_socket": {
-              "label": "Socket del agente"
+              "label": "Socket del agente",
+              "description": "Anulación opcional de SSH_AUTH_SOCK. Déjelo vacío para usar el valor del entorno o Pageant en Windows."
             },
             "connect_timeout_secs": {
-              "label": "Tiempo de espera de conexión (segundos)"
+              "label": "Tiempo de espera de conexión (segundos)",
+              "description": "Tiempo de espera del handshake SSH y la autenticación. Súbelo para hosts Windows/macOS lentos o de alta latencia."
             },
             "keepalive_interval_secs": {
-              "label": "Intervalo de keepalive (segundos)"
+              "label": "Intervalo de keepalive (segundos)",
+              "description": "Intervalo de sondas de keepalive; 3 sondas sin respuesta desconectan la sesión. 0 las desactiva."
             },
             "terminal_keepalive_secs": {
               "label": "Keepalive de actividad del terminal (segundos)",
@@ -497,22 +517,34 @@
               "label": "Comando remoto (RemoteCommand)",
               "description": "Se ejecuta en lugar de un shell al abrir una sesión de terminal (el PTY se solicita igual). Déjelo vacío para un shell interactivo normal; al reconectar se vuelve a ejecutar el comando."
             },
+            "ssh_algorithm_profile": {
+              "label": "Compatibilidad de algoritmos SSH",
+              "options": {
+                "modern": "Moderno (recomendado)",
+                "legacy": "Compatible con sistemas antiguos"
+              },
+              "description": "Mantiene los algoritmos modernos primero; el modo compatible añade suites antiguas para dispositivos SSH heredados."
+            },
             "sudo_source": {
               "label": "Origen de credenciales sudo",
               "options": {
                 "custom": "Personalizado (esta conexión)",
                 "global": "Perfil Quick Sudo global",
                 "off": "Desactivado"
-              }
+              },
+              "description": "De dónde salen las credenciales de sudo: los valores de esta conexión, un perfil global compartido, o desactivado. Se ignora en conexiones de solo lectura."
             },
             "sudo_profile": {
-              "label": "Perfil Quick Sudo"
+              "label": "Perfil Quick Sudo",
+              "description": "Perfil global de Quick Sudo que se enlazará; si queda vacío, se usa el enlace del banco de trabajo. Los hosts sin opciones dinámicas muestran un campo de texto (nombre o id del perfil)."
             },
             "sudo_password": {
-              "label": "Contraseña de sudo (override)"
+              "label": "Contraseña de sudo (override)",
+              "description": "Contraseña que se pasa a sudo por tubería; déjela vacía para reutilizar la contraseña de inicio de sesión."
             },
             "totp_secret": {
-              "label": "Secretos TOTP"
+              "label": "Secretos TOTP",
+              "description": "Un secreto por línea: URI otpauth://, clave base32 o código estático. La selección rotativa evita reutilizar un código en la misma ventana. También responde a la 2FA interactiva por teclado al iniciar sesión."
             },
             "auth_flow_mode": {
               "label": "Flujo 2FA",
@@ -524,19 +556,24 @@
               }
             },
             "password_prompt_hint": {
-              "label": "Pista de prompt de contraseña"
+              "label": "Pista de prompt de contraseña",
+              "description": "Subcadena personalizada que identifica los prompts de contraseña (p. ej. 'identity token')."
             },
             "totp_prompt_hint": {
-              "label": "Pista de prompt de OTP"
+              "label": "Pista de prompt de OTP",
+              "description": "Subcadena personalizada que identifica los prompts de OTP (p. ej. 'duo passcode')."
             },
             "sudo_use_pty": {
-              "label": "Solicitar PTY para sudo"
+              "label": "Solicitar PTY para sudo",
+              "description": "Algunos módulos PAM solo preguntan correctamente con un TTY. Si hay un perfil global enlazado, manda su propia preferencia."
             },
             "read_only": {
-              "label": "Solo lectura"
+              "label": "Solo lectura",
+              "description": "Rechaza toda operación de escritura (cambios SFTP, subidas, comandos sudo) en esta conexión; Quick Sudo queda desactivado mientras esté activo."
             },
             "sudo_whitelist": {
-              "label": "Lista blanca de comandos sudo"
+              "label": "Lista blanca de comandos sudo",
+              "description": "Lista blanca estilo sudoers para comandos privilegiados, una entrada por línea (o separada por ';'). Los tokens coinciden exactamente, '*' coincide con un argumento y un '*' final coincide con el resto (p. ej. 'systemctl restart *'). Si se establece, sudo solo se ejecuta para los comandos que coinciden; déjela vacía para desactivarla."
             }
           },
           "actions": {
@@ -547,7 +584,7 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "SSH Terminal",
+          "label": "Terminal SSH",
           "description": "Terminal SSH, gestor SFTP y operaciones remotas."
         },
         "io.dbx.ssh.files": {
@@ -585,22 +622,26 @@
                 "agent": "SSH Agent",
                 "none": "Nessuna autenticazione"
               },
-              "description": "SSH cifra sempre la connessione. La passphrase sblocca la chiave privata ed è diversa dalla password dell’account."
+              "description": "Come accedere al server: password, chiave privata, agent o nessuna autenticazione."
             },
             "password": {
               "label": "Password"
             },
             "private_key_path": {
-              "label": "Percorso chiave privata"
+              "label": "Percorso chiave privata",
+              "description": "Desktop: percorso locale. Web/Docker: percorso sul server o contenitore DBX. Se l'host supporta le opzioni dinamiche, un menu a tendina elenca le chiavi private trovate in ~/.ssh (percorso, algoritmo, fingerprint); altrimenti digita il percorso manualmente."
             },
             "private_key_passphrase": {
-              "label": "Passphrase chiave privata"
+              "label": "Passphrase chiave privata",
+              "description": "Passphrase che sblocca il file della chiave privata; è diversa dalla password dell'account."
             },
             "private_key": {
-              "label": "Slot legacy della chiave privata"
+              "label": "Contenuto della chiave privata",
+              "description": "Incolla il contenuto della chiave privata (formato OpenSSH, PEM o PPK) invece di un percorso file. Un contenuto non vuoto ha precedenza sul percorso; viene conservato nell'archivio segreti e non mostrato più."
             },
             "agent_socket": {
-              "label": "Socket agent"
+              "label": "Socket agent",
+              "description": "Override facoltativo di SSH_AUTH_SOCK. Lasciare vuoto per il valore predefinito dell'ambiente o Pageant su Windows."
             },
             "set_env": {
               "label": "Variabili d'ambiente (SetEnv)",
@@ -611,22 +652,34 @@
               "label": "Comando remoto (RemoteCommand)",
               "description": "Viene eseguito al posto di una shell all'apertura della sessione terminale (il PTY resta richiesto). Lasciare vuoto per una shell interattiva normale; alla riconnessione il comando viene rieseguito."
             },
+            "ssh_algorithm_profile": {
+              "label": "Compatibilità degli algoritmi SSH",
+              "options": {
+                "modern": "Moderno (consigliato)",
+                "legacy": "Compatibile con sistemi legacy"
+              },
+              "description": "Mantiene prima gli algoritmi moderni; la modalità compatibile aggiunge suite obsolete per dispositivi SSH legacy."
+            },
             "sudo_source": {
               "label": "Origine delle credenziali sudo",
               "options": {
                 "custom": "Personalizzato (questa connessione)",
                 "global": "Profilo Quick Sudo globale",
                 "off": "Disattivato"
-              }
+              },
+              "description": "Da dove arrivano le credenziali sudo: i valori di questa connessione, un profilo globale condiviso, o disattivato. Ignorato sulle connessioni di sola lettura."
             },
             "sudo_profile": {
-              "label": "Profilo Quick Sudo"
+              "label": "Profilo Quick Sudo",
+              "description": "Profilo globale Quick Sudo da collegare; se vuoto, si usa il collegamento del workbench. Gli host senza opzioni dinamiche mostrano un campo di testo (nome o id del profilo)."
             },
             "read_only": {
-              "label": "Sola lettura"
+              "label": "Sola lettura",
+              "description": "Rifiuta ogni operazione di scrittura (modifiche SFTP, caricamenti, comandi sudo) su questa connessione; Quick Sudo resta disattivato finché è abilitato."
             },
             "sudo_whitelist": {
-              "label": "Whitelist comandi sudo"
+              "label": "Whitelist comandi sudo",
+              "description": "Whitelist in stile sudoers per i comandi privilegiati, una voce per riga (o separata da ';'). I token corrispondono esattamente, '*' corrisponde a un argomento, un '*' finale corrisponde al resto (es. 'systemctl restart *'). Se impostata, sudo viene eseguito solo per i comandi corrispondenti; lasciare vuota per disattivare."
             },
             "auth_flow_mode": {
               "description": "Si applica ai prompt di accesso e sudo. Solo password non usa OTP. I profili Quick Sudo globali usano le proprie impostazioni.",
@@ -639,31 +692,31 @@
             },
             "sudo_password": {
               "label": "Password sudo alternativa",
-              "description": "Lascia vuoto per usare la password di accesso."
+              "description": "Password passata a sudo tramite pipe; lasciare vuoto per riutilizzare la password di accesso."
             },
             "sudo_use_pty": {
               "label": "Richiedi PTY per sudo",
-              "description": "Abilita per i sistemi PAM che richiedono un terminale."
+              "description": "Alcuni stack PAM chiedono correttamente solo con un TTY. Un profilo globale collegato prevale con la propria preferenza."
             },
             "totp_secret": {
               "label": "Segreti TOTP",
-              "description": "Un segreto per riga: URI otpauth://, chiave base32 o codice statico. Usato anche per la 2FA durante l’accesso."
+              "description": "Un segreto per riga: URI otpauth://, chiave base32 o codice statico. La selezione a rotazione evita di riutilizzare un codice nella stessa finestra. Risponde anche alla 2FA interattiva da tastiera all'accesso."
             },
             "password_prompt_hint": {
               "label": "Indicatore del prompt password",
-              "description": "Testo personalizzato che identifica il prompt della password."
+              "description": "Sottostringa personalizzata che identifica i prompt della password (es. 'identity token')."
             },
             "totp_prompt_hint": {
               "label": "Indicatore del prompt OTP",
-              "description": "Testo personalizzato che identifica il prompt OTP."
+              "description": "Sottostringa personalizzata che identifica i prompt OTP (es. 'duo passcode')."
             },
             "connect_timeout_secs": {
               "label": "Timeout connessione (secondi)",
-              "description": "Timeout per handshake SSH e autenticazione."
+              "description": "Timeout per handshake SSH e autenticazione. Aumentare per host Windows/macOS lenti o ad alta latenza."
             },
             "keepalive_interval_secs": {
               "label": "Intervallo keepalive (secondi)",
-              "description": "Tre risposte mancanti chiudono la sessione. 0 disabilita il keepalive."
+              "description": "Intervallo delle sonde keepalive; 3 sonde senza risposta chiudono la sessione. 0 le disabilita."
             },
             "terminal_keepalive_secs": {
               "label": "Keepalive attività del terminale (secondi)",
@@ -678,7 +731,7 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "SSH Terminal",
+          "label": "Terminale SSH",
           "description": "Terminale SSH, gestore SFTP e operazioni remote."
         },
         "io.dbx.ssh.files": {
@@ -716,28 +769,34 @@
                 "agent": "SSH Agent",
                 "none": "認証なし"
               },
-              "description": "SSH 接続は常に暗号化されます。秘密鍵のパスフレーズは鍵の解除用で、アカウントのパスワードとは別です。"
+              "description": "サーバーへのサインイン方法：パスワード、秘密鍵、SSH Agent、または認証なし。"
             },
             "password": {
               "label": "パスワード"
             },
             "private_key_path": {
-              "label": "秘密鍵のパス"
+              "label": "秘密鍵のパス",
+              "description": "デスクトップ：ローカルパス。Web/Docker：DBX サーバーまたはコンテナ上のパス。ホストが動的オプションに対応している場合、~/.ssh 配下で検出された秘密鍵（パス・アルゴリズム・フィンガープリント）のドロップダウンを表示します。未対応の場合は手入力してください。"
             },
             "private_key_passphrase": {
-              "label": "秘密鍵のパスフレーズ"
+              "label": "秘密鍵のパスフレーズ",
+              "description": "秘密鍵ファイルの解除に使うパスフレーズ。アカウントのパスワードとは別です。"
             },
             "private_key": {
-              "label": "レガシー秘密鍵スロット"
+              "label": "秘密鍵の内容",
+              "description": "ファイルパスの代わりに秘密鍵の内容（OpenSSH・PEM・PPK 形式）を貼り付けます。内容が空でなければパスより優先されます。シークレットストアに保存され、再表示されません。"
             },
             "agent_socket": {
-              "label": "エージェントソケット"
+              "label": "エージェントソケット",
+              "description": "SSH_AUTH_SOCK の任意上書き。空欄なら環境の既定値（Windows では Pageant）を使用します。"
             },
             "connect_timeout_secs": {
-              "label": "接続タイムアウト（秒）"
+              "label": "接続タイムアウト（秒）",
+              "description": "SSH ハンドシェイクと認証のタイムアウト。遅い Windows/macOS や高レイテンシのホストでは大きくしてください。"
             },
             "keepalive_interval_secs": {
-              "label": "Keepalive 間隔（秒）"
+              "label": "Keepalive 間隔（秒）",
+              "description": "Keepalive プローブの間隔。3 回連続無応答でセッションを切断します。0 で無効。"
             },
             "terminal_keepalive_secs": {
               "label": "ターミナル活動キープアライブ（秒）",
@@ -752,22 +811,34 @@
               "label": "リモートコマンド（RemoteCommand）",
               "description": "ターミナルセッション確立時にシェルの代わりに実行するコマンド（PTY は従来どおり要求）。空欄なら通常の対話シェルになります。再接続時は同じコマンドを再実行します。"
             },
+            "ssh_algorithm_profile": {
+              "label": "SSH アルゴリズム互換性",
+              "options": {
+                "modern": "モダン（推奨）",
+                "legacy": "レガシー互換"
+              },
+              "description": "モダンなアルゴリズムを優先し、レガシー互換モードでは古い SSH 機器向けの方式を追加します。"
+            },
             "sudo_source": {
               "label": "sudo 認証情報ソース",
               "options": {
                 "custom": "カスタム（この接続）",
                 "global": "グローバル Quick Sudo プロファイル",
                 "off": "オフ"
-              }
+              },
+              "description": "sudo 認証情報の取得元：この接続固有の値、共有グローバルプロファイル、または無効。読み取り専用接続では無視されます。"
             },
             "sudo_profile": {
-              "label": "Quick Sudo プロファイル"
+              "label": "Quick Sudo プロファイル",
+              "description": "紐付けるグローバル Quick Sudo プロファイル。空欄ならワークベンチの紐付けにフォールバックします。動的オプション非対応のホストではテキスト欄（プロファイル名または ID）になります。"
             },
             "sudo_password": {
-              "label": "sudo パスワード（上書き）"
+              "label": "sudo パスワード（上書き）",
+              "description": "sudo にパイプで渡すパスワード。空欄ならログイン パスワードを再利用します。"
             },
             "totp_secret": {
-              "label": "TOTP シークレット"
+              "label": "TOTP シークレット",
+              "description": "1 行に 1 件：otpauth:// URI、base32 キー、または静的コード。ローテーション選択で同じ時間窓内のコード再利用を回避します。ログイン時のキーボード対話式 2FA にも応答します。"
             },
             "auth_flow_mode": {
               "label": "2FA フロー",
@@ -779,19 +850,24 @@
               }
             },
             "password_prompt_hint": {
-              "label": "パスワード プロンプト判定語"
+              "label": "パスワード プロンプトの判定キーワード",
+              "description": "パスワード プロンプトを識別するカスタム部分文字列（例: 'identity token'）。"
             },
             "totp_prompt_hint": {
-              "label": "OTP プロンプト判定語"
+              "label": "OTP プロンプトの判定キーワード",
+              "description": "OTP プロンプトを識別するカスタム部分文字列（例: 'duo passcode'）。"
             },
             "sudo_use_pty": {
-              "label": "sudo で PTY を要求"
+              "label": "sudo で PTY を要求",
+              "description": "PAM スタックによっては TTY がないと正しくプロンプトが出ません。グローバル プロファイルを紐付けた場合はその設定が優先されます。"
             },
             "read_only": {
-              "label": "読み取り専用"
+              "label": "読み取り専用",
+              "description": "この接続でのすべての書き込み操作（SFTP 変更・アップロード・sudo コマンド）を拒否します。有効な間は Quick Sudo も強制オフになります。"
             },
             "sudo_whitelist": {
-              "label": "sudo コマンド許可リスト"
+              "label": "sudo コマンド許可リスト",
+              "description": "特権コマンドの sudoers 風許可リスト。1 行に 1 件（セミコロン区切りも可）。トークンは完全一致、'*' は引数 1 個、末尾の '*' は残り全部に一致します（例: 'systemctl restart *'）。設定すると sudo は一致するコマンドのみ実行。空欄で無効。"
             }
           },
           "actions": {
@@ -802,7 +878,7 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "SSH Terminal",
+          "label": "SSH ターミナル",
           "description": "SSH ターミナル、SFTP ファイル管理、リモート運用。"
         },
         "io.dbx.ssh.files": {
@@ -840,22 +916,26 @@
                 "agent": "Agente SSH",
                 "none": "Sem autenticação"
               },
-              "description": "SSH sempre criptografa a conexão. A frase secreta desbloqueia a chave privada e é diferente da senha da conta."
+              "description": "Como entrar no servidor: senha, chave privada, agente SSH ou sem autenticação."
             },
             "password": {
               "label": "Senha"
             },
             "private_key_path": {
-              "label": "Caminho da chave privada"
+              "label": "Caminho da chave privada",
+              "description": "Desktop: caminho local. Web/Docker: caminho no servidor ou contêiner DBX. Se o host suportar opções dinâmicas, uma lista suspensa mostra as chaves privadas encontradas em ~/.ssh (caminho, algoritmo, impressão digital); caso contrário, digite o caminho manualmente."
             },
             "private_key_passphrase": {
-              "label": "Frase secreta da chave"
+              "label": "Frase secreta da chave",
+              "description": "Frase que desbloqueia o arquivo da chave privada; é diferente da senha da conta."
             },
             "private_key": {
-              "label": "Slot legado de chave privada"
+              "label": "Conteúdo da chave privada",
+              "description": "Cole o conteúdo da chave privada (formato OpenSSH, PEM ou PPK) em vez de um caminho de arquivo. Um conteúdo não vazio tem precedência sobre o caminho; fica no cofre de segredos e nunca é exibido novamente."
             },
             "agent_socket": {
-              "label": "Socket do agente"
+              "label": "Socket do agente",
+              "description": "Substituição opcional do SSH_AUTH_SOCK. Deixe vazio para usar o padrão do ambiente ou o Pageant no Windows."
             },
             "set_env": {
               "label": "Variáveis de ambiente (SetEnv)",
@@ -866,22 +946,34 @@
               "label": "Comando remoto (RemoteCommand)",
               "description": "Executado em vez de um shell quando uma sessão de terminal é aberta (o PTY continua sendo solicitado). Deixe vazio para um shell interativo normal; reconectar executa o comando novamente."
             },
+            "ssh_algorithm_profile": {
+              "label": "Compatibilidade de algoritmos SSH",
+              "options": {
+                "modern": "Moderno (recomendado)",
+                "legacy": "Compatível com sistemas legados"
+              },
+              "description": "Mantém os algoritmos modernos em primeiro lugar; o modo compatível acrescenta suites antigas para dispositivos SSH legados."
+            },
             "sudo_source": {
               "label": "Origem das credenciais sudo",
               "options": {
                 "custom": "Personalizado (esta conexão)",
                 "global": "Perfil Quick Sudo global",
                 "off": "Desativado"
-              }
+              },
+              "description": "De onde vêm as credenciais sudo: os valores desta conexão, um perfil global compartilhado, ou desativado. Ignorado em conexões somente leitura."
             },
             "sudo_profile": {
-              "label": "Perfil Quick Sudo"
+              "label": "Perfil Quick Sudo",
+              "description": "Perfil global Quick Sudo a vincular; se vazio, usa o vínculo do workbench. Hosts sem opções dinâmicas mostram um campo de texto (nome ou id do perfil)."
             },
             "read_only": {
-              "label": "Somente leitura"
+              "label": "Somente leitura",
+              "description": "Rejeita toda operação de escrita (alterações SFTP, uploads, comandos sudo) nesta conexão; o Quick Sudo permanece desligado enquanto ativo."
             },
             "sudo_whitelist": {
-              "label": "Lista de permissões sudo"
+              "label": "Lista de permissões sudo",
+              "description": "Lista de permissões em estilo sudoers para comandos privilegiados, uma entrada por linha (ou separada por ';'). Tokens correspondem exatamente, '*' corresponde a um argumento, um '*' final corresponde ao restante (ex.: 'systemctl restart *'). Quando definida, o sudo só é executado para comandos correspondentes; deixe vazio para desativar."
             },
             "auth_flow_mode": {
               "description": "Aplica-se aos prompts de login e sudo. Somente senha não usa OTP. Os perfis globais Quick Sudo usam suas próprias configurações.",
@@ -894,31 +986,31 @@
             },
             "sudo_password": {
               "label": "Senha sudo alternativa",
-              "description": "Deixe vazio para usar a senha de login."
+              "description": "Senha passada ao sudo via pipe; deixe vazio para reutilizar a senha de login."
             },
             "sudo_use_pty": {
               "label": "Solicitar PTY para sudo",
-              "description": "Ative para sistemas PAM que exigem um terminal."
+              "description": "Alguns stacks PAM só perguntam corretamente com um TTY. Um perfil global vinculado tem preferência com sua própria configuração."
             },
             "totp_secret": {
               "label": "Segredos TOTP",
-              "description": "Um segredo por linha: URI otpauth://, chave base32 ou código estático. Também usado na 2FA durante o login."
+              "description": "Um segredo por linha: URI otpauth://, chave base32 ou código estático. A seleção rotativa evita reutilizar um código na mesma janela. Também responde à 2FA interativa por teclado no login."
             },
             "password_prompt_hint": {
               "label": "Identificador do prompt de senha",
-              "description": "Texto personalizado que identifica o prompt de senha."
+              "description": "Subtexto personalizado que identifica prompts de senha (ex.: 'identity token')."
             },
             "totp_prompt_hint": {
               "label": "Identificador do prompt OTP",
-              "description": "Texto personalizado que identifica o prompt OTP."
+              "description": "Subtexto personalizado que identifica prompts de OTP (ex.: 'duo passcode')."
             },
             "connect_timeout_secs": {
               "label": "Tempo limite de conexão (segundos)",
-              "description": "Tempo limite para handshake SSH e autenticação."
+              "description": "Tempo limite para handshake SSH e autenticação. Aumente para hosts Windows/macOS lentos ou de alta latência."
             },
             "keepalive_interval_secs": {
               "label": "Intervalo de keepalive (segundos)",
-              "description": "Três respostas ausentes encerram a sessão. 0 desativa o keepalive."
+              "description": "Intervalo das sondas de keepalive; 3 sondas sem resposta encerram a sessão. 0 desativa as sondas."
             },
             "terminal_keepalive_secs": {
               "label": "Keepalive de atividade do terminal (segundos)",
@@ -933,7 +1025,7 @@
           }
         },
         "io.dbx.ssh.workbench": {
-          "label": "SSH Terminal",
+          "label": "Terminal SSH",
           "description": "Terminal SSH, gestor SFTP e operações remotas."
         },
         "io.dbx.ssh.files": {
@@ -943,7 +1035,7 @@
       }
     },
     "zh-CN": {
-      "name": "SSH Terminal",
+      "name": "DBX SSH 终端",
       "description": "面向服务器运维的 SSH 终端：交互式会话、SFTP 文件传输、远程命令和受控运维操作集中在一个界面。",
       "contributions": {
         "io.dbx.ssh.connection": {
@@ -971,28 +1063,34 @@
                 "agent": "SSH Agent",
                 "none": "无认证"
               },
-              "description": "SSH 连接始终加密。私钥口令用于解锁私钥，与账号密码不同。"
+              "description": "选择登录服务器的方式：密码、私钥、SSH Agent 或无认证。"
             },
             "password": {
               "label": "密码"
             },
             "private_key_path": {
-              "label": "私钥路径"
+              "label": "私钥路径",
+              "description": "桌面端：本地路径。Web/Docker：DBX 服务器或容器上的路径。宿主支持动态选项时会以下拉列出 ~/.ssh 下发现的私钥（路径、算法、指纹）；否则请手动填写路径。"
             },
             "private_key_passphrase": {
-              "label": "私钥口令"
+              "label": "私钥口令",
+              "description": "用于解锁私钥文件的口令，与账号密码不同。"
             },
             "private_key": {
-              "label": "旧版私钥槽位"
+              "label": "私钥内容",
+              "description": "直接粘贴私钥内容（OpenSSH/PEM/PPK 格式）代替文件路径；内容非空时优先于路径生效。保存在密钥库中，不再回显。"
             },
             "agent_socket": {
-              "label": "Agent Socket"
+              "label": "Agent Socket",
+              "description": "可选的 SSH_AUTH_SOCK 覆盖；留空则使用环境默认值（Windows 下为 Pageant）。"
             },
             "connect_timeout_secs": {
-              "label": "连接超时（秒）"
+              "label": "连接超时（秒）",
+              "description": "SSH 握手与认证超时。Windows/macOS 较慢或高延迟的主机可调大。"
             },
             "keepalive_interval_secs": {
-              "label": "Keepalive 间隔（秒）"
+              "label": "Keepalive 间隔（秒）",
+              "description": "Keepalive 探测间隔；连续 3 次未响应即断开会话。0 表示关闭探测。"
             },
             "terminal_keepalive_secs": {
               "label": "终端活动保活（秒）",
@@ -1007,25 +1105,37 @@
               "label": "远程命令（RemoteCommand）",
               "description": "终端会话建立时执行该命令替代 shell（PTY 照常申请）。留空则为普通交互 shell；重连会重新执行同一条命令。"
             },
+            "ssh_algorithm_profile": {
+              "label": "SSH 算法兼容性",
+              "options": {
+                "modern": "现代（推荐）",
+                "legacy": "兼容旧版设备"
+              },
+              "description": "优先使用现代算法；兼容模式会为老旧 SSH 设备追加旧算法套件。"
+            },
             "sudo_source": {
               "label": "Sudo 凭据来源",
               "options": {
                 "custom": "自定义（本连接）",
                 "global": "全局 Quick Sudo 配置",
                 "off": "关闭"
-              }
+              },
+              "description": "Sudo 凭据的来源：本连接自带的配置、共享的全局配置，或关闭。只读连接上忽略此设置。"
             },
             "sudo_profile": {
-              "label": "Quick Sudo 配置"
+              "label": "Quick Sudo 配置",
+              "description": "选择要绑定的全局 Quick Sudo 配置；留空时回退到工作台绑定。宿主不支持动态选项时显示文本框（填写配置名称或 ID）。"
             },
             "sudo_password": {
-              "label": "sudo 密码覆盖"
+              "label": "sudo 密码覆盖",
+              "description": "通过管道传给 sudo 的密码；留空则复用登录密码。"
             },
             "totp_secret": {
-              "label": "TOTP 密钥"
+              "label": "TOTP 密钥",
+              "description": "每行一条：otpauth:// URI、base32 密钥或静态码。轮换选用可避免在同一时间窗内重复使用验证码；也用于应答登录时的键盘交互式 2FA。"
             },
             "auth_flow_mode": {
-              "label": "2FA 认证流",
+              "label": "2FA 认证流程",
               "description": "用于登录和 sudo 提示。仅密码模式不使用 OTP 密钥；全局 Quick Sudo 配置使用自身设置。",
               "options": {
                 "password_then_otp": "先密码，再 OTP",
@@ -1034,19 +1144,24 @@
               }
             },
             "password_prompt_hint": {
-              "label": "密码提示词"
+              "label": "密码提示词",
+              "description": "用于识别密码提示的自定义子串（如 'identity token'）。"
             },
             "totp_prompt_hint": {
-              "label": "OTP 提示词"
+              "label": "OTP 提示词",
+              "description": "用于识别 OTP 提示的自定义子串（如 'duo passcode'）。"
             },
             "sudo_use_pty": {
-              "label": "sudo 命令请求 PTY"
+              "label": "sudo 命令请求 PTY",
+              "description": "部分 PAM 模块只有在分配 TTY 时才能正确弹出提示。绑定了全局配置时，以其自身的设置为准。"
             },
             "read_only": {
-              "label": "只读"
+              "label": "只读",
+              "description": "在该连接上拒绝一切写操作（SFTP 变更、上传、sudo 命令）；启用期间 Quick Sudo 强制关闭。"
             },
             "sudo_whitelist": {
-              "label": "sudo 命令白名单"
+              "label": "sudo 命令白名单",
+              "description": "按 sudoers 风格为提权命令设置白名单，每行一条（也可用分号分隔）。词条精确匹配，'*' 匹配一个参数，结尾 '*' 匹配其余部分（如 'systemctl restart *'）。设置后 sudo 仅对匹配的命令执行；留空表示不限制。"
             }
           },
           "actions": {
@@ -1095,28 +1210,34 @@
                 "agent": "SSH Agent",
                 "none": "無認證"
               },
-              "description": "SSH 連線一律加密。私鑰密碼用於解鎖私鑰，與帳號密碼不同。"
+              "description": "選擇登入伺服器的方式：密碼、私鑰、SSH Agent 或無認證。"
             },
             "password": {
               "label": "密碼"
             },
             "private_key_path": {
-              "label": "私鑰路徑"
+              "label": "私鑰路徑",
+              "description": "桌面端：本機路徑。Web/Docker：DBX 伺服器或容器上的路徑。宿主支援動態選項時會以下拉列出 ~/.ssh 下發現的私鑰（路徑、演算法、指紋）；否則請手動填寫路徑。"
             },
             "private_key_passphrase": {
-              "label": "私鑰密語"
+              "label": "私鑰密語",
+              "description": "用於解鎖私鑰檔案的密語，與帳號密碼不同。"
             },
             "private_key": {
-              "label": "舊版私鑰槽位"
+              "label": "私鑰內容",
+              "description": "直接貼上私鑰內容（OpenSSH/PEM/PPK 格式）代替檔案路徑；內容非空時優先於路徑生效。儲存在金鑰庫中，不再回顯。"
             },
             "agent_socket": {
-              "label": "Agent Socket"
+              "label": "Agent Socket",
+              "description": "選用的 SSH_AUTH_SOCK 覆寫；留空則使用環境預設值（Windows 下為 Pageant）。"
             },
             "connect_timeout_secs": {
-              "label": "連線逾時（秒）"
+              "label": "連線逾時（秒）",
+              "description": "SSH 交握與認證逾時。Windows/macOS 較慢或高延遲的主機可調大。"
             },
             "keepalive_interval_secs": {
-              "label": "Keepalive 間隔（秒）"
+              "label": "Keepalive 間隔（秒）",
+              "description": "Keepalive 探測間隔；連續 3 次未回應即中斷連線。0 表示關閉探測。"
             },
             "terminal_keepalive_secs": {
               "label": "終端活動保活（秒）",
@@ -1131,22 +1252,34 @@
               "label": "遠端命令（RemoteCommand）",
               "description": "終端工作階段建立時執行該命令替代 shell（PTY 照常要求）。留空則為一般互動 shell；重新連線會重新執行同一條命令。"
             },
+            "ssh_algorithm_profile": {
+              "label": "SSH 演算法相容性",
+              "options": {
+                "modern": "現代（推薦）",
+                "legacy": "相容舊版設備"
+              },
+              "description": "優先使用現代演算法；相容模式會為老舊 SSH 設備追加舊演算法套件。"
+            },
             "sudo_source": {
               "label": "Sudo 憑據來源",
               "options": {
                 "custom": "自訂（本連線）",
                 "global": "全域 Quick Sudo 設定",
                 "off": "關閉"
-              }
+              },
+              "description": "Sudo 憑據的來源：本連線自帶的設定、共用的全域設定，或關閉。唯讀連線上忽略此設定。"
             },
             "sudo_profile": {
-              "label": "Quick Sudo 設定"
+              "label": "Quick Sudo 設定",
+              "description": "選擇要綁定的全域 Quick Sudo 設定；留空時回退到工作台綁定。宿主不支援動態選項時顯示文字框（填寫設定名稱或 ID）。"
             },
             "sudo_password": {
-              "label": "sudo 密碼覆寫"
+              "label": "sudo 密碼覆寫",
+              "description": "以管線傳給 sudo 的密碼；留空則重用登入密碼。"
             },
             "totp_secret": {
-              "label": "TOTP 金鑰"
+              "label": "TOTP 金鑰",
+              "description": "每行一條：otpauth:// URI、base32 金鑰或靜態碼。輪換選用可避免在同一時間窗內重複使用驗證碼；也用於應答登入時的鍵盤互動式 2FA。"
             },
             "auth_flow_mode": {
               "label": "2FA 認證流程",
@@ -1158,19 +1291,24 @@
               }
             },
             "password_prompt_hint": {
-              "label": "密碼提示詞"
+              "label": "密碼提示詞",
+              "description": "用於識別密碼提示的自訂子字串（如 'identity token'）。"
             },
             "totp_prompt_hint": {
-              "label": "OTP 提示詞"
+              "label": "OTP 提示詞",
+              "description": "用於識別 OTP 提示的自訂子字串（如 'duo passcode'）。"
             },
             "sudo_use_pty": {
-              "label": "sudo 命令請求 PTY"
+              "label": "sudo 命令請求 PTY",
+              "description": "部分 PAM 模組只有在配置 TTY 時才能正確彈出提示。綁定了全域設定時，以其自身的設定為準。"
             },
             "read_only": {
-              "label": "唯讀"
+              "label": "唯讀",
+              "description": "在該連線上拒絕一切寫入操作（SFTP 變更、上傳、sudo 命令）；啟用期間 Quick Sudo 強制關閉。"
             },
             "sudo_whitelist": {
-              "label": "sudo 命令白名單"
+              "label": "sudo 命令白名單",
+              "description": "以 sudoers 風格為提權命令設定白名單，每行一條（也可用分號分隔）。詞條精確匹配，'*' 匹配一個參數，結尾 '*' 匹配其餘部分（如 'systemctl restart *'）。設定後 sudo 僅對匹配的命令執行；留空表示不限制。"
             }
           },
           "actions": {

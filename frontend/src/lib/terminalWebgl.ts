@@ -6,9 +6,9 @@
 // 设计约束：
 // - 默认开启（对标 iShell 默认 GPU 加速）；WebGL 不可用（无 context、
 //   headless、驱动黑名单）时静默回退 DOM 渲染，功能不受损（optional 降级）。
-// - 浏览器 WebGL context 总数有限（每页 ~8-16 个）：只有主终端挂
-//   renderer；回放弹窗与 GIF 导出的离屏终端刻意不挂（导出依赖 2d canvas
-//   drawImage 稳定路径）。
+// - 浏览器 WebGL context 总数有限（每页 ~8-16 个）：只有主终端长期挂
+//   renderer；回放弹窗保持 DOM 渲染。GIF 导出在导出期间给离屏终端临时
+//   挂载（取像素必须有 canvas），导出完随终端 dispose 释放 context。
 // - context loss（GPU 重置/驱动切换）时 dispose renderer 回退 DOM 渲染，
 //   不重建、不报错——xterm DOM 渲染器始终在底层可用。
 // - 存储访问不得出现在默认参数位：宿主工作台 iframe 是

@@ -1,0 +1,37 @@
+version: 1
+plugin: dbx-plugin-ssh
+base_branch: main
+branch_prefix: codex/ssh/
+workflow:
+  stages: [discovery, contract, implementation, review, integration, verification]
+  merge_policy: integrator_only
+  implementation_isolation: one_branch_per_agent
+  dependencies:
+    implementation: [contract]
+    review: [implementation]
+    integration: [review]
+    verification: [integration]
+ownership:
+  contract: [manifest.json, docs/PROTOCOL.zh-CN.md]
+  backend: [backend/]
+  frontend: [frontend/, manifest.json]
+  tests: [scripts/]
+  integrator: [Cargo.lock, ui/, dist/, version_metadata, shared_contract_docs]
+validation:
+  local:
+    - python3 scripts/validate_repo.py
+    - node scripts/connection-forms/verify.mjs
+    - pnpm --dir frontend typecheck
+    - pnpm --dir frontend test
+    - pnpm --dir frontend build
+    - cargo fmt --manifest-path backend/Cargo.toml --check
+    - cargo clippy --locked --manifest-path backend/Cargo.toml --all-targets -- -D warnings
+    - cargo test --locked --manifest-path backend/Cargo.toml
+  ci_required: [validate, frontend, backend, ssh-smoke, candidates-check]
+security:
+  secrets: no_real_credentials
+  production_access: forbidden
+  install_and_restart: human_only
+  command_execution_changes: human_review_required
+  generated_artifacts: integrator_only
+

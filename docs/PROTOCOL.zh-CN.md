@@ -33,7 +33,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/read` 支持可选 `offset` 分片续读，见下文） |
 | `sftp/createDirectory`、`sftp/rename`、`sftp/delete` | SFTP 写操作 |
 | `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传，见下文） |
-| `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文） |
+| `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传；`saveToLocal` 本机落盘，见下文） |
 | `sftp/stat`、`sftp/exists`、`sftp/touch`、`sftp/write` | 扩展文件操作：元信息单查、存在性检查、空文件创建、小文件直写 |
 | `sftp/archive`、`sftp/extract` | 远端 tar.gz 打包与解压 |
 | `sftp/copy`、`sftp/move` | 服务器内复制 / 剪切（逐项执行，目标存在需 `overwrite`） |
@@ -42,6 +42,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/transfer/list`、`sftp/transfer/status` | 查询会话传输任务列表 / 单任务状态（含历史，会话维度过滤） |
 | `sftp/transfer/history` | 跨重启传输历史查询（持久化 + 内存 live 合并，见下文） |
 | `sftp/transfer/resumable` | 可续传上传扫描（中断任务的 spool 前缀仍在磁盘上的清单，见下文） |
+| `local/capabilities`、`local/reveal` | 本机落盘能力探测与在文件管理器中定位已完成的下载（见下文「下载本机落盘」） |
 | `sudo/stat`、`sudo/exists`、`sudo/touch` | sudo 元信息查询与空文件创建 |
 | `sudo/listDir`、`sudo/readFile`、`sudo/writeFile` | sudo 目录浏览与文件读写 |
 | `sudo/mkdir`、`sudo/remove`、`sudo/removeAll`、`sudo/chmod`、`sudo/rename` | sudo 写操作 |
@@ -49,6 +50,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sudo/profiles/options` | 连接表单动态下拉选项（`sudo_profile` 字段的 `options_action`）：返回 `{options: [{value: id, label: name}]}`，按名称排序，永不携带密钥 |
 | `connection/action` | 连接表单动作（manifest `connection-provider.actions` 声明）：`action=quick-sudo-profiles` 返回全局配置清单与本连接绑定状态的纯文本摘要（`{message, fieldValues}`） |
 | `keys/discover` | 本地 SSH 私钥发现（不返回私钥内容） |
+| `keys/discover/options` | 连接表单 `private_key_path` 字段的 `options_action` 动态下拉数据源 |
 | `ssh/knownHosts/list`、`ssh/knownHosts/remove` | known_hosts 条目管理（含 `@cert-authority` / `@revoked` 标记条目） |
 | `ssh/sessions/list` | 只读会话清单：sidecar 当前跟踪的活跃会话 |
 | `ssh/quickCommands/list`、`ssh/quickCommands/save`、`ssh/quickCommands/delete` | 全局快速命令管理（用户自定义常用命令片段，插件数据目录持久化，所有连接/工作台共享） |
@@ -402,7 +404,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 ## 服务器指标
 
-`ssh/metrics` 以单条 POSIX 只读命令采集：`/proc` 读取器、两次 `/proc/stat` 采样（间隔 0.4s）算 CPU 利用率、`df -kP` 采集挂载、`df -iP` 采集 inode 使用率，另附网络与进程扩展——两次网络计数快照（间隔 1s；Linux 读 `/proc/net/dev`，macOS/BSD 回退 `netstat -ibn`）差分出每接口速率，`ps` 分别按 CPU 与内存排序取前 8 进程。
+`ssh/metrics` 以单条 POSIX 只读命令采集：Linux 读 `/proc`（两次 `/proc/stat` 采样间隔 0.4s 算 CPU 利用率、`/proc/meminfo` 内存、`/proc/loadavg` + `/proc/uptime` 负载与运行时长）、`df -kP` 采集挂载、`df -iP` 采集 inode 使用率；macOS 无 `/proc`，各段自动回退——`sysctl vm.loadavg`/`kern.boottime` 补负载与运行时长、`sysctl hw.memsize` + `vm_stat`（free+inactive+speculative 页）+ `vm.swapusage` 补内存、`iostat -c 2`（1s 差分）补 CPU 利用率、`df -i` 补真实 inode 列（`df -iP` 在 macOS 会退化为容量列），回退分支按原字段形状输出故解析器共用。另附网络与进程扩展——两次网络计数快照（间隔 1s；Linux 读 `/proc/net/dev`，macOS/BSD 回退 `netstat -ibn`）差分出每接口速率，`ps` 分别按 CPU 与内存排序取前 8 进程。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -440,7 +442,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 - `sftp/transfer/list`：参数 `sessionId`。返回 `{ tasks: [...] }`——该会话进行中的上传 / 下载与近期历史（每个会话独立记录），元素结构 `{ taskId, sessionId, direction, fileName, size, transferred, status }`，`status` 取 `running` / `completed` / `cancelled`。
 - `sftp/transfer/status`：参数 `taskId`。返回单个任务的同构状态对象；任务不存在时先查历史，仍无则报错。
-- `sftp/transfer/history`：参数 `sessionId?`（可选过滤）、`limit?`（默认 50，上限 200）。返回 `{ tasks: [...] }`——持久化传输历史（`transfer-history.json`，环形上限 200 条，跨 sidecar 重启保留）与内存 live 任务按 `taskId` 去重合并、新→旧排序，元素结构 `{ taskId, sessionId, connectionId, direction, fileName, size, transferred, status, startedAt, finishedAt, error? }`（时间戳 Unix 毫秒；`status` 同上并含 `failed`）。无活动连接也可查询；仅状态跃迁落盘，逐块进度不落盘；跨进程（embedded 与 stdio `--mcp`）last-writer-wins；重启后遗留 `running` 呈现为 `failed`（不回写文件）。不进 MCP 工具面。
+- `sftp/transfer/history`：参数 `sessionId?`（可选过滤）、`limit?`（默认 50，上限 200）。返回 `{ tasks: [...] }`——持久化传输历史（`transfer-history.json`，环形上限 200 条，跨 sidecar 重启保留）与内存 live 任务按 `taskId` 去重合并、新→旧排序，元素结构 `{ taskId, sessionId, connectionId, direction, fileName, size, transferred, status, startedAt, finishedAt, error?, localPath? }`（时间戳 Unix 毫秒；`status` 同上并含 `failed`；`localPath` 仅 `saveToLocal` 下载完成行携带）。无活动连接也可查询；仅状态跃迁落盘，逐块进度不落盘；跨进程（embedded 与 stdio `--mcp`）last-writer-wins；重启后遗留 `running` 呈现为 `failed`（不回写文件）。不进 MCP 工具面。
 
 ## 主机密钥
 
@@ -466,6 +468,10 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 | `hasPassphrase` | bool | 私钥是否带口令 |
 
 `~/.ssh` 不存在或无可识别私钥时返回空 `keys` 数组，不算错误。
+
+### keys/discover/options
+
+参数：无（空对象）。`keys/discover` 的下拉渲染形态：返回 `{ options: [{ value, label }] }`，`value` 为私钥绝对路径，`label` 为 `文件名 · 算法[ · encrypted][ · SHA256:指纹]`（与宿主内置本地密钥建议器同风格）。供宿主连接表单把 `private_key_path` 渲染成动态下拉（无该扩展能力的宿主自动回退文本框，见 `sudo_profile` 先例）；只出元数据，绝不出私钥内容。
 
 ### ssh/knownHosts/list
 
@@ -570,6 +576,26 @@ offset 语义不变）。中断来源不限：前端中止、sidecar 重启、�
 后端把 `nextOffset` 置为该值继续分片；`offset > size` 报错。身份校验仅为 best-effort 的 size 一致
 （同尺寸改写会拼接错内容，文档明示）；返回体新增 `resumeOffset` 回显。会话内暂停/恢复为纯前端语义
 （分片循环在两分片之间挂起），不涉及新方法。
+
+### 下载本机落盘（sftp/download/start saveToLocal、local/capabilities、local/reveal）
+
+背景：宿主 `fileTransfer` API 是 optional 1.1 特性（当前宿主普遍缺失），而宿主 webview（Tauri/
+WKWebView 无 download handler）会把 `<a download>` 静默取消——字节既没落盘前端又报"已完成"。为此
+sidecar 提供本机落盘：`sftp/download/start` 增加可选 `saveToLocal`（默认 false，与 `offset>0` 互斥，
+组合报错）——分片经二进制通道发出的同时追加写入 `<data_dir>/transfers/downloads/download-<taskId>.part`
+暂存文件；`sftp/download/finish` 时 flush 并改名为最终路径（去重规则 `name`、`name (1).ext`、…，
+暂存目录与落盘目录跨卷时回退 copy+delete），返回 `{ success, taskId, localPath }`（无 sink 时
+`localPath` 省略）。落盘基目录：`DBX_SSH_DOWNLOAD_DIR` 覆盖 → `~/Downloads`（按需创建）→ `~` →
+`<data_dir>/downloads` 兜底；最终路径以 `finish` 返回为准并在完成通知/传输面板/历史中展示。
+取消（`sftp/transfer/cancel`）与会话关闭会删除 `.part` 暂存。
+
+- `local/capabilities`：无参。返回 `{ canSaveLocal: bool, downloadsDir, platform }`。`canSaveLocal`
+  判定"sidecar 与用户桌面同机"（macOS/Windows 恒真；Linux 需 `DISPLAY`/`WAYLAND_DISPLAY`；headless
+  web/docker 部署为 false，前端据此回退浏览器下载）；`DBX_SSH_LOCAL_SAVE`（`1`/`true`/`on`/`yes` 与
+  `0`/`false`/`off`/`no`）可强制覆盖该判定。前端按工作台生命周期缓存探测结果。
+- `local/reveal`：参数 `{ path }`。在该平台文件管理器中定位该文件（macOS `open -R`、Windows
+  `explorer /select,`、Linux `xdg-open` 父目录）。**安全约束**：`path` 必须与传输历史中某条
+  `completed` 下载行的 `localPath` 完全一致，否则拒绝——本方法不能成为任意路径打开原语。不进 MCP 工具面。
 
 ### ssh/metrics/history
 

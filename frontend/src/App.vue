@@ -84,6 +84,7 @@ import {
   TERMINAL_SEARCH_OPTIONS_KEY,
   terminalSearchSeedFromSelection,
   canAcceptTerminalDrop,
+  normalizeDropTargetDir,
   type TerminalSearchOptions,
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
@@ -94,6 +95,8 @@ import { focusableElements, nextFocusIndex, pickModalFocusTarget } from "./lib/m
 import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
+import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
+import { friendlySftpError } from "./lib/sftpErrors";
 import { expandSelection, filterSftpEntries, type SftpTypeFilter } from "./lib/sftpFileFilters";
 import { pushPathHistory, sanitizePathHistories } from "./lib/sftpPathHistory";
 import {
@@ -220,6 +223,8 @@ interface TransferTask {
   transferred: number;
   status: "queued" | "running" | "completed" | "cancelled" | "failed";
   error?: string;
+  // saveToLocal 下载完成后的本机落盘路径（用于展示与在文件管理器中定位）。
+  localPath?: string;
 }
 
 // sftp/transfer/history 行（落盘历史 + 内存 live 合并视图）：status 沿用现有枚举、无 queued。
@@ -235,6 +240,7 @@ interface TransferHistoryEntry {
   startedAt?: number;
   finishedAt?: number;
   error?: string;
+  localPath?: string;
 }
 
 interface WorkbenchState {
@@ -607,6 +613,13 @@ const recordingActive = ref(false);
 const recordingsOpen = ref(false);
 const recordings = ref<RecordingSummary[]>([]);
 const recordingsLoading = ref(false);
+// 删除确认走应用内弹窗：工作台 iframe 是 sandbox="allow-scripts"（无
+// allow-modals），window.confirm 恒返回 false——曾让删除按钮看起来完全失效。
+const recordingDeleteTarget = ref<RecordingSummary | null>(null);
+const recordingDeleteSubmitting = ref(false);
+// 行内导出进行中的 recordingId：多条记录共用全局导出锁（replayExporting），
+// 只有发起行显示 Encoding…，其余行仅禁用。
+const recordingExportingId = ref<string | null>(null);
 const replayState = ref<{ summary: RecordingSummary; events: ReplayEvent[] } | null>(null);
 const replayPlaying = ref(false);
 const replaySpeed = ref(1);
@@ -685,10 +698,17 @@ const searchMatchState = ref<TerminalSearchMatchState>("idle");
 const searchResultIndex = ref(0);
 const searchResultCount = ref(0);
 const pasteConfirm = ref<PasteConfirmation>();
+// 终端拖入文件的落点询问：null 表示取消；"cwd" 用 SFTP 当前目录（目录跟随
+// 开启时即 shell cwd）；{ dir } 是用户输入的目标目录（文件原名落其下）。
+const dropUploadPrompt = ref<{ files: File[] }>();
+const dropUploadTarget = ref<"cwd" | "custom">("cwd");
+const dropUploadPathInput = ref("");
+const dropUploadPathInputEl = ref<HTMLInputElement>();
 const terminalFontSize = ref(appearance.value.terminal.fontSize);
 // 终端 WebGL 渲染加速（对标 iShell GPU 加速）：localStorage 全局偏好，
 // 默认开；WebGL 不可用（headless/无 context）时静默回退 DOM 渲染。只有主
-// 终端挂 renderer——回放与 GIF 导出的离屏终端保持 2d canvas 路径。
+// 终端长期挂 renderer；回放弹窗保持 DOM 渲染，GIF 导出在导出期间给离屏
+// 终端临时挂载（取像素依赖 canvas），导出完随终端 dispose 释放 context。
 const webglEnabled = ref(loadWebglEnabled());
 const webglRenderer = ref<WebglRendererLike | null>(null);
 // True while attachSession sits inside its bounded backoff loop; turns the
@@ -754,6 +774,7 @@ let terminalMouseDownHandler: ((event: MouseEvent) => void) | undefined;
 let terminalMouseUpHandler: ((event: MouseEvent) => void) | undefined;
 let terminalMouseDownAt: { clientX: number; clientY: number } | undefined;
 let pasteConfirmResolver: ((accepted: boolean) => void) | undefined;
+let dropUploadResolver: ((choice: "cancel" | "cwd" | { dir: string }) => void) | undefined;
 let zoomNoticeTimer = 0;
 let resizeObserver: ResizeObserver | undefined;
 let disposeInput: { dispose(): void } | undefined;
@@ -1002,8 +1023,10 @@ function showNotice(message: string) {
 
 function showError(cause: unknown, target: "terminal" | "sftp" = "sftp") {
   const message = cause instanceof Error ? cause.message : String(cause);
-  if (target === "terminal") terminalError.value = message;
-  else sftpError.value = message;
+  // 常见错误（权限不足/文件不存在）翻成友好文案；其余原样透出。
+  const display = friendlySftpError(message, (key) => t(key)) ?? message;
+  if (target === "terminal") terminalError.value = display;
+  else sftpError.value = display;
 }
 
 function terminalTheme() {
@@ -1096,7 +1119,7 @@ function createTerminal() {
   // 选中复制（可在设置里关闭）：选择一变化即静默写入剪贴板，不弹提示。
   disposeSelectionCopy = terminal.onSelectionChange(() => {
     if (!termSelectCopy.value || !terminal?.hasSelection()) return;
-    void window.dbxPlugin.clipboard?.writeText(terminal.getSelection()).catch(() => undefined);
+    void writeClipboardText(terminal.getSelection(), clipboardDeps()).catch(() => undefined);
   });
   // 捕获阶段的 paste 监听：拦截 Ctrl+V 之外的所有粘贴路径（浏览器右键菜单等），
   // 统一走风险确认后再写入终端。
@@ -1146,13 +1169,16 @@ function handleTerminalKey(event: KeyboardEvent) {
     closeTerminalSearch();
     return consume();
   }
-  // iTerm2/XShell 风格组合键：Ctrl/Cmd+V 与 Ctrl/Cmd+Shift+V 粘贴（走同一风险
-  // 确认流程），Ctrl/Cmd+Shift+C 复制选区；普通 Ctrl+C 保持发给远端（SIGINT）。
+  // Windows Terminal/iTerm2 风格组合键：Ctrl/Cmd+V 与 Ctrl/Cmd+Shift+V 粘贴，
+  // Ctrl/Cmd+C 有选区时复制、无选区时保持发给远端（SIGINT）。
   const keyAction = resolveTerminalKeyAction({ mod, shiftKey: event.shiftKey, key: event.key, hasSelection: terminal?.hasSelection() ?? false });
   if (keyAction === "paste") {
-    // 同时取消原生 paste，避免浏览器与插件各粘贴一次。
-    void pasteFromClipboardToTerminal();
-    return consume();
+    // 不取消默认动作：放行浏览器原生 paste 事件（自带真实 clipboardData，
+    // 沙箱 iframe 中无需剪贴板读权限），由 terminalHost 的 capture 拦截器
+    // 统一走风险确认。stopPropagation 挡住宿主/文档级快捷键；返回 false
+    // 让 xterm 跳过该键，否则 Ctrl+V 会先作为 ^V 字符发给远端。
+    event.stopPropagation();
+    return false;
   }
   if (keyAction === "copy") {
     void copyTerminalSelection();
@@ -1304,7 +1330,7 @@ function waitForTerminalInputAck(sequence: number) {
   return new Promise<void>((resolve, reject) => {
     const timer = window.setTimeout(() => {
       terminalInputAckWaiters.delete(sequence);
-      reject(new Error("SSH terminal input acknowledgement timed out"));
+      reject(new Error(t("errors.terminalInputAckTimeout")));
     }, 15_000);
     terminalInputAckWaiters.set(sequence, { resolve, reject, timer });
   });
@@ -1987,7 +2013,7 @@ async function attachSession(sessionId: string, retryReference: string = initial
       workbenchId: workbenchId.value,
       afterSequence: lastSequence,
     }, { timeoutMs: 15_000 });
-    if (info.sessionId !== sessionId) throw new Error("The attached SSH session changed unexpectedly");
+    if (info.sessionId !== sessionId) throw new Error(t("errors.sessionChanged"));
     session.value = info;
     terminalState.value = "connected";
     reconnectPending.value = false;
@@ -2296,7 +2322,7 @@ async function copySuggestions() {
   const result = alertTriageResult.value;
   if (!result?.suggestions?.length) return;
   try {
-    await window.dbxPlugin.clipboard?.writeText(result.suggestions.map((item) => item.command).join("\n"));
+    await writeClipboardText(result.suggestions.map((item) => item.command).join("\n"), clipboardDeps());
     showNotice(t("terminalCopied"));
   } catch (cause) {
     showError(cause);
@@ -2787,7 +2813,9 @@ function blankMenuAction(action: "mkdir" | "newFile" | "refresh") {
 
 /** 通用剪贴板写入 + 已复制提示（行菜单/侧栏菜单共用；失败走 sftp 错误条）。 */
 function copyTextToClipboard(value: string, noticeKey: string, values?: Record<string, string | number>) {
-  void window.dbxPlugin.clipboard?.writeText(value).then(() => showNotice(t(noticeKey, values)));
+  void writeClipboardText(value, clipboardDeps())
+    .then(() => showNotice(t(noticeKey, values)))
+    .catch((cause) => showError(cause instanceof Error ? cause : new Error(String(cause))));
 }
 
 // R3-P1-3：目录列表加载的单调请求序号。慢链路下"先发 A 后发 B、A 晚到"
@@ -3726,19 +3754,20 @@ async function uploadHandleFiles(files: Array<{ handleId: string; name: string; 
   });
 }
 
-async function uploadLocalFiles(files: readonly File[]) {
+async function uploadLocalFiles(files: readonly File[], targetDir?: string) {
   openTransferPanel();
-  await runWithConcurrency([...files], 3, (file) => uploadSource(file.name, file.size, async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer())));
+  await runWithConcurrency([...files], 3, (file) => uploadSource(file.name, file.size, async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()), undefined, targetDir));
   await loadDirectory();
   if (files.length) showNotice(t("uploaded", { count: files.length }));
 }
 
-async function uploadSource(name: string, size: number, readChunk: (offset: number, length: number) => Promise<Uint8Array>, resume?: { taskId: string; remotePath: string }) {
+async function uploadSource(name: string, size: number, readChunk: (offset: number, length: number) => Promise<Uint8Array>, resume?: { taskId: string; remotePath: string }, targetDir?: string) {
   if (!session.value) return;
   // resume 携带原 taskId/remotePath：后端校验 spool meta 后从已传前缀续接。
+  // targetDir 仅新上传生效（终端拖入的自定义目标目录）；缺省仍是 SFTP 当前目录。
   const info = await window.dbxPlugin.invoke<{ taskId: string; chunkSize: number; resumeOffset?: number }>("sftp/upload/start", resume
     ? { sessionId: session.value.sessionId, remotePath: resume.remotePath, size, resumeTaskId: resume.taskId }
-    : { sessionId: session.value.sessionId, remotePath: joinRemote(currentPath.value, name), size });
+    : { sessionId: session.value.sessionId, remotePath: joinRemote(targetDir ?? currentPath.value, name), size });
   const startOffset = info.resumeOffset ?? 0;
   transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: name, size, transferred: startOffset, status: startOffset > 0 ? "running" : "queued" };
   try {
@@ -3746,7 +3775,7 @@ async function uploadSource(name: string, size: number, readChunk: (offset: numb
     while (offset < size) {
       await waitWhilePaused(info.taskId);
       const chunk = await readChunk(offset, info.chunkSize);
-      if (!chunk.byteLength) throw new Error("Local file ended before its declared size");
+      if (!chunk.byteLength) throw new Error(t("errors.localFileShortRead"));
       const payload = new Uint8Array(8 + chunk.byteLength);
       writeU64(payload, 0, offset);
       payload.set(chunk, 8);
@@ -3770,7 +3799,7 @@ function waitForUploadAck(taskId: string, nextOffset: number) {
       try {
         const status = await window.dbxPlugin.invoke<{ transferred: number; status: string }>("sftp/transfer/status", { taskId });
         if (status.transferred >= nextOffset && status.status === "running") resolve();
-        else reject(new Error("SFTP upload acknowledgement timed out"));
+        else reject(new Error(t("errors.uploadAckTimeout")));
       } catch (cause) {
         reject(cause instanceof Error ? cause : new Error(String(cause)));
       }
@@ -3779,21 +3808,35 @@ function waitForUploadAck(taskId: string, nextOffset: number) {
   });
 }
 
+// 本机落盘能力探测（sidecar local/capabilities）：宿主缺 fileTransfer API 时，
+// 桌面端 sidecar 可直接把下载写进本机下载目录；web/docker 模式探测失败或
+// canSaveLocal=false 时回退浏览器 <a download>。结果按工作台生命周期缓存。
+let localCapabilities: Promise<{ canSaveLocal: boolean; downloadsDir: string } | undefined> | undefined;
+function probeLocalCapabilities() {
+  localCapabilities ??= window.dbxPlugin
+    .invoke<{ canSaveLocal: boolean; downloadsDir: string }>("local/capabilities")
+    .catch(() => undefined);
+  return localCapabilities;
+}
+
 async function downloadEntry(entry: SftpEntry) {
   fileMenu.value = undefined;
   openTransferPanel();
   if (!session.value || entry.kind !== "file") return;
   const fileTransfer = window.dbxPlugin.fileTransfer;
-  // Web/Docker mode has no host save dialog; the whole file is buffered in browser
-  // memory before saving, so warn before starting large downloads.
-  if (!fileTransfer && (entry.size || 0) > WEB_DOWNLOAD_WARNING_BYTES && !window.confirm(t("webDownload.largeWarning", { name: entry.name, size: formatBytes(entry.size || 0) }))) return;
+  const local = fileTransfer ? undefined : await probeLocalCapabilities();
+  const saveToLocal = !!local?.canSaveLocal;
+  // Web/Docker mode has no local sink and no host save dialog; the whole file
+  // is buffered in browser memory before saving, so warn before large ones.
+  if (!fileTransfer && !saveToLocal && (entry.size || 0) > WEB_DOWNLOAD_WARNING_BYTES && !window.confirm(t("webDownload.largeWarning", { name: entry.name, size: formatBytes(entry.size || 0) }))) return;
   let info: DownloadInfo | undefined;
   let target: { handleId: string; chunkBytes: number } | undefined;
-  const chunks = fileTransfer ? undefined : ([] as Uint8Array[]);
+  const chunks = fileTransfer || saveToLocal ? undefined : ([] as Uint8Array[]);
   try {
     info = await window.dbxPlugin.invoke<DownloadInfo>("sftp/download/start", {
       sessionId: session.value.sessionId,
       remotePath: pathFromUri(entry.uri),
+      saveToLocal,
     });
     transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued" };
     target = fileTransfer ? await fileTransfer.beginSave({ name: info.fileName, size: info.size }) : undefined;
@@ -3807,8 +3850,8 @@ async function downloadEntry(entry: SftpEntry) {
       nextPromise.catch(() => undefined);
       const result = await nextPromise;
       const chunk = await chunkPromise;
-      if (chunk.byteLength !== result.length) throw new Error("SFTP download chunk length mismatch");
-      if (!result.eof && result.length === 0) throw new Error("SFTP download returned an empty chunk before end of file");
+      if (chunk.byteLength !== result.length) throw new Error(t("errors.downloadChunkLength"));
+      if (!result.eof && result.length === 0) throw new Error(t("errors.downloadEmptyChunk"));
       if (chunks) {
         chunks.push(chunk);
         offset += chunk.byteLength;
@@ -3817,23 +3860,37 @@ async function downloadEntry(entry: SftpEntry) {
           task.status = "running";
           task.transferred = offset;
         }
-      } else {
-        const write = await fileTransfer!.write(target!.handleId, offset, chunk);
+      } else if (fileTransfer && target) {
+        const write = await fileTransfer.write(target.handleId, offset, chunk);
         offset = write.nextOffset;
+      } else {
+        // saveToLocal：字节已在 sidecar 侧写入暂存文件，这里只跟进进度。
+        offset += chunk.byteLength;
+        const task = transferTasks[info.taskId];
+        if (task) {
+          task.status = "running";
+          task.transferred = offset;
+        }
       }
       if (result.eof) break;
     }
+    let localPath: string | undefined;
     if (target) {
       await fileTransfer!.finish(target.handleId);
       target = undefined;
     } else if (chunks) {
       saveBrowserDownload(chunks, info.fileName);
-      const task = transferTasks[info.taskId];
-      if (task) task.status = "completed";
     }
-    await window.dbxPlugin.invoke("sftp/download/finish", { taskId: info.taskId });
+    const finishResult = await window.dbxPlugin.invoke<{ localPath?: string }>("sftp/download/finish", { taskId: info.taskId });
+    localPath = finishResult?.localPath;
     cancelledTransferTasks.delete(info.taskId);
-    showNotice(t("downloaded", { name: info.fileName }));
+    const task = transferTasks[info.taskId];
+    if (task) {
+      task.status = "completed";
+      task.transferred = info.size;
+      if (localPath) task.localPath = localPath;
+    }
+    showNotice(localPath ? t("downloadedTo", { name: info.fileName, path: localPath }) : t("downloaded", { name: info.fileName }));
   } catch (cause) {
     if (info) {
       const waiter = downloadChunkWaiters.get(info.taskId);
@@ -3873,10 +3930,19 @@ function waitForDownloadChunk(taskId: string, offset: number) {
   return new Promise<Uint8Array>((resolve, reject) => {
     const timer = window.setTimeout(() => {
       downloadChunkWaiters.delete(taskId);
-      reject(new Error("SFTP download chunk timed out"));
+      reject(new Error(t("errors.downloadChunkTimeout")));
     }, 30_000);
     downloadChunkWaiters.set(taskId, { offset, resolve, reject, timer });
   });
+}
+
+// 在文件管理器中定位本机落盘的下载（sidecar 校验过该路径确为本插件记录）。
+async function revealTransferTarget(path: string) {
+  try {
+    await window.dbxPlugin.invoke("local/reveal", { path });
+  } catch (cause) {
+    showError(cause);
+  }
 }
 
 // —— 断点续传：暂停/恢复 + 可续传上传 ———
@@ -3975,6 +4041,17 @@ function onUploadInput(event: Event) {
   if (files.length) void uploadLocalFiles(files).catch(showError);
 }
 
+// File-manager copy/paste lands as ClipboardEvent.files in desktop webviews
+// that expose native file clipboard data. Text paste remains untouched so the
+// path/search inputs and terminal keep their normal clipboard semantics.
+function onSftpPaste(event: ClipboardEvent) {
+  if (!connected.value || !canWrite.value) return;
+  const files = Array.from(event.clipboardData?.files || []);
+  if (!files.length) return;
+  event.preventDefault();
+  void uploadLocalFiles(files).catch(showError);
+}
+
 function onDrop(event: DragEvent) {
   dragActive.value = false;
   if (!canWrite.value) return;
@@ -3991,23 +4068,77 @@ function onTerminalDragEnter(event: DragEvent) {
 function onTerminalDrop(event: DragEvent) {
   terminalDragActive.value = false;
   if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) return;
-  // Files dropped on the terminal upload into the SFTP current directory —
-  // with directory tracking on this is the shell's cwd, so the terminal alone
-  // (SFTP pane closed) is a complete upload entry point.
+  // Files dropped on the terminal ask for a landing directory first: the
+  // shell's cwd (SFTP directory tracking) or any absolute directory typed in
+  // the prompt — silence would make a wrong-guess overwrite too easy.
   const files = Array.from(event.dataTransfer?.files || []);
   if (!files.length) return;
-  void uploadLocalFiles(files).catch(showError);
+  void runTerminalDropUpload(files);
+}
+
+async function runTerminalDropUpload(files: File[]) {
+  const choice = await askDropUploadTarget(files);
   terminal?.focus();
+  if (choice === "cancel") return;
+  try {
+    await uploadLocalFiles(files, choice === "cwd" ? undefined : choice.dir);
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
+function askDropUploadTarget(files: File[]): Promise<"cancel" | "cwd" | { dir: string }> {
+  dropUploadTarget.value = "cwd";
+  dropUploadPathInput.value = "";
+  return new Promise((resolve) => {
+    dropUploadResolver = resolve;
+    dropUploadPrompt.value = { files };
+  });
+}
+
+// 选中“指定目录”即聚焦路径输入框（禁用态拿不到焦点，所以不在打开时聚焦）：
+// 键盘流为拖入 → Tab/方向键切到自定义 → 直接输入 → Enter 提交。
+watch(dropUploadTarget, async (target) => {
+  if (target !== "custom") return;
+  await nextTick();
+  dropUploadPathInputEl.value?.focus();
+});
+
+function confirmDropUpload() {
+  if (!dropUploadPrompt.value) return;
+  if (dropUploadTarget.value === "custom") {
+    const dir = normalizeDropTargetDir(dropUploadPathInput.value);
+    if (!dir) return;
+    resolveDropUpload({ dir });
+    return;
+  }
+  resolveDropUpload("cwd");
+}
+
+function resolveDropUpload(choice: "cancel" | "cwd" | { dir: string }) {
+  dropUploadPrompt.value = undefined;
+  const resolve = dropUploadResolver;
+  dropUploadResolver = undefined;
+  resolve?.(choice);
+}
+
+// 沙箱 iframe 的剪贴板依赖注入：宿主桥是 optional 且现网宿主未提供，
+// 缺失/拒绝时由 clipboardBridge 逐级降级（见 lib/clipboardBridge.ts）。
+function clipboardDeps(): ClipboardDeps {
+  return {
+    bridge: window.dbxPlugin.clipboard ?? null,
+    nativeClipboard: typeof navigator !== "undefined" ? (navigator as Navigator & { clipboard?: ClipboardDeps["nativeClipboard"] }).clipboard ?? null : null,
+  };
 }
 
 async function copyTerminalSelection() {
   const text = terminal?.getSelection() || "";
   if (!text) return;
   try {
-    await window.dbxPlugin.clipboard?.writeText(text);
+    await writeClipboardText(text, clipboardDeps());
     showNotice(t("terminalCopied"));
-  } catch (cause) {
-    showError(new Error(t("terminalCopyFailed", { error: cause instanceof Error ? cause.message : String(cause) })), "terminal");
+  } catch {
+    showError(new Error(t("terminalCopyUnavailable")), "terminal");
   }
   terminalMenu.value = undefined;
   terminal?.focus();
@@ -4016,20 +4147,12 @@ async function copyTerminalSelection() {
 async function pasteTerminal() {
   terminalMenu.value = undefined;
   try {
-    const text = await window.dbxPlugin.clipboard?.readText();
+    const text = await readClipboardText(clipboardDeps());
     await sendConfirmedPaste(text || "");
-  } catch (cause) {
-    showError(new Error(t("terminalPasteFailed", { error: cause instanceof Error ? cause.message : String(cause) })), "terminal");
+  } catch {
+    // 读剪贴板全链失败（宿主桥缺失 + 沙箱拒绝）：引导走原生 paste 快捷键。
+    showError(new Error(t("terminalPasteUseShortcut")), "terminal");
     terminal?.focus();
-  }
-}
-
-async function pasteFromClipboardToTerminal() {
-  try {
-    const text = await window.dbxPlugin.clipboard?.readText();
-    await sendConfirmedPaste(text || "");
-  } catch (cause) {
-    showError(new Error(t("terminalPasteFailed", { error: cause instanceof Error ? cause.message : String(cause) })), "terminal");
   }
 }
 
@@ -4597,7 +4720,7 @@ async function measureLatency() {
       command: "echo dbx-rtt-probe",
       timeoutSecs: 8,
     }, { timeoutMs: 15_000 });
-    if (!result.output.includes("dbx-rtt-probe")) throw new Error("unexpected probe output");
+    if (!result.output.includes("dbx-rtt-probe")) throw new Error(t("errors.probeOutput"));
     connectionLatency.value = performance.now() - startedAt;
   } catch {
     connectionLatency.value = null;
@@ -4750,13 +4873,22 @@ function toggleRecordings() {
   if (recordingsOpen.value) void loadRecordings();
 }
 
-async function deleteRecording(item: RecordingSummary) {
-  if (!window.confirm(t("recordingDeleteConfirm", { host: item.host || item.recordingId }))) return;
+function deleteRecording(item: RecordingSummary) {
+  recordingDeleteTarget.value = item;
+}
+
+async function confirmRecordingDelete() {
+  const item = recordingDeleteTarget.value;
+  if (!item || recordingDeleteSubmitting.value) return;
+  recordingDeleteSubmitting.value = true;
   try {
     await window.dbxPlugin.invoke("ssh/recording/delete", { recordingId: item.recordingId });
+    recordingDeleteTarget.value = null;
     await loadRecordings();
   } catch (cause) {
     showError(cause);
+  } finally {
+    recordingDeleteSubmitting.value = false;
   }
 }
 
@@ -4858,61 +4990,109 @@ function onReplaySeek(event: Event) {
   }
 }
 
-// GIF 导出：离屏 xterm 逐事件重放，按 500ms 事件时间抽帧（封顶 120 帧），
-// 每帧从 xterm 画布取像素 → encodeGif。纯前端，无新依赖。
+// GIF 导出管线：离屏 xterm 逐事件重放，按 500ms 事件时间抽帧（封顶 120 帧），
+// 每帧从 xterm 画布取像素 → encodeGif。纯前端，无新依赖。回放弹窗与录制
+// 列表行内按钮共用；调用方负责 replayExporting 状态与错误呈现。
+async function exportRecordingGif(summary: RecordingSummary, events: readonly ReplayEvent[]) {
+  const COLS = 80;
+  const ROWS = 24;
+  const FRAME_INTERVAL_MS = 500;
+  const MAX_FRAMES = 120;
+  const host = document.createElement("div");
+  host.style.cssText = "position:fixed;left:-99999px;top:0;";
+  document.body.appendChild(host);
+  let term: Terminal | null = null;
+  try {
+    term = new Terminal({ cols: COLS, rows: ROWS });
+    term.open(host);
+    // xterm 默认 DOM 渲染器不产生 canvas，逐帧取像素必须挂 WebGL renderer
+    // （addon 内部 preserveDrawingBuffer，drawImage 出来的帧才稳定）。渲染器
+    // 随终端 dispose，不长期占用浏览器有限的 WebGL context；挂载失败
+    // （headless/无 WebGL）走 !screen 分支给出明确错误，而不是永远空帧。
+    attachWebglRenderer(term, () => new WebglAddon());
+    const screen = host.querySelector("canvas") as HTMLCanvasElement | null;
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!screen || !context) throw new Error(t("replayExportFailed"));
+    canvas.width = screen.width;
+    canvas.height = screen.height;
+    const timeline = buildTimeline(events, 1);
+    const plan = gifFramePlan(timeline, FRAME_INTERVAL_MS, MAX_FRAMES);
+    const frames: Array<{ rgba: Uint8Array; delayMs: number }> = [];
+    let written = 0;
+    for (const boundary of plan) {
+      while (written < boundary) {
+        term.write(events[written]!.data);
+        written += 1;
+      }
+      // 等两帧渲染再取像素：正常窗口双 rAF 精确等待；标签页被隐藏等场景
+      // rAF 永不回调，用 250ms 定时兜底，导出流程永不悬挂在 Encoding…。
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const settle = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        requestAnimationFrame(() => requestAnimationFrame(settle));
+        window.setTimeout(settle, 250);
+      });
+      context.drawImage(screen, 0, 0);
+      frames.push({ rgba: new Uint8Array(context.getImageData(0, 0, canvas.width, canvas.height).data), delayMs: FRAME_INTERVAL_MS });
+    }
+    term.dispose();
+    term = null;
+    const gif = encodeGif(canvas.width, canvas.height, frames);
+    const fileName = `${summary.recordingId || "session"}.gif`;
+    // 落盘走宿主 fileTransfer（与 SFTP 下载同通道）：宿主沙箱里 <a download>
+    // 点击常被拦截或落点不可见，那正是“导出报错/没有文件”的来源。web/docker
+    // 模式缺失 fileTransfer 时才退回浏览器下载。
+    const fileTransfer = window.dbxPlugin.fileTransfer;
+    if (fileTransfer) {
+      const target = await fileTransfer.beginSave({ name: fileName, size: gif.byteLength });
+      try {
+        await fileTransfer.write(target.handleId, 0, gif);
+        await fileTransfer.finish(target.handleId);
+      } catch (cause) {
+        await fileTransfer.cancel(target.handleId).catch(() => undefined);
+        throw cause;
+      }
+    } else {
+      saveBrowserDownload([gif], fileName);
+    }
+    showNotice(t("replayExported"));
+  } finally {
+    term?.dispose();
+    host.remove();
+  }
+}
+
 async function exportReplayGif() {
   const state = replayState.value;
   if (!state || replayExporting.value || !state.events.length) return;
   replayExporting.value = true;
   try {
-    const COLS = 80;
-    const ROWS = 24;
-    const FRAME_INTERVAL_MS = 500;
-    const MAX_FRAMES = 120;
-    const host = document.createElement("div");
-    host.style.cssText = "position:fixed;left:-99999px;top:0;";
-    document.body.appendChild(host);
-    try {
-      const term = new Terminal({ cols: COLS, rows: ROWS });
-      term.open(host);
-      const screen = host.querySelector("canvas") as HTMLCanvasElement | null;
-      const canvas = document.createElement("canvas");
-      const context = canvas.getContext("2d");
-      if (!screen || !context) throw new Error(t("replayExportGif"));
-      canvas.width = screen.width;
-      canvas.height = screen.height;
-      const timeline = buildTimeline(state.events, 1);
-      const plan = gifFramePlan(timeline, FRAME_INTERVAL_MS, MAX_FRAMES);
-      const frames: Array<{ rgba: Uint8Array; delayMs: number }> = [];
-      let written = 0;
-      for (const boundary of plan) {
-        while (written < boundary) {
-          term.write(state.events[written]!.data);
-          written += 1;
-        }
-        // 等 xterm 完成两帧渲染再取像素。
-        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-        context.drawImage(screen, 0, 0);
-        frames.push({ rgba: new Uint8Array(context.getImageData(0, 0, canvas.width, canvas.height).data), delayMs: FRAME_INTERVAL_MS });
-      }
-      term.dispose();
-      const gif = encodeGif(canvas.width, canvas.height, frames);
-      const blob = new Blob([gif as unknown as BlobPart], { type: "image/gif" });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `${state.summary.recordingId || "session"}.gif`;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
-      showNotice(t("replayExported"));
-    } finally {
-      host.remove();
-    }
+    await exportRecordingGif(state.summary, state.events);
   } catch (cause) {
     showError(cause);
   } finally {
+    replayExporting.value = false;
+  }
+}
+
+// 列表行内导出：按需拉取事件（回放窗不必先打开），再走同一导出管线。
+async function exportRecordingFromList(item: RecordingSummary) {
+  if (replayExporting.value) return;
+  replayExporting.value = true;
+  recordingExportingId.value = item.recordingId;
+  try {
+    const events = await loadReplayEvents(item.recordingId);
+    if (!events.length) throw new Error(t("replayExportFailed"));
+    await exportRecordingGif(item, events);
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    recordingExportingId.value = null;
     replayExporting.value = false;
   }
 }
@@ -4942,6 +5122,44 @@ async function refreshDiskUsage() {
   diskUsage.value = await window.dbxPlugin
     .invoke<DiskUsage>("sftp/diskUsage", { sessionId: session.value.sessionId, path: currentPath.value }, { timeoutMs: 30_000 })
     .catch(() => undefined);
+}
+
+// 权限矩阵（所有者/属组/其他人 × 读/写/执行）与八进制草稿双向换算：
+// 草稿非法或为空时以 0 为基准，setuid/setgid/sticky 高位原样保留。
+const PERM_ROLES = [
+  { who: 6, key: "permOwner" },
+  { who: 3, key: "permGroup" },
+  { who: 0, key: "permOthers" },
+] as const;
+const PERM_COLUMNS = [
+  { bit: 4, key: "permRead" },
+  { bit: 2, key: "permWrite" },
+  { bit: 1, key: "permExec" },
+] as const;
+
+function draftModeBits(raw: string): number {
+  const text = raw.trim();
+  return /^[0-7]{3,4}$/.test(text) ? parseInt(text, 8) : 0;
+}
+
+function permBit(raw: string, who: number, bit: number): boolean {
+  return Boolean(draftModeBits(raw) & (bit << who));
+}
+
+function applyPermBit(raw: string, who: number, bit: number, on: boolean): string {
+  const bits = draftModeBits(raw);
+  const mode = on ? bits | (bit << who) : bits & ~(bit << who);
+  return `0${mode.toString(8)}`;
+}
+
+function toggleChmodPerm(who: number, bit: number, event: Event) {
+  const input = event.target;
+  if (input instanceof HTMLInputElement) chmodDraft.value = applyPermBit(chmodDraft.value, who, bit, input.checked);
+}
+
+function toggleAttrsPerm(who: number, bit: number, event: Event) {
+  const input = event.target;
+  if (input instanceof HTMLInputElement) attrsMode.value = applyPermBit(attrsMode.value, who, bit, input.checked);
 }
 
 function beginChmod(entry: SftpEntry) {
@@ -5438,9 +5656,11 @@ function trackStableFocus(event: FocusEvent) {
 const modalOpenStates = computed(() => [
   previewOpen.value,
   pasteConfirm.value,
+  dropUploadPrompt.value,
   attrsTarget.value,
   deleteTarget.value,
   batchDeleteOpen.value,
+  recordingDeleteTarget.value !== null,
   chmodTarget.value,
   newFileDialog.value,
   operationDialog.value,
@@ -5522,6 +5742,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
     resolvePasteConfirm(false);
     return;
   }
+  if (dropUploadPrompt.value) {
+    resolveDropUpload("cancel");
+    return;
+  }
   if (attrsTarget.value) {
     closeAttributes();
     return;
@@ -5532,6 +5756,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
   }
   if (batchDeleteOpen.value) {
     if (!batchDeleteSubmitting.value) batchDeleteOpen.value = false;
+    return;
+  }
+  if (recordingDeleteTarget.value) {
+    if (!recordingDeleteSubmitting.value) recordingDeleteTarget.value = null;
     return;
   }
   if (chmodTarget.value) {
@@ -5693,7 +5921,7 @@ async function initialize() {
   });
   await nextTick();
   createTerminal();
-  if (!connectionId.value || !workbenchId.value) throw new Error("DBX did not provide connectionId/workbenchId");
+  if (!connectionId.value || !workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
   const state = initialState();
   if (restored.value) {
     terminalState.value = "disconnected";
@@ -5792,15 +6020,15 @@ onBeforeUnmount(() => {
   terminal?.dispose();
   for (const waiter of uploadAckWaiters.values()) {
     window.clearTimeout(waiter.timer);
-    waiter.reject(new Error("Workbench detached"));
+    waiter.reject(new Error(t("errors.workbenchDetached")));
   }
   for (const waiter of terminalInputAckWaiters.values()) {
     window.clearTimeout(waiter.timer);
-    waiter.reject(new Error("Workbench detached"));
+    waiter.reject(new Error(t("errors.workbenchDetached")));
   }
   for (const waiter of downloadChunkWaiters.values()) {
     window.clearTimeout(waiter.timer);
-    waiter.reject(new Error("Workbench detached"));
+    waiter.reject(new Error(t("errors.workbenchDetached")));
   }
 });
 </script>
@@ -5951,8 +6179,10 @@ onBeforeUnmount(() => {
               <div class="transfer-title"><FileUp v-if="task.direction === 'upload'" /><Download v-else /><span>{{ task.fileName || task.taskId }}</span><strong>{{ transferPercent(task) }}%</strong></div>
               <progress :value="transferPercent(task)" max="100" />
               <div class="transfer-meta"><span>{{ t(`transferStatus.${task.status}`) }}</span><span>{{ formatBytes(task.transferred) }} / {{ formatBytes(task.size) }}</span><span v-if="transferSpeeds[task.taskId]">{{ formatBytes(transferSpeeds[task.taskId]) }}/s</span></div>
+              <p v-if="task.localPath" class="transfer-path mono" :title="task.localPath">{{ task.localPath }}</p>
               <button v-if="transferPausable(task.status)" class="link-button" @click="toggleTransferPause(task)">{{ t(pausedTaskIds.has(task.taskId) ? "transferResume" : "transferPause") }}</button>
               <button v-if="task.status === 'queued' || task.status === 'running'" class="link-button" @click="cancelTransfer(task)">{{ t("cancel") }}</button>
+              <button v-if="task.localPath" class="link-button" @click="revealTransferTarget(task.localPath)">{{ t("revealInFolder") }}</button>
               <p v-if="task.error" class="task-error">{{ task.error }}</p>
             </article>
             <!-- 可续传上传：中断任务的 spool 前缀仍在，选同名同大小文件续传 -->
@@ -5977,6 +6207,8 @@ onBeforeUnmount(() => {
               <article v-for="entry in transferHistory" :key="entry.taskId" class="transfer-card transfer-history-card">
                 <div class="transfer-title"><FileUp v-if="entry.direction === 'upload'" /><Download v-else /><span :title="entry.fileName">{{ entry.fileName || entry.taskId }}</span><strong>{{ formatBytes(entry.size) }}</strong></div>
                 <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span v-if="entry.transferred">{{ formatBytes(entry.transferred) }}</span></div>
+                <p v-if="entry.localPath" class="transfer-path mono" :title="entry.localPath">{{ entry.localPath }}</p>
+                <button v-if="entry.localPath" class="link-button" @click="revealTransferTarget(entry.localPath)">{{ t("revealInFolder") }}</button>
                 <p v-if="entry.error" class="task-error">{{ entry.error }}</p>
               </article>
             </template>
@@ -5991,7 +6223,7 @@ onBeforeUnmount(() => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
         <div ref="terminalHost" class="terminal-host" />
-        <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint", { path: currentPath }) }}</strong></div>
+        <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint") }}</strong></div>
         <TerminalSearchPanel
           v-if="searchOpen"
           :locale="locale"
@@ -6072,7 +6304,7 @@ onBeforeUnmount(() => {
                 <div class="metric-card">
                   <strong>{{ metrics.memory?.totalBytes ? Math.round(((metrics.memory.usedBytes ?? 0) / metrics.memory.totalBytes) * 100) : "–" }}%</strong>
                   <span>{{ t("metricsMemory") }}</span>
-                  <small v-if="metrics.memory?.totalBytes">{{ formatBytes(metrics.memory.usedBytes) }} / {{ formatBytes(metrics.memory.totalBytes) }}<template v-if="metrics.memory.swapTotalBytes"> · swap {{ formatBytes(metrics.memory.swapUsedBytes ?? 0) }}</template></small>
+                  <small v-if="metrics.memory?.totalBytes">{{ formatBytes(metrics.memory.usedBytes) }} / {{ formatBytes(metrics.memory.totalBytes) }}<template v-if="metrics.memory.swapTotalBytes"> · {{ t("metricsSwap") }} {{ formatBytes(metrics.memory.swapUsedBytes ?? 0) }}</template></small>
                 </div>
                 <div class="metric-card" v-if="metrics.uptimeSeconds != null">
                   <strong>{{ formatUptime(metrics.uptimeSeconds) }}</strong>
@@ -6086,7 +6318,7 @@ onBeforeUnmount(() => {
               </div>
               <div v-if="metrics.disks?.length" class="metrics-disks">
                 <div v-for="disk in metrics.disks" :key="disk.mount" class="disk-row">
-                  <span class="mono">{{ disk.mount }}</span>
+                  <span class="mono" :title="disk.mount">{{ disk.mount }}</span>
                   <progress :value="Math.min(100, disk.percentUsed)" max="100" :class="{ 'disk-warn': disk.percentUsed >= 85 }" />
                   <span class="numeric">{{ formatBytes(disk.usedBytes) }} / {{ formatBytes(disk.totalBytes) }} · {{ Math.round(disk.percentUsed) }}%</span>
                 </div>
@@ -6106,7 +6338,7 @@ onBeforeUnmount(() => {
                     class="disk-row"
                     :title="`rx ${formatBytes(net.rxTotal)} · tx ${formatBytes(net.txTotal)}`"
                   >
-                    <span class="mono">{{ net.name }}</span>
+                    <span class="mono" :title="net.name">{{ net.name }}</span>
                     <progress :value="networkRateShare(net)" max="100" />
                     <span class="numeric">↓ {{ formatRate(net.rxRate) }} · ↑ {{ formatRate(net.txRate) }}</span>
                   </div>
@@ -6186,6 +6418,7 @@ onBeforeUnmount(() => {
               <div class="transfer-meta"><span>{{ formatRecordedAt(item.startedAt) }}</span><span v-if="item.bytes">{{ formatBytes(item.bytes) }}</span></div>
               <div class="recording-actions">
                 <button class="link-button" @click="openReplay(item)">{{ t("replayOpen") }}</button>
+                <button class="link-button" :disabled="replayExporting" @click="exportRecordingFromList(item)">{{ recordingExportingId === item.recordingId ? t("replayExporting") : t("replayExportGif") }}</button>
                 <button class="link-button recording-delete" @click="deleteRecording(item)">{{ t("recordingDelete") }}</button>
               </div>
             </article>
@@ -6302,7 +6535,7 @@ onBeforeUnmount(() => {
 
       <div v-if="sftpPaneOpen" class="divider" @pointerdown="startDividerDrag" />
 
-      <section v-if="sftpPaneOpen" class="sftp-pane" :class="{ 'drag-active': dragActive }" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop">
+      <section v-if="sftpPaneOpen" class="sftp-pane" :class="{ 'drag-active': dragActive }" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop" @paste="onSftpPaste">
         <div class="path-toolbar">
           <button class="icon-button" :title="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
           <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
@@ -6581,6 +6814,16 @@ onBeforeUnmount(() => {
     <section v-if="chmodTarget" class="modal-backdrop" @mousedown.self="chmodTarget = undefined">
       <article class="modal small-modal">
         <header><h2>{{ t("permissionsEdit") }} · {{ chmodTarget.name }}</h2><button class="icon-button" @click="chmodTarget = undefined"><X /></button></header>
+        <div class="perm-matrix" role="group" :aria-label="t('permissionsEdit')">
+          <span></span>
+          <span v-for="column in PERM_COLUMNS" :key="column.bit" class="perm-matrix-head">{{ t(column.key) }}</span>
+          <template v-for="role in PERM_ROLES" :key="role.who">
+            <span class="perm-matrix-role">{{ t(role.key) }}</span>
+            <label v-for="column in PERM_COLUMNS" :key="column.bit" class="perm-matrix-cell">
+              <input type="checkbox" :checked="permBit(chmodDraft, role.who, column.bit)" @change="toggleChmodPerm(role.who, column.bit, $event)" />
+            </label>
+          </template>
+        </div>
         <input v-model="chmodDraft" class="mono" spellcheck="false" :placeholder="t('permissionsPlaceholder')" @keydown.enter="confirmChmod" />
         <p class="muted">{{ t("permissionsHint") }}</p>
         <footer><button @click="chmodTarget = undefined">{{ t("cancel") }}</button><button class="primary-button" :disabled="!chmodDraft.trim() || chmodSubmitting" @click="confirmChmod">{{ t("confirm") }}</button></footer>
@@ -6601,6 +6844,15 @@ onBeforeUnmount(() => {
         <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("sftpBatch.selected", { count: selectedEntries.length }) }}</strong><p class="muted">{{ t("sftpBatch.deleteMessage") }}</p></div></div>
         <div v-if="batchProgress" class="batch-progress-row"><progress class="batch-progress-bar" :value="batchProgressPercent(batchProgress)" max="100" /><span class="batch-progress mono">{{ t("sftpBatch.progress", { done: batchProgress.done, total: batchProgress.total }) }}</span></div>
         <footer><button @click="batchDeleteOpen = false" :disabled="batchDeleteSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="batchDeleteSubmitting" @click="confirmBatchDelete"><Loader2 v-if="batchDeleteSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
+      </article>
+    </section>
+
+    <!-- 录制删除确认：应用内弹窗替代 window.confirm（宿主沙箱 iframe 无 allow-modals，confirm 恒 false） -->
+    <section v-if="recordingDeleteTarget" class="modal-backdrop" @mousedown.self="recordingDeleteTarget = null">
+      <article class="modal small-modal destructive-modal">
+        <header><h2>{{ t("recordingDelete") }}</h2><button class="icon-button" @click="recordingDeleteTarget = null"><X /></button></header>
+        <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("recordingDeleteConfirm", { host: recordingDeleteTarget.host || recordingDeleteTarget.recordingId }) }}</strong><p class="muted">{{ formatRecordedAt(recordingDeleteTarget.startedAt) }} · {{ formatDuration(recordingDeleteTarget.durationSecs ?? 0) }}</p></div></div>
+        <footer><button @click="recordingDeleteTarget = null" :disabled="recordingDeleteSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="recordingDeleteSubmitting" @click="confirmRecordingDelete"><Loader2 v-if="recordingDeleteSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
       </article>
     </section>
 
@@ -6625,9 +6877,19 @@ onBeforeUnmount(() => {
             <dt>{{ t("sftpAttrs.owner") }}</dt><dd>{{ [attrsInfo.owner, attrsInfo.group].filter(Boolean).join(":") || "–" }}</dd>
             <dt>{{ t("sftpAttrs.modified") }}</dt><dd>{{ formatModified(attrsInfo.modifiedAt) || "–" }}</dd>
           </dl>
+          <div class="perm-matrix" role="group" :aria-label="t('sftpAttrs.permissions')">
+            <span></span>
+            <span v-for="column in PERM_COLUMNS" :key="column.bit" class="perm-matrix-head">{{ t(column.key) }}</span>
+            <template v-for="role in PERM_ROLES" :key="role.who">
+              <span class="perm-matrix-role">{{ t(role.key) }}</span>
+              <label v-for="column in PERM_COLUMNS" :key="column.bit" class="perm-matrix-cell">
+                <input type="checkbox" :disabled="!canWrite" :checked="permBit(attrsMode, role.who, column.bit)" @change="toggleAttrsPerm(role.who, column.bit, $event)" />
+              </label>
+            </template>
+          </div>
           <label class="attrs-permissions-edit">
             <span>{{ t("sftpAttrs.permissions") }}</span>
-            <input v-model="attrsMode" class="mono" spellcheck="false" :placeholder="t('permissionsPlaceholder')" @keydown.enter="saveAttributesPermissions" />
+            <input v-model="attrsMode" class="mono" spellcheck="false" :placeholder="t('permissionsPlaceholder')" :disabled="!canWrite" @keydown.enter="saveAttributesPermissions" />
           </label>
           <p class="muted">{{ t("permissionsHint") }}</p>
         </template>
@@ -6692,7 +6954,7 @@ onBeforeUnmount(() => {
                   <input v-model="profileDraft.sudoPassword" type="password" autocomplete="off" :placeholder="profileDraftHadPassword ? t('profilesPasswordKeep') : t('settingsSudoPasswordPlaceholder')" />
                 </label>
                 <label class="settings-field">
-                  <span>{{ t("profilesTotp") }}</span>
+                  <span>{{ t("settingsTotp") }}</span>
                   <textarea v-model="profileDraft.totpSecret" rows="2" spellcheck="false" :placeholder="profileDraftHadTotp ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
                 </label>
                 <label class="settings-field">
@@ -6844,8 +7106,8 @@ onBeforeUnmount(() => {
             <label class="settings-field">
               <span>{{ t("mcpSettings.permissionMode") }}</span>
               <select v-model="mcpDraft.permissionMode">
-                <option value="autonomous">autonomous</option>
-                <option value="confirm">confirm</option>
+                <option value="autonomous">{{ t("mcpSettings.permissionModeAutonomous") }}</option>
+                <option value="confirm">{{ t("mcpSettings.permissionModeConfirm") }}</option>
               </select>
             </label>
             <p v-if="mcpDraft.permissionMode === 'confirm'" class="muted settings-note">{{ t("mcpSettings.permissionModeConfirmHint") }}</p>
@@ -6937,7 +7199,7 @@ onBeforeUnmount(() => {
               <input v-model="profileDraft.sudoPassword" type="password" autocomplete="off" :placeholder="profileDraftHadPassword ? t('profilesPasswordKeep') : t('settingsSudoPasswordPlaceholder')" />
             </label>
             <label class="settings-field">
-              <span>{{ t("profilesTotp") }}</span>
+              <span>{{ t("settingsTotp") }}</span>
               <textarea v-model="profileDraft.totpSecret" rows="2" spellcheck="false" :placeholder="profileDraftHadTotp ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
             </label>
             <label class="settings-field">
@@ -7064,6 +7326,40 @@ onBeforeUnmount(() => {
       </article>
     </section>
 
+    <section v-if="dropUploadPrompt" class="modal-backdrop" @mousedown.self="resolveDropUpload('cancel')">
+      <article class="modal small-modal">
+        <header>
+          <h2>{{ t("terminalDropPrompt.title") }}</h2>
+          <button class="icon-button" @click="resolveDropUpload('cancel')"><X /></button>
+        </header>
+        <p class="muted">{{ t("terminalDropPrompt.summary", { count: dropUploadPrompt.files.length }) }}</p>
+        <pre class="command-output mono drop-file-list">{{ dropUploadPrompt.files.map((file) => file.name).join("\n") }}</pre>
+        <label class="drop-option">
+          <input v-model="dropUploadTarget" type="radio" name="drop-upload-target" value="cwd" />
+          <span>{{ t("terminalDropPrompt.toCurrent") }}</span>
+          <code class="mono">{{ currentPath }}</code>
+        </label>
+        <label class="drop-option">
+          <input v-model="dropUploadTarget" type="radio" name="drop-upload-target" value="custom" />
+          <span>{{ t("terminalDropPrompt.toCustom") }}</span>
+        </label>
+        <input
+          ref="dropUploadPathInputEl"
+          v-model="dropUploadPathInput"
+          class="drop-path-input mono"
+          type="text"
+          spellcheck="false"
+          :placeholder="t('terminalDropPrompt.pathPlaceholder')"
+          :disabled="dropUploadTarget !== 'custom'"
+          @keydown.enter.prevent="confirmDropUpload"
+        />
+        <footer>
+          <button @click="resolveDropUpload('cancel')">{{ t("cancel") }}</button>
+          <button class="primary-button" :disabled="dropUploadTarget === 'custom' && !normalizeDropTargetDir(dropUploadPathInput)" @click="confirmDropUpload">{{ t("upload") }}</button>
+        </footer>
+      </article>
+    </section>
+
     <input ref="uploadInput" class="hidden" type="file" multiple @change="onUploadInput" />
     <input ref="zmodemInput" class="hidden" type="file" multiple @change="onZmodemInput" />
     <input ref="trzszInput" class="hidden" type="file" multiple @change="onTrzszPickInput" @cancel="onTrzszPickCancel" />
@@ -7116,6 +7412,12 @@ onBeforeUnmount(() => {
 .attrs-permissions-edit { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .attrs-permissions-edit span { flex: 0 0 auto; color: var(--muted-foreground); }
 .attrs-permissions-edit input { flex: 1; }
+/* 权限矩阵：所有者/属组/其他人 × 读/写/执行勾选，与八进制输入双向联动 */
+.perm-matrix { display: grid; grid-template-columns: minmax(56px, auto) repeat(3, 1fr); gap: 4px 6px; align-items: center; margin: 2px 0 8px; font-size: 12px; }
+.perm-matrix-head { color: var(--muted-foreground); font-size: 11px; text-align: center; }
+.perm-matrix-role { color: var(--muted-foreground); white-space: nowrap; }
+.perm-matrix-cell { display: flex; justify-content: center; }
+.perm-matrix-cell input { width: 13px; height: 13px; margin: 0; accent-color: var(--primary); }
 
 /* 工具栏 A+/A- 字号步进按钮（复用 Ctrl+滚轮的 clampFontSize 语义） */
 .font-step-label { font-size: 11px; font-weight: 600; line-height: 1; letter-spacing: 0; }
@@ -7200,4 +7502,12 @@ onBeforeUnmount(() => {
 .replay-seek { flex: 1; }
 .replay-speed { width: 76px; }
 .replay-time { min-width: 110px; text-align: right; font-size: 12px; color: var(--muted-foreground); }
+/* 终端拖入上传落点询问：文件清单限高滚动，路径行对齐 radio 观感。 */
+.drop-file-list { max-height: 132px; margin: 0; overflow: auto; white-space: pre; }
+.drop-option { display: flex; align-items: center; gap: 7px; margin: 2px 0; font-size: 12px; cursor: pointer; }
+.drop-option input { accent-color: var(--primary); }
+.drop-option code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); font-size: 11px; }
+.drop-path-input { width: 100%; height: 28px; border: 1px solid var(--border); border-radius: 5px; padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.drop-path-input:focus { outline: none; border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
+.drop-path-input:disabled { opacity: .5; }
 </style>

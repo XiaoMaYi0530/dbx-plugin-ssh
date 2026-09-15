@@ -1,8 +1,8 @@
 # SSH/SFTP 特性能力清单
 
-插件现状：`backend/src/main.rs` 方法表（**67 个分发方法臂、68 个方法名**——`ssh/host-key/resolve`
-与 `connection/challenge/resolve` 共用一臂（main.rs:174），含 sftp/copy、sftp/move、ssh/host-key/check；
-2026-08-29 收口复核，修正如下的「68 臂」口径）。
+插件现状：`backend/src/main.rs` 方法表（**68 个分发方法臂、69 个方法名**——`ssh/host-key/resolve`
+与 `connection/challenge/resolve` 共用一臂（main.rs:174），含 sftp/copy、sftp/move、ssh/host-key/check、
+keys/discover/options；2026-08-29 收口复核，修正如下的「68 臂」口径）。
 原则：补齐完整 SSH/SFTP 能力面；DBX 已由宿主承担的能力（连接管理、
 profile 分组、全局外观）不重复实现。
 
@@ -15,6 +15,7 @@ profile 分组、全局外观）不重复实现。
 | 终端 PTY/回放/resize/目录跟随 | ssh_service.go | ✅ 已有 | — |
 | ssh/exec + sudo（含 PTY/MFA/TOTP 编排） | sudo_exec_service.go | ✅ 已有（exec.rs）；2026-09-04 OTP 多密钥轮换升级：使用/防重放台账进程全局（跨 exec 调用、跨会话；MCP `ssh_exec_sudo` 每调用独立实例也连续轮换），密钥 SHA-256 指纹+窗口+码键控，静态码 usage 键防时间戳漂移，选择排序对齐 resolveRotatingOTP（未用优先→剩余时长最长→配置顺序） | — |
 | ZMODEM rz/sz | ssh_service.go | ✅ 已有 | — |
+| 终端拖入文件上传（落点询问：当前目录 / 指定绝对路径目录） | Tabby/WindTerm 等拖拽上传 | ✅ 已有（2026-09-15：拖到终端面板先弹落点询问——上传到 SFTP 当前目录（目录跟随时即 shell cwd）或输入目标目录绝对路径（`normalizeDropTargetDir` 归一化，七语 `terminalDropPrompt`），确认后走 `sftp/upload/*` 既有链路；SFTP 面板与宿主 fileTransfer 拖放通道保持直传不变） | — |
 | 终端 Shell Integration 命令标记（OSC 633：命令/退出码/时长/cwd） | frontend/src/modules/ssh/osc633-parser.js | ✅ 已有（`terminalCommandMarkers.ts` 解析器移植 + 状态条，S-B；运行中时长 1s tick `runningCommandElapsedMs` + `marker-elapsed` span，X-B） | — |
 | 会话状态规范化展示（连接中/已连接/重连中/已断开/错误） | frontend/src/modules/ssh/session-status.js | ✅ 已有（`sessionStatus.ts` 移植 + reconnecting 扩展，S-B；多会话择优不适用未移植） | — |
 | 命令输出净化（控制序列剥离/回显移除） | frontend/src/modules/ssh/terminal-output.js | ✅ 已有（`terminalOutputText.ts` 通用部分移植；`.mcp_ctl_*` hook 特判不适用） | — |
@@ -26,7 +27,8 @@ profile 分组、全局外观）不重复实现。
 | 点击定位光标（iTerm2/kitty 风格）+ 细竖线光标 | iTerm2 Option+Click / kitty click-to-move | ✅ 已有（2026-09-09：`frontend/src/lib/terminalClickCursor.ts` 纯几何计算——同逻辑行内原地点击按字符差值代发左右方向键，宽字符 2 格记 1、折行跨行展开、备用屏/鼠标上报应用/trzsz·zmodem 占流一律不动作；光标 `cursorStyle: "bar"`。终端协议无直接落点能力，readline 只认按键，行外点击不动作防翻历史） | — |
 | known_hosts 管理（list/remove，宿主侧文件） | ssh_service.go ListKnownHosts/RemoveKnownHost | ✅ 已有（第一批，实测通过） | — |
 | 主机密钥预检/接受/拒绝（profile 维度） | CheckHostKey/Accept/RejectHostKey | ✅ ssh/host-key/check（探针预检三态，真机验证）+ 挑战流程 | P1 完成 |
-| 本地 SSH 私钥发现（~/.ssh 扫描 + 指纹） | DiscoverKeys | ✅ 已有（第一批，实测通过）（第一批） | P0 |
+| 本地 SSH 私钥发现（~/.ssh 扫描 + 指纹） | DiscoverKeys | ✅ 已有（第一批，实测通过）；2026-09-15 起另供 `keys/discover/options` 下拉形态（`{options:[{value,label}]}`，label `文件名 · 算法[ · encrypted][ · SHA256:指纹]`），只出元数据不出密钥材料 | P0 |
+| 连接表单私钥录入：密钥选择下拉 + 粘贴私钥内容 | Electerm 连接表单（选 key 文件 / 直接贴 key 内容）；宿主桌面端另有内置「本地密钥建议」下拉 | ✅ 已有（2026-09-15）：① 选键——`private_key_path` 字段声明 `options_action: keys/discover/options`，宿主动态下拉列出发现的私钥（web/Docker 模式也能用；无该扩展能力的宿主回退文本框，桌面端宿主内置建议器不受影响）；OS 级任意文件浏览对话框需宿主新增 `file` 字段类型，超出插件形态，暂不做。② 粘贴——`private_key` 字段从隐藏兼容槽位升级为可见「私钥内容」textarea（secret 绑定，多行掩码），OpenSSH/PEM/PPK 直贴；内容非空时优先于路径生效（ssh.rs `resolve_private_key_text`，CRLF 归一化），「路径或内容」二选一由 sidecar 连接时校验（manifest required_when 表达不了 or 语义故移除）；MCP 内联拨号同步支持 `privateKeyContent` | — |
 | Stat（文件元信息单查） | sftp_service.go Stat | ✅ 已有（第一批，实测通过）（第一批） | P0 |
 | Exists / Touch | Exists/Touch | ✅ 已有（第一批，实测通过）（第一批） | P0 |
 | 小文件直写 WriteFile（非传输槽） | WriteFile | ✅ 已有（第一批，实测通过）（第一批） | P0 |
@@ -36,7 +38,7 @@ profile 分组、全局外观）不重复实现。
 | **Sudo 文件操作族**（无 root 登录下管理 root 文件） | ListDirSudo/ReadFileSudo/WriteFileSudo/MkdirSudo/RemoveSudo/RemoveAllSudo/ChmodSudo/RenameSudo/StatSudo | ✅ 已有（sudo/stat…sudo/rename 共 11 方法，实测通过）；**DownloadSudo 未实现**——大体积 root 文件二进制下载暂退化为 `sudo/readFile`（exec+base64，受包尺寸限制），2026-08-29 对标复核修正口径 | **P0 核心** |
 | 终端缓冲区查询（增量 seq） | GetTerminalBuffer | ✅ ssh/terminal/replay | — |
 | 命令中止 | AbortCommand | ✅ ssh/exec/cancel | — |
-| SSH 指标（延迟/吞吐采样） | ssh_metrics_service.go | ✅ ssh/metrics：CPU/内存/负载/磁盘 + 网络接口速率、Top CPU/内存进程（`topMemory`）、磁盘 inode 使用率（`inodeUsePercent`）、快照缓存（`cached: true` → `cachedAt`，对齐 GetLastSnapshot） | — |
+| SSH 指标（延迟/吞吐采样） | ssh_metrics_service.go | ✅ ssh/metrics：CPU/内存/负载/磁盘 + 网络接口速率、Top CPU/内存进程（`topMemory`）、磁盘 inode 使用率（`inodeUsePercent`）、快照缓存（`cached: true` → `cachedAt`，对齐 GetLastSnapshot）；macOS 主机经 sysctl/`vm_stat`/`iostat` 回退同样可采 CPU/内存/负载/运行时长（2026-09-15 修复） | — |
 | MCP 尺寸限制策略（max read/upload/download） | PreferencesMCPSFTP | ✅ mcp/settings/get|set（持久化，重启重载，--mcp 同源） | P2 完成 |
 | MCP 本地↔远端传输 + 家目录（sftp_upload / sftp_download / sftp_pwd） | SFTPTransfer / sftpPwd | ✅ 已有（2026-08-30）：29 工具齐（0.4.61 补接 `ssh_alert_triage`）；单文件传输受 maxUpload/maxDownload 限制，本地路径校验先于拨号、校验拒绝不清连接池；0.4.61 SFTP 浏览家族懒建立 + `ssh_test_connection` saved-ref 寻址 + df overlay 行解析兜底（local_ubuntu MCP 覆盖轮发现）；`smoke_mcp.py --host` 真机回环（SHA-256 双端比对 + SFTP 全家族 + run_bg 闭环 + 意图识别三分类） | P2 完成 |
 | Profile MCP 策略开关 | UpdateProfileMCPPolicy | ⚠️ 由 DBX 侧承担，插件不重复 | 不做 |
@@ -171,6 +173,7 @@ React 19 独立桌面 SSH 工作台）为参照的能力借鉴（实施计划
 | iShell Pro 能力 | 插件状态 | 说明 |
 | --- | --- | --- |
 | SFTP 传输断点续传 / 暂停恢复 | ✅ 已有（同批落地） | 上传：中断任务 spool+meta 保留 → `sftp/transfer/resumable` 列出 → `sftp/upload/start resumeTaskId` 从已传前缀续传（文件名+字节数双校验）；下载：`sftp/download/start offset` 恢复（size 一致性 best-effort）；会话内暂停/恢复为分片间挂起（前端纯语义）。iShell 的传输器形态（独立客户端常驻）与之不同，语义对齐 |
+| 下载本机落盘 + 文件管理器定位（无 fileTransfer 宿主） | ✅ 已有（2026-09-15 修复批） | 宿主缺 `fileTransfer` 且 webview 会静默取消 `<a download>`（wry 无 download handler），此前下载"显示已完成但文件不存在"。现 `sftp/download/start saveToLocal` 由 sidecar 直写 `~/Downloads`（去重改名，`DBX_SSH_DOWNLOAD_DIR`/`DBX_SSH_LOCAL_SAVE` 可覆盖探测），`finish` 返回 `localPath` 并落进传输历史；完成通知/传输面板/历史展示路径，`local/reveal`（macOS `open -R`/Windows `explorer /select,`/Linux `xdg-open`）一键定位，仅允许 reveal 历史记录过的路径；web/docker 探测 false 时保留浏览器下载兜底；权限不足/文件不存在错误转七语友好提示（`lib/sftpErrors.ts`） |
 | 实时监控趋势（历史曲线 1–60s 采样） | ✅ 已有（轻量形态） | `metrics-history.jsonl` 环形 720 行 + `ssh/metrics/history` 回填 sparkline；采样间隔跟随指标卡 5s 轮询，不做独立采样线程与分桶聚合 |
 | 进程管理（列表 + SIGTERM/SIGKILL 终止需确认） | ✅ 已有 | `ssh/processes/list`（500 行 CPU 序）+ `ssh/processes/kill`（pid 0/1 拒绝、signal 白名单 1/2/9/15、前端 confirm 门禁）；iShell 的句柄数/监听端口维度未做 |
 | 会话录制回放 + GIF 导出 | ✅ 已有（同批新增） | `ssh/recording/*` 五方法：asciicast v2 `.cast` 落盘（会话关闭自动收尾）、`ssh/recording/get` 分页回放（xterm 重放、0.5–4× 倍速、进度条 seek）、GIF 导出（离屏 xterm 逐事件重放 + 500ms 抽帧 + 零依赖 GIF89a 编码器，封顶 120 帧）。iShell 的暂停/快进/水印/帧率质量参数未做 |

@@ -8,3 +8,6 @@
 !/ui/
 !/ui/.gitkeep
 .dbx-repository-signing-key.env
+
+# git worktrees (feature isolation)
+.worktrees/

@@ -18,9 +18,12 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
+import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -141,6 +144,10 @@ def main() -> None:
     args = parser.parse_args()
 
     started = time.monotonic()
+    # 本机落盘目录指向临时目录，避免污染开发者真实的 ~/Downloads；必须在
+    # sidecar 启动前注入（sidecar 启动时读取一次环境变量）。
+    download_dir = Path(tempfile.mkdtemp(prefix="dbx-ssh-smoke-downloads-"))
+    os.environ["DBX_SSH_DOWNLOAD_DIR"] = str(download_dir)
     client = SidecarClient.start(timeout=30)
     try:
         step("plugin/initialize")
@@ -500,6 +507,22 @@ def main() -> None:
             for key in keys[:3]:
                 fingerprint = str(key.get("fingerprint", ""))[:16]
                 print(f"      - {key.get('path')} {key.get('algorithm', '')} fp={fingerprint}...")
+
+        def case_keys_discover_options():
+            # 连接表单 private_key_path 的 options_action 数据源：只出元数据，
+            # 不出密钥材料。
+            result = req("keys/discover/options", {})
+            options = result.get("options") or []
+            print(f"    {len(options)} key option(s)")
+            for option in options[:3]:
+                label = str(option.get("label", ""))
+                value = str(option.get("value", ""))
+                if not value or not label:
+                    raise AssertionError(f"malformed option: {option}")
+                if "PRIVATE KEY" in label:
+                    raise AssertionError("key material leaked into option label")
+                print(f"      - {label}")
+                print(f"        {value}")
 
         def case_known_hosts():
             result = req("ssh/knownHosts/list", {})
@@ -993,6 +1016,7 @@ def main() -> None:
         print("\n--- keys group ---")
         report.run("ssh/batchBar/state broadcast", "ssh/batchBar/state", case_batch_bar_state_broadcast)
         report.run("keys/discover", "keys/discover", case_keys_discover)
+        report.run("keys/discover/options", "keys/discover/options", case_keys_discover_options)
         report.run("ssh/knownHosts/list", "ssh/knownHosts/list", case_known_hosts)
 
         print("\n--- agent terminal group ---")
@@ -1095,6 +1119,87 @@ def main() -> None:
                     raise AssertionError(f"unexpected resume error: {error}")
             else:
                 raise AssertionError("resume with unknown taskId accepted")
+
+        def case_local_capabilities_shape():
+            caps = req("local/capabilities")
+            if not isinstance(caps.get("canSaveLocal"), bool):
+                raise AssertionError(f"canSaveLocal missing: {json.dumps(caps)[:120]}")
+            if not isinstance(caps.get("downloadsDir"), str) or not caps["downloadsDir"]:
+                raise AssertionError(f"downloadsDir missing: {json.dumps(caps)[:120]}")
+            if not isinstance(caps.get("platform"), str) or not caps["platform"]:
+                raise AssertionError(f"platform missing: {json.dumps(caps)[:120]}")
+            print(f"    canSaveLocal={caps['canSaveLocal']} dir={caps['downloadsDir']} platform={caps['platform']}")
+
+        def case_local_sink_download_roundtrip():
+            raw = b"local-sink-smoke-payload-2026"
+            sink_src = f"{home}/.dbx-fs-smoke-sink"
+            req("sftp/write", {"sessionId": session_id, "remotePath": sink_src,
+                               "dataBase64": base64.b64encode(raw).decode()})
+            # saveToLocal + offset 互斥（续传语义要求调用方持有前缀）。
+            try:
+                req("sftp/download/start", {"sessionId": session_id, "remotePath": sink_src,
+                                            "offset": 1, "saveToLocal": True})
+            except SidecarError as error:
+                if "resume" not in str(error).lower():
+                    raise AssertionError(f"unexpected sink+resume error: {error}")
+            else:
+                raise AssertionError("saveToLocal with resume offset accepted")
+            info = req("sftp/download/start", {"sessionId": session_id, "remotePath": sink_src,
+                                               "saveToLocal": True})
+            if not info.get("saveToLocal"):
+                raise AssertionError(f"saveToLocal not echoed: {json.dumps(info)[:120]}")
+            task_id, size = info["taskId"], info["size"]
+            assert size == len(raw), f"size {size} != {len(raw)}"
+            offset = 0
+            while True:
+                result = req("sftp/download/next", {"taskId": task_id, "offset": offset})
+                offset += result["length"]
+                if result["eof"]:
+                    break
+                if offset >= size:
+                    break
+            finish = req("sftp/download/finish", {"taskId": task_id})
+            local_path = finish.get("localPath")
+            if not local_path:
+                raise AssertionError(f"finish returned no localPath: {json.dumps(finish)[:160]}")
+            saved = Path(local_path)
+            if not saved.is_file() or saved.read_bytes() != raw:
+                raise AssertionError(f"local file missing/mismatched: {local_path}")
+            print(f"    saved {len(raw)} bytes -> {local_path}")
+            # localPath 進歷史，才允許 reveal；任意路径必须被拒绝。
+            history = req("sftp/transfer/history", {"limit": 50})
+            row = next((t for t in history.get("tasks", []) if t.get("taskId") == task_id), None)
+            if not row or row.get("localPath") != local_path or row.get("status") != "completed":
+                raise AssertionError(f"history row missing localPath: {json.dumps(row)[:160]}")
+            try:
+                req("local/reveal", {"path": str(download_dir.parent / "not-recorded.txt")})
+            except SidecarError as error:
+                if "not saved by a completed download" not in str(error):
+                    raise AssertionError(f"unexpected reveal error: {error}")
+            else:
+                raise AssertionError("local/reveal accepted an unrecorded path")
+            print("    reveal refused unrecorded path")
+
+        def case_local_sink_download_chunk_binary_frames():
+            # 与 case_local_sink_download_roundtrip 分开的轻量校验：分块二进制帧
+            # 仍按 [8B offset][data] 形状发出（前端兼容依赖）。
+            raw = b"0123456789abcdef"
+            src = f"{home}/.dbx-fs-smoke-sink2"
+            req("sftp/write", {"sessionId": session_id, "remotePath": src,
+                               "dataBase64": base64.b64encode(raw).decode()})
+            info = req("sftp/download/start", {"sessionId": session_id, "remotePath": src,
+                                               "saveToLocal": True})
+            before = len(client.binary_frames)
+            result = req("sftp/download/next", {"taskId": info["taskId"], "offset": 0})
+            frames = [f for f in client.binary_frames[before:]
+                      if f[0] == f"sftp/download/{info['taskId']}"]
+            if not frames:
+                raise AssertionError("no binary frame emitted for download chunk")
+            channel, payload = frames[-1]
+            (frame_offset,) = struct.unpack(">Q", payload[:8])
+            if frame_offset != 0 or payload[8:] != raw[:result["length"]]:
+                raise AssertionError(f"binary frame shape mismatch: offset={frame_offset}")
+            req("sftp/download/finish", {"taskId": info["taskId"]})
 
         def case_processes_list_and_kill():
             listing = req("ssh/processes/list", {"sessionId": session_id}, timeout=30)
@@ -1201,6 +1306,12 @@ def main() -> None:
                    case_download_resume_offset)
         report.run("sftp upload resume unknown task refused", "sftp/upload/start",
                    case_upload_resume_rejects_unknown_task)
+        report.run("local/capabilities shape", "local/capabilities",
+                   case_local_capabilities_shape)
+        report.run("local sink download round-trip + reveal guard", "sftp/download/start",
+                   case_local_sink_download_roundtrip)
+        report.run("local sink download binary frame shape", "sftp/download/next",
+                   case_local_sink_download_chunk_binary_frames)
         report.run("ssh/processes list + kill round-trip", "ssh/processes/list",
                    case_processes_list_and_kill)
         report.run("ssh/metrics/history samples", "ssh/metrics/history", case_metrics_history)
@@ -1228,7 +1339,9 @@ def main() -> None:
         except SidecarError:
             pass
         for path, recursive in ((touch_path, False), (write_path, False), (resume_src, False),
-                                (archive_path, False), (extract_dir, True), (sudo_dir, True)):
+                                (archive_path, False), (extract_dir, True), (sudo_dir, True),
+                                (f"{home}/.dbx-fs-smoke-sink", False),
+                                (f"{home}/.dbx-fs-smoke-sink2", False)):
             try:
                 client.request("sftp/delete",
                                {"sessionId": session_id, "path": path, "recursive": recursive})
@@ -1248,6 +1361,7 @@ def main() -> None:
             except SidecarError:
                 pass
 
+        shutil.rmtree(download_dir, ignore_errors=True)
         client.close()
         step(f"summary ({time.monotonic() - started:.1f}s)")
         print(f"PASS {len(report.passed)} / SKIP {len(report.skipped)} / FAIL {len(report.failed)}")
