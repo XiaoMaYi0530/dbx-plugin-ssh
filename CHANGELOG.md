@@ -4,6 +4,27 @@
 
 This file records user-facing changes for DBX SSH Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
+## [0.4.76] — 2026-09-15
+
+发布地址 / Release: [ssh-v0.4.76](https://github.com/jinpy666/dbx-plugin-ssh/releases/tag/ssh-v0.4.76)
+
+### 改进 / Improved
+
+- **传输历史与下载工作流**：完善下载完成后的状态、进度展示和本地文件操作入口，并统一传输历史记录与恢复任务的界面反馈。
+  **Transfer history and download workflows:** Improved completed-download state, progress presentation, local file actions, and the UI feedback shared by transfer history and resumable tasks.
+
+- **跨平台 UI 与发布准备**：补齐运行时环境声明、国际化文案和发布安装脚本，确保构建后的插件 UI 与安装流程保持一致。
+  **Cross-platform UI and release readiness:** Added runtime environment declarations, localized copy, and release installation handling so the packaged UI and install flow stay aligned.
+
+### 验证 / Validation
+
+- 前端：420 个测试通过，类型检查和生产构建通过。
+  Frontend: 420 tests passed; type checking and production build passed.
+- Rust：457 个测试通过，Clippy 严格检查通过。
+  Rust: 457 tests passed; strict Clippy checks passed.
+- MCP、SSH/SFTP、OTP、触发器、性能和 UI walkthrough smoke 全部通过。
+  MCP, SSH/SFTP, OTP, trigger, performance, and UI walkthrough smoke tests all passed.
+
 ## [0.4.75] — 2026-09-15
 
 发布地址 / Release: [ssh-v0.4.75](https://github.com/jinpy666/dbx-plugin-ssh/releases/tag/ssh-v0.4.75)
@@ -78,4 +99,3 @@ This file records user-facing changes for DBX SSH Terminal. Unless noted otherwi
 ## 历史版本 / Previous releases
 
 - [GitHub Releases](https://github.com/jinpy666/dbx-plugin-ssh/releases)
-
