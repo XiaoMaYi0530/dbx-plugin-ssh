@@ -111,6 +111,11 @@ pub struct StoredConnection {
     pub authentication: AuthenticationMethod,
     pub private_key_path: String,
     pub private_key_passphrase: String,
+    /// Inline private key contents (`connection_secrets.private_key`), the
+    /// pasted-key alternative to `private_key_path`. Non-empty content wins
+    /// over the path (see `ssh.rs` key resolution); like every secret here it
+    /// only travels inside the connect pipeline and is never echoed back.
+    pub private_key: String,
     #[cfg_attr(windows, allow(dead_code))]
     pub agent_socket: String,
     pub connect_timeout_secs: u64,
@@ -260,6 +265,7 @@ impl JumpHost {
             password: self.password.clone(),
             authentication: AuthenticationMethod::from_method_name(&self.authentication),
             private_key_path: self.private_key_path.clone(),
+            private_key: String::new(),
             private_key_passphrase: self.private_key_passphrase.clone(),
             agent_socket: self.agent_socket.clone(),
             connect_timeout_secs: timeout_secs.max(1),
@@ -335,6 +341,10 @@ impl StoredConnection {
             .get("connection_secrets")
             .and_then(Value::as_object);
         let private_key_path = optional_string(external_config, "private_key_path");
+        // 私钥内容与口令同为凭据：原样读取（PEM/PPK 是多行文本，禁止 trim）。
+        let private_key = connection_secrets
+            .map(|secrets| credential_string(secrets, "private_key"))
+            .unwrap_or_default();
         let private_key_passphrase = connection_secrets
             .map(|secrets| credential_string(secrets, "private_key_passphrase"))
             .unwrap_or_default();
@@ -397,8 +407,11 @@ impl StoredConnection {
             authentication,
             AuthenticationMethod::PrivateKey | AuthenticationMethod::PrivateKeyPassword
         ) && private_key_path.is_empty()
+            && private_key.is_empty()
         {
-            return Err("Private-key authentication requires a private key path".to_string());
+            return Err(
+                "Private-key authentication requires a private key path or key content".to_string(),
+            );
         }
         Ok(Self {
             id,
@@ -411,10 +424,11 @@ impl StoredConnection {
             password,
             authentication,
             private_key_path,
+            private_key,
             private_key_passphrase,
             agent_socket,
             connect_timeout_secs: config_u64(external_config, connection, "connect_timeout_secs")
-                .unwrap_or(15)
+                .unwrap_or(30)
                 .max(1),
             keepalive_interval_secs: config_u64(
                 external_config,
@@ -861,8 +875,8 @@ mod tests {
         assert_eq!(keys, expected, "manifest field list drifted from parsing");
 
         // secret binding 只允许落在凭据字段；config binding 不得承载凭据语义。
-        // private_key 是隐藏的兼容槽位：外部工具（如宿主迁移）写进 Secret Store
-        // 的存量条目必须被 provider 声明，否则宿主校验拒绝整个连接。
+        // private_key 承载表单粘贴的私钥内容（外部工具写入的存量 secret 也
+        // 从这里生效），必须被 provider 声明，否则宿主校验拒绝整个连接。
         let secret_keys = [
             "password",
             "private_key_passphrase",
@@ -886,7 +900,9 @@ mod tests {
         }
 
         // required_when 链必须与 from_lifecycle_params 的凭据校验一致
-        // （model.rs: password/private-key-password 校验密码、private-key* 校验私钥路径）。
+        // （model.rs: password/private-key-password 校验密码）。private_key_path
+        // 不再声明 required_when：私钥「路径或内容」是二选一，manifest 表达不了
+        // or 语义，由解析层在连接时兜底校验。
         let one_of = |key: &str, constraint: &str| -> Vec<String> {
             fields.iter().find(|field| field["key"] == key).unwrap()[constraint]
                 .as_object()
@@ -904,9 +920,15 @@ mod tests {
             one_of("password", "required_when"),
             ["password", "private-key-password"]
         );
-        assert_eq!(
-            one_of("private_key_path", "required_when"),
-            ["private-key", "private-key-password"]
+        // private_key_path 是「路径或私钥内容」二选一：无 required_when，
+        // 凭据齐全性由解析层校验（见 private_key_accepts_path_or_content）。
+        assert!(
+            fields
+                .iter()
+                .find(|field| field["key"] == "private_key_path")
+                .unwrap()["required_when"]
+                .is_null(),
+            "private_key_path must not force the path when key content may be pasted instead"
         );
 
         // sudo 覆盖簇跟随表单选定的凭据来源（sudo_source）：自定义模式下才
@@ -1340,8 +1362,10 @@ mod manifest_contract_tests {
         // (id/host/port/username) are always required on both sides.
         let model_required: &[(&str, &[&str])] = &[
             ("password", &["password"]),
-            ("private-key", &["private_key_path"]),
-            ("private-key-password", &["password", "private_key_path"]),
+            // 私钥是「路径或内容」二选一，manifest 的 required_when 表达不了
+            // or 语义，所以两侧都不强制单字段；缺失由解析层在连接时报错。
+            ("private-key", &[]),
+            ("private-key-password", &["password"]),
             ("agent", &[]),
             ("none", &[]),
         ];
@@ -1621,6 +1645,17 @@ mod manifest_contract_tests {
         .unwrap();
         assert_eq!(zero_timeout.connect_timeout_secs, 1);
 
+        // ⑧b 表单未填时跟随 manifest 默认（30s）：慢速 Windows/macOS 主机的
+        //    握手+认证预算不再按旧默认 15s 一连接就打满。
+        let default_timeout = connection_with(
+            "password",
+            Some("pw"),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(default_timeout.connect_timeout_secs, 30);
+
         // ⑨ 跳板机不接受 none：链上每一跳都必须认证，"No authentication"
         //    只对最终会话合法。
         let none_hop = StoredConnection::from_lifecycle_params(&serde_json::json!({
@@ -1650,8 +1685,8 @@ mod manifest_contract_tests {
     /// from `external_config` and are consumed by the parser.
     #[test]
     fn bindings_match_parse_surfaces() {
-        // private_key 是隐藏兼容槽位：只为让宿主接受外部工具写入的存量
-        // secret，解析面故意不消费它。
+        // private_key 现在被解析面消费（表单粘贴的私钥内容 / 外部工具写入的
+        // 存量 secret），从 connection_secrets 读取。
         let secret_keys = [
             "private_key",
             "private_key_passphrase",
@@ -1781,7 +1816,7 @@ mod manifest_contract_tests {
             ("port", Value::from(22)),
             ("username", Value::from("root")),
             ("authentication", Value::from("password")),
-            ("connect_timeout_secs", Value::from(15)),
+            ("connect_timeout_secs", Value::from(30)),
             ("keepalive_interval_secs", Value::from(30)),
             ("terminal_keepalive_secs", Value::from(0)),
             ("sudo_source", Value::from("custom")),
@@ -1876,21 +1911,68 @@ mod manifest_contract_tests {
         assert_eq!(off.terminal_keepalive_secs, 0);
     }
 
-    /// The private_key_path required chain covers private-key-password (the
-    /// parser rejects an empty path there); the passphrase stays optional for
-    /// unencrypted keys.
+    /// 私钥凭据是「路径或内容」二选一：只贴内容、只给路径都能解析，两者
+    /// 全缺才在连接时报错；口令（passphrase）对未加密密钥保持可选。
     #[test]
-    fn private_key_required_when_covers_password_fallback() {
+    fn private_key_accepts_path_or_content() {
         let entry = field("private_key_path");
-        assert_eq!(
-            condition_one_of(&entry, "required_when"),
-            Some(vec![
-                "private-key".to_string(),
-                "private-key-password".to_string()
-            ])
+        assert!(
+            entry["required_when"].is_null(),
+            "private_key_path must stay optional: pasted key content is a valid alternative"
         );
         assert!(field("private_key_passphrase")["required_when"].is_null());
 
+        let content_only = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "content-only",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "external_config": { "authentication": "private-key" },
+                "connection_secrets": { "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n..." }
+            }
+        }))
+        .unwrap();
+        assert!(content_only.private_key_path.is_empty());
+        assert!(content_only.private_key.starts_with("-----BEGIN"));
+
+        // 多行凭据必须原样保留：PEM/PPK 内容不允许被 trim 破坏。
+        let multiline = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "multiline-key",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "external_config": { "authentication": "private-key" },
+                "connection_secrets": { "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----\n" }
+            }
+        }))
+        .unwrap();
+        assert!(multiline
+            .private_key
+            .ends_with("-----END OPENSSH PRIVATE KEY-----\n"));
+
+        let neither = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "no-key",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "external_config": { "authentication": "private-key" },
+                "connection_secrets": {}
+            }
+        }))
+        .unwrap_err();
+        assert!(
+            neither.contains("requires a private key path or key content"),
+            "{neither}"
+        );
+    }
+
+    /// The passphrase stays optional for unencrypted keys (private-key-password
+    /// mode must not be rejected for a missing passphrase).
+    #[test]
+    fn private_key_password_fallback_does_not_require_passphrase() {
         let without_passphrase = StoredConnection::from_lifecycle_params(&serde_json::json!({
             "connection": {
                 "id": "plain-key",

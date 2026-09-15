@@ -7,6 +7,7 @@ mod exec;
 mod highlight_rules;
 mod host_key;
 mod keys;
+mod local_downloads;
 mod mcp;
 mod mcp_safety;
 mod metrics;
@@ -643,6 +644,9 @@ impl Plugin {
                 let keys = keys::discover()?;
                 Ok(json!({ "keys": keys }))
             }
+            // 连接表单 private_key_path 的 options_action 数据源：宿主拉取后
+            // 渲染动态下拉；无该扩展能力的宿主保持文本框（见 sudo_profile 先例）。
+            "keys/discover/options" => keys::discover_options(),
             "ssh/knownHosts/list" => Ok(keys::list_known_hosts(&plugin_data_dir())?),
             "ssh/knownHosts/remove" => {
                 let host = required_string(&params, "host")?;
@@ -695,10 +699,15 @@ impl Plugin {
                 let session_id = required_string(&params, "sessionId")?;
                 let remote_path = required_string(&params, "remotePath")?;
                 let offset = optional_u64(&params, "offset", 0);
+                let save_to_local = params
+                    .get("saveToLocal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 self.runtime.block_on(self.ssh.start_download(
                     session_id,
                     remote_path,
                     offset,
+                    save_to_local,
                     emitter,
                 ))
             }
@@ -708,14 +717,33 @@ impl Plugin {
                 self.runtime
                     .block_on(self.ssh.download_chunk(task_id, offset as u64, emitter))
             }
-            "sftp/download/finish" => {
+            "sftp/download/finish" => self.runtime.block_on(
                 self.ssh
-                    .complete_download(required_string(&params, "taskId")?, emitter)?;
-                Ok(json!({ "success": true }))
-            }
+                    .complete_download(required_string(&params, "taskId")?, emitter),
+            ),
             "sftp/transfer/cancel" => {
                 self.ssh
                     .cancel_transfer(required_string(&params, "taskId")?, emitter)?;
+                Ok(json!({ "success": true }))
+            }
+            // 本机落盘能力探测：无宿主 fileTransfer API 时前端据此决定
+            // 走 sidecar 下载目录落盘还是浏览器 <a download> 兜底。
+            "local/capabilities" => {
+                let data_dir = plugin_data_dir();
+                let downloads_dir =
+                    local_downloads::downloads_base_dir(|key| std::env::var_os(key), &data_dir);
+                Ok(json!({
+                    "canSaveLocal": local_downloads::can_save_local(|key| std::env::var_os(key)),
+                    "downloadsDir": downloads_dir.to_string_lossy(),
+                    "platform": local_downloads::platform_name(),
+                }))
+            }
+            // 在文件管理器中定位已完成的下载。只允许 reveal 传输历史里
+            // 记录过的 localPath，不能成为任意路径打开原语。
+            "local/reveal" => {
+                let path = required_string(&params, "path")?;
+                let history = transfer_history::load_history(&plugin_data_dir());
+                local_downloads::reveal_validated(&history, std::path::Path::new(path))?;
                 Ok(json!({ "success": true }))
             }
             "sftp/transfer/resumable" => self.ssh.resumable_uploads(),

@@ -106,6 +106,10 @@ const mockTree: MockNode = mockDir("/", [
       mockFile("deploy.sh", 2481, "0755"),
       mockFile("docker-compose.yml", 8192),
       mockFile("server.log", 741248),
+      // 超长名称夹具：锁定 SFTP 文件列表/侧栏/预览标题在极端宽度下的省略号
+      // 截断（回归：长名曾把行布局挤错位）。
+      mockDir("a-very-long-directory-name-that-easily-overflows-narrow-side-panels"),
+      mockFile("release-artifact-bundle-2026-09-15-final-signed-verification-report.pdf", 999_999),
     ]),
   ]),
   mockDir("etc", [mockFile("hosts", 221), mockDir("nginx", [mockFile("nginx.conf", 1264)])]),
@@ -533,10 +537,15 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
         // /data 固定给 87%（>=85 警戒阈值），让 disk-warn 红色进度条始终可被视觉验证。
         { filesystem: "/dev/sdb1", mount: "/data", totalBytes: 105_550_471_168, usedBytes: 91_828_909_916, availableBytes: 13_721_561_252, percentUsed: 87 },
         { filesystem: "tmpfs", mount: "/dev/shm", totalBytes: 8_146_615_296, usedBytes: 0, availableBytes: 8_146_615_296, percentUsed: 0 },
+        // 超长挂载点夹具：锁定 disk-row 第一列的省略号截断（回归：长路径曾
+        // 外溢压住进度条与数值列，metrics 面板错位严重）。
+        { filesystem: "/dev/mapper/vg--main-very--long--logical--volume", mount: "/mnt/data/services/postgres/bind-mounts/very/long/path", totalBytes: 211_100_942_336, usedBytes: 12_000_000_000, availableBytes: 199_100_942_336, percentUsed: 6 },
       ],
       network: [
         { name: "eth0", rxRate: wave(48_000, 40_000), txRate: wave(12_000, 9_000), rxTotal: 123_456_789_012, txTotal: 9_876_543_210 },
         { name: "lo", rxRate: wave(1_200, 800), txRate: wave(1_200, 800), rxTotal: 5_555_555, txTotal: 5_555_555 },
+        // 超长网卡名夹具：同上，锁定 disk-row 截断。
+        { name: "br-0f17c3a9d2e4-docker-custom-network", rxRate: wave(2_400, 1_800), txRate: wave(1_800, 1_200), rxTotal: 12_345_678, txTotal: 8_765_432 },
       ],
       processes: [
         { pid: 1, user: "root", cpuPercent: 0.1, memPercent: 0.4, command: "systemd" },

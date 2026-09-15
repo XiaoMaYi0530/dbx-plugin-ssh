@@ -1432,7 +1432,7 @@ impl McpState {
                                  session: start the DBX app (its sidecar holds the credentials), \
                                  list saved connections with ssh_list_connections, or provide \
                                  inline credentials (host/username plus password or \
-                                 privateKeyPath)."
+                                 privateKeyPath/privateKeyContent)."
                             )
                         } else {
                             error
@@ -2697,7 +2697,7 @@ impl McpState {
                         "No connection named '{name}' is registered with this plugin session and \
                          the DBX app bridge is unavailable. Start the DBX app, list saved \
                          connections with ssh_list_connections, or provide inline credentials \
-                         (host/username plus password or privateKeyPath)."
+                         (host/username plus password or privateKeyPath/privateKeyContent)."
                     ));
                 } else {
                     (
@@ -2723,7 +2723,7 @@ impl McpState {
                     "Connection {pool_id} is not registered with this plugin session and the DBX \
                      app bridge is unavailable. Start the DBX app, list saved connections with \
                      ssh_list_connections, or provide inline credentials (host/username plus \
-                     password or privateKeyPath)."
+                     password or privateKeyPath/privateKeyContent)."
                 ))
             }
         };
@@ -3705,18 +3705,22 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let private_key_content = arguments
+        .get("privateKeyContent")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let has_key = !private_key_path.is_empty() || !private_key_content.is_empty();
     let authentication = match arguments
         .get("authentication")
         .and_then(Value::as_str)
         .unwrap_or("password")
     {
-        "private-key" if !private_key_path.is_empty() => AuthenticationMethod::PrivateKey,
-        "private-key-password" if !private_key_path.is_empty() => {
-            AuthenticationMethod::PrivateKeyPassword
-        }
+        "private-key" if has_key => AuthenticationMethod::PrivateKey,
+        "private-key-password" if has_key => AuthenticationMethod::PrivateKeyPassword,
         "agent" => AuthenticationMethod::Agent,
         _ => {
-            if !private_key_path.is_empty() {
+            if has_key {
                 AuthenticationMethod::PrivateKey
             } else {
                 AuthenticationMethod::Password
@@ -3729,9 +3733,11 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
     if matches!(
         authentication,
         AuthenticationMethod::PrivateKey | AuthenticationMethod::PrivateKeyPassword
-    ) && private_key_path.is_empty()
+    ) && !has_key
     {
-        return Err("Private-key authentication requires privateKeyPath".to_string());
+        return Err(
+            "Private-key authentication requires privateKeyPath or privateKeyContent".to_string(),
+        );
     }
     Ok(StoredConnection {
         sudo_whitelist: Vec::new(),
@@ -3746,6 +3752,7 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         password,
         authentication,
         private_key_path,
+        private_key: private_key_content,
         private_key_passphrase: arguments
             .get("privateKeyPassphrase")
             .and_then(Value::as_str)
@@ -3757,7 +3764,7 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
             .unwrap_or_default()
             .to_string(),
         connect_timeout_secs: arg_u64(arguments, "connectTimeoutSecs")?
-            .unwrap_or(15)
+            .unwrap_or(30)
             .max(1),
         keepalive_interval_secs: 30,
         // MCP drives exec channels, never the user's interactive PTY —
@@ -3874,9 +3881,9 @@ fn parse_jump_hosts(arguments: &Value) -> Result<Vec<JumpHost>, String> {
 /// Quick Sudo profile tool (schema round 6: every advertised parameter must
 /// carry an accurate description; defined once here, referenced by both
 /// schema sites so the wording can never drift apart).
-const AUTHENTICATION_DESCRIPTION: &str = "Authentication method for inline dials: password (default), private-key, private-key-password, or agent. Omitted is inferred: privateKeyPath present selects private-key, otherwise password; private-key* requires privateKeyPath and password requires password";
+const AUTHENTICATION_DESCRIPTION: &str = "Authentication method for inline dials: password (default), private-key, private-key-password, or agent. Omitted is inferred: privateKeyPath or privateKeyContent present selects private-key, otherwise password; private-key* requires one of the two and password requires password";
 const CONNECT_TIMEOUT_DESCRIPTION: &str =
-    "TCP connect timeout in seconds for inline dials (default 15, minimum 1)";
+    "TCP connect timeout in seconds for inline dials (default 30, minimum 1)";
 const AUTH_FLOW_MODE_DESCRIPTION: &str = "Two-factor sudo authentication flow: password_only (no OTP), password_plus_otp (password and TOTP code submitted together at a combined prompt), password_then_otp (password first, TOTP answered at a separate later prompt; default when omitted). Values are matched case-insensitively (PASSWORD_PLUS_OTP works); unrecognized values fall back to the default flow instead of erroring. When set both inline and via a Quick Sudo profile, explicit arguments win";
 const PASSWORD_PROMPT_HINT_DESCRIPTION: &str = "Text fragment used to recognize a non-standard sudo password prompt (localized or custom message) when the built-in prompt patterns miss it";
 const TOTP_PROMPT_HINT_DESCRIPTION: &str = "Text fragment used to recognize a non-standard TOTP/verification-code prompt when the built-in prompt patterns miss it";
@@ -3898,6 +3905,7 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
         "username": { "type": "string", "description": "Login user" },
         "password": { "type": "string", "description": "Login password (password auth, or sudo fallback)" },
         "privateKeyPath": { "type": "string", "description": "Local private key path for key auth" },
+        "privateKeyContent": { "type": "string", "description": "Private key contents for key auth (OpenSSH/PEM/PPK); takes precedence over privateKeyPath" },
         "privateKeyPassphrase": { "type": "string", "description": "Private key passphrase" },
         "agentSocket": { "type": "string", "description": "SSH agent socket for agent auth" },
         "authentication": { "type": "string", "enum": ["password", "private-key", "private-key-password", "agent"], "description": AUTHENTICATION_DESCRIPTION },
@@ -5964,6 +5972,51 @@ mod tests {
         assert_eq!(by_key.totp_secret, "123456");
         assert!(
             stored_connection_from_arguments(&json!({ "host": "h", "username": "u" })).is_err()
+        );
+    }
+
+    /// MCP inline dials accept pasted key contents as the path alternative:
+    /// content-only selects private-key without touching the filesystem, and
+    /// a dial with neither path nor content is rejected up front.
+    #[test]
+    fn connections_accept_private_key_content() {
+        let by_content = stored_connection_from_arguments(&json!({
+            "host": "h", "username": "u", "command": "x",
+            "privateKeyContent": "-----BEGIN OPENSSH PRIVATE KEY-----\nbody\n-----END OPENSSH PRIVATE KEY-----\n"
+        }))
+        .unwrap();
+        assert_eq!(by_content.authentication, AuthenticationMethod::PrivateKey);
+        assert!(by_content.private_key_path.is_empty());
+        assert!(by_content.private_key.starts_with("-----BEGIN"));
+
+        let explicit_password_mode = stored_connection_from_arguments(&json!({
+            "host": "h", "username": "u", "command": "x",
+            "authentication": "private-key-password",
+            "privateKeyContent": "-----BEGIN OPENSSH PRIVATE KEY-----\nbody\n-----END OPENSSH PRIVATE KEY-----\n",
+            "password": "login"
+        }))
+        .unwrap();
+        assert_eq!(
+            explicit_password_mode.authentication,
+            AuthenticationMethod::PrivateKeyPassword
+        );
+
+        // 既有的推断语义保持不变：没有密钥材料时显式 private-key 仍按
+        // 「有密码则回退 password」解析（内联拨号从不挂空路径的私钥）。
+        let degraded = stored_connection_from_arguments(&json!({
+            "host": "h", "username": "u", "command": "x",
+            "authentication": "private-key", "password": "login"
+        }))
+        .unwrap();
+        assert_eq!(degraded.authentication, AuthenticationMethod::Password);
+        let neither = stored_connection_from_arguments(&json!({
+            "host": "h", "username": "u", "command": "x",
+            "authentication": "private-key"
+        }))
+        .unwrap_err();
+        assert!(
+            neither.contains("Password authentication requires a password"),
+            "{neither}"
         );
     }
 

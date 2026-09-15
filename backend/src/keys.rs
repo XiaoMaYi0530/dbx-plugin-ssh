@@ -42,6 +42,36 @@ pub fn discover() -> Result<Vec<DiscoveredKey>, String> {
     Ok(discover_in(&PathBuf::from(home).join(".ssh")))
 }
 
+/// `keys/discover/options`: data source for the connection form's dynamic
+/// dropdown (manifest `options_action`). `value` is the absolute key path;
+/// the label mirrors the host's local-key picker style
+/// (`basename · algorithm[ · encrypted][ · fingerprint]`) so hosts that ship
+/// either the built-in picker or this dropdown render consistent text. Only
+/// metadata travels here — never key material.
+pub fn discover_options() -> Result<Value, String> {
+    let options: Vec<Value> = discover()?
+        .into_iter()
+        .map(|key| {
+            let file_name = Path::new(&key.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(key.path.as_str());
+            let mut parts = vec![file_name.to_string()];
+            if !key.algorithm.is_empty() {
+                parts.push(key.algorithm.clone());
+            }
+            if key.has_passphrase {
+                parts.push("encrypted".to_string());
+            }
+            if !key.fingerprint.is_empty() {
+                parts.push(key.fingerprint.clone());
+            }
+            json!({ "value": key.path, "label": parts.join(" · ") })
+        })
+        .collect();
+    Ok(json!({ "options": options }))
+}
+
 /// Scans `ssh_dir` (normally `~/.ssh`) for private keys. An unreadable or
 /// missing directory simply yields no results.
 fn discover_in(ssh_dir: &Path) -> Vec<DiscoveredKey> {
@@ -405,6 +435,45 @@ mod tests {
         std::fs::create_dir_all(&ssh_dir).unwrap();
         std::fs::write(ssh_dir.join("config"), "IdentityFile nothing_here\n").unwrap();
         assert!(discover().unwrap().is_empty());
+    }
+
+    /// `discover_options` renders one dropdown entry per discovered key with
+    /// metadata-only labels; key material never travels in the options.
+    #[test]
+    fn discover_options_shape_only_metadata() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let ssh_dir = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+
+        if !generate_key(&ssh_dir.join("id_ed25519"), "") {
+            // No ssh-keygen on this machine: verify the tolerant empty shape.
+            let _guard_env = HomeEnvGuard::set(home.path());
+            let options = discover_options().unwrap();
+            assert_eq!(options["options"].as_array().unwrap().len(), 0);
+            return;
+        }
+        assert!(generate_key(&ssh_dir.join("locked.pem"), "phrase"));
+
+        let _guard_env = HomeEnvGuard::set(home.path());
+        let options = discover_options().unwrap()["options"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let plain = options
+            .iter()
+            .find(|option| option["value"].as_str().unwrap().ends_with("id_ed25519"))
+            .expect("plain key listed");
+        assert!(plain["label"].as_str().unwrap().contains("ssh-ed25519"));
+        assert!(plain["label"].as_str().unwrap().contains("SHA256:"));
+        let encrypted = options
+            .iter()
+            .find(|option| option["value"].as_str().unwrap().ends_with("locked.pem"))
+            .expect("encrypted key listed");
+        assert!(encrypted["label"].as_str().unwrap().contains("encrypted"));
+
+        let serialized = serde_json::to_string(&options).unwrap();
+        assert!(!serialized.contains("PRIVATE KEY"));
     }
 
     #[cfg(unix)]

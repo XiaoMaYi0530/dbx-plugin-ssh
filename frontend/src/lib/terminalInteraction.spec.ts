@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canAcceptTerminalDrop, resolveTerminalKeyAction, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
+import { canAcceptTerminalDrop, normalizeDropTargetDir, resolveTerminalKeyAction, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
 
 describe("terminal interaction preferences (select-to-copy / right-click-paste)", () => {
   it("defaults select-to-copy to enabled and only honors an explicit 'false'", () => {
@@ -30,8 +30,13 @@ describe("terminal keyboard shortcuts (copy/paste routing)", () => {
     expect(resolveTerminalKeyAction({ mod: false, shiftKey: true, key: "c", hasSelection: true })).toBe("none");
   });
 
-  it("keeps plain Ctrl/Cmd+C as shell input (SIGINT) and never routes it to copy", () => {
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "c", hasSelection: true })).toBe("none");
+  it("routes plain Ctrl/Cmd+C with a selection to copy (Windows Terminal / iTerm2 semantics)", () => {
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "c", hasSelection: true })).toBe("copy");
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "C", hasSelection: true })).toBe("copy");
+  });
+
+  it("keeps plain Ctrl/Cmd+C without a selection as shell input (SIGINT)", () => {
+    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "c", hasSelection: false })).toBe("none");
   });
 
   it("routes both Ctrl+V and Ctrl/Cmd+Shift+V to paste", () => {
@@ -71,5 +76,25 @@ describe("terminal drop acceptance", () => {
     expect(canAcceptTerminalDrop({ connected: false, canWrite: true, transferBusy: false })).toBe(false);
     expect(canAcceptTerminalDrop({ connected: true, canWrite: false, transferBusy: false })).toBe(false);
     expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: true })).toBe(false);
+  });
+});
+
+describe("terminal drop prompt target directory", () => {
+  it("treats blank input as unusable so the confirm button stays disabled", () => {
+    expect(normalizeDropTargetDir("")).toBeNull();
+    expect(normalizeDropTargetDir("   ")).toBeNull();
+    expect(normalizeDropTargetDir("\t / \n")).toBe("/");
+  });
+
+  it("collapses trailing slashes while keeping the bare root intact", () => {
+    expect(normalizeDropTargetDir("/")).toBe("/");
+    expect(normalizeDropTargetDir("//")).toBe("/");
+    expect(normalizeDropTargetDir("/data/uploads/")).toBe("/data/uploads");
+    expect(normalizeDropTargetDir("/data/uploads///")).toBe("/data/uploads");
+  });
+
+  it("keeps ordinary paths and inner slashes untouched", () => {
+    expect(normalizeDropTargetDir("/var/log")).toBe("/var/log");
+    expect(normalizeDropTargetDir("  /home/user/uploads  ")).toBe("/home/user/uploads");
   });
 });

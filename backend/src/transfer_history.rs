@@ -165,6 +165,14 @@ fn merge_transition(task: &Value, prev_started_at: Option<u64>, prev_connection_
     {
         row["error"] = json!(error);
     }
+    // saveToLocal 下载完成行的本机落盘路径；`local/reveal` 以它做白名单校验。
+    if let Some(local_path) = task
+        .get("localPath")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        row["localPath"] = json!(local_path);
+    }
     row
 }
 

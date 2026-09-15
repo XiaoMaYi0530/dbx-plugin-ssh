@@ -30,6 +30,7 @@ use crate::exec::{
 };
 use crate::highlight_rules;
 use crate::host_key::{HostKeyState, HostKeyVerifier};
+use crate::local_downloads;
 use crate::metrics;
 use crate::metrics_history;
 use crate::model::{
@@ -628,6 +629,15 @@ struct UploadState {
     file: std::fs::File,
 }
 
+/// Local (client-machine) persistence target for a download started with
+/// `saveToLocal`: chunks are appended to a staging `.part` file while they
+/// stream through, and `complete_download` renames it into the user's
+/// Downloads folder once every byte arrived.
+struct DownloadSink {
+    part_path: PathBuf,
+    file: AsyncMutex<tokio::fs::File>,
+}
+
 #[derive(Clone)]
 struct DownloadState {
     session_id: String,
@@ -635,6 +645,7 @@ struct DownloadState {
     file_name: String,
     size: u64,
     next_offset: u64,
+    sink: Option<Arc<DownloadSink>>,
 }
 
 struct FinishingUpload {
@@ -1369,9 +1380,9 @@ impl SshRuntime {
             }
         };
 
-        let none = session
-            .authenticate_none(&connection.username)
+        let none = tokio::time::timeout(timeout, session.authenticate_none(&connection.username))
             .await
+            .map_err(|_| "SSH authentication probe timed out".to_string())?
             .map_err(|error| format!("SSH auth probe failed: {error}"))?;
         eprintln!(
             "[ssh-trace] tcp+banner ok, auth none success={}",
@@ -3775,11 +3786,17 @@ impl SshRuntime {
         session_id: &str,
         remote_path: &str,
         offset: u64,
+        save_to_local: bool,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         let remote_path = normalize_remote_path(remote_path)?;
         if self.active_transfer_count(session_id)? >= 3 {
             return Err("This SSH session already has three active transfers".to_string());
+        }
+        // Resume re-attaches with bytes the caller already holds locally, which
+        // the staging file would be missing — only fresh downloads may sink.
+        if save_to_local && offset > 0 {
+            return Err("Local save downloads cannot resume from an offset".to_string());
         }
         let sftp = self.sftp(session_id).await?;
         let size = sftp
@@ -3811,6 +3828,29 @@ impl SshRuntime {
             .unwrap_or("download")
             .to_string();
         let task_id = Uuid::new_v4().to_string();
+        let sink = if save_to_local {
+            let staging = self.transfer_dir.join("downloads");
+            std::fs::create_dir_all(&staging)
+                .map_err(|error| format!("Failed to create download staging directory: {error}"))?;
+            let part_path = staging.join(format!("download-{task_id}.part"));
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&part_path)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to create local download file '{}': {error}",
+                        part_path.display()
+                    )
+                })?;
+            Some(Arc::new(DownloadSink {
+                part_path,
+                file: AsyncMutex::new(file),
+            }))
+        } else {
+            None
+        };
         self.downloads
             .lock()
             .map_err(|_| "Download registry is poisoned".to_string())?
@@ -3822,6 +3862,7 @@ impl SshRuntime {
                     file_name: file_name.clone(),
                     size,
                     next_offset: offset,
+                    sink,
                 },
             );
         emitter
@@ -3840,7 +3881,7 @@ impl SshRuntime {
             size,
         );
         Ok(
-            json!({ "taskId": task_id, "fileName": file_name, "size": size, "chunkSize": TRANSFER_CHUNK_SIZE, "resumeOffset": offset }),
+            json!({ "taskId": task_id, "fileName": file_name, "size": size, "chunkSize": TRANSFER_CHUNK_SIZE, "resumeOffset": offset, "saveToLocal": save_to_local }),
         )
     }
 
@@ -3885,6 +3926,14 @@ impl SshRuntime {
             .await
             .map_err(|error| format!("SFTP download failed: {error}"))?;
         chunk.truncate(length);
+        if let Some(sink) = download.sink.as_ref() {
+            sink.file
+                .lock()
+                .await
+                .write_all(&chunk)
+                .await
+                .map_err(|error| format!("Failed to write local download file: {error}"))?;
+        }
         let next_offset = offset.saturating_add(length as u64);
         let mut payload = Vec::with_capacity(8 + length);
         payload.extend_from_slice(&offset.to_be_bytes());
@@ -3938,6 +3987,11 @@ impl SshRuntime {
             let _ = std::fs::remove_file(&upload.local_path);
             remove_upload_meta(&self.transfer_dir, task_id);
         }
+        if let Some(download) = download.as_ref() {
+            if let Some(sink) = download.sink.as_ref() {
+                let _ = std::fs::remove_file(&sink.part_path);
+            }
+        }
         if upload.is_none() && download.is_none() && finishing.is_none() {
             return Err("Transfer task was not found".to_string());
         }
@@ -3953,13 +4007,20 @@ impl SshRuntime {
             .map_err(plugin_error)
     }
 
-    pub fn complete_download(&self, task_id: &str, emitter: &PluginEmitter) -> Result<(), String> {
+    pub async fn complete_download(
+        &self,
+        task_id: &str,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
         let download = self
             .downloads
             .lock()
             .map_err(|_| "Download registry is poisoned".to_string())?
             .remove(task_id)
             .ok_or("Download task was not found".to_string())?;
+        let record_failed = |error: &str| {
+            self.record_transfer(json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "failed", "error": error }));
+        };
         if download.next_offset < download.size {
             let error = format!(
                 "Download is incomplete: received {} of {} bytes",
@@ -3967,15 +4028,66 @@ impl SshRuntime {
             );
             // The task dies here without reaching the completed path, so
             // the failure is recorded explicitly.
-            self.record_transfer(json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "failed", "error": error }));
+            record_failed(&error);
             return Err(error);
         }
-        let task = json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.size, "status": "completed" });
+        let local_path = match download.sink.as_ref() {
+            None => None,
+            Some(sink) => {
+                match Self::finalize_download_sink(self, sink, &download.file_name).await {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        record_failed(&error);
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        let mut task = json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.size, "status": "completed" });
+        if let Some(path) = local_path.as_ref() {
+            task["localPath"] = json!(path.to_string_lossy());
+        }
         self.record_transfer(task.clone());
         emitter
             .event("sftp/transfer/progress", task)
             .map_err(plugin_error)?;
-        Ok(())
+        Ok(json!({
+            "success": true,
+            "taskId": task_id,
+            "localPath": local_path.as_ref().map(|path| path.to_string_lossy()),
+        }))
+    }
+
+    /// Flushes the staging file and moves it to its final non-colliding name
+    /// in the user's Downloads folder. Rename first (same volume = cheap);
+    /// staging and Downloads can live on different volumes, so a failed rename
+    /// falls back to copy+delete. The staging file survives failures so the
+    /// bytes are never lost silently.
+    async fn finalize_download_sink(
+        &self,
+        sink: &DownloadSink,
+        file_name: &str,
+    ) -> Result<PathBuf, String> {
+        {
+            let file = sink.file.lock().await;
+            file.sync_all()
+                .await
+                .map_err(|error| format!("Failed to flush local download file: {error}"))?;
+        }
+        let base = local_downloads::downloads_base_dir(|key| std::env::var_os(key), &self.data_dir);
+        let final_path = local_downloads::pick_download_path(&base, file_name);
+        if std::fs::rename(&sink.part_path, &final_path).is_ok() {
+            return Ok(final_path);
+        }
+        std::fs::copy(&sink.part_path, &final_path)
+            .and_then(|_| std::fs::remove_file(&sink.part_path))
+            .map_err(|error| {
+                format!(
+                    "Failed to move the download into '{}': {error}",
+                    final_path.display()
+                )
+            })?;
+        Ok(final_path)
     }
 
     pub fn transfer_list(&self, session_id: &str) -> Result<Value, String> {
@@ -4321,6 +4433,9 @@ impl SshRuntime {
                 let Some((task_id, download)) = downloads.remove_entry(&task_id) else {
                     continue;
                 };
+                if let Some(sink) = download.sink.as_ref() {
+                    let _ = std::fs::remove_file(&sink.part_path);
+                }
                 self.persist_transfer_record(&json!({
                     "taskId": task_id,
                     "sessionId": download.session_id,
@@ -4457,15 +4572,7 @@ async fn authenticate_private_key_result(
     session: &mut Handle<SshClient>,
     connection: &StoredConnection,
 ) -> Result<AuthResult, String> {
-    let key_path = expand_private_key_path(&connection.private_key_path);
-    let key_text = tokio::fs::read_to_string(&key_path)
-        .await
-        .map_err(|error| {
-            format!(
-                "Failed to read SSH private key '{}': {error}",
-                key_path.display()
-            )
-        })?;
+    let key_text = resolve_private_key_text(connection).await?;
     let passphrase = (!connection.private_key_passphrase.is_empty())
         .then_some(connection.private_key_passphrase.as_str());
     let private_key = decode_secret_key(&key_text, passphrase)
@@ -4486,6 +4593,35 @@ async fn authenticate_private_key_result(
     .await
     .map_err(|_| "SSH private-key authentication timed out".to_string())?
     .map_err(|error| format!("SSH private-key authentication failed: {error}"))
+}
+
+/// Private key source resolution for authentication: pasted key content
+/// (`connection_secrets.private_key`) wins over the key path, mirroring the
+/// form's either-or contract. CRLF is normalized so keys pasted from Windows
+/// editors or stored with CRLF line endings still decode.
+async fn resolve_private_key_text(connection: &StoredConnection) -> Result<String, String> {
+    if !connection.private_key.is_empty() {
+        return Ok(normalize_private_key_text(&connection.private_key));
+    }
+    let key_path = expand_private_key_path(&connection.private_key_path);
+    let text = tokio::fs::read_to_string(&key_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to read SSH private key '{}': {error}",
+                key_path.display()
+            )
+        })?;
+    Ok(normalize_private_key_text(&text))
+}
+
+/// Normalizes CRLF/CR line endings to LF. Key material itself is base64 or
+/// hex per line, so no meaningful content is affected.
+fn normalize_private_key_text(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 async fn authenticate_private_key(
@@ -4927,6 +5063,68 @@ mod tests {
         let frames = replay.after(1);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].sequence, 2);
+    }
+
+    // —— 私钥来源解析：粘贴内容优先于路径（connection_secrets.private_key）———
+
+    fn key_connection(path: &str, content: &str) -> StoredConnection {
+        StoredConnection::from_lifecycle_params(&json!({
+            "connection": {
+                "id": "key-resolve",
+                "host": "example.com",
+                "port": 22,
+                "username": "user",
+                "external_config": {
+                    "authentication": "private-key",
+                    "private_key_path": path
+                },
+                "connection_secrets": { "private_key": content }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn private_key_text_normalizes_carriage_returns() {
+        assert_eq!(
+            normalize_private_key_text("a\r\nb\rc\nd"),
+            "a\nb\nc\nd".to_string()
+        );
+        assert_eq!(normalize_private_key_text("plain\n"), "plain\n".to_string());
+    }
+
+    #[tokio::test]
+    async fn pasted_key_content_wins_over_key_path() {
+        // 路径指向不存在的文件也能取到内容：content 非空时不碰文件系统。
+        let connection = key_connection(
+            "/definitely/missing/id_test",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nbody\n-----END OPENSSH PRIVATE KEY-----\n",
+        );
+        let text = resolve_private_key_text(&connection).await.unwrap();
+        assert!(text.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert!(text.ends_with("-----END OPENSSH PRIVATE KEY-----\n"));
+    }
+
+    #[tokio::test]
+    async fn key_path_fallback_reads_and_normalizes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf_key");
+        std::fs::write(
+            &path,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\r\nbody\r\n-----END OPENSSH PRIVATE KEY-----\r\n",
+        )
+        .unwrap();
+        let connection = key_connection(&path.display().to_string(), "");
+        let text = resolve_private_key_text(&connection).await.unwrap();
+        assert!(text.contains("\nbody\n"));
+        assert!(!text.contains('\r'));
+    }
+
+    #[tokio::test]
+    async fn missing_key_without_content_reports_the_path() {
+        let connection = key_connection("/definitely/missing/id_test", "");
+        let error = resolve_private_key_text(&connection).await.unwrap_err();
+        assert!(error.contains("Failed to read SSH private key"), "{error}");
     }
 
     // —— F1: 断点续传（spool meta / resume 校验 / resumable 扫描）———
@@ -5781,6 +5979,7 @@ mod tests {
                 file_name: "live.bin".to_string(),
                 size: 9,
                 next_offset: 5,
+                sink: None,
             },
         );
         let no_connection = |_: &str| String::new();

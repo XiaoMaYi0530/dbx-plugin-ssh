@@ -225,7 +225,11 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .folder-icon { color: var(--warning); fill: color-mix(in srgb, var(--warning) 16%, transparent); }
 .rename-input { width: 100%; min-width: 60px; height: 22px; border: 1px solid var(--primary); border-radius: 3px; padding: 1px 5px; background: var(--background); color: var(--foreground); }
 .file-footer { height: 26px; min-height: 26px; justify-content: space-between; gap: 16px; border-top: 1px solid var(--border); padding: 0 8px; color: var(--muted-foreground); font-size: 11px; }
-.file-footer span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--terminal-font-family); }
+/* 窄面板下三段信息（条目数/磁盘余量/当前路径）一律单行：余量与路径可收缩
+   省略（完整值走 title），条目数固定不缩，避免换行把 26px 页脚挤错位。 */
+.file-footer span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-footer span:first-child { flex: 0 0 auto; }
+.file-footer span:last-child { font-family: var(--terminal-font-family); }
 .empty { display: flex; min-height: 120px; align-items: center; justify-content: center; gap: 8px; padding: 16px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
 .empty.compact { min-height: 42px; padding: 8px; }
 
@@ -246,6 +250,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .transfer-title strong { font-size: 11px; font-variant-numeric: tabular-nums; }
 .transfer-card progress { width: 100%; height: 4px; border: 0; accent-color: var(--primary); }
 .transfer-meta { justify-content: space-between; gap: 8px; color: var(--muted-foreground); font-size: 10px; font-variant-numeric: tabular-nums; }
+.transfer-path { margin: 0; color: var(--muted-foreground); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
 .link-button { align-self: flex-end; padding: 2px 0; color: var(--primary); font-size: 11px; }
 .task-error { margin: 0; color: var(--destructive); font-size: 10px; overflow-wrap: anywhere; }
 .activity-dot { position: absolute; top: 4px; right: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 0 1px var(--background); }
@@ -380,6 +385,8 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .metric-card small { color: var(--muted-foreground); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .metrics-disks { display: flex; flex-direction: column; gap: 6px; margin: 0; }
 .disk-row { display: grid; grid-template-columns: minmax(70px, 130px) 1fr auto; align-items: center; gap: 10px; font-size: 11px; }
+/* 超长挂载点/网卡名不得外溢压到进度条与数值列：第一列截断省略，完整值走 title。 */
+.disk-row > .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .disk-row progress { width: 100%; height: 8px; accent-color: var(--primary); }
 /* >=85% 磁盘占用转警示红；accent-color 是 progress 跨浏览器唯一可靠着色点
    （::-webkit-progress-value/::-moz-progress-bar 各家不同名，规则要成对写）。 */

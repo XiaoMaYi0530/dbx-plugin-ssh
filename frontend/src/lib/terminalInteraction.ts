@@ -23,15 +23,15 @@ export function resolveTerminalRightClickAction(options: { selectCopy: boolean; 
 export type TerminalKeyAction = "copy" | "paste" | "none";
 
 /**
- * Keyboard shortcut routing inside the terminal (iTerm2/XShell style):
- * Ctrl/Cmd+V and Ctrl/Cmd+Shift+V paste, Ctrl/Cmd+Shift+C copies the current
- * selection. Plain Ctrl/Cmd+C must stay untouched so it keeps reaching the
+ * Keyboard shortcut routing inside the terminal (Windows Terminal/iTerm2
+ * style): Ctrl/Cmd+V and Ctrl/Cmd+Shift+V paste, Ctrl/Cmd+C copies when a
+ * selection exists and otherwise stays untouched so it keeps reaching the
  * remote shell as SIGINT.
  */
 export function resolveTerminalKeyAction(options: { mod: boolean; shiftKey: boolean; key: string; hasSelection: boolean }): TerminalKeyAction {
   const key = options.key.toLowerCase();
   if (options.mod && key === "v") return "paste";
-  if (options.mod && options.shiftKey && key === "c" && options.hasSelection) return "copy";
+  if (options.mod && key === "c" && options.hasSelection) return "copy";
   return "none";
 }
 
@@ -90,4 +90,19 @@ export function terminalSearchSeedFromSelection(selection: string): string {
  */
 export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: boolean; transferBusy: boolean }): boolean {
   return options.connected && options.canWrite && !options.transferBusy;
+}
+
+/**
+ * Target directory typed into the terminal drop prompt: whitespace is
+ * trimmed, trailing slashes collapse (the bare root "/" stays intact), and
+ * an empty result means the input is unusable so the caller can keep the
+ * confirm button disabled. The sidecar's normalize_remote_path is the final
+ * authority — this only shapes the input before joinRemote().
+ */
+export function normalizeDropTargetDir(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith("/")) return trimmed;
+  const collapsed = trimmed.replace(/\/+$/, "");
+  return collapsed || "/";
 }

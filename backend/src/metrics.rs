@@ -4,8 +4,11 @@
 //! The collector stays a single POSIX shell command in the same style as the
 //! base script: two network counter snapshots separated by `sleep 1`
 //! (`/proc/net/dev` on Linux, `netstat -ibn` on macOS/BSD) and one `ps`
-//! invocation sorted by CPU. All parsing lives in pure functions so Linux and
-//! macOS sample fixtures can be unit-tested without a server.
+//! invocation sorted by CPU. CPU/memory/load/uptime prefer the Linux `/proc`
+//! readers and fall back to sysctl/`vm_stat`/`iostat` on macOS; the fallback
+//! branches re-emit the same line shapes so the shared parsers stay
+//! unchanged. All parsing lives in pure functions so Linux and macOS sample
+//! fixtures can be unit-tested without a server.
 
 use std::collections::BTreeMap;
 
@@ -25,8 +28,14 @@ const PROCESS_TOP_LIMIT: usize = 8;
 const METRICS_SCRIPT: &str = concat!(
     "echo \"hostname=$(hostname 2>/dev/null)\"; ",
     "echo \"kernel=$(uname -r 2>/dev/null)\"; ",
-    "echo \"loadavg=$(cat /proc/loadavg 2>/dev/null)\"; ",
-    "echo \"uptime=$(cat /proc/uptime 2>/dev/null)\"; ",
+    // Linux /proc first; macOS/BSD falls back to sysctl (braces stripped so
+    // the parser sees three plain floats).
+    "echo \"loadavg=$(cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')\"; ",
+    // /proc/uptime is two floats; kern.boottime is `{ sec = N, usec = … }` —
+    // capture the first `=` value (greedy `.*sec` would grab `usec`).
+    "if [ -r /proc/uptime ]; then echo \"uptime=$(cat /proc/uptime 2>/dev/null)\"; ",
+    "else boot=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^[^=]*= *\\([0-9][0-9]*\\).*/\\1/p'); ",
+    "[ -n \"$boot\" ] && echo \"uptime=$(( $(date +%s) - boot ))\"; fi; ",
     "echo \"nproc=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)\"; ",
     // Network + processes run before the --mem--/--cpu--/--df-- sections so
     // the base parser safely skips these lines (its section state is still
@@ -41,12 +50,30 @@ const METRICS_SCRIPT: &str = concat!(
     "(ps -eo pid=,user=,pcpu=,pmem=,args= 2>/dev/null || true) | sort -k3,3nr | head -n 8; ",
     "echo '--psm--'; ",
     "(ps -eo pid=,user=,pcpu=,pmem=,args= 2>/dev/null || true) | sort -k4,4nr | head -n 8; ",
-    // Inode usage: `df -iP` keeps the portable layout; busybox/GNU column
-    // differences are handled by the parser, not the command.
+    // Inode usage: `df -iP` keeps the portable layout on Linux; on macOS
+    // `-P` silently forces block mode (inode columns vanish), so Darwin must
+    // use bare `df -i` to get real iused/ifree/%iused. Column differences
+    // are handled by the parser, not the command.
     "echo '--dfi--'; ",
-    "df -iP 2>/dev/null | tail -n +2 | head -n 24; ",
-    "echo '--mem--'; grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null; ",
-    "echo '--cpu--'; head -n 1 /proc/stat; sleep 0.4; head -n 1 /proc/stat; ",
+    "if [ \"$(uname -s 2>/dev/null)\" = Darwin ]; then df -i 2>/dev/null | tail -n +2 | head -n 24; ",
+    "else df -iP 2>/dev/null | tail -n +2 | head -n 24; fi; ",
+    "echo '--mem--'; ",
+    "if [ -r /proc/meminfo ]; then grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null; ",
+    // macOS: total from hw.memsize (bytes -> kB); available = free + inactive
+    // + speculative pages (vm_stat values carry a trailing dot); swap from
+    // vm.swapusage in MB — all re-emitted in meminfo `Key: value kB` shape
+    // so the shared parser stays unchanged.
+    "else echo \"MemTotal: $(($(sysctl -n hw.memsize 2>/dev/null)/1024)) kB\"; ",
+    "pskb=$(($(sysctl -n vm.pagesize 2>/dev/null || sysctl -n hw.pagesize 2>/dev/null)/1024)); ",
+    "vm_stat 2>/dev/null | awk -v pskb=\"$pskb\" '/Pages free:/{f=$NF} /Pages inactive:/{ia=$NF} /Pages speculative:/{sp=$NF} END{gsub(/\\./,\"\",f); gsub(/\\./,\"\",ia); gsub(/\\./,\"\",sp); if (f!=\"\") printf \"MemAvailable: %d kB\\n\", (f+ia+sp)*pskb}'; ",
+    "sysctl -n vm.swapusage 2>/dev/null | awk -F'[ =M]+' '{if ($2 != \"\") printf \"SwapTotal: %d kB\\nSwapFree: %d kB\\n\", $2*1024, $6*1024}'; fi; ",
+    "echo '--cpu--'; ",
+    "if [ -r /proc/stat ]; then head -n 1 /proc/stat; sleep 0.4; head -n 1 /proc/stat; ",
+    // macOS: `iostat -c 2` takes two samples 1s apart; the second is a real
+    // delta. The us/sy/id columns sit at a variable offset (per-disk columns
+    // precede them), so anchor on the header row and re-emit the percentages
+    // as two synthetic tick rows for the shared delta parser.
+    "else iostat -c 2 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if($i==\"id\") c=i} END{if(c){us=$(c-2); sy=$(c-1); id=$c; if (us ~ /^[0-9]+$/ && sy ~ /^[0-9]+$/ && id ~ /^[0-9]+$/) printf \"cpu  0 0 0 0 0\\ncpu  %d 0 0 %d 0\\n\", us+sy, id}}'; fi; ",
     "echo '--df--'; df -kP 2>/dev/null | tail -n +2 | head -n 24; ",
     // Distribution identification (IMPL_PLAN §1.5): both standard paths,
     // first present wins; neither existing (BSD, busybox minimal) leaves the
@@ -602,13 +629,15 @@ cpu  200 0 300 8100 40 0 0 0 0 0
 /dev/sdc1 2048000 1024000 1024000 50% /var
 ";
 
-    /// `netstat -ibn` macOS shape: header row plus per-address duplicate rows
-    /// for the same interface name.
+    /// Collector output in post-fix macOS shape: sysctl/vm_stat/iostat
+    /// fallbacks re-emit the Linux line shapes (`loadavg`/`uptime` keys,
+    /// meminfo-style `--mem--` rows, synthetic `cpu` tick rows), `netstat
+    /// -ibn` network counters and bare `df -i` inode columns.
     const MACOS_FIXTURE: &str = "\
 hostname=mac-mini
-kernel=
-loadavg=
-uptime=
+kernel=25.0.0
+loadavg= 164.17 195.50 176.54
+uptime=1789900000
 nproc=10
 --net--
 Name       Mtu   Network       Address            Ipkts  Ierrs     Ibytes    Opkts  Oerrs     Obytes  Coll
@@ -625,11 +654,24 @@ en0        1500  192.168.1    192.168.1.10       98805      0  1500000    54361 
 --ps--
    321 jin          45.1  8.3 /Applications/DBX.app/Contents/MacOS/DBX
    402 root         3.2  0.4 /usr/libexec/taskgated
+--psm--
+   321 jin          45.1  8.3 /Applications/DBX.app/Contents/MacOS/DBX
+   402 root         3.2  0.4 /usr/libexec/taskgated
+--dfi--
+Filesystem         512-blocks       Used Available Capacity  iused      ifree %iused  Mounted on
+/dev/disk3s1s1     1942700360   24682824  96661440    21%   458732  480207920    0%   /
+devfs                     541        541         0  100%      936          0  100%   /dev
 --mem--
+MemTotal: 33554432 kB
+MemAvailable: 6104352 kB
+SwapTotal: 18874368 kB
+SwapFree: 809216 kB
 --cpu--
-cpu  10 0 20 800 4 0 0 0 0 0
-cpu  20 0 30 810 4 0 0 0 0 0
+cpu  0 0 0 0 0
+cpu  97 0 0 3 0
 --df--
+/dev/disk3s1s1 971350180 12341412 48020792 21% /
+devfs 270 270 0 100% /dev
 ";
 
     #[test]
@@ -806,6 +848,25 @@ eth0: 100    1 0 0 0 0 0 0 50 1 0 0 0 0 0 0
     fn parses_macos_json_end_to_end() {
         let metrics = parse_metrics_output(MACOS_FIXTURE);
         assert_eq!(metrics["hostname"], "mac-mini");
+        // sysctl 回退产出的负载与运行时长被解析成三个 load 与整数秒。
+        assert_eq!(metrics["cpu"]["load1"], 164.17);
+        assert_eq!(metrics["cpu"]["load15"], 176.54);
+        assert_eq!(metrics["uptimeSeconds"], 1_789_900_000_u64);
+        // iostat 百分比合成的 tick 行算出 CPU 繁忙率：(97+0)*100/(97+3)。
+        assert_eq!(metrics["cpu"]["percent"], 97.0);
+        // meminfo 形状的 sysctl 回退行给出完整内存与 swap 视图。
+        assert_eq!(metrics["memory"]["totalBytes"], 34_359_738_368_u64);
+        assert_eq!(metrics["memory"]["availableBytes"], 6_250_856_448_u64);
+        assert_eq!(metrics["memory"]["usedBytes"], 28_108_881_920_u64);
+        assert_eq!(metrics["memory"]["swapTotalBytes"], 19_327_352_832_u64);
+        assert_eq!(metrics["memory"]["swapUsedBytes"], 18_498_715_648_u64);
+        // df -i 的 %iused 列（最右百分号）胜过同行的 Capacity 21%。
+        let disks = metrics["disks"].as_array().unwrap();
+        assert_eq!(disks[0]["mount"], json!("/"));
+        assert_eq!(disks[0]["inodeUsePercent"], 0.0);
+        assert_eq!(disks[1]["mount"], json!("/dev"));
+        assert_eq!(disks[1]["inodeUsePercent"], 100.0);
+        // Network/process extensions stay intact on the fallback path.
         assert_eq!(metrics["network"].as_array().unwrap().len(), 2);
         assert_eq!(
             metrics["processes"][0]["command"],
