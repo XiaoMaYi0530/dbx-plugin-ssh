@@ -134,6 +134,7 @@ const messages = {
     downloaded: "{name} downloaded",
     downloadedTo: "{name} saved to {path}",
     revealInFolder: "Show in folder",
+    openDownloadedFile: "Open file",
     fileTransferUnavailable: "DBX file transfer API is unavailable.",
     newFolder: "New folder",
     sftpSearch: {
@@ -471,6 +472,7 @@ const messages = {
     downloaded: "{name} descargado",
     downloadedTo: "{name} guardado en {path}",
     revealInFolder: "Mostrar en la carpeta",
+    openDownloadedFile: "Abrir archivo",
     fileTransferUnavailable: "La API de transferencia de archivos de DBX no está disponible.",
     newFolder: "Nueva carpeta",
     sftpSearch: {
@@ -802,6 +804,7 @@ const messages = {
     downloaded: "{name} scaricato",
     downloadedTo: "{name} salvato in {path}",
     revealInFolder: "Mostra nella cartella",
+    openDownloadedFile: "Apri file",
     fileTransferUnavailable: "L'API di trasferimento file DBX non è disponibile.",
     newFolder: "Nuova cartella",
     sftpSearch: {
@@ -1133,6 +1136,7 @@ const messages = {
     downloaded: "{name} をダウンロードしました",
     downloadedTo: "{name} を {path} に保存しました",
     revealInFolder: "フォルダに表示",
+    openDownloadedFile: "ファイルを開く",
     fileTransferUnavailable: "DBX ファイル転送 API を利用できません。",
     newFolder: "新しいフォルダー",
     sftpSearch: {
@@ -1464,6 +1468,7 @@ const messages = {
     downloaded: "{name} baixado",
     downloadedTo: "{name} salvo em {path}",
     revealInFolder: "Mostrar na pasta",
+    openDownloadedFile: "Abrir arquivo",
     fileTransferUnavailable: "A API de transferência de arquivos do DBX não está disponível.",
     newFolder: "Nova pasta",
     sftpSearch: {
@@ -1795,6 +1800,7 @@ const messages = {
     downloaded: "已下载 {name}",
     downloadedTo: "已下载 {name} → {path}",
     revealInFolder: "在文件夹中显示",
+    openDownloadedFile: "打开文件",
     fileTransferUnavailable: "DBX 文件传输 API 不可用。",
     newFolder: "新建文件夹",
     sftpSearch: {
@@ -2132,6 +2138,7 @@ const messages = {
     downloaded: "已下載 {name}",
     downloadedTo: "已下載 {name} → {path}",
     revealInFolder: "在資料夾中顯示",
+    openDownloadedFile: "開啟檔案",
     fileTransferUnavailable: "DBX 檔案傳輸 API 無法使用。",
     newFolder: "新增資料夾",
     sftpSearch: {

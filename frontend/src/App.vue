@@ -3945,6 +3945,16 @@ async function revealTransferTarget(path: string) {
   }
 }
 
+// 在系统默认应用中打开已完成的下载；sidecar 会校验路径必须来自本插件
+// 的完成历史，避免把这个按钮变成任意本机路径打开入口。
+async function openTransferTarget(path: string) {
+  try {
+    await window.dbxPlugin.invoke("local/open", { path });
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
 // —— 断点续传：暂停/恢复 + 可续传上传 ———
 
 // 分片循环在每个分片之间调用；暂停时挂起，恢复后继续。
@@ -6183,6 +6193,7 @@ onBeforeUnmount(() => {
               <button v-if="transferPausable(task.status)" class="link-button" @click="toggleTransferPause(task)">{{ t(pausedTaskIds.has(task.taskId) ? "transferResume" : "transferPause") }}</button>
               <button v-if="task.status === 'queued' || task.status === 'running'" class="link-button" @click="cancelTransfer(task)">{{ t("cancel") }}</button>
               <button v-if="task.localPath" class="link-button" @click="revealTransferTarget(task.localPath)">{{ t("revealInFolder") }}</button>
+              <button v-if="task.localPath" class="link-button" @click="openTransferTarget(task.localPath)">{{ t("openDownloadedFile") }}</button>
               <p v-if="task.error" class="task-error">{{ task.error }}</p>
             </article>
             <!-- 可续传上传：中断任务的 spool 前缀仍在，选同名同大小文件续传 -->
@@ -6209,6 +6220,7 @@ onBeforeUnmount(() => {
                 <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span v-if="entry.transferred">{{ formatBytes(entry.transferred) }}</span></div>
                 <p v-if="entry.localPath" class="transfer-path mono" :title="entry.localPath">{{ entry.localPath }}</p>
                 <button v-if="entry.localPath" class="link-button" @click="revealTransferTarget(entry.localPath)">{{ t("revealInFolder") }}</button>
+                <button v-if="entry.localPath" class="link-button" @click="openTransferTarget(entry.localPath)">{{ t("openDownloadedFile") }}</button>
                 <p v-if="entry.error" class="task-error">{{ entry.error }}</p>
               </article>
             </template>

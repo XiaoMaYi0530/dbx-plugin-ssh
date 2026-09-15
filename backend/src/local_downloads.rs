@@ -4,8 +4,8 @@
 //! is optional (absent on current hosts) and `<a download>` is silently
 //! cancelled inside a Tauri/WKWebView without a download handler. The sidecar
 //! therefore writes finished downloads to the user's Downloads folder so the
-//! completion notice can show a real path, and `local/reveal` opens the file
-//! manager on that path.
+//! completion notice can show a real path. `local/reveal` opens the file
+//! manager and `local/open` opens the downloaded file in the OS default app.
 //!
 //! Reveal is deliberately restricted to paths recorded by a completed local
 //! download — never an arbitrary open-path primitive.
@@ -168,12 +168,47 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Failed to launch file manager: {error}"))
 }
 
+/// Opens a downloaded file with the operating system's default application.
+pub fn open_in_default_app(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("Downloaded file no longer exists".to_string());
+    }
+    if cfg!(target_os = "macos") {
+        return std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Failed to open downloaded file: {error}"));
+    }
+    if cfg!(windows) {
+        return std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Failed to open downloaded file: {error}"));
+    }
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Failed to open downloaded file: {error}"))
+}
+
 /// Validates `path` against the persisted transfer history before revealing:
 /// only a completed download row that recorded this exact `localPath` may be
 /// opened. Survives sidecar restarts because history rows persist on disk.
 pub fn reveal_validated(history: &[Value], path: &Path) -> Result<(), String> {
     if is_recorded_download(history, path) {
         reveal_in_file_manager(path)
+    } else {
+        Err("Path was not saved by a completed download of this plugin".to_string())
+    }
+}
+
+/// Same allowlist as reveal, but opens the file itself rather than its folder.
+pub fn open_validated(history: &[Value], path: &Path) -> Result<(), String> {
+    if is_recorded_download(history, path) {
+        open_in_default_app(path)
     } else {
         Err("Path was not saved by a completed download of this plugin".to_string())
     }
@@ -291,5 +326,17 @@ mod tests {
         assert!(rejected
             .unwrap_err()
             .contains("not saved by a completed download"));
+    }
+
+    #[test]
+    fn open_requires_recorded_completed_download() {
+        let history = vec![serde_json::json!({
+            "direction": "download", "status": "completed", "localPath": "/Downloads/a.txt"
+        })];
+        assert!(is_recorded_download(
+            &history,
+            Path::new("/Downloads/a.txt")
+        ));
+        assert!(!is_recorded_download(&history, Path::new("/etc/passwd")));
     }
 }

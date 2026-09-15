@@ -746,6 +746,14 @@ impl Plugin {
                 local_downloads::reveal_validated(&history, std::path::Path::new(path))?;
                 Ok(json!({ "success": true }))
             }
+            // 在默认应用中打开已完成的本机下载；同样只允许打开传输历史中
+            // 记录过的路径，不能成为任意路径执行原语。
+            "local/open" => {
+                let path = required_string(&params, "path")?;
+                let history = transfer_history::load_history(&plugin_data_dir());
+                local_downloads::open_validated(&history, std::path::Path::new(path))?;
+                Ok(json!({ "success": true }))
+            }
             "sftp/transfer/resumable" => self.ssh.resumable_uploads(),
             "sftp/transfer/list" => self
                 .ssh
