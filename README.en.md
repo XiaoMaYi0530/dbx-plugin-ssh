@@ -45,7 +45,8 @@ connections, terminal, files, and automation share the same DBX connection conte
 - Interactive PTY terminal with resize, session recovery, clipboard support,
   remote-directory tracking, and batch input.
 - SFTP browsing, sorting, preview, upload, download, rename, create, drag and drop,
-  and recursive delete.
+  and recursive delete. Focus the SFTP pane and press Ctrl/Cmd+V to upload local
+  files from the system clipboard into the current directory.
 - Large-file transfers with progress, cancellation, acknowledgements, and atomic replacement.
 - Known Hosts verification, changed-key rejection, read-only mode, and directory disk usage.
 - ProxyJump chains up to three hops, keepalive, cancellable remote commands, chmod,
@@ -53,6 +54,9 @@ connections, terminal, files, and automation share the same DBX connection conte
 - TOTP and keyboard-interactive two-factor authentication, plus MCP tools for automation clients.
 - Simplified Chinese, Traditional Chinese, English, Spanish, Italian, Japanese,
   and Portuguese UI.
+
+Clipboard file paste uses the native `paste` file event exposed by the host/browser. If a host
+does not expose that event, the Upload button and drag-and-drop workflow remain available.
 
 See the [feature and competitor comparison](docs/COMPARISON.en.md) for a capability matrix
 covering OpenSSH + sftp, Tabby, Termius, FinalShell, electerm, and iSHell Pro.

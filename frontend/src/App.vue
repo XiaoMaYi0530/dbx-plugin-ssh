@@ -96,6 +96,7 @@ import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
 import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
+import { filesFromClipboard } from "./lib/clipboardFiles";
 import { friendlySftpError } from "./lib/sftpErrors";
 import { expandSelection, filterSftpEntries, type SftpTypeFilter } from "./lib/sftpFileFilters";
 import { pushPathHistory, sanitizePathHistories } from "./lib/sftpPathHistory";
@@ -415,6 +416,7 @@ const HIGHLIGHT_PALETTE = ["#ef4444", "#f59e0b", "#facc15", "#22c55e", "#3b82f6"
 type TerminalSearchMatchState = "idle" | "match" | "no-match";
 
 const terminalHost = ref<HTMLElement>();
+const sftpPane = ref<HTMLElement>();
 const paneContainer = ref<HTMLElement>();
 const uploadInput = ref<HTMLInputElement>();
 const zmodemInput = ref<HTMLInputElement>();
@@ -4051,14 +4053,28 @@ function onUploadInput(event: Event) {
   if (files.length) void uploadLocalFiles(files).catch(showError);
 }
 
-// File-manager copy/paste lands as ClipboardEvent.files in desktop webviews
-// that expose native file clipboard data. Text paste remains untouched so the
-// path/search inputs and terminal keep their normal clipboard semantics.
-function onSftpPaste(event: ClipboardEvent) {
+/**
+ * Focus the SFTP workbench itself when the user clicks its blank area. This
+ * gives Ctrl/Cmd+V a stable native paste target without stealing focus from
+ * path/search inputs or toolbar controls.
+ */
+function focusSftpPaneOnPointerDown(event: PointerEvent) {
+  const target = event.target;
+  if (target instanceof Element && target.closest("button, input, select, textarea, a, [contenteditable='true']")) return;
+  sftpPane.value?.focus({ preventScroll: true });
+}
+
+/**
+ * Native file paste is the browser-compatible bridge for Finder/Explorer
+ * clipboard files. Text paste is deliberately left untouched so path/search
+ * inputs and the remote SFTP clipboard keep their existing behavior.
+ */
+function onSftpClipboardPaste(event: ClipboardEvent) {
   if (!connected.value || !canWrite.value) return;
-  const files = Array.from(event.clipboardData?.files || []);
+  const files = filesFromClipboard(event.clipboardData);
   if (!files.length) return;
   event.preventDefault();
+  event.stopPropagation();
   void uploadLocalFiles(files).catch(showError);
 }
 
@@ -6547,7 +6563,7 @@ onBeforeUnmount(() => {
 
       <div v-if="sftpPaneOpen" class="divider" @pointerdown="startDividerDrag" />
 
-      <section v-if="sftpPaneOpen" class="sftp-pane" :class="{ 'drag-active': dragActive }" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop" @paste="onSftpPaste">
+      <section v-if="sftpPaneOpen" ref="sftpPane" class="sftp-pane" tabindex="-1" :class="{ 'drag-active': dragActive }" @pointerdown="focusSftpPaneOnPointerDown" @paste.capture="onSftpClipboardPaste" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop">
         <div class="path-toolbar">
           <button class="icon-button" :title="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
           <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
@@ -6586,7 +6602,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <button class="icon-button" :title="t('sftpPaste.action')" :disabled="!connected || !canWrite || !sftpClipboard || pasteBusy" @click="pasteClipboard"><ClipboardPaste /></button>
-          <button class="icon-button icon-teal" :title="t('upload')" :disabled="!connected || !canWrite" @click.stop="chooseUpload"><FileUp /></button>
+          <button class="icon-button icon-teal" :title="`${t('upload')} · Ctrl/Cmd+V`" :disabled="!connected || !canWrite" @click.stop="chooseUpload"><FileUp /></button>
           <button class="icon-button icon-amber" :title="t('newFolder')" :disabled="!connected || !canWrite" @click="operationDraft = ''; operationDialog = 'mkdir'"><FolderPlus /></button>
           <button class="icon-button icon-amber" :title="t('sftpNewFile.action')" :disabled="!connected || !canWrite" @click="openNewFileDialog"><FilePlus /></button>
           <label class="follow-directory-control sudo-label" :title="!canWrite ? t('readOnly') : t('sudo.modeHint')">
