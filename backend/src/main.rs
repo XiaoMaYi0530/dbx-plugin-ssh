@@ -20,6 +20,7 @@ mod sftp_bookmarks;
 mod sftp_copy;
 mod sftp_ext;
 mod ssh;
+mod ssh_algorithms;
 mod sudo_allowlist;
 mod sudo_fs;
 mod sudo_profiles;

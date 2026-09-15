@@ -12,7 +12,7 @@ use russh::client::{self, AuthResult, Handle};
 use russh::keys::agent::{client::AgentClient, AgentIdentity};
 use russh::keys::ssh_key::HashAlg;
 use russh::keys::{decode_secret_key, key::PrivateKeyWithHashAlg};
-use russh::{cipher, kex, mac, ChannelMsg, Disconnect, MethodKind, Preferred};
+use russh::{cipher, kex, mac, ChannelMsg, Disconnect, MethodKind};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
 use serde_json::{json, Value};
@@ -41,6 +41,7 @@ use crate::model::{
 };
 use crate::quick_commands;
 use crate::session_recording;
+use crate::ssh_algorithms;
 use crate::sudo_profiles;
 use crate::transfer_history;
 
@@ -67,6 +68,7 @@ fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
 /// russh implements, preserving modern preference order while allowing older
 /// appliances to negotiate hmac-sha1, SHA-1 DH groups, CBC, or 3DES.
 fn ssh_client_config(connection: &StoredConnection) -> client::Config {
+    let mut preferred = ssh_algorithms::preferred(connection.algorithm_policy);
     let mut config = client::Config {
         nodelay: true,
         keepalive_interval: (connection.keepalive_interval_secs > 0)
@@ -75,7 +77,6 @@ fn ssh_client_config(connection: &StoredConnection) -> client::Config {
         ..Default::default()
     };
     if connection.ssh_algorithm_profile == "legacy" {
-        let mut preferred = Preferred::DEFAULT.clone();
         let mut kex_algorithms = preferred.kex.to_vec();
         for algorithm in [kex::DH_GEX_SHA1, kex::DH_G14_SHA1, kex::DH_G1_SHA1] {
             if !kex_algorithms.contains(&algorithm) {
@@ -101,6 +102,8 @@ fn ssh_client_config(connection: &StoredConnection) -> client::Config {
             }
         }
         preferred.mac = Cow::Owned(macs);
+        config.preferred = preferred;
+    } else {
         config.preferred = preferred;
     }
     config
@@ -1310,6 +1313,7 @@ impl SshRuntime {
                 &format!("jump-{}-{}", position + 1, connection.id),
                 connection.connect_timeout_secs,
                 connection.keepalive_interval_secs,
+                connection.algorithm_policy,
                 &connection.ssh_algorithm_profile,
             );
             let handle = self

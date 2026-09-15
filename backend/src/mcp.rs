@@ -32,6 +32,7 @@ use crate::model::{AuthenticationMethod, JumpHost, StoredConnection, SudoSource}
 use crate::multi_exec;
 use crate::sftp_copy;
 use crate::ssh::{SshClient, SshRuntime, NO_TERMINAL_SESSION_MESSAGE};
+use crate::ssh_algorithms::SshAlgorithmPolicy;
 use crate::sudo_allowlist;
 use crate::sudo_profiles;
 
@@ -3767,6 +3768,9 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
             .unwrap_or(30)
             .max(1),
         keepalive_interval_secs: 30,
+        algorithm_policy: SshAlgorithmPolicy::parse(
+            arguments.get("sshAlgorithmPolicy").and_then(Value::as_str),
+        ),
         // MCP drives exec channels, never the user's interactive PTY —
         // activity injection doesn't apply here.
         terminal_keepalive_secs: 0,
@@ -3888,6 +3892,7 @@ const CONNECT_TIMEOUT_DESCRIPTION: &str =
 const AUTH_FLOW_MODE_DESCRIPTION: &str = "Two-factor sudo authentication flow: password_only (no OTP), password_plus_otp (password and TOTP code submitted together at a combined prompt), password_then_otp (password first, TOTP answered at a separate later prompt; default when omitted). Values are matched case-insensitively (PASSWORD_PLUS_OTP works); unrecognized values fall back to the default flow instead of erroring. When set both inline and via a Quick Sudo profile, explicit arguments win";
 const PASSWORD_PROMPT_HINT_DESCRIPTION: &str = "Text fragment used to recognize a non-standard sudo password prompt (localized or custom message) when the built-in prompt patterns miss it";
 const TOTP_PROMPT_HINT_DESCRIPTION: &str = "Text fragment used to recognize a non-standard TOTP/verification-code prompt when the built-in prompt patterns miss it";
+const SSH_ALGORITHM_POLICY_DESCRIPTION: &str = "SSH algorithm compatibility: compatible (default) keeps russh secure KEX/ciphers and adds SHA-1 MACs as a last resort; secure disables SHA-1; legacy additionally enables old SHA-1 Diffie-Hellman and AES-CBC algorithms";
 
 /// Tool-specific parameters layered on the shared connection properties.
 /// Each entry is `(key, json type, description)`; the type is part of the
@@ -3911,6 +3916,7 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
         "agentSocket": { "type": "string", "description": "SSH agent socket for agent auth" },
         "authentication": { "type": "string", "enum": ["password", "private-key", "private-key-password", "agent"], "description": AUTHENTICATION_DESCRIPTION },
         "connectTimeoutSecs": { "type": "integer", "description": CONNECT_TIMEOUT_DESCRIPTION },
+        "sshAlgorithmPolicy": { "type": "string", "enum": ["secure", "compatible", "legacy"], "description": SSH_ALGORITHM_POLICY_DESCRIPTION },
         "sudoPassword": { "type": "string", "description": "Sudo password override (defaults to password)" },
         "totpSecret": { "type": "string", "description": "TOTP secret (otpauth:// URI, base32 key, or static code) for 2FA auto-answer; multiple secrets (newline/semicolon separated) rotate automatically — unexpired, unused codes first, across calls" },
         "authFlowMode": { "type": "string", "enum": ["password_only", "password_plus_otp", "password_then_otp"], "description": AUTH_FLOW_MODE_DESCRIPTION },

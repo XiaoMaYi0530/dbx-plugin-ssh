@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ssh_algorithms::SshAlgorithmPolicy;
+
 pub const TERMINAL_REPLAY_LIMIT: usize = 2 * 1024 * 1024;
 pub const TRANSFER_CHUNK_SIZE: usize = 256 * 1024;
 pub const MAX_TRANSFER_SIZE: u64 = 16 * 1024 * 1024 * 1024;
@@ -120,6 +122,9 @@ pub struct StoredConnection {
     pub agent_socket: String,
     pub connect_timeout_secs: u64,
     pub keepalive_interval_secs: u64,
+    /// SSH algorithm compatibility profile.  The default appends only SHA-1
+    /// MACs to russh's secure defaults; legacy KEX/ciphers require `legacy`.
+    pub algorithm_policy: SshAlgorithmPolicy,
     /// Interactive-terminal activity keepalive: interval in seconds for
     /// injecting space+backspace into the PTY so server-side idle policies
     /// (TMOUT, bastion keystroke audits) never fire. 0 = off; the parser
@@ -255,6 +260,7 @@ impl JumpHost {
         id: &str,
         timeout_secs: u64,
         keepalive_secs: u64,
+        algorithm_policy: SshAlgorithmPolicy,
         ssh_algorithm_profile: &str,
     ) -> StoredConnection {
         StoredConnection {
@@ -275,6 +281,7 @@ impl JumpHost {
             agent_socket: self.agent_socket.clone(),
             connect_timeout_secs: timeout_secs.max(1),
             keepalive_interval_secs: keepalive_secs,
+            algorithm_policy,
             // Jump hops carry no interactive terminal, so no activity
             // keepalive either.
             terminal_keepalive_secs: 0,
@@ -364,6 +371,11 @@ impl StoredConnection {
         let password_prompt_hint = optional_string(external_config, "password_prompt_hint");
         let totp_prompt_hint = optional_string(external_config, "totp_prompt_hint");
         let auth_flow_mode = optional_string(external_config, "auth_flow_mode");
+        let algorithm_policy = SshAlgorithmPolicy::parse(
+            external_config
+                .and_then(|config| config.get("ssh_algorithm_policy"))
+                .and_then(Value::as_str),
+        );
         // 会话特性两件套（camelCase 为主；snake_case 别名兼容手改配置/历史
         // 草稿）。setEnv 严格校验，非法条目让连接直接失败（宁可连不上也
         // 不错配）；remoteCommand trim 后非空才生效。
@@ -453,6 +465,7 @@ impl StoredConnection {
                 "keepalive_interval_secs",
             )
             .unwrap_or(30),
+            algorithm_policy,
             terminal_keepalive_secs: clamp_terminal_keepalive(
                 config_u64(external_config, connection, "terminal_keepalive_secs").unwrap_or(0),
             ),
@@ -885,6 +898,7 @@ mod tests {
             "totp_prompt_hint",
             "connect_timeout_secs",
             "keepalive_interval_secs",
+            "ssh_algorithm_policy",
             "terminal_keepalive_secs",
             "set_env",
             "remote_command",
@@ -1240,7 +1254,14 @@ mod tests {
         assert_eq!(connection.jump_hosts[0].port, 2202);
         assert_eq!(connection.jump_hosts[0].password, "jump-pw");
         assert_eq!(connection.jump_hosts[1].authentication, "private-key");
-        let synthesized = connection.jump_hosts[1].to_connection("jump-2", 20, 30, "modern");
+        let synthesized =
+            connection.jump_hosts[1].to_connection(
+                "jump-2",
+                20,
+                30,
+                connection.algorithm_policy,
+                "modern",
+            );
         assert_eq!(synthesized.host, "inner.example.com");
         assert_eq!(synthesized.runtime_port, 22);
         assert_eq!(synthesized.authentication, AuthenticationMethod::PrivateKey);
@@ -1762,6 +1783,7 @@ mod manifest_contract_tests {
             "agent_socket",
             "connect_timeout_secs",
             "keepalive_interval_secs",
+            "ssh_algorithm_policy",
             "terminal_keepalive_secs",
             "set_env",
             "remote_command",
@@ -1882,6 +1904,7 @@ mod manifest_contract_tests {
             ("authentication", Value::from("password")),
             ("connect_timeout_secs", Value::from(30)),
             ("keepalive_interval_secs", Value::from(30)),
+            ("ssh_algorithm_policy", Value::from("compatible")),
             ("terminal_keepalive_secs", Value::from(0)),
             ("sudo_source", Value::from("custom")),
             ("sudo_use_pty", Value::from(false)),
@@ -1921,11 +1944,36 @@ mod manifest_contract_tests {
         assert_eq!(connection.authentication, AuthenticationMethod::Password);
         assert_eq!(connection.connect_timeout_secs, 15);
         assert_eq!(connection.keepalive_interval_secs, 30);
+        assert_eq!(connection.algorithm_policy, SshAlgorithmPolicy::Compatible);
         assert_eq!(connection.terminal_keepalive_secs, 0);
         assert!(connection.sudo_enabled());
         assert!(!connection.sudo_use_pty);
         assert_eq!(connection.auth_flow_mode, "password_then_otp");
         assert!(!connection.read_only);
+    }
+
+    #[test]
+    fn algorithm_policy_is_configurable_and_unknown_values_fail_closed() {
+        let parse = |policy: &str| {
+            StoredConnection::from_lifecycle_params(&serde_json::json!({
+                "connection": {
+                    "id": "algorithm-policy",
+                    "host": "example.com",
+                    "port": 22,
+                    "username": "user",
+                    "password": "pw",
+                    "external_config": {
+                        "ssh_algorithm_policy": policy
+                    }
+                }
+            }))
+            .unwrap()
+            .algorithm_policy
+        };
+
+        assert_eq!(parse("secure"), SshAlgorithmPolicy::Secure);
+        assert_eq!(parse("legacy"), SshAlgorithmPolicy::Legacy);
+        assert_eq!(parse("not-a-profile"), SshAlgorithmPolicy::Secure);
     }
 
     /// The terminal activity keepalive is opt-in: absent config means off,

@@ -343,6 +343,28 @@
           "description": "Keepalive probe interval; 3 missed probes disconnect the session. 0 disables probes."
         },
         {
+          "key": "ssh_algorithm_policy",
+          "label": "SSH algorithm compatibility",
+          "type": "select",
+          "binding": "config",
+          "default": "compatible",
+          "options": [
+            {
+              "label": "Compatible (secure first)",
+              "value": "compatible"
+            },
+            {
+              "label": "Secure only",
+              "value": "secure"
+            },
+            {
+              "label": "Legacy server",
+              "value": "legacy"
+            }
+          ],
+          "description": "Compatible keeps modern algorithms first and enables SHA-1 MACs only as a last resort. Secure only disables SHA-1. Legacy also enables old SHA-1 Diffie-Hellman and AES-CBC; use it only for old servers."
+        },
+        {
           "key": "terminal_keepalive_secs",
           "label": "Terminal activity keepalive (seconds)",
           "type": "number",
@@ -503,6 +525,11 @@
             "keepalive_interval_secs": {
               "label": "Intervalo de keepalive (segundos)",
               "description": "Intervalo de sondas de keepalive; 3 sondas sin respuesta desconectan la sesión. 0 las desactiva."
+            },
+            "ssh_algorithm_policy": {
+              "label": "Compatibilidad de algoritmos SSH",
+              "options": { "compatible": "Compatible (seguro primero)", "secure": "Solo seguro", "legacy": "Servidor antiguo" },
+              "description": "Compatible mantiene los algoritmos modernos primero y usa MAC SHA-1 solo como último recurso. Solo seguro desactiva SHA-1. Servidor antiguo también habilita Diffie-Hellman SHA-1 y AES-CBC; úsalo solo con servidores antiguos."
             },
             "terminal_keepalive_secs": {
               "label": "Keepalive de actividad del terminal (segundos)",
@@ -718,6 +745,11 @@
               "label": "Intervallo keepalive (secondi)",
               "description": "Intervallo delle sonde keepalive; 3 sonde senza risposta chiudono la sessione. 0 le disabilita."
             },
+            "ssh_algorithm_policy": {
+              "label": "Compatibilità degli algoritmi SSH",
+              "options": { "compatible": "Compatibile (sicuro prima)", "secure": "Solo sicuro", "legacy": "Server legacy" },
+              "description": "Compatibile mantiene prima gli algoritmi moderni e abilita i MAC SHA-1 solo come ultima risorsa. Solo sicuro disabilita SHA-1. Server legacy abilita anche Diffie-Hellman SHA-1 e AES-CBC: usarlo solo con server obsoleti."
+            },
             "terminal_keepalive_secs": {
               "label": "Keepalive attività del terminale (secondi)",
               "description": "Inietta spazio+backspace nel terminale interattivo a questo intervallo, così le policy di inattività lato server (TMOUT, audit del bastion) non si attivano mai. 0 disabilita."
@@ -797,6 +829,11 @@
             "keepalive_interval_secs": {
               "label": "Keepalive 間隔（秒）",
               "description": "Keepalive プローブの間隔。3 回連続無応答でセッションを切断します。0 で無効。"
+            },
+            "ssh_algorithm_policy": {
+              "label": "SSH アルゴリズム互換性",
+              "options": { "compatible": "互換（安全な方式を優先）", "secure": "安全な方式のみ", "legacy": "旧式サーバー" },
+              "description": "互換では最新の方式を優先し、SHA-1 MAC は最後の手段としてのみ有効です。安全な方式のみでは SHA-1 を無効化します。旧式サーバーでは SHA-1 Diffie-Hellman と AES-CBC も有効になります。古いサーバーに限って使用してください。"
             },
             "terminal_keepalive_secs": {
               "label": "ターミナル活動キープアライブ（秒）",
@@ -1012,6 +1049,11 @@
               "label": "Intervalo de keepalive (segundos)",
               "description": "Intervalo das sondas de keepalive; 3 sondas sem resposta encerram a sessão. 0 desativa as sondas."
             },
+            "ssh_algorithm_policy": {
+              "label": "Compatibilidade de algoritmos SSH",
+              "options": { "compatible": "Compatível (seguro primeiro)", "secure": "Somente seguro", "legacy": "Servidor legado" },
+              "description": "Compatível mantém os algoritmos modernos primeiro e habilita MACs SHA-1 apenas como último recurso. Somente seguro desativa SHA-1. Servidor legado também habilita Diffie-Hellman SHA-1 e AES-CBC; use apenas com servidores antigos."
+            },
             "terminal_keepalive_secs": {
               "label": "Keepalive de atividade do terminal (segundos)",
               "description": "Injeta espaço+backspace no terminal interativo nesse intervalo para que políticas de ociosidade do servidor (TMOUT, auditoria do bastion) nunca sejam acionadas. 0 desativa."
@@ -1091,6 +1133,11 @@
             "keepalive_interval_secs": {
               "label": "Keepalive 间隔（秒）",
               "description": "Keepalive 探测间隔；连续 3 次未响应即断开会话。0 表示关闭探测。"
+            },
+            "ssh_algorithm_policy": {
+              "label": "SSH 算法兼容性",
+              "options": { "compatible": "兼容（优先安全算法）", "secure": "仅安全算法", "legacy": "老旧服务器" },
+              "description": "兼容模式优先使用现代算法，仅在没有其他选择时启用 SHA-1 MAC。仅安全算法会禁用 SHA-1。老旧服务器模式还会启用 SHA-1 Diffie-Hellman 和 AES-CBC，仅用于老旧服务器。"
             },
             "terminal_keepalive_secs": {
               "label": "终端活动保活（秒）",
@@ -1238,6 +1285,11 @@
             "keepalive_interval_secs": {
               "label": "Keepalive 間隔（秒）",
               "description": "Keepalive 探測間隔；連續 3 次未回應即中斷連線。0 表示關閉探測。"
+            },
+            "ssh_algorithm_policy": {
+              "label": "SSH 演算法相容性",
+              "options": { "compatible": "相容（優先安全演算法）", "secure": "僅安全演算法", "legacy": "舊版伺服器" },
+              "description": "相容模式會優先使用現代演算法，只有在沒有其他選擇時才啟用 SHA-1 MAC。僅安全演算法會停用 SHA-1。舊版伺服器模式還會啟用 SHA-1 Diffie-Hellman 與 AES-CBC，僅適用於舊版伺服器。"
             },
             "terminal_keepalive_secs": {
               "label": "終端活動保活（秒）",
