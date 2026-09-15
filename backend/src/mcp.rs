@@ -3809,6 +3809,7 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         // SetEnv / RemoteCommand are workbench connection-form features.
         set_env: Vec::new(),
         remote_command: String::new(),
+        ssh_algorithm_profile: "modern".to_string(),
         jump_hosts,
     })
 }

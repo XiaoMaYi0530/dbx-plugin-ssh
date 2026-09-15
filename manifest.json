@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH Terminal",
-  "version": "0.4.73",
+  "version": "0.4.74",
   "publisher": "jinpy",
   "description": "A secure SSH terminal for interactive sessions, SFTP file transfer, remote commands, and guarded server operations.",
   "source": "https://github.com/jinpy666/dbx-plugin-ssh",
@@ -368,6 +368,24 @@
           "description": "Executed instead of a shell when a terminal session opens (a PTY is still requested). Leave empty for a normal interactive shell; reconnecting re-runs the command."
         },
         {
+          "key": "ssh_algorithm_profile",
+          "label": "SSH algorithm compatibility",
+          "type": "select",
+          "binding": "config",
+          "default": "modern",
+          "options": [
+            {
+              "label": "Modern (recommended)",
+              "value": "modern"
+            },
+            {
+              "label": "Legacy-compatible",
+              "value": "legacy"
+            }
+          ],
+          "description": "Modern keeps secure algorithms first. Legacy-compatible appends hmac-sha1, SHA-1 DH groups, CBC, and 3DES only for older SSH appliances."
+        },
+        {
           "key": "read_only",
           "label": "Read only",
           "type": "boolean",
@@ -499,6 +517,14 @@
               "label": "Comando remoto (RemoteCommand)",
               "description": "Se ejecuta en lugar de un shell al abrir una sesión de terminal (el PTY se solicita igual). Déjelo vacío para un shell interactivo normal; al reconectar se vuelve a ejecutar el comando."
             },
+            "ssh_algorithm_profile": {
+              "label": "Compatibilidad de algoritmos SSH",
+              "options": {
+                "modern": "Moderno (recomendado)",
+                "legacy": "Compatible con sistemas antiguos"
+              },
+              "description": "Mantiene los algoritmos modernos primero; el modo compatible añade suites antiguas para dispositivos SSH heredados."
+            },
             "sudo_source": {
               "label": "Origen de credenciales sudo",
               "options": {
@@ -625,6 +651,14 @@
             "remote_command": {
               "label": "Comando remoto (RemoteCommand)",
               "description": "Viene eseguito al posto di una shell all'apertura della sessione terminale (il PTY resta richiesto). Lasciare vuoto per una shell interattiva normale; alla riconnessione il comando viene rieseguito."
+            },
+            "ssh_algorithm_profile": {
+              "label": "Compatibilità degli algoritmi SSH",
+              "options": {
+                "modern": "Moderno (consigliato)",
+                "legacy": "Compatibile con sistemi legacy"
+              },
+              "description": "Mantiene prima gli algoritmi moderni; la modalità compatibile aggiunge suite obsolete per dispositivi SSH legacy."
             },
             "sudo_source": {
               "label": "Origine delle credenziali sudo",
@@ -777,6 +811,14 @@
               "label": "リモートコマンド（RemoteCommand）",
               "description": "ターミナルセッション確立時にシェルの代わりに実行するコマンド（PTY は従来どおり要求）。空欄なら通常の対話シェルになります。再接続時は同じコマンドを再実行します。"
             },
+            "ssh_algorithm_profile": {
+              "label": "SSH アルゴリズム互換性",
+              "options": {
+                "modern": "モダン（推奨）",
+                "legacy": "レガシー互換"
+              },
+              "description": "モダンなアルゴリズムを優先し、レガシー互換モードでは古い SSH 機器向けの方式を追加します。"
+            },
             "sudo_source": {
               "label": "sudo 認証情報ソース",
               "options": {
@@ -903,6 +945,14 @@
             "remote_command": {
               "label": "Comando remoto (RemoteCommand)",
               "description": "Executado em vez de um shell quando uma sessão de terminal é aberta (o PTY continua sendo solicitado). Deixe vazio para um shell interativo normal; reconectar executa o comando novamente."
+            },
+            "ssh_algorithm_profile": {
+              "label": "Compatibilidade de algoritmos SSH",
+              "options": {
+                "modern": "Moderno (recomendado)",
+                "legacy": "Compatível com sistemas legados"
+              },
+              "description": "Mantém os algoritmos modernos em primeiro lugar; o modo compatível acrescenta suites antigas para dispositivos SSH legados."
             },
             "sudo_source": {
               "label": "Origem das credenciais sudo",
@@ -1055,6 +1105,14 @@
               "label": "远程命令（RemoteCommand）",
               "description": "终端会话建立时执行该命令替代 shell（PTY 照常申请）。留空则为普通交互 shell；重连会重新执行同一条命令。"
             },
+            "ssh_algorithm_profile": {
+              "label": "SSH 算法兼容性",
+              "options": {
+                "modern": "现代（推荐）",
+                "legacy": "兼容旧版设备"
+              },
+              "description": "优先使用现代算法；兼容模式会为老旧 SSH 设备追加旧算法套件。"
+            },
             "sudo_source": {
               "label": "Sudo 凭据来源",
               "options": {
@@ -1193,6 +1251,14 @@
             "remote_command": {
               "label": "遠端命令（RemoteCommand）",
               "description": "終端工作階段建立時執行該命令替代 shell（PTY 照常要求）。留空則為一般互動 shell；重新連線會重新執行同一條命令。"
+            },
+            "ssh_algorithm_profile": {
+              "label": "SSH 演算法相容性",
+              "options": {
+                "modern": "現代（推薦）",
+                "legacy": "相容舊版設備"
+              },
+              "description": "優先使用現代演算法；相容模式會為老舊 SSH 設備追加舊演算法套件。"
             },
             "sudo_source": {
               "label": "Sudo 憑據來源",
