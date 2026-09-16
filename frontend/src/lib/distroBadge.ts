@@ -31,6 +31,13 @@ const DISTRO_BADGES: Record<string, [string, string]> = {
   amazon: ["Amazon Linux", "#ff9900"],
   kali: ["Kali Linux", "#557cff"],
   suse: ["SUSE", "#30ba78"],
+  // 阿里云/龙蜥家族（国内云主机高频）：alibaba-cloud-linux/alinux 是 Alibaba
+  // Cloud Linux 各代实际使用过的 ID；anolis/openanolis 是龙蜥。
+  "alibaba-cloud-linux": ["Alibaba Cloud Linux", "#ff6a00"],
+  alinux: ["Alibaba Cloud Linux", "#ff6a00"],
+  anolis: ["OpenAnolis", "#ff6a00"],
+  openanolis: ["OpenAnolis", "#ff6a00"],
+  tencentos: ["TencentOS", "#006eff"],
 };
 
 /**
@@ -38,7 +45,8 @@ const DISTRO_BADGES: Record<string, [string, string]> = {
  * - 已知 osId：monogram 首字母 + 发行版主题色，大小写不敏感、容忍首尾空白；
  * - tooltip/aria 用的显示名优先 osPretty 原文（§1.6：tooltip 用 osPretty），
  *   缺省回退映射表标准名；
- * - 未知/缺失 osId 但有 osPretty 原文：通用灰 "?" 徽标，name 用 osPretty 原文；
+ * - 未知/缺失 osId 但有 osPretty 原文：通用灰徽标，monogram 取 osPretty 首字母
+ *   （"?" 在头部看着像坏掉的帮助按钮），name 用 osPretty 原文；
  * - 两者都缺：null（调用方不渲染徽标）。
  */
 export function distroBadge(osId: string | null | undefined, osPretty?: string | null): DistroBadge | null {
@@ -50,5 +58,6 @@ export function distroBadge(osId: string | null | undefined, osPretty?: string |
   }
   const fallbackName = pretty || normalizedId;
   if (!fallbackName) return null;
-  return { label: "?", color: DISTRO_GENERIC_COLOR, name: fallbackName };
+  const label = fallbackName.charAt(0).toUpperCase() || "?";
+  return { label, color: DISTRO_GENERIC_COLOR, name: fallbackName };
 }
