@@ -1315,6 +1315,7 @@ mod tests {
         assert_eq!(apply_command_placeholders("100%", &placeholders), "100%");
     }
 
+    #[cfg(unix)] // echo 单引号语义依赖 POSIX shell，Windows 下无对应行为
     #[tokio::test]
     async fn execute_command_echo_positive_case() {
         let placeholders = CommandPlaceholders::new("example.com", "deploy", 2222, "prod-box");
@@ -1357,6 +1358,7 @@ mod tests {
         assert_eq!(answer.as_str(), "pw");
     }
 
+    #[cfg(unix)] // 依赖 POSIX sleep/ExitStatusExt，Windows 下无语义
     #[tokio::test]
     async fn execute_command_timeout_negative_case() {
         let placeholders = CommandPlaceholders::new("h", "u", 22, "n");
@@ -1371,6 +1373,7 @@ mod tests {
         assert!(error.contains("timed out"), "{error}");
     }
 
+    #[cfg(unix)] // ExitStatusExt::from_raw 是 POSIX 专属
     #[tokio::test]
     async fn execute_command_reports_exit_code_without_output() {
         use std::os::unix::process::ExitStatusExt;

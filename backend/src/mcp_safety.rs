@@ -1052,9 +1052,11 @@ pub fn is_sensitive_path(token: &str) -> bool {
 /// components are kept — resolving them needs a base directory, and
 /// keeping them is the conservative choice.
 pub(crate) fn normalized_path(path: &str) -> String {
-    let absolute = path.starts_with('/');
+    // Windows 的 canonicalize 产出 `\` 分隔（含 \\?\ 前缀），组件匹配必须
+    // 同时认两种分隔符，否则敏感路径黑名单在 Windows 上静默失效。
+    let absolute = path.starts_with('/') || path.starts_with('\\');
     let parts: Vec<&str> = path
-        .split('/')
+        .split(['/', '\\'])
         .filter(|component| !component.is_empty() && *component != ".")
         .collect();
     let joined = parts.join("/");
