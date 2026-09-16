@@ -446,8 +446,23 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .file-footer span:nth-child(2) { color: var(--muted-foreground); }
 
 /* SSH settings dialog */
-.settings-modal { width: min(520px, 100%); }
+.settings-modal { width: min(680px, 100%); }
 .settings-body { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 14px; overflow-y: auto; padding-right: 4px; }
+/* 分类导航布局（对齐宿主设置页）：左栏分类 + 右栏内容；右栏滚动，左栏不滚。 */
+.settings-layout { display: flex; min-height: 0; flex: 1 1 auto; margin: 0 -16px; border-top: 1px solid var(--border); }
+.settings-nav { display: flex; flex: 0 0 148px; flex-direction: column; gap: 1px; overflow-y: auto; border-right: 1px solid var(--border); padding: 8px; }
+.settings-nav button { height: 28px; overflow: hidden; border: 0; border-radius: var(--radius); padding: 0 8px; background: transparent; color: var(--muted-foreground); font-size: 12px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.settings-nav button:hover { background: var(--accent); }
+.settings-nav button.is-active { background: var(--accent); color: var(--foreground); font-weight: 500; }
+.settings-content { display: flex; min-width: 0; flex: 1 1 auto; flex-direction: column; gap: 14px; overflow-y: auto; padding: 12px 16px; }
+.settings-pane { display: flex; flex-direction: column; gap: 10px; }
+.settings-pane .settings-section-title:first-child { margin-top: 0; border-top: 0; padding-top: 0; }
+/* 窄弹窗：左栏变顶部横向分类条。 */
+@media (max-width: 560px) {
+  .settings-layout { flex-direction: column; }
+  .settings-nav { flex: 0 0 auto; flex-direction: row; border-right: 0; border-bottom: 1px solid var(--border); }
+  .settings-nav button { flex: 0 0 auto; }
+}
 .settings-field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--muted-foreground); }
 /* 开关行恢复横向布局：.settings-field 的 column 会让 .switch-control 在列向
    flex 里被 stretch/flex-basis 拉成方块、文字掉到下一行（WebGL 开关）。 */

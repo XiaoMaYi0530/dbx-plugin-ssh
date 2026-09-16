@@ -663,6 +663,17 @@ const metrics = ref<ServerMetrics>();
 const metricsLoading = ref(false);
 const metricsError = ref("");
 const settingsOpen = ref(false);
+// 设置弹窗分类导航（左栏）：标签复用各区块既有 i18n 键，不新增文案。
+const SETTINGS_CATEGORIES = [
+  { id: "sudo", labelKey: "settingsQuickSudo" },
+  { id: "agent", labelKey: "agentTerminalSection" },
+  { id: "transfer", labelKey: "downloadSettings.title" },
+  { id: "terminal", labelKey: "settingsNav.terminal" },
+  { id: "security", labelKey: "settingsNav.security" },
+  { id: "mcp", labelKey: "mcpLimits.title" },
+] as const;
+type SettingsCategory = (typeof SETTINGS_CATEGORIES)[number]["id"];
+const settingsCategory = ref<SettingsCategory>("sudo");
 const auditOpen = ref(false);
 const settingsLoading = ref(false);
 const settingsLoadFailed = ref(false);
@@ -7251,6 +7262,12 @@ onBeforeUnmount(() => {
             <button class="link-button" @click="openSettings">{{ t("refresh") }}</button>
           </div>
           <template v-else>
+          <div class="settings-layout">
+            <nav class="settings-nav" aria-label="settings categories">
+              <button v-for="cat in SETTINGS_CATEGORIES" :key="cat.id" type="button" :class="{ 'is-active': settingsCategory === cat.id }" @click="settingsCategory = cat.id">{{ t(cat.labelKey) }}</button>
+            </nav>
+            <div class="settings-content">
+            <div v-show="settingsCategory === 'sudo'" class="settings-pane">
             <label class="settings-field">
               <span>{{ t("settingsCredentialSource") }}</span>
               <span class="credential-source-row">
@@ -7363,7 +7380,9 @@ onBeforeUnmount(() => {
             </template>
             <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }} <button class="link-button" @click="loadSudoProfiles">{{ t("refresh") }}</button></p>
             <p class="muted settings-note">{{ t("settingsNote") }}</p>
+            </div>
 
+            <div v-show="settingsCategory === 'agent'" class="settings-pane">
             <h3 class="settings-section-title">{{ t("agentTerminalSection") }}</h3>
             <label class="settings-field">
               <span>{{ t("agentTerminalMode") }}</span>
@@ -7372,20 +7391,6 @@ onBeforeUnmount(() => {
               </select>
             </label>
             <p class="muted settings-note">{{ agentTerminalModeHint }}</p>
-
-            <h3 class="settings-section-title">{{ t("downloadSettings.title") }}</h3>
-            <label class="settings-field">
-              <span>{{ t("downloadSettings.directory") }}</span>
-              <input v-model="downloadDirDraft" class="mono" spellcheck="false" :placeholder="localDownloadDir || t('downloadSettings.default')" />
-            </label>
-            <p class="muted settings-note">{{ t("downloadSettings.hint") }}</p>
-
-            <h3 class="settings-section-title">{{ t("webglSection") }}</h3>
-            <label class="settings-field settings-switch-row">
-              <button class="switch-control" type="button" role="switch" :aria-checked="webglEnabled" @click="setWebglEnabled(!webglEnabled)"><span /></button>
-              <span>{{ t("webglLabel") }}</span>
-            </label>
-            <p class="muted settings-note">{{ t("webglHint") }}</p>
             <div class="settings-remembered">
               <h4 class="settings-section-title">{{ t("settingsRemembered.section") }}</h4>
               <label class="settings-field"><span>{{ t("settingsRemembered.label") }}</span></label>
@@ -7398,6 +7403,24 @@ onBeforeUnmount(() => {
               </ul>
               <p class="muted settings-note">{{ t("settingsRemembered.hint") }}</p>
             </div>
+            </div>
+
+            <div v-show="settingsCategory === 'transfer'" class="settings-pane">
+            <h3 class="settings-section-title">{{ t("downloadSettings.title") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("downloadSettings.directory") }}</span>
+              <input v-model="downloadDirDraft" class="mono" spellcheck="false" :placeholder="localDownloadDir || t('downloadSettings.default')" />
+            </label>
+            <p class="muted settings-note">{{ t("downloadSettings.hint") }}</p>
+            </div>
+
+            <div v-show="settingsCategory === 'terminal'" class="settings-pane">
+            <h3 class="settings-section-title">{{ t("webglSection") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <button class="switch-control" type="button" role="switch" :aria-checked="webglEnabled" @click="setWebglEnabled(!webglEnabled)"><span /></button>
+              <span>{{ t("webglLabel") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("webglHint") }}</p>
 
             <h3 class="settings-section-title">{{ t("terminalSelectCopy.section") }}</h3>
             <label class="quick-sudo-control">
@@ -7405,8 +7428,9 @@ onBeforeUnmount(() => {
               <span>{{ t("terminalSelectCopy.label") }}</span>
             </label>
             <p class="muted settings-note">{{ t("terminalSelectCopy.hint") }}</p>
-          </template>
+            </div>
 
+          <div v-show="settingsCategory === 'security'" class="settings-pane">
           <h3 class="settings-section-title">{{ t("knownHosts.title") }}</h3>
           <div v-if="knownHostsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
           <p v-else-if="knownHostsError" class="task-error">{{ knownHostsError }} <button class="link-button" @click="loadKnownHosts">{{ t("refresh") }}</button></p>
@@ -7435,7 +7459,9 @@ onBeforeUnmount(() => {
             </li>
           </ul>
           <p class="muted settings-note">{{ t("keysPanel.hint") }}</p>
+          </div>
 
+          <div v-show="settingsCategory === 'mcp'" class="settings-pane">
           <h3 class="settings-section-title">{{ t("mcpLimits.title") }}</h3>
           <div v-if="mcpLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
           <template v-else>
@@ -7468,6 +7494,10 @@ onBeforeUnmount(() => {
             <p v-if="!mcpInputsValid" class="task-error">{{ t("mcpLimits.invalid") }}</p>
             <p v-if="mcpError" class="task-error">{{ mcpError }} <button class="link-button" @click="loadMcpSettings">{{ t("refresh") }}</button></p>
             <!-- 独立「保存」链接已并入底部主「保存」串行链（saveSettings）。 -->
+          </template>
+          </div>
+            </div>
+          </div>
           </template>
 
         </div>
