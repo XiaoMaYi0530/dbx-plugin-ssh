@@ -1301,6 +1301,60 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_parser_rejects_missing_identity_fields_and_bad_runtime_values() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "connection": {} }),
+            serde_json::json!({ "connection": { "id": "x" } }),
+            serde_json::json!({
+                "connection": {
+                    "id": "x", "host": "target", "port": 22, "username": "user"
+                }
+            }),
+        ] {
+            assert!(
+                StoredConnection::from_lifecycle_params(&params).is_err(),
+                "malformed lifecycle payload must fail before dialing: {params}"
+            );
+        }
+
+        // Invalid runtime values are treated as an absent host/port and fall
+        // back to the logical target. They must never create a zero-port dial.
+        let fallback = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "x", "host": "target", "port": 2222,
+                "username": "user", "password": "secret"
+            },
+            "runtime": { "host": "  ", "port": 0 }
+        }))
+        .unwrap();
+        assert_eq!(fallback.runtime_host, "target");
+        assert_eq!(fallback.runtime_port, 2222);
+    }
+
+    #[test]
+    fn lifecycle_parser_keeps_valid_runtime_endpoint_and_clamps_timeouts() {
+        let connection = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "x", "host": "target", "port": 22,
+                "username": "user", "password": "secret",
+                "external_config": {
+                    "connect_timeout_secs": 0,
+                    "keepalive_interval_secs": 0,
+                    "terminal_keepalive_secs": 999999
+                }
+            },
+            "runtime": { "host": "127.0.0.1", "port": 65535 }
+        }))
+        .unwrap();
+        assert_eq!(connection.runtime_host, "127.0.0.1");
+        assert_eq!(connection.runtime_port, 65535);
+        assert_eq!(connection.connect_timeout_secs, 1);
+        assert_eq!(connection.keepalive_interval_secs, 0);
+        assert_eq!(connection.terminal_keepalive_secs, 3600);
+    }
+
+    #[test]
     fn rejects_adversarial_jump_host_fields() {
         let build = |jump: Value| {
             StoredConnection::from_lifecycle_params(&serde_json::json!({

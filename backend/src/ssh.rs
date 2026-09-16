@@ -209,6 +209,73 @@ enum DialTarget {
     JumpStream(russh::ChannelStream<russh::client::Msg>),
 }
 
+/// Identifies which SSH server supplied a host key.  A DBX-managed runtime
+/// endpoint is only a transport route; its host key must never be presented
+/// to the user as the target server's identity.  Legacy plugin-owned jump
+/// chains, however, authenticate each jump as a separate SSH server.
+#[derive(Clone, Copy)]
+struct HostKeyChallengeScope {
+    kind: &'static str,
+    jump_index: Option<usize>,
+    jump_count: usize,
+}
+
+impl HostKeyChallengeScope {
+    const fn target(jump_count: usize) -> Self {
+        Self {
+            kind: "target",
+            jump_index: None,
+            jump_count,
+        }
+    }
+
+    const fn jump(index: usize, count: usize) -> Self {
+        Self {
+            kind: "jump",
+            jump_index: Some(index),
+            jump_count: count,
+        }
+    }
+}
+
+/// Wire fields intentionally mirror the host challenge contract one-for-one.
+#[allow(clippy::too_many_arguments)]
+fn host_key_challenge_payload(
+    challenge_id: &str,
+    operation_id: &str,
+    connection_id: &str,
+    scope: HostKeyChallengeScope,
+    host: &str,
+    port: u16,
+    key_type: String,
+    fingerprint: String,
+) -> Value {
+    json!({
+        "challengeId": challenge_id,
+        "operationId": operation_id,
+        "connectionId": connection_id,
+        "kind": "host-key",
+        "hostKeyScope": scope.kind,
+        "jumpIndex": scope.jump_index,
+        "jumpCount": scope.jump_count,
+        "host": host,
+        "port": port,
+        "keyType": key_type,
+        "fingerprint": fingerprint,
+    })
+}
+
+/// The first leg of a legacy ProxyJump chain must reach its first jump host,
+/// not the DBX runtime endpoint for the final target.  When there is no
+/// plugin-owned chain, DBX owns transport setup and supplies that endpoint.
+fn initial_dial_endpoint(connection: &StoredConnection) -> (String, u16) {
+    connection
+        .jump_hosts
+        .first()
+        .map(|jump| (jump.host.clone(), jump.port))
+        .unwrap_or_else(|| (connection.runtime_host.clone(), connection.runtime_port))
+}
+
 impl DialTarget {
     async fn through_jump(jump: &Handle<SshClient>, host: &str, port: u16) -> Result<Self, String> {
         let channel = jump
@@ -264,6 +331,7 @@ impl PromptBroker {
         fingerprint: String,
         connection_id: &str,
         operation_id: &str,
+        scope: HostKeyChallengeScope,
         emitter: &PluginEmitter,
     ) -> Option<PromptDecision> {
         let challenge_id = Uuid::new_v4().to_string();
@@ -278,16 +346,16 @@ impl PromptBroker {
         if emitter
             .event(
                 "connection/challenge",
-                json!({
-                    "challengeId": challenge_id,
-                    "operationId": operation_id,
-                    "connectionId": connection_id,
-                    "kind": "host-key",
-                    "host": host,
-                    "port": port,
-                    "keyType": key_type,
-                    "fingerprint": fingerprint
-                }),
+                host_key_challenge_payload(
+                    &challenge_id,
+                    operation_id,
+                    connection_id,
+                    scope,
+                    host,
+                    port,
+                    key_type,
+                    fingerprint,
+                ),
             )
             .is_err()
         {
@@ -388,6 +456,7 @@ pub struct SshClient {
     port: u16,
     connection_id: String,
     operation_id: String,
+    host_key_scope: HostKeyChallengeScope,
     dial_deadline: Arc<DialDeadline>,
     connect_timeout: Duration,
 }
@@ -444,6 +513,7 @@ impl client::Handler for SshClient {
                         server_public_key.fingerprint(HashAlg::Sha256).to_string(),
                         &self.connection_id,
                         &self.operation_id,
+                        self.host_key_scope,
                         emitter,
                     )
                     .await;
@@ -481,7 +551,15 @@ impl client::Handler for SshClient {
                 if let Some(emitter) = self.emitter.as_ref() {
                     let _ = emitter.event(
                         "ssh/host-key/notice",
-                        json!({ "kind": "changed", "message": error.to_string() }),
+                        json!({
+                            "kind": "changed",
+                            "message": error.to_string(),
+                            "hostKeyScope": self.host_key_scope.kind,
+                            "jumpIndex": self.host_key_scope.jump_index,
+                            "jumpCount": self.host_key_scope.jump_count,
+                            "host": self.host.clone(),
+                            "port": self.port,
+                        }),
                     );
                 }
                 Err(russh::Error::from(error))
@@ -1464,7 +1542,8 @@ impl SshRuntime {
         emitter: Option<PluginEmitter>,
     ) -> Result<(Handle<SshClient>, Vec<Handle<SshClient>>), String> {
         let mut jump_handles = Vec::new();
-        let mut dial = DialTarget::Tcp((connection.runtime_host.clone(), connection.runtime_port));
+        let mut dial = DialTarget::Tcp(initial_dial_endpoint(connection));
+        let jump_count = connection.jump_hosts.len();
 
         for (position, jump) in connection.jump_hosts.iter().enumerate() {
             let jump_connection = jump.to_connection(
@@ -1473,7 +1552,13 @@ impl SshRuntime {
                 connection.keepalive_interval_secs,
             );
             let handle = self
-                .dial_and_authenticate(&jump_connection, dial, operation_id, emitter.clone())
+                .dial_and_authenticate(
+                    &jump_connection,
+                    dial,
+                    operation_id,
+                    emitter.clone(),
+                    HostKeyChallengeScope::jump(position + 1, jump_count),
+                )
                 .await
                 .map_err(|error| {
                     format!(
@@ -1495,7 +1580,13 @@ impl SshRuntime {
         }
 
         let target = self
-            .dial_and_authenticate(connection, dial, operation_id, emitter)
+            .dial_and_authenticate(
+                connection,
+                dial,
+                operation_id,
+                emitter,
+                HostKeyChallengeScope::target(jump_count),
+            )
             .await?;
         Ok((target, jump_handles))
     }
@@ -1506,6 +1597,7 @@ impl SshRuntime {
         dial: DialTarget,
         operation_id: &str,
         emitter: Option<PluginEmitter>,
+        host_key_scope: HostKeyChallengeScope,
     ) -> Result<Handle<SshClient>, String> {
         // Match tiny-rdm: after 3 unanswered keepalive probes the connection
         // is declared dead so the workbench can reconnect.
@@ -1522,6 +1614,7 @@ impl SshRuntime {
             port: connection.port,
             connection_id: connection.id.clone(),
             operation_id: operation_id.to_string(),
+            host_key_scope,
             dial_deadline: dial_deadline.clone(),
             connect_timeout: timeout,
         };
@@ -5864,6 +5957,74 @@ mod tests {
             host_key_unreachable_response("SSH connection to h:22 timed out".to_string());
         assert_eq!(unreachable["state"], "unreachable");
         assert_eq!(unreachable["error"], "SSH connection to h:22 timed out");
+    }
+
+    #[test]
+    fn initial_dial_uses_runtime_only_without_a_legacy_jump_chain() {
+        let direct = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "direct", "host": "target.internal", "port": 22,
+                "username": "user", "password": "secret"
+            },
+            "runtime": { "host": "127.0.0.1", "port": 39122 }
+        }))
+        .unwrap();
+        assert_eq!(
+            initial_dial_endpoint(&direct),
+            ("127.0.0.1".to_string(), 39122)
+        );
+
+        let jumped = StoredConnection::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "jumped", "host": "target.internal", "port": 22,
+                "username": "user", "password": "secret",
+                "external_config": { "jump_hosts": [{
+                    "host": "bastion.internal", "port": 2202,
+                    "username": "relay", "password": "jump-secret"
+                }] }
+            },
+            "runtime": { "host": "127.0.0.1", "port": 39122 }
+        }))
+        .unwrap();
+        assert_eq!(
+            initial_dial_endpoint(&jumped),
+            ("bastion.internal".to_string(), 2202),
+            "a plugin-owned jump chain must start at its first bastion, not the target runtime endpoint"
+        );
+    }
+
+    #[test]
+    fn host_key_challenge_names_target_or_exact_jump_hop() {
+        let target = host_key_challenge_payload(
+            "challenge-target",
+            "operation-1",
+            "connection-1",
+            HostKeyChallengeScope::target(2),
+            "target.internal",
+            22,
+            "ssh-ed25519".to_string(),
+            "SHA256:target".to_string(),
+        );
+        assert_eq!(target["hostKeyScope"], "target");
+        assert!(target["jumpIndex"].is_null());
+        assert_eq!(target["jumpCount"], 2);
+        assert_eq!(target["host"], "target.internal");
+
+        let jump = host_key_challenge_payload(
+            "challenge-jump",
+            "operation-1",
+            "connection-1",
+            HostKeyChallengeScope::jump(2, 3),
+            "bastion-2.internal",
+            2202,
+            "rsa-sha2-512".to_string(),
+            "SHA256:jump".to_string(),
+        );
+        assert_eq!(jump["hostKeyScope"], "jump");
+        assert_eq!(jump["jumpIndex"], 2);
+        assert_eq!(jump["jumpCount"], 3);
+        assert_eq!(jump["host"], "bastion-2.internal");
+        assert_eq!(jump["port"], 2202);
     }
 
     #[test]

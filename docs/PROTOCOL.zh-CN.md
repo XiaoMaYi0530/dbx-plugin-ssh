@@ -462,7 +462,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 插件数据目录解析顺序（取第一个可用项，"可用"= 环境变量存在且 trim 后非空）：① `DBX_PLUGIN_DATA_DIR` 原样使用（宿主显式注入，未来方案 A 接入点）；② `DBX_DATA_DIR` → `<DBX_DATA_DIR>/plugin-data/io.dbx.ssh`（便携/web 模式，`plugin-data/` 避开安装器管理的注册树）；③ 平台标准用户数据目录下 `dbx-plugin-data/io.dbx.ssh`（macOS `$HOME/Library/Application Support`、其他 unix `${XDG_DATA_HOME:-$HOME/.local/share}`、Windows `%APPDATA%`）；④ 全缺才回落 `std::env::temp_dir()/dbx-plugin-data/io.dbx.ssh`（临时兜底，永不失败）。当前宿主尚未注入 `DBX_PLUGIN_DATA_DIR`，实际生效的是 ③；切勿将持久数据依赖 ④ 的临时目录（重启即清空）。
 
-框架级连接测试挑战采用事件 `connection/challenge` 和固定响应方法 `connection/challenge/resolve`。原型未声明 `test`，因此暂不触发该流程。
+连接测试与工作台打开复用同一 SSH 拨号、认证与主机密钥校验链；区别仅为测试在认证成功后立即断开。框架级测试挑战采用事件 `connection/challenge` 和固定响应方法 `connection/challenge/resolve`。事件载荷为 `{challengeId, operationId, connectionId, kind:"host-key", hostKeyScope:"target"|"jump", jumpIndex?, jumpCount, host, port, keyType, fingerprint}`：`host`/`port` 永远是待信任 SSH 服务器的逻辑身份，不能用 DBX 隧道/代理的 `runtime.host`/`runtime.port` 替代；`hostKeyScope:"jump"` 时 `jumpIndex` 为从 1 开始的跳板序号。宿主必须在**未保存草稿的测试页**消费此事件、显示确认框，并以事件中的 `challengeId` 和 `operationId` 原样调用 resolve；关闭确认框应回传 `accept:false`，不得把等待确认误报为连接超时。宿主负责先为草稿建立与保存后完全相同的隧道/代理运行时端点，并把传输层建链失败与 SSH 握手/信任/认证失败分别呈现。
 
 ## 本地密钥与 known_hosts
 
