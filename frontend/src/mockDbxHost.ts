@@ -42,7 +42,7 @@ const appearance: DbxPluginAppearance = {
   colors: light
     ? { background: "rgb(255 255 255)", foreground: "rgb(10 10 10)", muted: "rgb(245 245 245)", mutedForeground: "rgb(115 115 115)", accent: "rgb(245 245 245)", accentForeground: "rgb(23 23 23)", border: "rgb(229 229 229)", destructive: "rgb(231 0 11)" }
     : { background: "rgb(19 20 22)", foreground: "rgb(215 215 219)", muted: "rgb(42 42 45)", mutedForeground: "rgb(151 152 157)", accent: "rgb(46 47 51)", accentForeground: "rgb(221 221 226)", border: "rgb(110 110 114 / 0.28)", destructive: "rgb(243 98 95)" },
-  terminal: { fontFamily: "Cascadia Mono, Consolas, monospace", fontSize: 13 },
+  terminal: { fontFamily: "'JetBrains Mono', 'Cascadia Mono', Consolas, monospace", fontSize: 13 },
 };
 
 // 镜像宿主 1.1 theme 通道形状（colors 反查 --color-* 令牌），与真实宿主一致。

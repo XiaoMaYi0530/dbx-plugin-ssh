@@ -33,11 +33,12 @@ const THEME_BRIDGE_VARS = [
   ["--success-bg", "--color-success-bg", "color-mix(in srgb, var(--success) 14%, transparent)"],
   ["--warning", "--color-warning", "rgb(251 191 36)"],
   ["--warning-bg", "--color-warning-bg", "color-mix(in srgb, var(--warning) 14%, transparent)"],
+  ["--info", "--color-info", "rgb(96 165 250)"],
   ["--radius", "--radius-md", "6px"],
   ["--ui-font-family", "--font-sans", 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'],
   // ssh 用 --terminal-font-family，其余插件用 --mono-font-family，两个名字都桥。
-  ["--mono-font-family", "--font-mono", "'Cascadia Mono', Consolas, monospace"],
-  ["--terminal-font-family", "--font-mono", "'Cascadia Mono', Consolas, monospace"],
+  ["--mono-font-family", "--font-mono", "'JetBrains Mono', 'Cascadia Mono', Consolas, monospace"],
+  ["--terminal-font-family", "--font-mono", "'JetBrains Mono', 'Cascadia Mono', Consolas, monospace"],
 ] as const;
 
 export const THEME_BRIDGE_STYLE_ID = "dbx-host-theme-bridge";
@@ -57,7 +58,7 @@ export function themeBridgeCss(overrides?: Partial<Record<string, string>>): str
   // data-dbx-theme，只有插件 applyAppearance 的 data-theme；漏掉会让 UA 表单
   // 控件（复选框/滚动条）在亮色宿主仍按暗色渲染。
   const scheme = ':root[data-dbx-theme="light"],:root[data-theme="light"]{color-scheme:light}:root[data-dbx-theme="dark"],:root[data-theme="dark"]{color-scheme:dark}';
-  const lightStatus = ':root[data-dbx-theme="light"],:root[data-theme="light"]{--success:var(--color-success,rgb(22 163 74));--warning:var(--color-warning,rgb(217 119 6))}';
+  const lightStatus = ':root[data-dbx-theme="light"],:root[data-theme="light"]{--success:var(--color-success,rgb(22 163 74));--warning:var(--color-warning,rgb(217 119 6));--info:var(--color-info,rgb(37 99 235))}';
   const darkOverlay = ':root[data-dbx-theme="dark"],:root[data-theme="dark"]{--overlay:color-mix(in srgb, var(--background) 70%, transparent)}';
   return `:root{${declarations.join(";")};--overlay:rgb(0 0 0 / 40%)}${scheme}${lightStatus}${darkOverlay}`;
 }
