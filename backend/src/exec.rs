@@ -1278,8 +1278,9 @@ pub fn parse_metrics_output(output: &str) -> serde_json::Value {
                     fields[2].parse::<u64>(),
                     fields[3].parse::<u64>(),
                 ) {
-                    if let Some(percent) =
-                        fields[4].strip_suffix('%').and_then(|p| p.parse::<f64>().ok())
+                    if let Some(percent) = fields[4]
+                        .strip_suffix('%')
+                        .and_then(|p| p.parse::<f64>().ok())
                     {
                         disks.push(json!({
                             "filesystem": fields[0],

@@ -6104,7 +6104,10 @@ mod tests {
     #[test]
     fn local_transfer_root_setting_accepts_absolute_and_empty_only() {
         assert_eq!(validated_transfer_root(&json!("")).unwrap(), "");
-        assert_eq!(validated_transfer_root(&json!(ABS_TEST_ROOT)).unwrap(), ABS_TEST_ROOT);
+        assert_eq!(
+            validated_transfer_root(&json!(ABS_TEST_ROOT)).unwrap(),
+            ABS_TEST_ROOT
+        );
         assert!(validated_transfer_root(&json!("relative/path")).is_err());
         assert!(validated_transfer_root(&json!(42)).is_err());
     }
