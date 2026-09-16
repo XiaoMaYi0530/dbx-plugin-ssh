@@ -472,7 +472,7 @@ const pauseWaiters = new Map<string, Array<() => void>>();
 // 后端扫描出的可续传上传任务（spool 前缀仍在磁盘上）。
 const transferPanelOpen = ref(false);
 // 传输历史（sftp/transfer/history，落盘+内存合并）：面板打开或活动任务清零时刷新；
-// 历史区仅无进行中任务时展示。后端未升级/读取失败仅提示加载失败（optional 特性降级）。
+// 历史区与活跃任务并列展示，后端未升级/读取失败仅提示加载失败（optional 特性降级）。
 const transferHistory = ref<TransferHistoryEntry[]>([]);
 const transferHistoryLoading = ref(false);
 const transferHistoryFailed = ref(false);
@@ -961,7 +961,9 @@ const sortedEntries = computed(() => {
     return result * direction;
   });
 });
-const transferList = computed(() => Object.values(transferTasks).sort((left, right) => right.taskId.localeCompare(left.taskId)));
+// Object insertion order is the order a task joined this workbench. Do not
+// sort by taskId: task IDs are UUIDs, so doing so randomly reorders a batch.
+const transferList = computed(() => Object.values(transferTasks));
 const activeTransfers = computed(() => transferList.value.filter((task) => task.status === "queued" || task.status === "running").length);
 const zmodemBusy = computed(() => zmodemState.value !== "idle");
 const zmodemPercent = computed(() => zmodemTotalSize.value > 0 ? Math.min(100, Math.round((zmodemTransferred.value / zmodemTotalSize.value) * 100)) : 0);
@@ -2198,7 +2200,7 @@ async function clearTransferHistory() {
   }
 }
 
-// 打开传输面板或最后一个活动任务结束（进行中清零）时拉取历史：历史区仅在无进行中任务时展示。
+// 打开传输面板或最后一个活动任务结束时拉取历史：历史区常驻展示，活跃任务只影响列表而不遮挡快照。
 watch(transferPanelOpen, (open) => {
   if (open) {
     void refreshTransferHistory();
@@ -6329,28 +6331,26 @@ onBeforeUnmount(() => {
               </article>
             </template>
             <input ref="resumeInput" type="file" class="hidden" @change="onResumeFilePicked" />
-            <!-- 历史区：无进行中任务时展示（落盘历史跨重启可查，failed 显示原因） -->
-            <template v-if="!activeTransfers">
-              <div class="transfer-history-head">
-                <h3 class="transfer-history-title">{{ t("transfersHistory.title") }}</h3>
-                <span class="transfer-history-actions">
-                  <button class="icon-button" :title="t('refresh')" :disabled="transferHistoryLoading" @click="refreshTransferHistory"><RefreshCw :class="{ spinning: transferHistoryLoading }" /></button>
-                  <button class="icon-button" :title="t('transfersHistory.clear')" :disabled="!transferHistory.length" @click="clearTransferHistory"><Trash2 /></button>
-                </span>
-              </div>
-              <div v-if="transferHistoryFailed" class="empty compact">
-                <span>{{ t("transfersHistory.loadFailed") }}</span>
-                <button class="link-button" @click="refreshTransferHistory">{{ t("refresh") }}</button>
-              </div>
-              <div v-else-if="transferHistoryLoading && !transferHistory.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
-              <div v-else-if="!transferHistory.length" class="empty compact">{{ t("transfersHistory.empty") }}</div>
-              <article v-for="entry in transferHistory" :key="entry.taskId" class="transfer-card transfer-history-card" @contextmenu="showTransferHistoryMenu($event, entry)">
-                <div class="transfer-title"><FileUp v-if="entry.direction === 'upload'" /><Download v-else /><span :title="entry.fileName">{{ entry.fileName || entry.taskId }}</span></div>
-                <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span>{{ formatBytes(entry.size) }}</span></div>
-                <p v-if="entry.localPath" class="transfer-path mono" :title="entry.localPath">{{ entry.localPath }}</p>
-                <p v-if="entry.error" class="task-error">{{ entry.error }}</p>
-              </article>
-            </template>
+            <!-- 传输历史与活跃任务并列展示：历史是落盘快照，不应被当前传输状态遮住。 -->
+            <div class="transfer-history-head">
+              <h3 class="transfer-history-title">{{ t("transfersHistory.title") }}</h3>
+              <span class="transfer-history-actions">
+                <button class="icon-button" :title="t('refresh')" :disabled="transferHistoryLoading" @click="refreshTransferHistory"><RefreshCw :class="{ spinning: transferHistoryLoading }" /></button>
+                <button class="icon-button" :title="t('transfersHistory.clear')" :disabled="!transferHistory.length" @click="clearTransferHistory"><Trash2 /></button>
+              </span>
+            </div>
+            <div v-if="transferHistoryFailed" class="empty compact">
+              <span>{{ t("transfersHistory.loadFailed") }}</span>
+              <button class="link-button" @click="refreshTransferHistory">{{ t("refresh") }}</button>
+            </div>
+            <div v-else-if="transferHistoryLoading && !transferHistory.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+            <div v-else-if="!transferHistory.length" class="empty compact">{{ t("transfersHistory.empty") }}</div>
+            <article v-for="entry in transferHistory" :key="entry.taskId" class="transfer-card transfer-history-card" @contextmenu="showTransferHistoryMenu($event, entry)">
+              <div class="transfer-title"><FileUp v-if="entry.direction === 'upload'" /><Download v-else /><span :title="entry.fileName">{{ entry.fileName || entry.taskId }}</span></div>
+              <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span>{{ formatBytes(entry.size) }}</span></div>
+              <p v-if="entry.localPath" class="transfer-path mono" :title="entry.localPath">{{ entry.localPath }}</p>
+              <p v-if="entry.error" class="task-error">{{ entry.error }}</p>
+            </article>
           </section>
         </div>
       </div>
