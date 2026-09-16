@@ -80,6 +80,39 @@ jobs:
       - run: cargo clippy --locked --manifest-path backend/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --locked --manifest-path backend/Cargo.toml
 
+  windows-regression:
+    name: Windows connection-config regression
+    runs-on: windows-2022
+    needs: [validate]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
+      - name: Validate connection form contract
+        run: node scripts/connection-forms/verify.mjs
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path backend/Cargo.toml --check
+      - name: Run native Windows backend regression tests
+        run: cargo test --locked --manifest-path backend/Cargo.toml
+      - name: Build and smoke the Windows sidecar
+        run: |
+          cargo build --locked --release --manifest-path backend/Cargo.toml
+          python scripts/smoke_mcp.py --binary backend/target/release/dbx-plugin-ssh.exe
+
   ssh-smoke:
     name: SSH container smoke
     runs-on: ubuntu-24.04

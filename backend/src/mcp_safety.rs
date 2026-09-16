@@ -1413,6 +1413,21 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_path_detection_handles_windows_separators() {
+        for token in [
+            r"C:\Users\运维\.ssh\id_ed25519",
+            r"C:\Users\运维\.aws\credentials",
+            r"\\server\share\etc\shadow",
+        ] {
+            assert!(
+                is_sensitive_path(token),
+                "expected Windows path '{token}' to be flagged sensitive"
+            );
+        }
+        assert!(!is_sensitive_path(r"C:\work\project\shadowing.md"));
+    }
+
+    #[test]
     fn quoting_is_not_parsed_and_stays_conservative() {
         // A `;` inside quotes splits segments; both halves must be read-only
         // for the whole command to pass. Here the second half (`b' x ...`)

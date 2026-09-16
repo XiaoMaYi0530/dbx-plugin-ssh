@@ -1268,6 +1268,122 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_parser_preserves_utf8_connection_text_and_windows_paths() {
+        let payload = serde_json::json!({
+            "connection": {
+                "id": "windows-unicode",
+                "name": "生产机-北京",
+                "host": "2001:db8::42",
+                "port": 2222,
+                "username": "运维",
+                "password": "密码🔐",
+                "external_config": {
+                    "authentication": "private-key",
+                    "private_key_path": "C:\\Users\\测试\\.ssh\\id_ed25519",
+                    "setEnv": "LANG=zh_CN.UTF-8\nDBX_LABEL=应用服务器",
+                    "remoteCommand": "printf '已连接\\n'"
+                },
+                "connection_secrets": {
+                    "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\r\n测试\r\n-----END OPENSSH PRIVATE KEY-----\r\n"
+                }
+            },
+            "runtime": { "host": "127.0.0.1", "port": 39222 }
+        });
+        // Exercise the same UTF-8 JSON boundary used by the host bridge, not
+        // only the in-memory `serde_json::Value` representation.
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+        let connection = StoredConnection::from_lifecycle_params(&decoded).unwrap();
+
+        // The logical endpoint is used for host-key identity; the runtime
+        // endpoint is the actual dial target supplied by the host tunnel.
+        assert_eq!(connection.name.as_deref(), Some("生产机-北京"));
+        assert_eq!(connection.host, "2001:db8::42");
+        assert_eq!(connection.port, 2222);
+        assert_eq!(connection.runtime_host, "127.0.0.1");
+        assert_eq!(connection.runtime_port, 39222);
+        assert_eq!(connection.username, "运维");
+        assert_eq!(connection.password, "密码🔐");
+        assert_eq!(
+            connection.private_key_path,
+            "C:\\Users\\测试\\.ssh\\id_ed25519"
+        );
+        assert_eq!(
+            connection.private_key,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\r\n测试\r\n-----END OPENSSH PRIVATE KEY-----\r\n"
+        );
+        assert_eq!(
+            connection.set_env,
+            vec![
+                ("LANG".to_string(), "zh_CN.UTF-8".to_string()),
+                ("DBX_LABEL".to_string(), "应用服务器".to_string()),
+            ]
+        );
+        assert_eq!(connection.remote_command, "printf '已连接\\n'");
+    }
+
+    #[test]
+    fn lifecycle_parser_accepts_network_address_forms_and_rejects_ambiguous_hosts() {
+        for host in [
+            "127.0.0.1",
+            "ssh.example.test",
+            "2001:db8::1",
+            "[2001:db8::1]",
+        ] {
+            let connection = StoredConnection::from_lifecycle_params(&serde_json::json!({
+                "connection": {
+                    "id": "address",
+                    "host": host,
+                    "port": 22,
+                    "username": "user",
+                    "password": "secret"
+                }
+            }))
+            .unwrap();
+            assert_eq!(connection.host, host);
+        }
+
+        for host in ["my server", "ssh://server.example.test:22", "server\nname"] {
+            let result = StoredConnection::from_lifecycle_params(&serde_json::json!({
+                "connection": {
+                    "id": "address",
+                    "host": host,
+                    "port": 22,
+                    "username": "user",
+                    "password": "secret"
+                }
+            }));
+            assert!(result.is_err(), "ambiguous host must fail fast: {host:?}");
+        }
+
+        for port in [0_u64, 65_536] {
+            let result = StoredConnection::from_lifecycle_params(&serde_json::json!({
+                "connection": {
+                    "id": "port",
+                    "host": "server.example.test",
+                    "port": port,
+                    "username": "user",
+                    "password": "secret"
+                }
+            }));
+            assert!(result.is_err(), "invalid port must fail fast: {port}");
+        }
+    }
+
+    #[test]
+    fn sftp_uri_roundtrip_keeps_utf8_paths_and_confines_parent_segments() {
+        let path = "/home/运维/../应用/日志.txt";
+        assert_eq!(
+            path_from_sftp_uri(&sftp_uri(path)).unwrap(),
+            "/home/应用/日志.txt"
+        );
+        assert_eq!(
+            path_from_sftp_uri("sftp:relative/目录/./文件.txt").unwrap(),
+            "/relative/目录/文件.txt"
+        );
+    }
+
+    #[test]
     fn parses_jump_host_chains() {
         let connection = StoredConnection::from_lifecycle_params(&serde_json::json!({
             "connection": {
