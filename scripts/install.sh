@@ -13,12 +13,29 @@
 # Environment:
 #   DBX_HOST_WORKTREE   host checkout used for the installer binary
 #                       (must be supplied explicitly for host integration)
-#   DBX_TEST_APP        DBX.app bundle to relaunch (default: probe the host
-#                       worktree, then `open -a DBX`)
+#   DBX_TEST_APP        DBX.app bundle to relaunch on macOS, or the dbx.exe
+#                       path on Windows (default: probe the host worktree /
+#                       uninstall registry, then fall back to `open -a DBX`)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP_DATA="${DBX_APP_DATA:-$HOME/Library/Application Support/com.dbx.app}"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+  *) IS_WINDOWS=0 ;;
+esac
+
+# Resolve DBX.exe from the uninstall registry on Windows (DisplayIcon points
+# at the exe); returns a Windows-style path, empty when not found.
+dbx_exe_from_registry() {
+  powershell -NoProfile -Command 'Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* -ErrorAction SilentlyContinue | Where-Object DisplayName -eq "DBX" | Select-Object -First 1 -ExpandProperty DisplayIcon' \
+    2>/dev/null | tr -d '\r' | tr -d '"' | head -1
+}
+
+if [ "$IS_WINDOWS" = 1 ]; then
+  APP_DATA="${DBX_APP_DATA:-${APPDATA:-$HOME/AppData/Roaming}/com.dbx.app}"
+else
+  APP_DATA="${DBX_APP_DATA:-$HOME/Library/Application Support/com.dbx.app}"
+fi
 REINSTALL=0
 RESTART=1
 KEEP_OLD=0
@@ -43,23 +60,46 @@ VERSION="$(python3 -c "import json;print(json.load(open('manifest.json'))['versi
 export PATH="$HOME/.cargo/bin:$PATH"
 
 INSTALLER="$DBX_HOST_WORKTREE/target/release/examples/install_plugin"
+[ "$IS_WINDOWS" = 1 ] && INSTALLER="$INSTALLER.exe"
 if [ ! -x "$INSTALLER" ]; then
   echo "==> building PluginPackageInstaller example"
   (cd "$DBX_HOST_WORKTREE" && cargo build -p dbx-core --example install_plugin --release)
 fi
 
-APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-  /Applications/DBX.app/Contents/Info.plist 2>/dev/null || echo 0.6.0)"
+DBX_EXE=""
+if [ "$IS_WINDOWS" = 1 ]; then
+  DBX_EXE="${DBX_TEST_APP:-}"
+  [ -n "$DBX_EXE" ] && [ ! -f "$DBX_EXE" ] && DBX_EXE=""
+  [ -z "$DBX_EXE" ] && DBX_EXE="$(dbx_exe_from_registry)"
+  APP_VERSION=""
+  if [ -n "$DBX_EXE" ]; then
+    APP_VERSION="$(powershell -NoProfile -Command "(Get-Item '$DBX_EXE').VersionInfo.ProductVersion" \
+      2>/dev/null | tr -d '\r' | head -1)"
+  fi
+  APP_VERSION="${APP_VERSION:-0.6.0}"
+else
+  APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+    /Applications/DBX.app/Contents/Info.plist 2>/dev/null || echo 0.6.0)"
+fi
 
 WAS_RUNNING=0
-if pgrep -f "DBX.app/Contents/MacOS/dbx" >/dev/null 2>&1; then
-  WAS_RUNNING=1
+if [ "$IS_WINDOWS" = 1 ]; then
+  if tasklist //FI "IMAGENAME eq dbx.exe" 2>/dev/null | grep -qi "dbx\.exe"; then
+    WAS_RUNNING=1
+  fi
+  echo "==> stopping DBX"
+  taskkill //F //IM dbx.exe >/dev/null 2>&1 || true
+  sleep 2
+else
+  if pgrep -f "DBX.app/Contents/MacOS/dbx" >/dev/null 2>&1; then
+    WAS_RUNNING=1
+  fi
+  echo "==> stopping DBX"
+  osascript -e 'quit app id "com.dbx.app"' >/dev/null 2>&1 || true
+  sleep 2
+  pkill -f "DBX.app/Contents/MacOS/dbx" 2>/dev/null || true
+  sleep 1
 fi
-echo "==> stopping DBX"
-osascript -e 'quit app id "com.dbx.app"' >/dev/null 2>&1 || true
-sleep 2
-pkill -f "DBX.app/Contents/MacOS/dbx" 2>/dev/null || true
-sleep 1
 
 PLUGIN_STORE="$APP_DATA/plugins"
 if [ "$REINSTALL" = 1 ]; then
@@ -127,7 +167,13 @@ fi
 
 if [ "$RESTART" = 1 ] && [ "$WAS_RUNNING" = 1 ]; then
   echo "==> restarting DBX"
-  if [ -n "${DBX_TEST_APP:-}" ] && [ -d "$DBX_TEST_APP" ]; then
+  if [ "$IS_WINDOWS" = 1 ]; then
+    if [ -n "$DBX_EXE" ]; then
+      cmd //c start "" "$DBX_EXE"
+    else
+      echo "WARN: DBX.exe path unknown (set DBX_TEST_APP); start DBX manually" >&2
+    fi
+  elif [ -n "${DBX_TEST_APP:-}" ] && [ -d "$DBX_TEST_APP" ]; then
     open "$DBX_TEST_APP"
   elif [ -d "$DBX_HOST_WORKTREE/target/debug/bundle/macos/DBX.app" ]; then
     open "$DBX_HOST_WORKTREE/target/debug/bundle/macos/DBX.app"
