@@ -6096,13 +6096,15 @@ mod tests {
         assert_eq!(inside.clone().sanitized(), inside);
     }
 
+    #[cfg(windows)]
+    const ABS_TEST_ROOT: &str = "C:\\tmp\\transfers";
+    #[cfg(not(windows))]
+    const ABS_TEST_ROOT: &str = "/tmp/transfers";
+
     #[test]
     fn local_transfer_root_setting_accepts_absolute_and_empty_only() {
         assert_eq!(validated_transfer_root(&json!("")).unwrap(), "");
-        assert_eq!(
-            validated_transfer_root(&json!("/tmp/transfers")).unwrap(),
-            "/tmp/transfers"
-        );
+        assert_eq!(validated_transfer_root(&json!(ABS_TEST_ROOT)).unwrap(), ABS_TEST_ROOT);
         assert!(validated_transfer_root(&json!("relative/path")).is_err());
         assert!(validated_transfer_root(&json!(42)).is_err());
     }
@@ -6267,9 +6269,9 @@ mod tests {
 
         // The transfer root accepts an absolute path and clears on empty.
         let with_root = state
-            .settings_set(&json!({ "localTransferRoot": "/tmp/transfers" }))
+            .settings_set(&json!({ "localTransferRoot": ABS_TEST_ROOT }))
             .unwrap();
-        assert_eq!(with_root["localTransferRoot"], "/tmp/transfers");
+        assert_eq!(with_root["localTransferRoot"], ABS_TEST_ROOT);
         let cleared = state
             .settings_set(&json!({ "localTransferRoot": "" }))
             .unwrap();

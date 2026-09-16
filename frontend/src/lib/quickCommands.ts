@@ -60,3 +60,22 @@ export function upsertQuickCommand(list: QuickCommand[], item: QuickCommand, lim
 export function removeQuickCommand(list: QuickCommand[], id: string): QuickCommand[] {
   return list.filter((item) => item.id !== id);
 }
+
+/** 名称/命令的大小写不敏感子串过滤；空查询返回全量。 */
+export function filterQuickCommands(
+  list: readonly QuickCommand[],
+  query: string,
+): QuickCommand[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [...list];
+  return list.filter(
+    (item) =>
+      item.name.toLowerCase().includes(needle) ||
+      item.command.toLowerCase().includes(needle),
+  );
+}
+
+/** 写入终端的命令文本：多行命令折叠为单行并去首尾空白（Run/Paste 共用）。 */
+export function quickCommandText(command: string): string {
+  return command.replace(/\r?\n/g, " ").trim();
+}

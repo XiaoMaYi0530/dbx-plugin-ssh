@@ -31,7 +31,7 @@ export const DBX_POPOVER: Record<"light" | "dark", string> = {
   dark: "rgb(30 30 32)",
 };
 
-const DEFAULT_TERMINAL_FONT_FAMILY = "'Cascadia Mono', Consolas, monospace";
+const DEFAULT_TERMINAL_FONT_FAMILY = "'JetBrains Mono', 'Cascadia Mono', Consolas, monospace";
 const DEFAULT_UI_FONT_FAMILY = "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 const DEFAULT_TERMINAL_FONT_SIZE = 13;
 

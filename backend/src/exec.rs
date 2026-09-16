@@ -1267,20 +1267,30 @@ pub fn parse_metrics_output(output: &str) -> serde_json::Value {
         } else if section == "--df--" {
             // filesystem total used avail pct mount
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() >= 6 {
-                let (total, used, available) = (
-                    fields[1].parse::<u64>().unwrap_or(0) * 1024,
-                    fields[2].parse::<u64>().unwrap_or(0) * 1024,
-                    fields[3].parse::<u64>().unwrap_or(0) * 1024,
-                );
-                disks.push(json!({
-                    "filesystem": fields[0],
-                    "mount": fields[5],
-                    "totalBytes": total,
-                    "usedBytes": used,
-                    "availableBytes": available,
-                    "percentUsed": fields[4].trim_end_matches('%').parse::<f64>().unwrap_or(0.0),
-                }));
+            // 严格行形校验：容量三列必须是数字、百分比列必须以 % 结尾、挂载点
+            // 必须是绝对路径。段切换只认 --mem--/--cpu--/--df--，后面的 --os--
+            // 段内容会落在 df 段里——os-release 的 `PRETTY_NAME="Alibaba Cloud
+            // Linux release 3 (OpenAnolis)"` 恰好 6 个字段，宽松解析会把
+            // "(OpenAnolis)" 混成 0 B 的幽灵磁盘行。
+            if fields.len() >= 6 && fields[5].starts_with('/') {
+                if let (Ok(total_kib), Ok(used_kib), Ok(available_kib)) = (
+                    fields[1].parse::<u64>(),
+                    fields[2].parse::<u64>(),
+                    fields[3].parse::<u64>(),
+                ) {
+                    if let Some(percent) =
+                        fields[4].strip_suffix('%').and_then(|p| p.parse::<f64>().ok())
+                    {
+                        disks.push(json!({
+                            "filesystem": fields[0],
+                            "mount": fields[5],
+                            "totalBytes": total_kib * 1024,
+                            "usedBytes": used_kib * 1024,
+                            "availableBytes": available_kib * 1024,
+                            "percentUsed": percent,
+                        }));
+                    }
+                }
             }
         }
     }
@@ -2218,6 +2228,23 @@ tmpfs 8154428 0 8154428 0% /dev/shm
         assert_eq!(disks.len(), 3);
         assert_eq!(disks[1]["mount"], "/dev/shm");
         assert_eq!(disks[2]["percentUsed"], 55.0);
+    }
+
+    #[test]
+    fn df_section_rejects_os_release_bleed() {
+        // --os-- 段不被段切换识别，其内容会落在 --df-- 段里；
+        // PRETTY_NAME 恰好 6 个字段，绝不能被解析成幽灵磁盘行。
+        let output = "\
+--df--
+/dev/vda1 41022688 16785408 22573568 44% /
+--os--
+NAME=\"Alibaba Cloud Linux\"
+PRETTY_NAME=\"Alibaba Cloud Linux release 3 (OpenAnolis)\"
+";
+        let metrics = parse_metrics_output(output);
+        let disks = metrics["disks"].as_array().unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0]["mount"], "/");
     }
 
     #[test]

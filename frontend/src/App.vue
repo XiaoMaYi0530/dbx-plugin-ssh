@@ -13,11 +13,14 @@ import {
   Film,
   Pause,
   Play,
+  Plus,
   ArrowDown,
+  ArrowLeft,
   ArrowLeftRight,
   ArrowUp,
   ArrowUpDown,
   Bot,
+  Braces,
   ClipboardPaste,
   Columns3,
   Copy,
@@ -98,6 +101,8 @@ import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousC
 import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
 import { filesFromClipboard } from "./lib/clipboardFiles";
 import { friendlySftpError } from "./lib/sftpErrors";
+import { filterDiskMounts, filterNetworkInterfaces } from "./lib/metricsView";
+import { isCountdownActive, nextCountdownValue, RECORD_COUNTDOWN_START } from "./lib/recordingCountdown";
 import { expandSelection, filterSftpEntries, type SftpTypeFilter } from "./lib/sftpFileFilters";
 import { pushPathHistory, sanitizePathHistories } from "./lib/sftpPathHistory";
 import {
@@ -112,7 +117,7 @@ import {
   type SftpBookmark,
 } from "./lib/sftpBookmarks";
 import { browseCommandHistory, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
-import { normalizeQuickCommands, QUICK_COMMANDS_LIMIT, type QuickCommand } from "./lib/quickCommands";
+import { filterQuickCommands, normalizeQuickCommands, QUICK_COMMANDS_LIMIT, quickCommandText, type QuickCommand } from "./lib/quickCommands";
 import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
 import { clampFontSize } from "./lib/terminalZoom";
@@ -552,6 +557,29 @@ const quickCommands = ref<QuickCommand[]>(loadQuickCommands());
 const quickMenuOpen = ref(false);
 const quickSaving = ref(false);
 const quickDraft = reactive<{ id?: string; name: string; command: string }>({ name: "", command: "" });
+// Termius Snippets 式面板状态：搜索过滤 / 卡片展开 / 编辑器子视图。
+const quickSearch = ref("");
+const quickExpandedId = ref<string | null>(null);
+const quickEditorOpen = ref(false);
+const filteredQuickCommands = computed(() => filterQuickCommands(quickCommands.value, quickSearch.value));
+
+function openQuickEditor(item?: QuickCommand) {
+  quickDraft.id = item?.id;
+  quickDraft.name = item?.name ?? "";
+  quickDraft.command = item?.command ?? "";
+  quickEditorOpen.value = true;
+}
+
+function closeQuickEditor() {
+  quickEditorOpen.value = false;
+  quickDraft.id = undefined;
+  quickDraft.name = "";
+  quickDraft.command = "";
+}
+
+function toggleQuickExpand(id: string) {
+  quickExpandedId.value = quickExpandedId.value === id ? null : id;
+}
 // 批量发送命令条（Electerm quick-command bar 风格）：常驻贴在终端底部，回车
 // 即发送。目标来自 ssh/sessions/list（跨连接全部活跃会话），命令写入各会话
 // 交互终端（PTY 键盘语义，输出回显在各自终端，对齐 tiny-rdm batch send）。
@@ -2708,6 +2736,9 @@ const metricsRxSparkline = computed(() => sparklinePath(metricSamples.rx, 60, 18
 const metricsTxSparkline = computed(() => sparklinePath(metricSamples.tx, 60, 18));
 const metricsCpuSparkline = computed(() => sparklinePath(metricSamples.cpu, 120, 18));
 const metricsMemSparkline = computed(() => sparklinePath(metricSamples.mem, 120, 18));
+// 视图层去噪：伪文件系统/overlay 重复挂载/零流量虚拟网卡不进渲染（纯函数在 lib/metricsView）。
+const visibleDiskMounts = computed(() => filterDiskMounts(metrics.value?.disks));
+const visibleNetworkInterfaces = computed(() => filterNetworkInterfaces(metrics.value?.network));
 // 旧 sidecar 无 osId/osPretty 时整体缺徽标（optional 降级，§6.6）。
 const metricsDistroBadge = computed<DistroBadge | null>(() => (metrics.value ? distroBadge(metrics.value.osId, metrics.value.osPretty) : null));
 
@@ -2719,6 +2750,8 @@ watch(() => session.value?.sessionId, (next, previous) => {
     metricSamples.mem = [];
     // 录制挂在具体 session 上：换会话后本端标记复位（后端随旧会话自动收尾）。
     recordingActive.value = false;
+    cancelRecordCountdown();
+    stopRecordingClock();
   }
 });
 
@@ -4477,9 +4510,7 @@ async function addQuickCommand() {
       command,
     });
     quickCommands.value = normalizeQuickCommands(response.commands);
-    quickDraft.id = undefined;
-    quickDraft.name = "";
-    quickDraft.command = "";
+    closeQuickEditor();
   } catch (cause) {
     showError(cause, "terminal");
   } finally {
@@ -4487,14 +4518,15 @@ async function addQuickCommand() {
   }
 }
 
-// 点击条目的编辑按钮：载入编辑器（携带 id 即更新语义），再次添加即保存。
+// 点击卡片的编辑按钮：编辑器子视图载入草稿（携带 id 即更新语义）。
 function editQuickCommand(item: QuickCommand) {
-  quickDraft.id = item.id;
-  quickDraft.name = item.name;
-  quickDraft.command = item.command;
+  openQuickEditor(item);
 }
 
 async function deleteQuickCommand(id: string) {
+  const target = quickCommands.value.find((item) => item.id === id);
+  // 删除是不可逆操作：先确认（与重命名覆盖/强杀进程同一 confirm 语义）。
+  if (target && !window.confirm(t("quickCommandDeleteConfirm", { name: target.name || target.command }))) return;
   try {
     const response = await window.dbxPlugin.invoke<{ commands: unknown }>("ssh/quickCommands/delete", { id });
     quickCommands.value = normalizeQuickCommands(response.commands);
@@ -4507,14 +4539,23 @@ async function deleteQuickCommand(id: string) {
 // 必须走 PTY 写入——输出直接回显在终端里、cd/env 等状态留在当前 shell；
 // ssh/exec 是独立非交互通道，不回显也不共享 shell 状态，不符合语义。
 // 命令原文按键盘输入写入（用户可见可中断），不经过任何 shell 拼接转义。
-function sendQuickCommand(item: QuickCommand) {
+// Run = 写入并回车执行；Paste = 只粘贴到命令行（不执行，可继续编辑）。
+// 两种模式都不关弹窗（对齐 Termius：连续挑多条命令是高频操作，关窗会
+// 打断流程）；手动 Esc/外点/再点工具栏按钮关闭。
+function writeQuickCommand(item: QuickCommand, execute: boolean) {
   if (!session.value || terminalTransferBusy.value || commandRunning.value) return;
-  quickMenuOpen.value = false;
-  const text = item.command.replace(/\r?\n/g, " ").trim();
+  const text = quickCommandText(item.command);
   if (!text) return;
-  trackPendingInput(`${text}\r`);
-  sendTerminalBytes(new TextEncoder().encode(`${text}\r`));
+  const payload = execute ? `${text}\r` : text;
+  if (execute) trackPendingInput(payload);
+  sendTerminalBytes(new TextEncoder().encode(payload));
   terminal?.focus();
+}
+function sendQuickCommand(item: QuickCommand) {
+  writeQuickCommand(item, true);
+}
+function pasteQuickCommand(item: QuickCommand) {
+  writeQuickCommand(item, false);
 }
 
 // 一键 sudo -v：向当前交互终端按键盘语义写入 `sudo -v` + 回车（等价手敲执行），
@@ -4742,6 +4783,12 @@ function toggleQuickMenu() {
   const next = !quickMenuOpen.value;
   closeToolbarPopovers();
   quickMenuOpen.value = next;
+  if (next) {
+    // 每次打开回到列表态：清空搜索/展开/编辑器子视图。
+    quickSearch.value = "";
+    quickExpandedId.value = null;
+    quickEditorOpen.value = false;
+  }
 }
 
 function toggleConnectionInfo() {
@@ -4906,8 +4953,8 @@ function networkRateShare(net: { rxRate: number; txRate: number }) {
   return Math.min(100, Math.round((Math.max(net.rxRate, net.txRate) / metricsRatePeak.value) * 100));
 }
 
-const metricsProcGridStyle = { gridTemplateColumns: "52px 76px 52px 56px minmax(0, 1fr)" };
-const procGridStyle = { gridTemplateColumns: "52px 72px 52px 56px 84px minmax(0, 1fr) 132px" };
+const metricsProcGridStyle = { gridTemplateColumns: "48px 64px 48px 52px minmax(0, 1fr)" };
+const procGridStyle = { gridTemplateColumns: "48px 60px 48px 52px 76px minmax(0, 1fr) 132px" };
 
 // —— F2：指标历史回填 + 进程管理 ———
 
@@ -4965,19 +5012,74 @@ async function killProcessRow(row: ProcessRow, signal: 15 | 9) {
 
 // —— F3：终端录制 + 回放（asciicast v2）———
 
+// 录制开始倒计时（录制软件惯例）：点击后 3→2→1 动画，归零才真正
+// recording/start；Esc/点击遮罩取消。录制中工具栏按钮变红色胶囊显示时长。
+const recordCountdown = ref<number | null>(null);
+const recordingStartedAt = ref<number | null>(null);
+const recordingElapsedSec = ref(0);
+let recordCountdownTimer = 0;
+let recordingElapsedTimer = 0;
+
+function beginRecordCountdown() {
+  if (!session.value || recordCountdown.value !== null) return;
+  recordCountdown.value = RECORD_COUNTDOWN_START;
+  window.clearInterval(recordCountdownTimer);
+  recordCountdownTimer = window.setInterval(() => {
+    const next = nextCountdownValue(recordCountdown.value);
+    recordCountdown.value = next;
+    if (next === null) {
+      window.clearInterval(recordCountdownTimer);
+      void startRecordingNow();
+    }
+  }, 1000);
+}
+
+function cancelRecordCountdown() {
+  window.clearInterval(recordCountdownTimer);
+  recordCountdown.value = null;
+}
+
+function startRecordingClock() {
+  recordingStartedAt.value = Date.now();
+  recordingElapsedSec.value = 0;
+  window.clearInterval(recordingElapsedTimer);
+  recordingElapsedTimer = window.setInterval(() => {
+    recordingElapsedSec.value = recordingStartedAt.value
+      ? Math.floor((Date.now() - recordingStartedAt.value) / 1000)
+      : 0;
+  }, 1000);
+}
+
+function stopRecordingClock() {
+  window.clearInterval(recordingElapsedTimer);
+  recordingStartedAt.value = null;
+  recordingElapsedSec.value = 0;
+}
+
+async function startRecordingNow() {
+  if (!session.value || recordingActive.value) return;
+  try {
+    await window.dbxPlugin.invoke("ssh/recording/start", { sessionId: session.value.sessionId });
+    recordingActive.value = true;
+    startRecordingClock();
+    showNotice(t("recordingStarted"));
+  } catch (cause) {
+    showError(cause);
+  }
+}
+
 async function toggleRecording() {
   if (!session.value) return;
+  if (!recordingActive.value) {
+    beginRecordCountdown();
+    return;
+  }
   try {
-    if (recordingActive.value) {
-      await window.dbxPlugin.invoke("ssh/recording/stop", { sessionId: session.value.sessionId });
-      recordingActive.value = false;
-      showNotice(t("recordingStopped"));
-      if (recordingsOpen.value) await loadRecordings();
-    } else {
-      await window.dbxPlugin.invoke("ssh/recording/start", { sessionId: session.value.sessionId });
-      recordingActive.value = true;
-      showNotice(t("recordingStarted"));
-    }
+    await window.dbxPlugin.invoke("ssh/recording/stop", { sessionId: session.value.sessionId });
+    recordingActive.value = false;
+    stopRecordingClock();
+    showNotice(t("recordingStopped"));
+    if (recordingsOpen.value) await loadRecordings();
   } catch (cause) {
     showError(cause);
   }
@@ -5052,7 +5154,15 @@ async function openReplay(item: RecordingSummary) {
     replayPlaying.value = false;
     await nextTick();
     if (replayHost.value) {
-      replayTerminal = new Terminal({ cols: 100, rows: 26, convertEol: false });
+      // 回放终端跟随宿主外观（主题色/字体/字号），不再是默认纯黑 xterm。
+      replayTerminal = new Terminal({
+        cols: 100,
+        rows: 26,
+        convertEol: false,
+        theme: terminalTheme(),
+        fontFamily: appearance.value.terminal.fontFamily,
+        fontSize: appearance.value.terminal.fontSize,
+      });
       replayTerminal.open(replayHost.value);
     }
   } catch (cause) {
@@ -5907,6 +6017,11 @@ function onDocumentKeydown(event: KeyboardEvent) {
     return;
   }
   if (event.key !== "Escape") return;
+  // 录制倒计时优先取消（遮罩在终端区，不属于弹层体系）。
+  if (isCountdownActive(recordCountdown.value)) {
+    cancelRecordCountdown();
+    return;
+  }
   if (previewOpen.value) {
     closePreview();
     return;
@@ -6238,26 +6353,53 @@ onBeforeUnmount(() => {
         <div class="menu-anchor">
           <button class="icon-button icon-amber" :title="t('quickCommands')" :disabled="!connected" @click.stop="toggleQuickMenu"><Zap /></button>
           <section v-if="quickMenuOpen" class="popover quick-commands-popover" @click.stop>
-            <h3>{{ t("quickCommands") }}</h3>
-            <p class="quick-command-global-hint">{{ t("quickCommandsGlobalHint") }}</p>
-            <div v-if="!quickCommands.length" class="empty compact">{{ t("quickCommandsEmpty") }}</div>
-            <div v-for="item in quickCommands" :key="item.id" class="quick-command-row">
-              <button class="quick-command-send" :title="item.command" @click="sendQuickCommand(item)">
-                <strong>{{ item.name }}</strong>
-                <span class="mono">{{ item.command }}</span>
-              </button>
-              <button class="icon-button" :title="t('quickCommandsEdit')" @click="editQuickCommand(item)"><Pencil /></button>
-              <button class="icon-button" :title="t('delete')" @click="deleteQuickCommand(item.id)"><Trash2 /></button>
-            </div>
-            <footer class="quick-command-editor">
-              <input v-model="quickDraft.name" :placeholder="t('quickCommandsName')" :maxlength="60" />
-              <input v-model="quickDraft.command" class="mono" :placeholder="t('quickCommandsCommand')" :maxlength="500" @keydown.enter="addQuickCommand" />
-              <div class="quick-command-editor-actions">
-                <button class="primary-button" :disabled="quickSaving || !quickDraft.command.trim() || (!quickDraft.id && quickCommands.length >= 20)" @click="addQuickCommand">{{ quickDraft.id ? t("save") : t("quickCommandsAdd") }}</button>
-                <button v-if="quickDraft.id" @click="quickDraft.id = undefined; quickDraft.name = ''; quickDraft.command = ''">{{ t("cancel") }}</button>
-                <span class="quick-command-limit">{{ t("quickCommandsLimit", { count: quickCommands.length, limit: 20 }) }}</span>
+            <!-- Termius Snippets 式结构：列表态（搜索 + 卡片 + 整宽新建按钮）与
+                 编辑器子视图（返回 + 名称 + 多行命令 + 保存）两个视图切换。 -->
+            <template v-if="!quickEditorOpen">
+              <h3>{{ t("quickCommands") }}</h3>
+              <p class="quick-command-global-hint">{{ t("quickCommandsGlobalHint") }}</p>
+              <div v-if="quickCommands.length" class="quick-search">
+                <Search />
+                <input v-model="quickSearch" :placeholder="t('quickCommandsSearch')" spellcheck="false" />
               </div>
-            </footer>
+              <div v-if="!quickCommands.length" class="empty compact">{{ t("quickCommandsEmpty") }}</div>
+              <div v-else-if="!filteredQuickCommands.length" class="empty compact">{{ t("quickCommandsNoMatch") }}</div>
+              <div v-for="item in filteredQuickCommands" :key="item.id" class="quick-command-row quick-card" :class="{ expanded: quickExpandedId === item.id }">
+                <button class="quick-card-main" :title="item.command" @click="toggleQuickExpand(item.id)">
+                  <Braces class="quick-card-icon" />
+                  <span class="quick-card-text">
+                    <strong>{{ item.name }}</strong>
+                    <span class="mono">{{ item.command }}</span>
+                  </span>
+                </button>
+                <div class="quick-card-actions">
+                  <button class="quick-action" :disabled="!connected" @click="sendQuickCommand(item)">{{ t("quickCommandRun") }}</button>
+                  <button class="quick-action" :disabled="!connected" @click="pasteQuickCommand(item)">{{ t("quickCommandPaste") }}</button>
+                  <button class="icon-button compact" :title="t('quickCommandsEdit')" @click="editQuickCommand(item)"><Pencil /></button>
+                  <button class="icon-button compact" :title="t('delete')" @click="deleteQuickCommand(item.id)"><Trash2 /></button>
+                </div>
+                <div v-if="quickExpandedId === item.id" class="quick-card-full mono">{{ item.command }}</div>
+              </div>
+              <footer class="quick-command-footer">
+                <button class="quick-new-btn" :disabled="quickCommands.length >= 20" @click="openQuickEditor()"><Plus />{{ t("quickCommandsNew") }}</button>
+                <span class="quick-command-limit">{{ t("quickCommandsLimit", { count: quickCommands.length, limit: 20 }) }}</span>
+              </footer>
+            </template>
+            <template v-else>
+              <header class="quick-editor-head">
+                <button class="icon-button compact" :title="t('cancel')" @click="closeQuickEditor"><ArrowLeft /></button>
+                <h3>{{ quickDraft.id ? t("quickCommandsEdit") : t("quickCommandsNew") }}</h3>
+              </header>
+              <footer class="quick-command-editor">
+                <input v-model="quickDraft.name" :placeholder="t('quickCommandsName')" :maxlength="60" autofocus />
+                <textarea v-model="quickDraft.command" class="mono" rows="4" :placeholder="t('quickCommandsCommand')" :maxlength="500" @keydown.ctrl.enter="addQuickCommand" />
+                <div class="quick-command-editor-actions">
+                  <button class="primary-button" :disabled="quickSaving || !quickDraft.command.trim() || (!quickDraft.id && quickCommands.length >= 20)" @click="addQuickCommand">{{ quickDraft.id ? t("save") : t("quickCommandsAdd") }}</button>
+                  <button @click="closeQuickEditor">{{ t("cancel") }}</button>
+                  <span class="quick-command-limit">{{ t("quickCommandsLimit", { count: quickCommands.length, limit: 20 }) }}</span>
+                </div>
+              </footer>
+            </template>
           </section>
         </div>
         <div class="menu-anchor">
@@ -6315,7 +6457,7 @@ onBeforeUnmount(() => {
           </section>
         </div>
         <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
-        <button class="icon-button" :class="{ 'is-recording': recordingActive }" :title="t('recordingTitle')" :disabled="!connected" @click="toggleRecording"><Disc /></button>
+        <button class="icon-button" :class="{ 'is-recording': recordingActive, 'recording-live': recordingActive }" :title="t('recordingTitle')" :disabled="!connected" @click="toggleRecording"><Disc /><span v-if="recordingActive" class="recording-elapsed mono">{{ formatDuration(recordingElapsedSec) }}</span></button>
         <button class="icon-button" :class="{ 'is-active': recordingsOpen }" :title="t('recordingsTitle')" @click="toggleRecordings"><Film /></button>
         <div class="menu-anchor">
           <button class="icon-button icon-neutral" :title="t('connectionInfo')" @click.stop="toggleConnectionInfo"><Info /></button>
@@ -6427,6 +6569,11 @@ onBeforeUnmount(() => {
           <progress v-if="reconnectCountdown" :value="reconnectCountdown.percent" max="100" />
           <button class="reconnect-now" @click="reconnectNow">{{ t("reconnectNow") }}</button>
         </div>
+        <!-- 录制开始倒计时遮罩：大数字 3→2→1（:key 重触发放缩动画），Esc/点击取消 -->
+        <div v-if="recordCountdown !== null" class="record-countdown-overlay" role="status" @click="cancelRecordCountdown">
+          <span class="record-countdown-number" :key="recordCountdown">{{ recordCountdown }}</span>
+          <span class="record-countdown-hint">{{ t("recordingCountdownHint") }}</span>
+        </div>
         <div v-if="terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
           <Loader2 v-if="terminalState === 'connecting'" class="spinning large-icon" />
           <svg v-else class="terminal-state-icon" viewBox="0 0 64 64" role="img" aria-label="SSH">
@@ -6470,7 +6617,7 @@ onBeforeUnmount(() => {
         </div>
         <section v-if="metricsOpen" class="metrics-float">
           <header>
-            <h2>{{ t("metrics") }}<span v-if="metricsDistroBadge" class="distro-badge" :style="{ backgroundColor: metricsDistroBadge.color }" :title="metricsDistroBadge.name">{{ metricsDistroBadge.label }}</span><span v-if="metrics?.hostname" class="metrics-host"> · {{ metrics.hostname }}</span></h2>
+            <h2>{{ t("metrics") }}<span v-if="metricsDistroBadge" class="distro-badge" :style="{ backgroundColor: metricsDistroBadge.color }" :title="metricsDistroBadge.name">{{ metricsDistroBadge.label }}</span><span v-if="metrics?.hostname" class="metrics-host" :title="metrics.hostname"> · {{ metrics.hostname }}</span></h2>
             <button :title="t('close')" class="icon-button" @click="closeMetrics"><X /></button>
           </header>
           <div class="metrics-float-body">
@@ -6488,34 +6635,34 @@ onBeforeUnmount(() => {
                   <span>{{ t("metricsMemory") }}</span>
                   <small v-if="metrics.memory?.totalBytes">{{ formatBytes(metrics.memory.usedBytes) }} / {{ formatBytes(metrics.memory.totalBytes) }}<template v-if="metrics.memory.swapTotalBytes"> · {{ t("metricsSwap") }} {{ formatBytes(metrics.memory.swapUsedBytes ?? 0) }}</template></small>
                 </div>
-                <div class="metric-card" v-if="metrics.uptimeSeconds != null">
+                <div class="metric-card metric-card--wide" v-if="metrics.uptimeSeconds != null">
                   <strong>{{ formatUptime(metrics.uptimeSeconds) }}</strong>
                   <span>{{ t("metricsUptime") }}</span>
                   <small v-if="metrics.kernel">{{ metrics.kernel }}</small>
                 </div>
               </div>
               <div v-if="metricsCpuSparkline || metricsMemSparkline" class="metrics-disks metrics-trend">
-                <div class="disk-row"><span class="mono">{{ t("metricsCpu") }}</span><svg class="metrics-sparkline metrics-trend-line" width="120" height="18" viewBox="0 0 120 18" role="img" aria-label="cpu trend"><polyline :points="metricsCpuSparkline" fill="none" style="stroke: var(--primary)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg><span class="numeric">{{ Math.round(metricSamples.cpu.at(-1) ?? 0) }}%</span></div>
+                <div class="disk-row"><span class="mono">{{ t("metricsCpu") }}</span><svg class="metrics-sparkline metrics-trend-line" width="120" height="18" viewBox="0 0 120 18" role="img" aria-label="cpu trend"><polyline :points="metricsCpuSparkline" fill="none" style="stroke: var(--info)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg><span class="numeric">{{ Math.round(metricSamples.cpu.at(-1) ?? 0) }}%</span></div>
                 <div class="disk-row"><span class="mono">{{ t("metricsMemory") }}</span><svg class="metrics-sparkline metrics-trend-line" width="120" height="18" viewBox="0 0 120 18" role="img" aria-label="memory trend"><polyline :points="metricsMemSparkline" fill="none" style="stroke: var(--success)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg><span class="numeric">{{ Math.round(metricSamples.mem.at(-1) ?? 0) }}%</span></div>
               </div>
-              <div v-if="metrics.disks?.length" class="metrics-disks">
-                <div v-for="disk in metrics.disks" :key="disk.mount" class="disk-row">
+              <div v-if="visibleDiskMounts.length" class="metrics-disks">
+                <div v-for="disk in visibleDiskMounts" :key="disk.mount" class="disk-row">
                   <span class="mono" :title="disk.mount">{{ disk.mount }}</span>
                   <progress :value="Math.min(100, disk.percentUsed)" max="100" :class="{ 'disk-warn': disk.percentUsed >= 85 }" />
                   <span class="numeric">{{ formatBytes(disk.usedBytes) }} / {{ formatBytes(disk.totalBytes) }} · {{ Math.round(disk.percentUsed) }}%</span>
                 </div>
               </div>
-              <div v-if="metrics.network?.length">
+              <div v-if="visibleNetworkInterfaces.length">
                 <h3 class="settings-section-title metrics-net-title">
                   <span>{{ t("metricsNetwork") }}</span>
                   <span v-if="metricsRxSparkline || metricsTxSparkline" class="metrics-sparkline-group">
-                    <svg class="metrics-sparkline" width="60" height="18" viewBox="0 0 60 18" role="img" aria-label="rx"><polyline :points="metricsRxSparkline" fill="none" style="stroke: var(--primary)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg>
+                    <svg class="metrics-sparkline" width="60" height="18" viewBox="0 0 60 18" role="img" aria-label="rx"><polyline :points="metricsRxSparkline" fill="none" style="stroke: var(--info)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg>
                     <svg class="metrics-sparkline" width="60" height="18" viewBox="0 0 60 18" role="img" aria-label="tx"><polyline :points="metricsTxSparkline" fill="none" style="stroke: var(--success)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" /></svg>
                   </span>
                 </h3>
                 <div class="metrics-disks">
                   <div
-                    v-for="net in metrics.network"
+                    v-for="net in visibleNetworkInterfaces"
                     :key="net.name"
                     class="disk-row"
                     :title="`rx ${formatBytes(net.rxTotal)} · tx ${formatBytes(net.txTotal)}`"
@@ -6538,8 +6685,8 @@ onBeforeUnmount(() => {
                 <div v-for="proc in metrics.processes" :key="proc.pid" class="file-row" :style="metricsProcGridStyle">
                   <span class="mono">{{ proc.pid }}</span>
                   <span class="mono">{{ proc.user }}</span>
-                  <span class="numeric">{{ proc.cpuPercent }}%</span>
-                  <span class="numeric">{{ proc.memPercent }}%</span>
+                  <span class="numeric" :class="{ 'proc-hot': proc.cpuPercent >= 50 }">{{ proc.cpuPercent }}%</span>
+                  <span class="numeric" :class="{ 'proc-hot': proc.memPercent >= 30 }">{{ proc.memPercent }}%</span>
                   <span class="mono" :title="proc.command">{{ proc.command }}</span>
                 </div>
               </div>
@@ -6570,8 +6717,8 @@ onBeforeUnmount(() => {
                   <div v-for="proc in visibleProcessRows" :key="proc.pid" class="file-row" :style="procGridStyle">
                     <span class="mono">{{ proc.pid }}</span>
                     <span class="mono">{{ proc.user }}</span>
-                    <span class="numeric">{{ proc.cpuPercent }}%</span>
-                    <span class="numeric">{{ proc.memPercent }}%</span>
+                    <span class="numeric" :class="{ 'proc-hot': proc.cpuPercent >= 50 }">{{ proc.cpuPercent }}%</span>
+                    <span class="numeric" :class="{ 'proc-hot': proc.memPercent >= 30 }">{{ proc.memPercent }}%</span>
                     <span class="mono">{{ proc.etime }}</span>
                     <span class="mono" :title="proc.command">{{ proc.command }}</span>
                     <span class="proc-kill-group">
@@ -6595,13 +6742,17 @@ onBeforeUnmount(() => {
           <div class="metrics-float-body">
             <div v-if="recordingsLoading && !recordings.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
             <div v-else-if="!recordings.length" class="empty compact">{{ t("recordingsEmpty") }}</div>
-            <article v-for="item in recordings" :key="item.recordingId" class="transfer-card">
-              <div class="transfer-title"><Disc /><span>{{ item.host || item.recordingId }}</span><strong>{{ formatDuration(item.durationSecs ?? 0) }}</strong></div>
-              <div class="transfer-meta"><span>{{ formatRecordedAt(item.startedAt) }}</span><span v-if="item.bytes">{{ formatBytes(item.bytes) }}</span></div>
+            <article v-for="item in recordings" :key="item.recordingId" class="recording-card">
+              <Disc class="recording-icon" />
+              <div class="recording-text">
+                <span class="recording-host">{{ item.host || item.recordingId }}</span>
+                <span class="recording-meta">{{ formatRecordedAt(item.startedAt) }}<template v-if="item.bytes"> · {{ formatBytes(item.bytes) }}</template></span>
+              </div>
+              <span class="recording-duration mono">{{ formatDuration(item.durationSecs ?? 0) }}</span>
               <div class="recording-actions">
-                <button class="link-button" @click="openReplay(item)">{{ t("replayOpen") }}</button>
-                <button class="link-button" :disabled="replayExporting" @click="exportRecordingFromList(item)">{{ recordingExportingId === item.recordingId ? t("replayExporting") : t("replayExportGif") }}</button>
-                <button class="link-button recording-delete" @click="deleteRecording(item)">{{ t("recordingDelete") }}</button>
+                <button class="icon-button compact" :title="t('replayOpen')" @click="openReplay(item)"><Play /></button>
+                <button class="icon-button compact" :title="t('replayExportGif')" :disabled="replayExporting" @click="exportRecordingFromList(item)"><Loader2 v-if="recordingExportingId === item.recordingId" class="spinning" /><Download v-else /></button>
+                <button class="icon-button compact recording-delete" :title="t('recordingDelete')" @click="deleteRecording(item)"><Trash2 /></button>
               </div>
             </article>
           </div>
@@ -6613,7 +6764,10 @@ onBeforeUnmount(() => {
               <h2>{{ t("replayTitle") }}<span class="metrics-host"> · {{ replayState.summary.host || replayState.summary.recordingId }}</span></h2>
               <button class="icon-button" :title="t('replayClose')" @click="closeReplay"><X /></button>
             </header>
-            <div ref="replayHost" class="replay-terminal"></div>
+            <div class="replay-terminal-wrap">
+              <div ref="replayHost" class="replay-terminal"></div>
+              <div v-if="replayDurationMs <= 0" class="replay-empty">{{ t("replayEmpty") }}</div>
+            </div>
             <div class="replay-controls">
               <button class="icon-button" :title="t(replayPlaying ? 'replayPause' : 'replayPlay')" @click="toggleReplayPlay"><Pause v-if="replayPlaying" /><Play v-else /></button>
               <select v-model.number="replaySpeed" class="replay-speed" :title="t('replaySpeed')">
@@ -7569,17 +7723,17 @@ onBeforeUnmount(() => {
 <style scoped>
 /* SFTP 面板扩展（工作包 B）：搜索/类型过滤、批量条、路径历史、属性弹窗。 */
 .sftp-filter-bar { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid var(--border); padding: 5px 7px; }
-.sftp-search-input { display: flex; flex: 1; min-width: 0; height: 26px; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 5px; padding: 0 7px; background: var(--background); }
+.sftp-search-input { display: flex; flex: 1; min-width: 0; height: 26px; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 7px; background: var(--background); }
 .sftp-search-input:focus-within { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
 .sftp-search-input svg { width: 13px; height: 13px; flex: 0 0 13px; color: var(--muted-foreground); }
 .sftp-search-input input { min-width: 0; flex: 1; border: 0; padding: 0; background: transparent; color: var(--foreground); font-size: 12px; outline: none; }
 .sftp-search-clear { display: grid; width: 16px; height: 16px; flex: 0 0 16px; border: 0; border-radius: 50%; padding: 0; place-items: center; background: transparent; color: var(--muted-foreground); cursor: pointer; }
 .sftp-search-clear:hover { background: var(--accent); color: var(--foreground); }
 .sftp-search-clear svg { width: 11px; height: 11px; }
-.sftp-type-filter { height: 26px; border: 1px solid var(--border); border-radius: 5px; padding: 0 3px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.sftp-type-filter { height: 26px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 3px; background: var(--background); color: var(--foreground); font-size: 12px; }
 .sftp-batch-bar { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid var(--border); padding: 5px 8px; background: color-mix(in srgb, var(--primary) 8%, var(--background)); color: var(--muted-foreground); font-size: 11px; }
 .sftp-batch-bar span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sftp-batch-bar button { display: inline-flex; height: 22px; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: 4px; padding: 0 7px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; }
+.sftp-batch-bar button { display: inline-flex; height: 24px; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; }
 .sftp-batch-bar button:hover:not(:disabled) { background: var(--accent); }
 .sftp-batch-bar button.danger { color: var(--destructive); }
 .sftp-batch-bar button svg { width: 12px; height: 12px; }
@@ -7587,7 +7741,7 @@ onBeforeUnmount(() => {
 .batch-progress-bar { flex: 0 1 140px; height: 6px; min-width: 80px; accent-color: var(--primary); }
 .batch-progress-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 .batch-progress-row .batch-progress-bar { flex: 1; }
-.path-history-popover { display: flex; width: 250px; max-height: min(320px, 50vh); flex-direction: column; padding: 6px; overflow: auto; }
+.path-history-popover { display: flex; width: 250px; max-height: min(320px, 50vh); flex-direction: column; padding: 8px; overflow: auto; }
 .path-history-title { margin: 4px; color: var(--muted-foreground); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; }
 .path-history-popover .path-item { display: block; width: 100%; height: 26px; overflow: hidden; border: 0; border-radius: 4px; padding: 0 7px; background: transparent; color: var(--foreground); font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .path-history-popover .path-item:hover { background: var(--accent); }
@@ -7603,13 +7757,12 @@ onBeforeUnmount(() => {
 .bookmark-save-path { overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .bookmark-label-input { width: 100%; border: 1px solid var(--border); border-radius: 4px; padding: 4px 7px; background: var(--background); color: var(--foreground); font-size: 11px; }
 .bookmark-save-actions { display: flex; justify-content: flex-end; gap: 4px; }
-.bookmark-save-actions .icon-button { width: 26px; height: 26px; flex: 0 0 26px; }
 /* 传输历史区标题：与任务卡片间的分隔线 */
 .transfer-history-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; border-top: 1px solid var(--border); margin-top: 10px; }
 .transfer-history-title { margin: 0; padding-top: 8px; }
 .transfer-history-actions { display: flex; gap: 2px; padding-top: 6px; }
 .attrs-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 12px; }
-.attrs-grid dt { color: var(--muted-foreground); white-space: nowrap; }
+.attrs-grid dt { max-width: 16ch; overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
 .attrs-grid dd { margin: 0; overflow-wrap: anywhere; }
 .attrs-permissions-edit { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .attrs-permissions-edit span { flex: 0 0 auto; color: var(--muted-foreground); }
@@ -7634,26 +7787,49 @@ onBeforeUnmount(() => {
 /* 快速命令栏（工具栏下拉）：发送 / 编辑 / 删除 + 底部新增编辑器 */
 .quick-commands-popover { display: flex; width: min(360px, calc(100vw - 24px)); max-height: min(480px, calc(100vh - 60px)); flex-direction: column; gap: 4px; padding: 8px; overflow: auto; }
 .quick-commands-popover h3 { margin: 2px 4px 6px; font-size: 12px; }
-.quick-command-row { display: flex; align-items: center; gap: 2px; }
-.quick-command-row .icon-button { width: 24px; height: 24px; flex: 0 0 24px; }
-.quick-command-row .icon-button svg { width: 12px; height: 12px; }
-.quick-command-send { display: flex; min-width: 0; flex: 1; flex-direction: column; align-items: flex-start; gap: 1px; border: 1px solid transparent; border-radius: 4px; padding: 4px 7px; background: transparent; color: var(--foreground); text-align: left; cursor: pointer; }
-.quick-command-send:hover { background: var(--accent); border-color: var(--border); }
-.quick-command-send strong { max-width: 100%; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.quick-command-send .mono { max-width: 100%; overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.quick-command-editor { display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 8px; }
-.quick-command-editor input { width: 100%; height: 28px; border: 1px solid var(--border); border-radius: 5px; padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
-.quick-command-editor input:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
+/* 搜索行：图标 + 无边框输入（容器边框即输入框）。 */
+.quick-search { display: flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 4px; padding: 0 8px; background: var(--background); }
+.quick-search:focus-within { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
+.quick-search svg { width: 13px; height: 13px; flex: 0 0 13px; color: var(--muted-foreground); }
+.quick-search input { min-width: 0; flex: 1; height: 26px; border: 0; padding: 0; background: transparent; color: var(--foreground); font-size: 12px; outline: none; }
+/* 命令卡片（Termius Snippets 式）：{} 图标 + 名称/命令两行；动作按钮 hover
+   或展开时浮现；展开时显示完整命令（自动换行）。 */
+.quick-card { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; border: 1px solid transparent; border-radius: var(--radius); padding: 3px 4px; }
+.quick-card:hover { background: color-mix(in srgb, var(--accent) 55%, transparent); }
+.quick-card.expanded { border-color: var(--border); background: color-mix(in srgb, var(--accent) 40%, transparent); }
+.quick-card-main { display: flex; min-width: 0; flex: 1; align-items: center; gap: 8px; border: 0; padding: 3px; background: transparent; color: var(--foreground); text-align: left; cursor: pointer; }
+.quick-card-icon { width: 15px; height: 15px; flex: 0 0 15px; color: var(--muted-foreground); }
+.quick-card.expanded .quick-card-icon, .quick-card:hover .quick-card-icon { color: var(--primary); }
+.quick-card-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
+.quick-card-text strong { max-width: 100%; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.quick-card-text .mono { max-width: 100%; overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.quick-card-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; opacity: 0; transition: opacity 100ms ease; }
+.quick-card:hover .quick-card-actions, .quick-card.expanded .quick-card-actions, .quick-card-actions:focus-within { opacity: 1; }
+.quick-action { height: 22px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 10px; cursor: pointer; }
+.quick-action:hover:not(:disabled) { background: var(--accent); }
+.quick-card-full { flex: 1 1 100%; margin: 2px 4px 4px 27px; color: var(--foreground); font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.quick-command-footer { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 8px; }
+.quick-new-btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; flex: 1; height: 26px; border: 1px dashed var(--border); border-radius: var(--radius); background: transparent; color: var(--foreground); font-size: 11px; cursor: pointer; }
+.quick-new-btn:hover:not(:disabled) { border-color: color-mix(in srgb, var(--primary) 60%, var(--border)); background: var(--accent); }
+.quick-new-btn:disabled { cursor: default; opacity: .42; }
+.quick-new-btn svg { width: 13px; height: 13px; }
+.quick-editor-head { display: flex; align-items: center; gap: 6px; }
+.quick-editor-head h3 { flex: 1; margin: 0; }
+/* 编辑器子视图（新建/编辑共用）：名称 + 多行命令 + 保存/取消。 */
+.quick-command-editor { display: flex; flex-direction: column; gap: 5px; margin-top: 6px; }
+.quick-command-editor input { width: 100%; height: 26px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.quick-command-editor textarea { width: 100%; resize: vertical; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; line-height: 1.5; }
+.quick-command-editor input:focus, .quick-command-editor textarea:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); outline: none; }
 .quick-command-editor-actions { display: flex; align-items: center; gap: 6px; }
 .quick-command-editor-actions .quick-command-limit { flex: 1; overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
-.quick-command-editor-actions button { height: 26px; border: 1px solid var(--border); border-radius: 5px; padding: 0 10px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; }
+.quick-command-editor-actions button { height: 24px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; }
 .quick-command-editor-actions .primary-button { background: var(--primary); color: var(--primary-foreground); }
 
 /* 连接信息面板（工具栏下拉，只读） */
 .connection-info-popover { width: min(300px, calc(100vw - 24px)); padding: 8px 12px 12px; }
 .connection-info-popover h3 { margin: 4px 0 8px; font-size: 12px; }
 .connection-info-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 12px; }
-.connection-info-grid dt { color: var(--muted-foreground); white-space: nowrap; }
+.connection-info-grid dt { max-width: 16ch; overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
 .connection-info-grid dd { display: flex; min-width: 0; align-items: center; gap: 8px; margin: 0; overflow-wrap: anywhere; }
 .connection-info-grid .task-error { font-size: 10px; }
 .connection-info-grid .link-button { flex: 0 0 auto; align-self: center; font-size: 10px; }
@@ -7669,7 +7845,7 @@ onBeforeUnmount(() => {
 .agent-run-banner svg { width: 14px; height: 14px; flex: 0 0 14px; }
 .agent-run-text { flex: 0 0 auto; color: var(--foreground); }
 .agent-run-command { min-width: 0; flex: 1; overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
-.agent-interrupt { flex: 0 0 auto; height: 22px; border: 1px solid var(--border); border-radius: 4px; padding: 0 8px; background: var(--background); color: var(--destructive); font-size: 11px; cursor: pointer; }
+.agent-interrupt { flex: 0 0 auto; height: 24px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--destructive); font-size: 11px; cursor: pointer; }
 .agent-interrupt:hover { background: var(--accent); }
 .agent-prompt-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; font-size: 12px; }
 .agent-risk-badge { flex: 0 0 auto; border-radius: 999px; padding: 2px 8px; font-size: 10px; font-weight: 600; letter-spacing: .02em; }
@@ -7681,10 +7857,55 @@ onBeforeUnmount(() => {
 .agent-prompt-command textarea:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); outline: none; }
 .agent-prompt-countdown { padding-bottom: 10px; }
 /* —— 断点续传 / 进程管理 / 会话录制（F1-F3）—— */
-.is-recording { color: var(--destructive, #e5484d); }
+.is-recording { color: var(--destructive); }
+/* 录制中：图标按钮扩成红色胶囊，图标呼吸 + 时长计数（mono 等宽不跳动）。 */
+.icon-button.recording-live { width: auto; gap: 4px; padding: 0 7px; }
+.icon-button.recording-live svg { animation: record-pulse 1.6s ease-in-out infinite; }
+.recording-elapsed { font-size: 11px; font-variant-numeric: tabular-nums; }
+@keyframes record-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* 录制开始倒计时遮罩：终端区中央大数字逐级放缩淡入，点击/Esc 取消。 */
+.record-countdown-overlay {
+  position: absolute;
+  z-index: 5;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: color-mix(in srgb, var(--background) 62%, transparent);
+  cursor: pointer;
+  user-select: none;
+}
+.record-countdown-number {
+  color: var(--foreground);
+  font-size: 72px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 4px 24px rgb(0 0 0 / 40%);
+  animation: record-countdown-pop 0.9s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+.record-countdown-hint { color: var(--muted-foreground); font-size: 11px; }
+@keyframes record-countdown-pop {
+  0% { opacity: 0; transform: scale(1.5); }
+  25% { opacity: 1; transform: scale(1); }
+  85% { opacity: 1; transform: scale(0.96); }
+  100% { opacity: 0.25; transform: scale(0.92); }
+}
 .recordings-float { width: 440px; }
-.recording-actions { display: flex; gap: 14px; }
-.recording-delete { color: var(--destructive, #e5484d); }
+/* 录制记录卡片：左 图标+主机/时间两行，右 时长+操作图标按钮（不再复用
+   传输卡片 grid——那是为进度条设计的，录制卡塞进去行列全错位）。 */
+.recording-card { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--border); padding: 8px 4px; }
+.recording-icon { width: 16px; height: 16px; flex: 0 0 16px; color: var(--muted-foreground); }
+.recording-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
+.recording-host { overflow: hidden; font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.recording-meta { overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.recording-duration { flex: 0 0 auto; color: var(--foreground); font-size: 11px; font-variant-numeric: tabular-nums; }
+.recording-actions { display: flex; flex: 0 0 auto; gap: 2px; }
+.recording-delete { color: var(--muted-foreground); }
+.recording-delete:hover:not(:disabled) { color: var(--destructive); }
 .resumable-hint { margin: 2px 0 6px; font-size: 12px; }
 .metrics-trend .metrics-trend-line { width: 120px; height: 18px; }
 .proc-manage { margin-top: 10px; }
@@ -7692,24 +7913,31 @@ onBeforeUnmount(() => {
 .proc-sort-row { display: flex; gap: 16px; margin: 6px 0; font-size: 12px; color: var(--muted-foreground); }
 .proc-sort-option { display: inline-flex; align-items: center; gap: 4px; }
 .proc-kill-group { display: flex; gap: 8px; justify-content: flex-end; }
-.proc-kill-force { color: var(--destructive, #e5484d); }
-.replay-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 90; display: flex; align-items: center; justify-content: center; }
-.replay-modal { background: var(--background); color: var(--foreground); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px 14px; width: min(920px, 92vw); display: flex; flex-direction: column; gap: 10px; }
+.proc-kill-force { color: var(--destructive); }
+/* 回放弹窗并入模态体系：遮罩用 --overlay、z-index 走 80 梯队、圆角同 .modal。 */
+.replay-overlay { position: fixed; inset: 0; background: var(--overlay); z-index: 80; display: flex; align-items: center; justify-content: center; }
+.replay-modal { background: var(--popover); color: var(--foreground); border: 1px solid var(--border); border-radius: var(--radius-lg, 8px); padding: 16px; width: min(920px, 92vw); display: flex; flex-direction: column; gap: 10px; box-shadow: var(--shadow-modal); }
 /* 标题行弹性布局：关闭按钮固定右上角（block 布局下按钮会掉到标题下一行）。 */
 .replay-modal header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .replay-modal header h2 { margin: 0; min-width: 0; overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
 /* 不固定高度：xterm 26 行实际渲染 442px，写死 420px 会让终端溢出压住下方控制条。 */
 .replay-terminal { min-height: 44px; }
 .replay-controls { display: flex; align-items: center; gap: 10px; }
-.replay-seek { flex: 1; }
-.replay-speed { width: 76px; }
+.replay-seek { flex: 1; min-width: 0; height: 4px; accent-color: var(--primary); cursor: pointer; }
+/* 空录制（00:00/00:00）在终端区中央给提示，不再黑屏干等。 */
+.replay-terminal-wrap { position: relative; }
+.replay-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted-foreground); font-size: 12px; pointer-events: none; }
+/* 控制行控件对齐：播放钮 24px / 倍速 26px / 导出按钮走次级按钮规范。 */
+.replay-controls .link-button { display: inline-flex; height: 24px; align-items: center; align-self: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 11px; }
+.replay-controls .link-button:hover:not(:disabled) { background: var(--accent); }
+.replay-speed { width: 76px; height: 26px; }
 .replay-time { min-width: 110px; text-align: right; font-size: 12px; color: var(--muted-foreground); }
 /* 终端拖入上传落点询问：文件清单限高滚动，路径行对齐 radio 观感。 */
 .drop-file-list { max-height: 132px; margin: 0; overflow: auto; white-space: pre; }
 .drop-option { display: flex; align-items: center; gap: 7px; margin: 2px 0; font-size: 12px; cursor: pointer; }
 .drop-option input { accent-color: var(--primary); }
 .drop-option code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); font-size: 11px; }
-.drop-path-input { width: 100%; height: 28px; border: 1px solid var(--border); border-radius: 5px; padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.drop-path-input { width: 100%; height: 26px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
 .drop-path-input:focus { outline: none; border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
 .drop-path-input:disabled { opacity: .5; }
 </style>

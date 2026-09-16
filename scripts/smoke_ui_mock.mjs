@@ -19,7 +19,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, existsSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 
-const ROOT = new URL("..", import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
 // No --strictPort / fixed port: vite picks a free one and prints the URL.
 // ?render=dom：锁 DOM 渲染器（WebGL 渲染下终端文本只存在于 GPU canvas，
 // DOM 文本断言失效；WebGL 成功/回退逻辑由 terminalWebgl 单测覆盖）。
@@ -32,13 +32,31 @@ function skip(reason) {
 }
 
 // --- dependency gate (outside the repo) ---
+// Windows 上 Git Bash 的 /tmp 映射到 %TEMP%，而 Node 的 file:///tmp 解析到
+// 盘符根下 —— 两个候选都试；macOS/Linux 保持原路径。
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL, fileURLToPath } from "node:url";
+
 let chromium;
-try {
-  ({ chromium } = await import("file:///tmp/dbx-ui-mock/node_modules/playwright-core/index.mjs"));
-} catch {
-  skip("playwright-core not available at /tmp/dbx-ui-mock (npm install --prefix /tmp/dbx-ui-mock playwright-core)");
+const playwrightCandidates = process.platform === "win32"
+  ? [join(tmpdir(), "dbx-ui-mock"), "C:\\tmp\\dbx-ui-mock", "D:\\tmp\\dbx-ui-mock"]
+  : ["/tmp/dbx-ui-mock"];
+for (const dir of playwrightCandidates) {
+  try {
+    ({ chromium } = await import(pathToFileURL(join(dir, "node_modules/playwright-core/index.mjs")).href));
+    break;
+  } catch { /* try next candidate */ }
 }
-const hasChrome = existsSync("/Applications/Google Chrome.app") || existsSync("/Applications/Chromium.app");
+if (!chromium) skip("playwright-core not available at /tmp/dbx-ui-mock (npm install --prefix /tmp/dbx-ui-mock playwright-core)");
+const chromeCandidates = process.platform === "win32"
+  ? [
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      join(process.env.LOCALAPPDATA ?? "", "Google\\Chrome\\Application\\chrome.exe"),
+    ]
+  : ["/Applications/Google Chrome.app", "/Applications/Chromium.app"];
+const hasChrome = chromeCandidates.some((p) => p && existsSync(p));
 if (!hasChrome) skip("no system Chrome/Chromium");
 
 // --- vite dev server ---
@@ -46,6 +64,8 @@ console.log("==> starting vite dev server");
 const vite = spawn("pnpm", ["--dir", "frontend", "exec", "vite"], {
   cwd: ROOT,
   stdio: ["ignore", "pipe", "pipe"],
+  // Windows: pnpm 是 .cmd 包装，Node ≥18.20/20.12 起无 shell 直接 spawn 报 EINVAL。
+  shell: process.platform === "win32",
 });
 vite.stderr.on("data", (d) => process.stderr.write(d));
 let stdoutBuf = "";
@@ -123,8 +143,10 @@ try {
   await page.click('button[title="Quick commands"]');
   await expect(page, ".quick-commands-popover", "quick commands popover");
   await expectText(page, ".quick-command-global-hint", "Stored globally", "global-store hint");
-  await page.fill(".quick-command-editor input:not(.mono)", "ui-mock cmd");
-  await page.fill(".quick-command-editor input.mono", "echo ui-mock-batch");
+  // 编辑器已改为子视图：先点"新建"按钮，名称 input + 命令 textarea。
+  await page.click(".quick-new-btn");
+  await page.fill(".quick-command-editor input", "ui-mock cmd");
+  await page.fill(".quick-command-editor textarea", "echo ui-mock-batch");
   await page.click(".quick-command-editor .primary-button");
   await expectText(page, ".quick-command-row strong", "ui-mock cmd", "quick command row");
   await page.screenshot({ path: `${SHOT_DIR}/02-quick-commands.png`, fullPage: false });
@@ -188,6 +210,10 @@ try {
   // --- global quick commands: delete --------------------------------------
   console.log("==> quick commands: delete");
   await page.click('button[title="Quick commands"]');
+  // 动作按钮 hover 浮现（opacity 0 → 1），先悬停卡片再点删除；
+  // 删除有 window.confirm 确认（不可逆操作），自动接受。
+  await page.hover(".quick-command-row");
+  page.once("dialog", (dialog) => void dialog.accept());
   await page.click(".quick-command-row button.icon-button:last-child");
   await expectText(page, ".quick-commands-popover .empty.compact", "No quick commands yet", "quick commands empty after delete");
 
@@ -203,5 +229,15 @@ try {
   }
 } finally {
   await browser.close();
-  vite.kill("SIGTERM");
+  if (process.platform === "win32") {
+    // vite 经 cmd shell → pnpm.cmd → node 三层包裹，杀 shell 杀不掉真正的
+    // vite 进程；必须 taskkill /T 杀整棵树，并销毁管道让事件循环能退出。
+    try {
+      spawn("taskkill", ["/F", "/T", "/PID", String(vite.pid)], { stdio: "ignore" }).unref();
+    } catch { /* already gone */ }
+  } else {
+    vite.kill("SIGTERM");
+  }
+  vite.stdout?.destroy();
+  vite.stderr?.destroy();
 }

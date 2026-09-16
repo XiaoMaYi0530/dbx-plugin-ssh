@@ -83,11 +83,16 @@ scripts/sidecar_client.py   # stdio-framed 协议客户端库（直接驱动 sid
 ## 安装与交付
 
 ```bash
-scripts/install.sh                # 官方 PluginPackageInstaller 安装 + 重启 DBX
+scripts/install.sh                # 官方 PluginPackageInstaller 安装 + 重启 DBX（自动识别 macOS/Windows）
 scripts/install.sh --reinstall    # 同版本重装（开发迭代用）
 scripts/install.sh --app-data <dir> --no-restart   # 自定义存储/不重启
 scripts/test.sh --skip-host               # 无 host worktree 时的独立验证
 ```
+
+- 平台差异：Windows 下默认插件库为 `%APPDATA%\com.dbx.app`，停 DBX 用
+  `taskkill /IM dbx.exe`，重启路径从卸载注册表 DisplayIcon 解析（可用
+  `DBX_TEST_APP=<dbx.exe 路径>` 覆盖）；安装器二进制自动补 `.exe` 后缀。
+  APP_VERSION 取自 dbx.exe 的 ProductVersion，取不到回落 0.6.0。
 
 - 安装语义：`plugins/<id>/versions/<ver>/` + `activations/<20位序号>-<uuid>.json`
   （`{sequence, version, previousVersion, packageSha256, activatedAt}`，camelCase）。
@@ -118,3 +123,5 @@ scripts/test.sh --skip-host               # 无 host worktree 时的独立验证
 | 打包报 Cargo.lock v4 does not understand | /usr/local/bin 旧 cargo 1.69 抢占 PATH；构建/打包前确保 $HOME/.cargo/bin 在 PATH 首位 |
 | Go 插件打包报 go.work 与模块 go 版本冲突 | npm CLI 包装注入捆绑 SDK root；直调 plugin-cli-darwin-arm64/bin/dbx-plugin 并 env -u DBX_PLUGIN_SDK_ROOT |
 | dbx-plugin: command not found | nvm PATH 未加载；CLI 在 ~/.nvm/.../bin |
+| Windows 编译报 `link.exe failed` / `extra operand` | Git Bash 的 /usr/bin/link.exe（coreutils）抢占 MSVC 链接器；build.cmd/install.cmd 已内置 vcvars64 + `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` 绝对路径固定（注意 vcvars64 的 stdout 不能重定向到 nul，否则变量不生效） |
+| Windows 编译 openssl-sys 报 `Locale/Maketext/Simple.pm` | Git Bash 的 MSYS perl 缺模块；设 `OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe`（两个 .cmd 包装已内置，检测到 Strawberry Perl 自动设） |
