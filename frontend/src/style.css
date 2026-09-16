@@ -448,7 +448,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 /* SSH settings dialog */
 .settings-modal { width: min(680px, 100%); }
 .settings-body { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 14px; overflow-y: auto; padding-right: 4px; }
-/* 分类导航布局（对齐宿主设置页）：左栏分类 + 右栏内容；右栏滚动，左栏不滚。 */
+/* 分类导航布局（对齐宿主设置页）：左栏分类 + 右栏内容；右栏滚动，左栏不滚。
+   弹窗高度固定，切分类时不再随内容多少跳动。 */
+.settings-nav-modal { height: min(600px, calc(100vh - 40px)); }
 .settings-layout { display: flex; min-height: 0; flex: 1 1 auto; margin: 0 -16px; border-top: 1px solid var(--border); }
 .settings-nav { display: flex; flex: 0 0 148px; flex-direction: column; gap: 1px; overflow-y: auto; border-right: 1px solid var(--border); padding: 8px; }
 .settings-nav button { height: 28px; overflow: hidden; border: 0; border-radius: var(--radius); padding: 0 8px; background: transparent; color: var(--muted-foreground); font-size: 12px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
