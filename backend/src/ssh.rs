@@ -4897,8 +4897,9 @@ async fn authenticate_private_key_result(
 
 /// Private key source resolution for authentication: pasted key content
 /// (`connection_secrets.private_key`) wins over the key path, mirroring the
-/// form's either-or contract. CRLF is normalized so keys pasted from Windows
-/// editors or stored with CRLF line endings still decode.
+/// form's either-or contract. Common Windows text artifacts (CRLF, UTF-8 BOM,
+/// and leading whitespace) are normalized so keys pasted from Windows editors
+/// or stored with Windows line endings still decode.
 async fn resolve_private_key_text(connection: &StoredConnection) -> Result<String, String> {
     if !connection.private_key.is_empty() {
         return Ok(normalize_private_key_text(&connection.private_key));
@@ -4915,13 +4916,13 @@ async fn resolve_private_key_text(connection: &StoredConnection) -> Result<Strin
     Ok(normalize_private_key_text(&text))
 }
 
-/// Normalizes CRLF/CR line endings to LF. Key material itself is base64 or
-/// hex per line, so no meaningful content is affected.
+/// Normalizes text artifacts around a PEM/PPK key. `russh` matches PEM begin
+/// markers exactly at the start of a line, so a UTF-8 BOM or indentation on
+/// the first line otherwise becomes the opaque `Could not read key` error.
 fn normalize_private_key_text(text: &str) -> String {
-    if !text.contains('\r') {
-        return text.to_string();
-    }
-    text.replace("\r\n", "\n").replace('\r', "\n")
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.strip_prefix('\u{feff}').unwrap_or(&normalized);
+    normalized.trim_start().to_string()
 }
 
 async fn authenticate_private_key(
@@ -5418,6 +5419,18 @@ mod tests {
             "a\nb\nc\nd".to_string()
         );
         assert_eq!(normalize_private_key_text("plain\n"), "plain\n".to_string());
+    }
+
+    #[test]
+    fn private_key_text_normalizes_windows_bom_and_leading_whitespace() {
+        let key = "\u{feff} \r\n-----BEGIN PRIVATE KEY-----\r\n\
+            MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\r\n\
+            -----END PRIVATE KEY-----\r\n";
+        let normalized = normalize_private_key_text(key);
+
+        assert!(normalized.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+        assert!(!normalized.contains('\r'));
+        assert!(decode_secret_key(&normalized, None).is_ok());
     }
 
     #[tokio::test]
