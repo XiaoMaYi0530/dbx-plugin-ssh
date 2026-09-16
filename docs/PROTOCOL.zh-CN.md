@@ -129,11 +129,14 @@ append-only；5 MiB 轮转保留一代 `.1`；open-append 单行写保证 embedd
 stdio `--mcp` 双进程共享数据目录时的行完整性；进程内 Mutex 串行）。审计面 =
 `call_tool` 每次工具调用一条（gate + outcome + exitCode + 耗时）+ 终端路由审批
 生命周期一条（`approval` 字段；工作台人工操作不记）。行结构（camelCase）：
-`{tsMs, tool, connectionId, gate, approval, outcome, exitCode, durationMs, mode, error}`，
+`{tsMs, tool, connectionId, gate, approval, outcome, exitCode, durationMs, mode, command, output, error}`，
 其中 `gate ∈ pass|write-denied|whitelist-denied|sensitive-path|destructive-unconfirmed|
 sudo-allowlist-denied|read-only-server`，`approval ∈ none|prompt|approved|denied|
 timeout|remembered`，`outcome ∈ ok|error`，`mode ∈ stdio|embedded|terminal`；
-`error` 钳制 1 KiB，凭据从不进入命令文本。宿主桥转发的调用由实际执行方（app 侧
+`command` / `output`（0.4.77 起）记录被审命令文本与其输出尾部——exec 族工具从
+入参 `command` 与结果 `output` 提取，审批行只带命令文本；`command` 钳制 512 字符、
+`output` 钳制 1024 字符，旧版行无此两字段按 null 回放。`error` 钳制 1 KiB，
+凭据从不进入命令文本。宿主桥转发的调用由实际执行方（app 侧
 sidecar）记账，不双计。
 
 - `ssh/audit/list`：`{limit?: 1–500 缺省 100, beforeTs?: ms}` → `{entries: [行…],
@@ -210,15 +213,17 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 ## 自动交互触发器（Expect）与外部密码管理器
 
-对标 tssh「自动交互（Expect 系列）」与「外部密码管理器（PasswordCommand / PassphraseCommand）」的两组连接级特性（manifest 字段 `triggers`、`trigger_answer_1`、`trigger_answer_2`、`password_command`、`passphrase_command`；仅作用于交互终端会话的 PTY 输出，exec/命令通道不接入）：
+对标 tssh「自动交互（Expect 系列）」与「外部密码管理器（PasswordCommand / PassphraseCommand）」的两组连接级特性（manifest 字段 `triggers_enabled`、`triggers`、`trigger_answer_1`、`trigger_answer_2`、`password_command`、`passphrase_command`；仅作用于交互终端会话的 PTY 输出，exec/命令通道不接入）。tssh 官方项目与配置参考见 <https://github.com/trzsz/trzsz-ssh>；本插件保留一个整段文本输入框，不把 Expect 阶段拆成多组表单字段：
 
-- `triggers`（textarea，binding config，默认空 = 功能关闭）：expect 式有序阶段规则，接受 JSON 对象（宿主 lifecycle payload）与 JSON 字符串（表单 textarea）两种形态，JSON 顶层可选 `"enabled": false`（0.4.77 起）——保留规则的同时显式关闭引擎，缺省或 `true` 行为不变。字符串形态另兼容 tssh（trzsz-ssh）文本规则（0.4.77 起）：文本非法 JSON 但含 `Expect*` 指令即按 tssh 规则解析，`#!!` / `#!` / `#` 前缀可选——全局指令 `ExpectCount`（**0 即显式关闭**；缺省时按已列阶段数生效，不让粘贴的规则静默失效；正值截断超出序号的阶段）、`ExpectTimeout`、`ExpectSleepMS`、`ExpectPassSleep`（no|none|each|enter），阶段指令 `ExpectPatternN`、`ExpectSendTextN`、`ExpectSendOtpN`（本地命令取 stdout，即 `sendCommand`）、`ExpectCaseSendTextN <pattern> <text>`；非合法正则的 pattern 按字面量匹配兜底（tssh README 示例 `*assword` 即非合法正则），tssh 密文/TOTP 应答（`ExpectSendPass*` / `ExpectSend*Enc*` / `ExpectCaseSendPass*` 等）不可移植、直接报错并提示改用 sendText / sendSecretKey / sendCommand。JSON schema：`{ "timeoutSecs": 30, "sleepMs": 100, "passSleep": "none", "enabled": true, "stages": [ { "pattern": "(?i)verification code", "sendText": "654321\\r", "sendSecretKey": "trigger_answer_1", "sendCommand": "oathtool --totp -b %h", "casePattern": "\\(yes/no\\)", "caseSendText": "y", "caseSendSecretKey": "trigger_answer_2" } ] }`。每阶段 `pattern` 必填（Rust `regex` crate 语法，支持 `(?i)`，≤512 字符）；应答 `sendText` / `sendSecretKey` / `sendCommand` **三选一**；case 组可选，`caseSendText` / `caseSendSecretKey` **二选一**。取值范围：`timeoutSecs` 1–600（默认 30）、`sleepMs` 0–5000（默认 100）、`passSleep` ∈ none|each|enter（默认 none）、阶段数 1–16、`sendText` ≤4096 字符、`sendCommand` ≤1024 字符。`sendText` 转义：`\r` `\n` `\t` 解释为控制字符、`\|` 为分段停顿符（段间停 `sleepMs`），其余反斜杠原样；密文/命令应答自动补 `\r`。**校验失败行为**：非法 JSON / 不可编译正则 / 字段组合错误 / 超限 → 连接解析直接失败并报明确错误，不静默降级（tssh 文本形态仅 pattern 字面量兜底一处放宽）。
+- `triggers_enabled`（boolean，binding config，默认 `false`）：连接表单独立总开关。关闭时即使 `triggers` 仍有旧文本也不会解析、校验或挂载引擎；统一默认关闭，必须手动打开。
+- `triggers`（textarea，binding config，仅在 `triggers_enabled=true` 时显示；默认空）：expect 式有序阶段规则，接受 JSON 对象（宿主 lifecycle payload）与 JSON 字符串（表单 textarea）两种形态，JSON 顶层可选 `"enabled": false`（0.4.77 起）——保留规则的同时显式关闭引擎，缺省或 `true` 行为不变。字符串形态另兼容 tssh（trzsz-ssh）文本规则（0.4.77 起）：文本非法 JSON 但含 `Expect*` 指令即按 tssh 规则解析，`#!!` / `#!` / `#` 前缀可选——全局指令 `ExpectCount`（**0 即显式关闭**；缺省时按已列阶段数生效，不让粘贴的规则静默失效；正值截断超出序号的阶段）、`ExpectTimeout`、`ExpectSleepMS`、`ExpectPassSleep`（no|none|each|enter），阶段指令 `ExpectPatternN`、`ExpectSendTextN`、`ExpectSendOtpN` / `ExpectSendEncOtpN`（本地命令取 stdout，即 `sendCommand`；Enc 形态为 tssh `--enc-secret` 密文解密后取命令）、`ExpectSendPassN` / `ExpectCaseSendPassN <pattern> <enc>`（tssh `--enc-secret` 密文，**按 tssh 同款算法解密**——hex(nonce12 ‖ AES-256-GCM(ct‖tag))，固定内嵌密钥与 tssh 源码逐字节一致）、`ExpectSendTotpN` / `ExpectSendEncTotpN`（RFC 6238 TOTP：HMAC-SHA1、6 位、30 秒步长，命中时按当前时间生成验证码，与 pquerna/otp 默认参数逐字节兼容）及 `ExpectCaseSendTextN <pattern> <text>`；非合法正则的 pattern 按字面量匹配兜底（tssh README 示例 `*assword` 即非合法正则）。JSON schema：`{ "timeoutSecs": 30, "sleepMs": 100, "passSleep": "none", "enabled": true, "stages": [ { "pattern": "(?i)verification code", "sendText": "654321\\r", "sendSecretKey": "trigger_answer_1", "sendSecret": "字面密文", "sendTotp": "base32 TOTP 密钥", "sendCommand": "oathtool --totp -b %h", "casePattern": "\\(yes/no\\)", "caseSendText": "y", "caseSendSecretKey": "trigger_answer_2", "caseSendSecret": "字面密文" } ] }`（`sendSecret` / `sendTotp` / `caseSendSecret` 为 0.4.77 新增，承接 tssh 密文/TOTP 解密产物；连接配置持久化的是原始输入文本，解密值只在会话内存存活）。每阶段 `pattern` 必填（Rust `regex` crate 语法，支持 `(?i)`，≤512 字符）；应答 `sendText` / `sendSecretKey` / `sendSecret` / `sendTotp` / `sendCommand` **五选一**；case 组可选，`caseSendText` / `caseSendSecretKey` / `caseSendSecret` **三选一**。取值范围：`timeoutSecs` 1–600（默认 30）、`sleepMs` 0–5000（默认 100）、`passSleep` ∈ none|each|enter（默认 none）、阶段数 1–16、`sendText`/`sendSecret` ≤4096 字符、`sendTotp` 解码后 ≤64 字节、`sendCommand` ≤1024 字符。`sendText` 转义：`\r` `\n` `\t` 解释为控制字符、`\|` 为分段停顿符（段间停 `sleepMs`），其余反斜杠原样；密文/TOTP/命令应答自动补 `\r`。**校验失败行为**：非法 JSON / 非法 hex 或解密失败的 `--enc-secret` blob / 非法 base32 TOTP 密钥 / 不可编译正则 / 字段组合错误 / 超限 → 连接解析直接失败并报明确错误，不静默降级（tssh 文本形态仅 pattern 字面量兜底一处放宽）。
 - 引擎语义（sidecar 终端读循环内）：PTY 输出经 ANSI 剥离归一化后进入 ≤8 KiB 滚动缓冲，跨 chunk 匹配；阶段命中即消费已匹配文本并推进游标（末阶段后回卷，序列可重复）；`casePattern` 命中即应答但**不推进**游标，答完继续等本阶段 pattern；行尾 `$` / `#` shell 提示（与终端内 Quick Sudo 同一判据）将游标归零（一轮结束后可再次触发）。**超时只在序列中途生效**（已命中前序阶段、在等第 2..N 阶段）——空闲等待第一阶段是事件驱动的无限期等待，不设超时、不产生 timeout 事件（否则闲置会话每 `timeoutSecs` 刷一次事件）；超时将游标归零，会话继续不断连。`passSleep` 仅作用于密文/命令应答：none 整段+回车一次写入、each 逐字符按 `sleepMs` 停顿、enter 先应答、停 `sleepMs` 再回车。
-- 密文槽位（对齐 tssh `ExpectSendPass`）：`sendSecretKey` 引用 `connection_secrets.trigger_answer_1` / `trigger_answer_2`（manifest 各一个 password 字段，走宿主 secret binding；与 tssh `--enc-secret` 自有加密格式的差异即在于此——密文托管归宿主，sidecar 只在连接配置里收到解析后的值）。槽位名固定两个；引用未知或未填充的槽位时连接失败。
+- 密文槽位（对齐 tssh `ExpectSendPass`）：`sendSecretKey` 引用 `connection_secrets.trigger_answer_1` / `trigger_answer_2`（manifest 各一个 password 字段，走宿主 secret binding）。槽位名固定两个；引用未知或未填充的槽位时连接失败。tssh `ExpectSendPassN` 的 `--enc-secret` 密文则按 tssh 同款固定密钥在 sidecar 内解密（同为混淆而非加密），无需密文槽。
 - 事件 `ssh/trigger`：每次自动应答 / 超时发出 `{ sessionId, stage(1-based), kind: "text"|"secret"|"command"|"timeout" }`，**永不携带应答内容**（密文不出 sidecar）。`sendCommand` 本地执行失败时什么都不发送、不发事件（stderr 只记失败原因如退出码/超时）。
 - 防双答互斥：触发器引擎在终端读循环中**先于**终端内 Quick Sudo 观察输出；同一 chunk 至多被其中之一自动应答（触发器命中则该 chunk 跳过 auto-sudo，反之亦然）。
 - `password_command` / `passphrase_command`（text，binding config，默认空；对齐 tssh 同名配置）：登录密码 / 私钥口令缺失时本地执行命令取回（gopass、1Password CLI、`oathtool` 等）。占位符 `%h` host、`%u` username、`%p` port、`%n` 连接名（缺省回退连接 id）、`%%` 字面 `%`（其余 `%x` 原样保留）；unix `sh -c` / windows `cmd /C` 执行，10 秒超时，stdout 去掉**单个**结尾换行后为凭据（输出上限 4096 字节，超出按失败处理）。优先级：既有显式凭据（宿主 secret binding / 表单密码）> 命令；配置了 `password_command` 时密码类认证允许不存储密码；`passphrase_command` 仅在密钥确实无法无口令解码时执行。解析点：拨号认证的 orchestration 构建前一次性解析，结果回填后供密码链（password / keyboard-interactive）与 sudo 编排共用，单次连接只执行一次命令。
-- MCP：连接类工具新增可选参数 `triggers`（JSON 字符串，同上 schema）、`passwordCommand`、`passphraseCommand`（字符串），与存储路径同一套解析校验，非法即拨号报错；内联拨号没有 secret binding，`sendSecretKey` 引用槽位即报错。
+- MCP：连接类工具新增可选参数 `triggers`（JSON 字符串，同上 schema）、`passwordCommand`、`passphraseCommand`（字符串），与存储路径同一套解析校验，非法即拨号报错；内联拨号没有 secret binding，`sendSecretKey` 引用槽位即报错。MCP 的 `triggers` 是显式参数，不受连接表单 `triggers_enabled` 影响。
+- `triggers/validate`（sidecar RPC）：复用同一 parser 做 JSON/tssh 语法检测，返回 `valid`、`enabled`、`format`（`empty`/`json`/`tssh`）和阶段数；失败只返回定位错误，不回显 secret、解密结果或 TOTP key。连接表单若不能调用该 RPC，`connection/test` 仍在启用时执行同一最终校验。
 - **安全声明**：①恶意服务器可伪造匹配提示骗取回发内容（含密文槽位的值）——`pattern` 只应指向明确可信的提示序列，密文仅用于该连接上明确配置的场景；②`sendCommand` / `password_command` / `passphrase_command` 以当前用户权限在本地执行，命令完全来自用户自己的连接配置（插件不提供任何默认命令，MCP 工具描述不推广命令执行面）；③密文 / 凭据内容绝不进日志、事件或错误信息，命令输出用后 zeroize。
 
 ## Sudo 文件操作
@@ -462,7 +467,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 插件数据目录解析顺序（取第一个可用项，"可用"= 环境变量存在且 trim 后非空）：① `DBX_PLUGIN_DATA_DIR` 原样使用（宿主显式注入，未来方案 A 接入点）；② `DBX_DATA_DIR` → `<DBX_DATA_DIR>/plugin-data/io.dbx.ssh`（便携/web 模式，`plugin-data/` 避开安装器管理的注册树）；③ 平台标准用户数据目录下 `dbx-plugin-data/io.dbx.ssh`（macOS `$HOME/Library/Application Support`、其他 unix `${XDG_DATA_HOME:-$HOME/.local/share}`、Windows `%APPDATA%`）；④ 全缺才回落 `std::env::temp_dir()/dbx-plugin-data/io.dbx.ssh`（临时兜底，永不失败）。当前宿主尚未注入 `DBX_PLUGIN_DATA_DIR`，实际生效的是 ③；切勿将持久数据依赖 ④ 的临时目录（重启即清空）。
 
-连接测试与工作台打开复用同一 SSH 拨号、认证与主机密钥校验链；区别仅为测试在认证成功后立即断开。框架级测试挑战采用事件 `connection/challenge` 和固定响应方法 `connection/challenge/resolve`。事件载荷为 `{challengeId, operationId, connectionId, kind:"host-key", hostKeyScope:"target"|"jump", jumpIndex?, jumpCount, host, port, keyType, fingerprint}`：`host`/`port` 永远是待信任 SSH 服务器的逻辑身份，不能用 DBX 隧道/代理的 `runtime.host`/`runtime.port` 替代；`hostKeyScope:"jump"` 时 `jumpIndex` 为从 1 开始的跳板序号。宿主必须在**未保存草稿的测试页**消费此事件、显示确认框，并以事件中的 `challengeId` 和 `operationId` 原样调用 resolve；关闭确认框应回传 `accept:false`，不得把等待确认误报为连接超时。宿主负责先为草稿建立与保存后完全相同的隧道/代理运行时端点，并把传输层建链失败与 SSH 握手/信任/认证失败分别呈现。
+框架级连接测试挑战采用事件 `connection/challenge` 和固定响应方法 `connection/challenge/resolve`。原型未声明 `test`，因此暂不触发该流程。
 
 ## 本地密钥与 known_hosts
 

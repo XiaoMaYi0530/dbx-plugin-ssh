@@ -178,8 +178,16 @@
           }
         },
         {
+          "key": "advanced_options",
+          "label": "Show advanced options",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "description": "Show optional SSH, sudo, automation, and command settings. Off by default."
+        },
+        {
           "key": "sudo_source",
-          "label": "Sudo credential source",
+          "label": "Sudo credentials",
           "type": "select",
           "binding": "config",
           "default": "custom",
@@ -197,7 +205,13 @@
               "label": "Off"
             }
           ],
-          "description": "Where sudo credentials come from: this connection's own values, a shared global profile, or disabled. Ignored on read-only connections."
+          "description": "Choose the source of sudo credentials. Ignored for read-only connections.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "sudo_profile",
@@ -211,11 +225,11 @@
               "global"
             ]
           },
-          "description": "Pick the global Quick Sudo profile to bind; falls back to the workbench binding when empty. Hosts without dynamic options show a text field (profile name or id)."
+          "description": "Optional global Quick Sudo profile."
         },
         {
           "key": "sudo_password",
-          "label": "Sudo password override",
+          "label": "Sudo password",
           "type": "password",
           "binding": "secret",
           "visible_when": {
@@ -224,11 +238,11 @@
               "custom"
             ]
           },
-          "description": "Password piped to sudo; leave empty to reuse the login password."
+          "description": "Password for sudo; empty reuses the login password."
         },
         {
           "key": "sudo_use_pty",
-          "label": "Request PTY for sudo commands",
+          "label": "Request PTY for sudo",
           "type": "boolean",
           "binding": "config",
           "default": false,
@@ -238,11 +252,11 @@
               "custom"
             ]
           },
-          "description": "Some PAM stacks only prompt correctly with a TTY. A bound global profile overrides this with its own preference."
+          "description": "Request a TTY for sudo prompts."
         },
         {
           "key": "sudo_whitelist",
-          "label": "Sudo command whitelist",
+          "label": "Sudo allowlist",
           "type": "textarea",
           "binding": "config",
           "default": "",
@@ -253,11 +267,11 @@
               "global"
             ]
           },
-          "description": "sudoers-style allowlist for privileged commands, one entry per line (or separated by ';'). Tokens match exactly, '*' matches one argument, a trailing '*' matches the rest (e.g. 'systemctl restart *'). When set, sudo runs only for matching commands; leave empty to disable."
+          "description": "Optional sudo command allowlist, one entry per line. Empty allows all commands."
         },
         {
           "key": "auth_flow_mode",
-          "label": "2FA flow",
+          "label": "2FA",
           "type": "select",
           "binding": "config",
           "default": "off",
@@ -286,7 +300,7 @@
               "label": "Password only"
             }
           ],
-          "description": "Off (default for new connections) never sends OTP codes automatically - answer 2FA prompts yourself. The other modes let the plugin answer password and OTP prompts for login and sudo; password-only mode ignores OTP secrets. Existing connections keep their stored mode. Global Quick Sudo profiles use their own settings."
+          "description": "Choose how login and sudo prompts handle OTP. Off keeps OTP manual; existing connections keep their saved mode."
         },
         {
           "key": "totp_secret",
@@ -300,11 +314,11 @@
               "password_plus_otp"
             ]
           },
-          "description": "One secret per line: otpauth:// URI, base32 key, or a static code. Rotating selection avoids reusing a code in the same window. Also answers login-time keyboard-interactive 2FA."
+          "description": "One per line: otpauth:// URI, base32 key, or static code."
         },
         {
           "key": "password_prompt_hint",
-          "label": "Password prompt hint",
+          "label": "Password prompt",
           "type": "text",
           "binding": "config",
           "visible_when": {
@@ -314,11 +328,11 @@
               "off"
             ]
           },
-          "description": "Custom substring that identifies password prompts (e.g. 'identity token')."
+          "description": "Optional text used to recognize password prompts."
         },
         {
           "key": "totp_prompt_hint",
-          "label": "OTP prompt hint",
+          "label": "OTP prompt",
           "type": "text",
           "binding": "config",
           "visible_when": {
@@ -328,63 +342,119 @@
               "password_plus_otp"
             ]
           },
-          "description": "Custom substring that identifies OTP prompts (e.g. 'duo passcode')."
+          "description": "Optional text used to recognize OTP prompts."
         },
         {
           "key": "connect_timeout_secs",
-          "label": "Connect timeout (seconds)",
+          "label": "SSH timeout (seconds)",
           "type": "number",
           "binding": "config",
           "default": 30,
-          "description": "SSH handshake and authentication timeout. Raise this for slow Windows/macOS or high-latency hosts."
+          "description": "SSH handshake and authentication timeout.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "keepalive_interval_secs",
-          "label": "Keepalive interval (seconds)",
+          "label": "SSH keepalive (seconds)",
           "type": "number",
           "binding": "config",
           "default": 30,
-          "description": "Keepalive probe interval; 3 missed probes disconnect the session. 0 disables probes."
+          "description": "SSH keepalive interval; 0 disables it.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "terminal_keepalive_secs",
-          "label": "Terminal activity keepalive (seconds)",
+          "label": "Terminal keepalive (seconds)",
           "type": "number",
           "binding": "config",
           "default": 0,
-          "description": "Injects space+backspace into the interactive terminal at this interval so server-side idle policies (TMOUT, bastion audits) never trigger. 0 disables."
+          "description": "Terminal idle keepalive; 0 disables it.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "set_env",
-          "label": "Set environment variables",
+          "label": "Environment (SetEnv)",
           "type": "textarea",
           "binding": "config",
           "default": "",
           "placeholder": "LANG=zh_CN.UTF-8",
-          "description": "One KEY=VALUE entry per line (semicolons also separate entries), sent to the server on the terminal, exec and sudo channels. Duplicate keys: the last entry wins. Invalid entries fail the connection; values come from this configuration only - the local environment is never transmitted."
+          "description": "Optional KEY=VALUE entries sent on terminal, exec, and sudo channels.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
+        },
+        {
+          "key": "triggers_enabled",
+          "label": "Enable automatic replies",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "description": "Enable tssh/JSON Expect rules. Off by default; saved rules stay inactive.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "triggers",
-          "label": "Auto interaction triggers",
+          "label": "Automatic reply rules",
           "type": "textarea",
           "binding": "config",
           "default": "",
-          "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}",
-          "description": "Expect-style auto interaction: ordered stage regexes match terminal output in sequence and each hit auto-sends a reply - sendText (\\r = Enter), sendSecretKey (a trigger secret slot key below, Enter appended), or sendCommand (stdout of a local command). The placeholder shows a minimal one-stage example; empty disables. Also accepts tssh (trzsz-ssh) text rules with or without the #!! prefix: ExpectCount (0 disables), ExpectTimeout, ExpectSleepMS, ExpectPassSleep, ExpectPatternN, ExpectSendTextN, ExpectSendOtpN (= sendCommand) and ExpectCaseSendTextN; non-regex patterns match as literal text; tssh ciphertext/TOTP answers (--enc-secret) are rejected. JSON may carry \"enabled\": false to switch rules off while keeping them. Risk: a malicious server can fake a matching prompt to trick the terminal into sending the configured reply, including secret-slot contents. Invalid JSON, limits exceeded (max 16 stages), or an uncompileable regex fails the connection."
+          "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r",
+          "description": "tssh/JSON Expect rules for automatic replies. A server can spoof prompts and receive configured replies. Empty disables.",
+          "visible_when": {
+            "field": "triggers_enabled",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "trigger_answer_1",
-          "label": "Trigger secret slot 1",
+          "label": "Secret slot 1",
           "type": "password",
           "binding": "secret",
-          "description": "Secret for trigger slot 1: reference it from a stage's sendSecretKey (value: trigger_answer_1). Sent to the server automatically with Enter appended when the matching pattern hits; a malicious server could fake that prompt to harvest it."
+          "description": "Secret sent when referenced by sendSecretKey. A server can spoof the prompt.",
+          "visible_when": {
+            "field": "triggers_enabled",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "trigger_answer_2",
-          "label": "Trigger secret slot 2",
+          "label": "Secret slot 2",
           "type": "password",
           "binding": "secret",
-          "description": "Secret for trigger slot 2: reference it from a stage's sendSecretKey (value: trigger_answer_2). Sent to the server automatically with Enter appended when the matching pattern hits; a malicious server could fake that prompt to harvest it."
+          "description": "Secret sent when referenced by sendSecretKey. A server can spoof the prompt.",
+          "visible_when": {
+            "field": "triggers_enabled",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "password_command",
@@ -392,7 +462,13 @@
           "type": "text",
           "binding": "config",
           "default": "",
-          "description": "Run locally when the login password is missing to fetch it from an external manager (gopass, 1Password CLI, oathtool, ...); stdout minus one trailing newline is the password. Placeholders: %h host, %u username, %p port, %n connection name, %% a literal %. Explicit credentials win over the command. Risk: the command executes locally with your user privileges."
+          "description": "Local command to fetch a missing login password. stdout minus one final newline is used. Runs with your user privileges.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "passphrase_command",
@@ -400,7 +476,13 @@
           "type": "text",
           "binding": "config",
           "default": "",
-          "description": "Run locally when the private key passphrase is missing; stdout minus one trailing newline is the passphrase. Placeholders: %h host, %u username, %p port, %n connection name, %% a literal %. Risk: the command executes locally with your user privileges."
+          "description": "Local command to fetch a missing private-key passphrase. stdout minus one final newline is used. Runs with your user privileges.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "remote_command",
@@ -408,15 +490,27 @@
           "type": "text",
           "binding": "config",
           "default": "",
-          "description": "Executed instead of a shell when a terminal session opens (a PTY is still requested). Leave empty for a normal interactive shell; reconnecting re-runs the command."
+          "description": "Run instead of the shell when a terminal opens. Empty uses a normal shell.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         },
         {
           "key": "read_only",
-          "label": "Read only",
+          "label": "Read-only",
           "type": "boolean",
           "binding": "config",
           "default": false,
-          "description": "Reject every write operation (SFTP changes, uploads, sudo commands) on this connection; Quick Sudo stays off while enabled."
+          "description": "Reject write operations on this connection.",
+          "visible_when": {
+            "field": "advanced_options",
+            "one_of": [
+              "true"
+            ]
+          }
         }
       ],
       "workbench": "io.dbx.ssh.workbench",
@@ -522,71 +616,71 @@
               "description": "Anulación opcional de SSH_AUTH_SOCK. Déjelo vacío para usar el valor del entorno o Pageant en Windows."
             },
             "connect_timeout_secs": {
-              "label": "Tiempo de espera de conexión (segundos)",
-              "description": "Tiempo de espera del handshake SSH y la autenticación. Súbelo para hosts Windows/macOS lentos o de alta latencia."
+              "label": "Tiempo de espera SSH (s)",
+              "description": "Tiempo de espera del handshake y la autenticación SSH."
             },
             "keepalive_interval_secs": {
-              "label": "Intervalo de keepalive (segundos)",
-              "description": "Intervalo de sondas de keepalive; 3 sondas sin respuesta desconectan la sesión. 0 las desactiva."
+              "label": "Keepalive SSH (s)",
+              "description": "Intervalo de keepalive SSH; 0 lo desactiva."
             },
             "terminal_keepalive_secs": {
-              "label": "Keepalive de actividad del terminal (segundos)",
-              "description": "Inyecta espacio+retroceso en el terminal interactivo a este intervalo para que las políticas de inactividad del servidor (TMOUT, auditoría del bastión) nunca se activen. 0 lo desactiva."
+              "label": "Keepalive del terminal (s)",
+              "description": "Keepalive de inactividad del terminal; 0 lo desactiva."
             },
             "set_env": {
-              "label": "Variables de entorno (SetEnv)",
-              "description": "Una entrada CLAVE=VALOR por línea (los punto y coma también separan entradas); se envían al servidor en los canales de terminal, exec y sudo. Claves duplicadas: gana la última entrada. Las entradas no válidas hacen fallar la conexión; los valores provienen solo de esta configuración, nunca del entorno local.",
+              "label": "Entorno (SetEnv)",
+              "description": "Entradas KEY=VALUE opcionales para los canales de terminal, exec y sudo.",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
             "triggers": {
-              "label": "Disparadores de interacción automática",
-              "description": "Interacción automática estilo expect: los patrones de cada etapa se comparan en orden con la salida del terminal y cada acierto envía automáticamente una respuesta: sendText (\\r = Enter), sendSecretKey (clave de una ranura secreta de disparador, Enter añadido) o sendCommand (stdout de un comando local). El marcador de posición muestra un ejemplo mínimo de una etapa; vacío desactiva. Riesgo: un servidor malicioso puede falsificar el aviso para que el terminal envíe la respuesta configurada, incluidas las ranuras secretas. JSON no válido, límites excedidos (máx. 16 etapas) o una expresión regular inválida hacen fallar la conexión. También acepta reglas en formato de texto de tssh (trzsz-ssh), con o sin el prefijo #!!: ExpectCount (0 desactiva), ExpectTimeout, ExpectSleepMS, ExpectPassSleep, ExpectPatternN, ExpectSendTextN, ExpectSendOtpN (= sendCommand) y ExpectCaseSendTextN; un patrón no válido como regex coincide como texto literal; las respuestas cifradas o TOTP de tssh (--enc-secret) se rechazan. El JSON puede llevar \"enabled\": false para apagar las reglas sin borrarlas.",
-              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+              "label": "Reglas de respuesta automática",
+              "description": "Reglas Expect de tssh/JSON para responder automáticamente. Un servidor puede falsificar prompts y recibir respuestas configuradas. Vacío desactiva.",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
             },
             "trigger_answer_1": {
-              "label": "Ranura secreta de disparo 1",
-              "description": "Secreto para la ranura de disparo 1: referéncielo desde el sendSecretKey de una etapa (valor: trigger_answer_1). Se envía automáticamente al servidor con Enter añadido cuando el patrón coincide; un servidor malicioso podría falsificar ese aviso para capturarlo."
+              "label": "Ranura secreta 1",
+              "description": "Secreto enviado al usar sendSecretKey. Un servidor puede falsificar el prompt."
             },
             "trigger_answer_2": {
-              "label": "Ranura secreta de disparo 2",
-              "description": "Secreto para la ranura de disparo 2: referéncielo desde el sendSecretKey de una etapa (valor: trigger_answer_2). Se envía automáticamente al servidor con Enter añadido cuando el patrón coincide; un servidor malicioso podría falsificar ese aviso para capturarlo."
+              "label": "Ranura secreta 2",
+              "description": "Secreto enviado al usar sendSecretKey. Un servidor puede falsificar el prompt."
             },
             "password_command": {
               "label": "Comando de contraseña",
-              "description": "Si falta la contraseña de acceso, ejecuta este comando localmente para obtenerla de un gestor externo (gopass, 1Password CLI, oathtool, ...); el stdout sin un salto de línea final es la contraseña. Marcadores: %h host, %u usuario, %p puerto, %n nombre de conexión, %% un % literal. Las credenciales explícitas tienen prioridad. Riesgo: el comando se ejecuta localmente con tus privilegios de usuario."
+              "description": "Comando local para obtener una contraseña de acceso ausente. Se usa stdout sin el último salto de línea. Se ejecuta con tus permisos."
             },
             "passphrase_command": {
-              "label": "Comando de frase de clave",
-              "description": "Si falta la frase de la clave privada, ejecuta este comando localmente para obtenerla; el stdout sin un salto de línea final es la frase. Marcadores: %h host, %u usuario, %p puerto, %n nombre de conexión, %% un % literal. Riesgo: el comando se ejecuta localmente con tus privilegios de usuario."
+              "label": "Comando de passphrase",
+              "description": "Comando local para obtener la passphrase de una clave ausente. Se usa stdout sin el último salto de línea. Se ejecuta con tus permisos."
             },
             "remote_command": {
-              "label": "Comando remoto (RemoteCommand)",
-              "description": "Se ejecuta en lugar de un shell al abrir una sesión de terminal (el PTY se solicita igual). Déjelo vacío para un shell interactivo normal; al reconectar se vuelve a ejecutar el comando."
+              "label": "Comando remoto",
+              "description": "Se ejecuta en lugar del shell al abrir el terminal. Vacío usa un shell normal."
             },
             "sudo_source": {
-              "label": "Origen de credenciales sudo",
+              "label": "Credenciales sudo",
               "options": {
                 "custom": "Personalizado (esta conexión)",
                 "global": "Perfil Quick Sudo global",
                 "off": "Desactivado"
               },
-              "description": "De dónde salen las credenciales de sudo: los valores de esta conexión, un perfil global compartido, o desactivado. Se ignora en conexiones de solo lectura."
+              "description": "Elige el origen de las credenciales sudo. Se ignora en conexiones de solo lectura."
             },
             "sudo_profile": {
               "label": "Perfil Quick Sudo",
-              "description": "Perfil global de Quick Sudo que se enlazará; si queda vacío, se usa el enlace del banco de trabajo. Los hosts sin opciones dinámicas muestran un campo de texto (nombre o id del perfil)."
+              "description": "Perfil global Quick Sudo opcional."
             },
             "sudo_password": {
-              "label": "Contraseña de sudo (override)",
-              "description": "Contraseña que se pasa a sudo por tubería; déjela vacía para reutilizar la contraseña de inicio de sesión."
+              "label": "Contraseña sudo",
+              "description": "Contraseña para sudo; vacía reutiliza la de inicio de sesión."
             },
             "totp_secret": {
               "label": "Secretos TOTP",
-              "description": "Un secreto por línea: URI otpauth://, clave base32 o código estático. La selección rotativa evita reutilizar un código en la misma ventana. También responde a la 2FA interactiva por teclado al iniciar sesión."
+              "description": "Uno por línea: URI otpauth://, clave base32 o código estático."
             },
             "auth_flow_mode": {
-              "label": "Flujo 2FA",
-              "description": "Desactivado (valor por defecto en conexiones nuevas) nunca envía códigos OTP automáticamente: responda los prompts de 2FA usted mismo. Los demás modos permiten que el plugin responda a los prompts de contraseña y OTP para inicio de sesión y sudo; solo contraseña ignora los secretos OTP. Las conexiones existentes conservan su modo guardado. Los perfiles globales Quick Sudo usan sus propios ajustes.",
+              "label": "2FA",
+              "description": "Define cómo responder a OTP en el inicio de sesión y sudo. Desactivado mantiene el OTP manual.",
               "options": {
                 "off": "Desactivado (responder OTP manualmente)",
                 "password_then_otp": "Primero contraseña, después OTP",
@@ -595,24 +689,32 @@
               }
             },
             "password_prompt_hint": {
-              "label": "Pista de prompt de contraseña",
-              "description": "Subcadena personalizada que identifica los prompts de contraseña (p. ej. 'identity token')."
+              "label": "Prompt de contraseña",
+              "description": "Texto opcional para reconocer prompts de contraseña."
             },
             "totp_prompt_hint": {
-              "label": "Pista de prompt de OTP",
-              "description": "Subcadena personalizada que identifica los prompts de OTP (p. ej. 'duo passcode')."
+              "label": "Prompt de OTP",
+              "description": "Texto opcional para reconocer prompts de OTP."
             },
             "sudo_use_pty": {
               "label": "Solicitar PTY para sudo",
-              "description": "Algunos módulos PAM solo preguntan correctamente con un TTY. Si hay un perfil global enlazado, manda su propia preferencia."
+              "description": "Solicita un TTY para los prompts de sudo."
             },
             "read_only": {
               "label": "Solo lectura",
-              "description": "Rechaza toda operación de escritura (cambios SFTP, subidas, comandos sudo) en esta conexión; Quick Sudo queda desactivado mientras esté activo."
+              "description": "Rechaza las operaciones de escritura en esta conexión."
             },
             "sudo_whitelist": {
-              "label": "Lista blanca de comandos sudo",
-              "description": "Lista blanca estilo sudoers para comandos privilegiados, una entrada por línea (o separada por ';'). Los tokens coinciden exactamente, '*' coincide con un argumento y un '*' final coincide con el resto (p. ej. 'systemctl restart *'). Si se establece, sudo solo se ejecuta para los comandos que coinciden; déjela vacía para desactivarla."
+              "label": "Lista blanca sudo",
+              "description": "Lista opcional de comandos sudo, uno por línea. Vacía permite todos."
+            },
+            "triggers_enabled": {
+              "label": "Activar respuestas automáticas",
+              "description": "Activa reglas Expect de tssh/JSON. Desactivado por defecto; las reglas guardadas permanecen inactivas."
+            },
+            "advanced_options": {
+              "label": "Mostrar opciones avanzadas",
+              "description": "Muestra opciones SSH, sudo, automatización y comandos. Desactivado por defecto."
             }
           },
           "actions": {
@@ -683,59 +785,59 @@
               "description": "Override facoltativo di SSH_AUTH_SOCK. Lasciare vuoto per il valore predefinito dell'ambiente o Pageant su Windows."
             },
             "set_env": {
-              "label": "Variabili d'ambiente (SetEnv)",
-              "description": "Una voce CHIAVE=VALORE per riga (il punto e virgola separa le voci); inviate al server sui canali terminale, exec e sudo. Chiavi duplicate: vince l'ultima voce. Le voci non valide fanno fallire la connessione; i valori provengono solo da questa configurazione, mai dall'ambiente locale.",
+              "label": "Ambiente (SetEnv)",
+              "description": "Voci KEY=VALUE opzionali per i canali terminale, exec e sudo.",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
             "triggers": {
-              "label": "Trigger di interazione automatica",
-              "description": "Interazione automatica in stile expect: le espressioni regolari delle fasi confrontano in ordine l'output del terminale e a ogni corrispondenza viene inviata automaticamente una risposta: sendText (\\r = Invio), sendSecretKey (chiave di uno slot segreto trigger, Invio aggiunto) o sendCommand (stdout di un comando locale). Il segnaposto mostra un esempio minimo a una fase; vuoto disattiva. Rischio: un server maligno può falsificare il prompt per indurre il terminale a inviare la risposta configurata, inclusi i contenuti degli slot segreti. JSON non valido, limiti superati (max 16 fasi) o espressione regolare errata fanno fallire la connessione. Accetta anche regole in formato testo di tssh (trzsz-ssh), con o senza prefisso #!!: ExpectCount (0 disattiva), ExpectTimeout, ExpectSleepMS, ExpectPassSleep, ExpectPatternN, ExpectSendTextN, ExpectSendOtpN (= sendCommand) ed ExpectCaseSendTextN; i pattern non validi come regex corrispondono come testo letterale; le risposte cifrate/TOTP di tssh (--enc-secret) vengono rifiutate. Il JSON può contenere \"enabled\": false per disattivare le regole senza cancellarle.",
-              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+              "label": "Regole di risposta automatica",
+              "description": "Regole Expect tssh/JSON per risposte automatiche. Un server può falsificare i prompt e ricevere le risposte configurate. Vuoto disabilita.",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
             },
             "trigger_answer_1": {
-              "label": "Slot segreto trigger 1",
-              "description": "Segreto per lo slot trigger 1: farvi riferimento dal sendSecretKey di una fase (valore: trigger_answer_1). Inviato automaticamente al server con Invio aggiunto quando il pattern corrisponde; un server maligno potrebbe falsificare quel prompt per raccoglierlo."
+              "label": "Slot segreto 1",
+              "description": "Segreto inviato quando viene usato da sendSecretKey. Un server può falsificare il prompt."
             },
             "trigger_answer_2": {
-              "label": "Slot segreto trigger 2",
-              "description": "Segreto per lo slot trigger 2: farvi riferimento dal sendSecretKey di una fase (valore: trigger_answer_2). Inviato automaticamente al server con Invio aggiunto quando il pattern corrisponde; un server maligno potrebbe falsificare quel prompt per raccoglierlo."
+              "label": "Slot segreto 2",
+              "description": "Segreto inviato quando viene usato da sendSecretKey. Un server può falsificare il prompt."
             },
             "password_command": {
               "label": "Comando password",
-              "description": "Se manca la password di accesso, esegue localmente questo comando per recuperarla da un gestore esterno (gopass, 1Password CLI, oathtool, ...); lo stdout senza l'ultimo ritorno a capo è la password. Segnaposto: %h host, %u utente, %p porta, %n nome connessione, %% un % letterale. Le credenziali esplicite hanno la precedenza. Rischio: il comando viene eseguito localmente con i tuoi privilegi utente."
+              "description": "Comando locale per recuperare una password di accesso mancante. Usa lo stdout senza l'ultimo ritorno a capo. Viene eseguito con i tuoi privilegi."
             },
             "passphrase_command": {
               "label": "Comando passphrase",
-              "description": "Se manca la passphrase della chiave privata, esegue localmente questo comando per recuperarla; lo stdout senza l'ultimo ritorno a capo è la passphrase. Segnaposto: %h host, %u utente, %p porta, %n nome connessione, %% un % letterale. Rischio: il comando viene eseguito localmente con i tuoi privilegi utente."
+              "description": "Comando locale per recuperare la passphrase di una chiave mancante. Usa lo stdout senza l'ultimo ritorno a capo. Viene eseguito con i tuoi privilegi."
             },
             "remote_command": {
-              "label": "Comando remoto (RemoteCommand)",
-              "description": "Viene eseguito al posto di una shell all'apertura della sessione terminale (il PTY resta richiesto). Lasciare vuoto per una shell interattiva normale; alla riconnessione il comando viene rieseguito."
+              "label": "Comando remoto",
+              "description": "Eseguito al posto della shell all'apertura del terminale. Vuoto usa una shell normale."
             },
             "sudo_source": {
-              "label": "Origine delle credenziali sudo",
+              "label": "Credenziali sudo",
               "options": {
                 "custom": "Personalizzato (questa connessione)",
                 "global": "Profilo Quick Sudo globale",
                 "off": "Disattivato"
               },
-              "description": "Da dove arrivano le credenziali sudo: i valori di questa connessione, un profilo globale condiviso, o disattivato. Ignorato sulle connessioni di sola lettura."
+              "description": "Scegli la fonte delle credenziali sudo. Ignorato sulle connessioni di sola lettura."
             },
             "sudo_profile": {
               "label": "Profilo Quick Sudo",
-              "description": "Profilo globale Quick Sudo da collegare; se vuoto, si usa il collegamento del workbench. Gli host senza opzioni dinamiche mostrano un campo di testo (nome o id del profilo)."
+              "description": "Profilo globale Quick Sudo opzionale."
             },
             "read_only": {
               "label": "Sola lettura",
-              "description": "Rifiuta ogni operazione di scrittura (modifiche SFTP, caricamenti, comandi sudo) su questa connessione; Quick Sudo resta disattivato finché è abilitato."
+              "description": "Rifiuta le operazioni di scrittura su questa connessione."
             },
             "sudo_whitelist": {
-              "label": "Whitelist comandi sudo",
-              "description": "Whitelist in stile sudoers per i comandi privilegiati, una voce per riga (o separata da ';'). I token corrispondono esattamente, '*' corrisponde a un argomento, un '*' finale corrisponde al resto (es. 'systemctl restart *'). Se impostata, sudo viene eseguito solo per i comandi corrispondenti; lasciare vuota per disattivare."
+              "label": "Allowlist sudo",
+              "description": "Allowlist opzionale dei comandi sudo, uno per riga. Vuota consente tutti i comandi."
             },
             "auth_flow_mode": {
-              "description": "Disattivato (predefinito per le nuove connessioni) non invia mai codici OTP automaticamente: rispondere ai prompt 2FA manualmente. Le altre modalità consentono al plugin di rispondere ai prompt password e OTP per accesso e sudo; solo password ignora i segreti OTP. Le connessioni esistenti conservano la modalità memorizzata. I profili Quick Sudo globali usano le proprie impostazioni.",
-              "label": "Flusso 2FA",
+              "description": "Scegli come gestire gli OTP per accesso e sudo. Disattivato lascia l'OTP manuale.",
+              "label": "2FA",
               "options": {
                 "off": "Disattivato (rispondere all'OTP manualmente)",
                 "password_then_otp": "Prima password, poi OTP",
@@ -744,36 +846,44 @@
               }
             },
             "sudo_password": {
-              "label": "Password sudo alternativa",
-              "description": "Password passata a sudo tramite pipe; lasciare vuoto per riutilizzare la password di accesso."
+              "label": "Password sudo",
+              "description": "Password per sudo; se vuota riusa quella di accesso."
             },
             "sudo_use_pty": {
               "label": "Richiedi PTY per sudo",
-              "description": "Alcuni stack PAM chiedono correttamente solo con un TTY. Un profilo globale collegato prevale con la propria preferenza."
+              "description": "Richiede un TTY per i prompt sudo."
             },
             "totp_secret": {
               "label": "Segreti TOTP",
-              "description": "Un segreto per riga: URI otpauth://, chiave base32 o codice statico. La selezione a rotazione evita di riutilizzare un codice nella stessa finestra. Risponde anche alla 2FA interattiva da tastiera all'accesso."
+              "description": "Uno per riga: URI otpauth://, chiave base32 o codice statico."
             },
             "password_prompt_hint": {
-              "label": "Indicatore del prompt password",
-              "description": "Sottostringa personalizzata che identifica i prompt della password (es. 'identity token')."
+              "label": "Prompt password",
+              "description": "Testo opzionale per riconoscere i prompt della password."
             },
             "totp_prompt_hint": {
-              "label": "Indicatore del prompt OTP",
-              "description": "Sottostringa personalizzata che identifica i prompt OTP (es. 'duo passcode')."
+              "label": "Prompt OTP",
+              "description": "Testo opzionale per riconoscere i prompt OTP."
             },
             "connect_timeout_secs": {
-              "label": "Timeout connessione (secondi)",
-              "description": "Timeout per handshake SSH e autenticazione. Aumentare per host Windows/macOS lenti o ad alta latenza."
+              "label": "Timeout SSH (secondi)",
+              "description": "Timeout per handshake e autenticazione SSH."
             },
             "keepalive_interval_secs": {
-              "label": "Intervallo keepalive (secondi)",
-              "description": "Intervallo delle sonde keepalive; 3 sonde senza risposta chiudono la sessione. 0 le disabilita."
+              "label": "Keepalive SSH (secondi)",
+              "description": "Intervallo keepalive SSH; 0 lo disattiva."
             },
             "terminal_keepalive_secs": {
-              "label": "Keepalive attività del terminale (secondi)",
-              "description": "Inietta spazio+backspace nel terminale interattivo a questo intervallo, così le policy di inattività lato server (TMOUT, audit del bastion) non si attivano mai. 0 disabilita."
+              "label": "Keepalive terminale (secondi)",
+              "description": "Keepalive di inattività del terminale; 0 lo disattiva."
+            },
+            "triggers_enabled": {
+              "label": "Abilita risposte automatiche",
+              "description": "Abilita regole Expect tssh/JSON. Disattivato per impostazione predefinita; le regole salvate restano inattive."
+            },
+            "advanced_options": {
+              "label": "Mostra opzioni avanzate",
+              "description": "Mostra le impostazioni SSH, sudo, automazione e comandi. Disattivato per impostazione predefinita."
             }
           },
           "actions": {
@@ -844,71 +954,71 @@
               "description": "SSH_AUTH_SOCK の任意上書き。空欄なら環境の既定値（Windows では Pageant）を使用します。"
             },
             "connect_timeout_secs": {
-              "label": "接続タイムアウト（秒）",
-              "description": "SSH ハンドシェイクと認証のタイムアウト。遅い Windows/macOS や高レイテンシのホストでは大きくしてください。"
+              "label": "SSH タイムアウト（秒）",
+              "description": "SSH ハンドシェイクと認証のタイムアウト。"
             },
             "keepalive_interval_secs": {
-              "label": "Keepalive 間隔（秒）",
-              "description": "Keepalive プローブの間隔。3 回連続無応答でセッションを切断します。0 で無効。"
+              "label": "SSH キープアライブ（秒）",
+              "description": "SSH キープアライブ間隔。0 で無効。"
             },
             "terminal_keepalive_secs": {
-              "label": "ターミナル活動キープアライブ（秒）",
-              "description": "この間隔で対話ターミナルにスペース+バックスペースを注入し、サーバー側のアイドルポリシー（TMOUT、踏み台監査）が発動しないようにします。0 で無効。"
+              "label": "ターミナル キープアライブ（秒）",
+              "description": "ターミナルのアイドル維持間隔。0 で無効。"
             },
             "set_env": {
-              "label": "環境変数（SetEnv）",
-              "description": "1 行に KEY=VALUE を 1 件（セミコロン区切りも可）。ターミナル・exec・sudo の各チャネルでサーバーへ送信します。同じキーが重複した場合は最後の指定が優先され、不正なエントリがあると接続は失敗します。値はこの設定からのみ取得され、ローカルの環境変数は送信されません。",
+              "label": "環境（SetEnv）",
+              "description": "ターミナル、exec、sudo チャネルへ送る任意の KEY=VALUE。",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
             "triggers": {
-              "label": "自動インタラクション トリガー",
-              "description": "expect 風の自動インタラクション: 各ステージの正規表現を順にターミナル出力へ照合し、一致すると自動で応答を送信します。sendText（\\r = Enter）、sendSecretKey（下のトリガー用シークレットスロットのキー名、Enter を自動付加）、sendCommand（ローカルコマンドの標準出力）。プレースホルダーは最小の 1 ステージ例。空欄で無効。リスク: 悪意あるサーバーが一致するプロンプトを偽装し、設定済みの応答（シークレットスロットを含む）を送り込ませるおそれがあります。JSON 不正・上限超過（最大 16 ステージ）・正規表現エラーでは接続が失敗します。tssh（trzsz-ssh）のテキスト形式ルールも受け付けます（#!! 接頭辞の有無は問わない）：ExpectCount（0 で無効）・ExpectTimeout・ExpectSleepMS・ExpectPassSleep・ExpectPatternN・ExpectSendTextN・ExpectSendOtpN（= sendCommand）・ExpectCaseSendTextN。正規表現として無効なパターンはリテラル一致にフォールバックし、tssh の暗号文／TOTP 応答（--enc-secret）は拒否されます。JSON に \"enabled\": false を付けるとルールを消さずに無効化できます。",
-              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+              "label": "自動応答ルール",
+              "description": "自動応答用の tssh/JSON Expect ルール。サーバーがプロンプトを偽装して設定済みの応答を受け取る可能性があります。空欄で無効。",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
             },
             "trigger_answer_1": {
-              "label": "トリガー用シークレットスロット 1",
-              "description": "トリガー用シークレットスロット 1：ステージの sendSecretKey から参照します（値: trigger_answer_1）。対応するパターンが一致すると Enter を付けて自動送信されます。悪意あるサーバーがそのプロンプトを偽装して取得するおそれがあります。"
+              "label": "シークレットスロット 1",
+              "description": "sendSecretKey で参照すると送信されるシークレット。サーバーがプロンプトを偽装する可能性があります。"
             },
             "trigger_answer_2": {
-              "label": "トリガー用シークレットスロット 2",
-              "description": "トリガー用シークレットスロット 2：ステージの sendSecretKey から参照します（値: trigger_answer_2）。対応するパターンが一致すると Enter を付けて自動送信されます。悪意あるサーバーがそのプロンプトを偽装して取得するおそれがあります。"
+              "label": "シークレットスロット 2",
+              "description": "sendSecretKey で参照すると送信されるシークレット。サーバーがプロンプトを偽装する可能性があります。"
             },
             "password_command": {
               "label": "パスワードコマンド",
-              "description": "ログインパスワードが未設定のとき、ローカルでこのコマンドを実行して外部パスワードマネージャー（gopass、1Password CLI、oathtool など）から取得します。末尾の改行 1 つを除いた標準出力がパスワードになります。プレースホルダー: %h ホスト、%u ユーザー名、%p ポート、%n 接続名、%% は % 文字そのもの。明示的な認証情報が優先されます。リスク: コマンドはローカルであなたのユーザー権限で実行されます。"
+              "description": "未設定のログインパスワードを取得するローカルコマンド。末尾の改行 1 つを除く標準出力を使います。ユーザー権限で実行されます。"
             },
             "passphrase_command": {
               "label": "パスフレーズコマンド",
-              "description": "秘密鍵のパスフレーズが未設定のとき、ローカルでこのコマンドを実行して取得します。末尾の改行 1 つを除いた標準出力がパスフレーズになります。プレースホルダー: %h ホスト、%u ユーザー名、%p ポート、%n 接続名、%% は % 文字そのもの。リスク: コマンドはローカルであなたのユーザー権限で実行されます。"
+              "description": "未設定の秘密鍵パスフレーズを取得するローカルコマンド。末尾の改行 1 つを除く標準出力を使います。ユーザー権限で実行されます。"
             },
             "remote_command": {
-              "label": "リモートコマンド（RemoteCommand）",
-              "description": "ターミナルセッション確立時にシェルの代わりに実行するコマンド（PTY は従来どおり要求）。空欄なら通常の対話シェルになります。再接続時は同じコマンドを再実行します。"
+              "label": "リモートコマンド",
+              "description": "ターミナル開始時にシェルの代わりに実行します。空欄なら通常のシェルです。"
             },
             "sudo_source": {
-              "label": "sudo 認証情報ソース",
+              "label": "sudo 認証情報",
               "options": {
                 "custom": "カスタム（この接続）",
                 "global": "グローバル Quick Sudo プロファイル",
                 "off": "オフ"
               },
-              "description": "sudo 認証情報の取得元：この接続固有の値、共有グローバルプロファイル、または無効。読み取り専用接続では無視されます。"
+              "description": "sudo 認証情報の取得元を選択します。読み取り専用接続では無視されます。"
             },
             "sudo_profile": {
               "label": "Quick Sudo プロファイル",
-              "description": "紐付けるグローバル Quick Sudo プロファイル。空欄ならワークベンチの紐付けにフォールバックします。動的オプション非対応のホストではテキスト欄（プロファイル名または ID）になります。"
+              "description": "任意のグローバル Quick Sudo プロファイル。"
             },
             "sudo_password": {
-              "label": "sudo パスワード（上書き）",
-              "description": "sudo にパイプで渡すパスワード。空欄ならログイン パスワードを再利用します。"
+              "label": "sudo パスワード",
+              "description": "sudo に渡すパスワード。空欄ならログインパスワードを再利用します。"
             },
             "totp_secret": {
               "label": "TOTP シークレット",
-              "description": "1 行に 1 件：otpauth:// URI、base32 キー、または静的コード。ローテーション選択で同じ時間窓内のコード再利用を回避します。ログイン時のキーボード対話式 2FA にも応答します。"
+              "description": "1 行に 1 件：otpauth:// URI、base32 キー、または静的コード。"
             },
             "auth_flow_mode": {
-              "label": "2FA フロー",
-              "description": "オフ（新規接続の既定値）では OTP コードを自動送信しません。2FA プロンプトは手動で入力してください。他のモードではログインと sudo のパスワード／OTP プロンプトをプラグインが自動応答します。パスワードのみの場合は OTP を使いません。既存の接続は保存済みのモードを維持します。グローバル Quick Sudo は独自の設定を使います。",
+              "label": "2FA",
+              "description": "ログインと sudo の OTP 処理を選択します。オフでは OTP を手動入力します。",
               "options": {
                 "off": "オフ（OTP は手動で入力）",
                 "password_then_otp": "パスワードの後に OTP",
@@ -917,24 +1027,32 @@
               }
             },
             "password_prompt_hint": {
-              "label": "パスワード プロンプトの判定キーワード",
-              "description": "パスワード プロンプトを識別するカスタム部分文字列（例: 'identity token'）。"
+              "label": "パスワードプロンプト",
+              "description": "パスワードプロンプトを識別する任意の文字列。"
             },
             "totp_prompt_hint": {
-              "label": "OTP プロンプトの判定キーワード",
-              "description": "OTP プロンプトを識別するカスタム部分文字列（例: 'duo passcode'）。"
+              "label": "OTP プロンプト",
+              "description": "OTP プロンプトを識別する任意の文字列。"
             },
             "sudo_use_pty": {
               "label": "sudo で PTY を要求",
-              "description": "PAM スタックによっては TTY がないと正しくプロンプトが出ません。グローバル プロファイルを紐付けた場合はその設定が優先されます。"
+              "description": "sudo プロンプト用に TTY を要求します。"
             },
             "read_only": {
               "label": "読み取り専用",
-              "description": "この接続でのすべての書き込み操作（SFTP 変更・アップロード・sudo コマンド）を拒否します。有効な間は Quick Sudo も強制オフになります。"
+              "description": "この接続での書き込み操作を拒否します。"
             },
             "sudo_whitelist": {
-              "label": "sudo コマンド許可リスト",
-              "description": "特権コマンドの sudoers 風許可リスト。1 行に 1 件（セミコロン区切りも可）。トークンは完全一致、'*' は引数 1 個、末尾の '*' は残り全部に一致します（例: 'systemctl restart *'）。設定すると sudo は一致するコマンドのみ実行。空欄で無効。"
+              "label": "sudo 許可リスト",
+              "description": "任意の sudo コマンド許可リスト。1 行 1 件。空欄ならすべて許可します。"
+            },
+            "triggers_enabled": {
+              "label": "自動応答を有効化",
+              "description": "tssh/JSON Expect ルールを有効にします。既定はオフで、保存済みルールも実行しません。"
+            },
+            "advanced_options": {
+              "label": "詳細オプションを表示",
+              "description": "SSH、sudo、自動化、コマンドの追加設定を表示します。既定ではオフです。"
             }
           },
           "actions": {
@@ -1005,59 +1123,59 @@
               "description": "Substituição opcional do SSH_AUTH_SOCK. Deixe vazio para usar o padrão do ambiente ou o Pageant no Windows."
             },
             "set_env": {
-              "label": "Variáveis de ambiente (SetEnv)",
-              "description": "Uma entrada CHAVE=VALOR por linha (ponto e vírgula também separa entradas); enviadas ao servidor nos canais de terminal, exec e sudo. Chaves duplicadas: a última entrada vence. Entradas inválidas fazem a conexão falhar; os valores vêm apenas desta configuração — o ambiente local nunca é transmitido.",
+              "label": "Ambiente (SetEnv)",
+              "description": "Entradas KEY=VALUE opcionais para os canais de terminal, exec e sudo.",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
             "triggers": {
-              "label": "Gatilhos de interação automática",
-              "description": "Interação automática estilo expect: os padrões das etapas são comparados em ordem com a saída do terminal e cada acerto envia automaticamente uma resposta — sendText (\\r = Enter), sendSecretKey (chave de um slot secreto de gatilho abaixo, Enter adicionado) ou sendCommand (stdout de um comando local). O marcador de posição mostra um exemplo mínimo de uma etapa; vazio desativa. Risco: um servidor malicioso pode forjar o prompt para induzir o terminal a enviar a resposta configurada, incluindo o conteúdo dos slots secretos. JSON inválido, limites excedidos (máx. 16 etapas) ou regex inválida fazem a conexão falhar. Também aceita regras em formato de texto do tssh (trzsz-ssh), com ou sem o prefixo #!!: ExpectCount (0 desativa), ExpectTimeout, ExpectSleepMS, ExpectPassSleep, ExpectPatternN, ExpectSendTextN, ExpectSendOtpN (= sendCommand) e ExpectCaseSendTextN; padrões inválidos como regex correspondem como texto literal; respostas cifradas/TOTP do tssh (--enc-secret) são rejeitadas. O JSON pode usar \"enabled\": false para desligar as regras sem apagá-las.",
-              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+              "label": "Regras de resposta automática",
+              "description": "Regras Expect de tssh/JSON para respostas automáticas. Um servidor pode falsificar prompts e receber respostas configuradas. Vazio desativa.",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
             },
             "trigger_answer_1": {
-              "label": "Slot secreto de gatilho 1",
-              "description": "Segredo para o slot de gatilho 1: referencie-o pelo sendSecretKey de uma etapa (valor: trigger_answer_1). Enviado automaticamente ao servidor com Enter adicionado quando o padrão corresponde; um servidor malicioso pode forjar esse prompt para capturá-lo."
+              "label": "Slot secreto 1",
+              "description": "Segredo enviado quando referenciado por sendSecretKey. Um servidor pode falsificar o prompt."
             },
             "trigger_answer_2": {
-              "label": "Slot secreto de gatilho 2",
-              "description": "Segredo para o slot de gatilho 2: referencie-o pelo sendSecretKey de uma etapa (valor: trigger_answer_2). Enviado automaticamente ao servidor com Enter adicionado quando o padrão corresponde; um servidor malicioso pode forjar esse prompt para capturá-lo."
+              "label": "Slot secreto 2",
+              "description": "Segredo enviado quando referenciado por sendSecretKey. Um servidor pode falsificar o prompt."
             },
             "password_command": {
               "label": "Comando de senha",
-              "description": "Se a senha de acesso estiver ausente, executa este comando localmente para obtê-la de um gerenciador externo (gopass, 1Password CLI, oathtool, ...); o stdout sem uma quebra de linha final é a senha. Marcadores: %h host, %u usuário, %p porta, %n nome da conexão, %% um % literal. Credenciais explícitas têm prioridade. Risco: o comando é executado localmente com seus privilégios de usuário."
+              "description": "Comando local para obter uma senha de login ausente. Usa o stdout sem a última quebra de linha. Executado com seus privilégios."
             },
             "passphrase_command": {
               "label": "Comando de frase secreta",
-              "description": "Se a frase secreta da chave privada estiver ausente, executa este comando localmente para obtê-la; o stdout sem uma quebra de linha final é a frase secreta. Marcadores: %h host, %u usuário, %p porta, %n nome da conexão, %% um % literal. Risco: o comando é executado localmente com seus privilégios de usuário."
+              "description": "Comando local para obter a frase secreta de uma chave ausente. Usa o stdout sem a última quebra de linha. Executado com seus privilégios."
             },
             "remote_command": {
-              "label": "Comando remoto (RemoteCommand)",
-              "description": "Executado em vez de um shell quando uma sessão de terminal é aberta (o PTY continua sendo solicitado). Deixe vazio para um shell interativo normal; reconectar executa o comando novamente."
+              "label": "Comando remoto",
+              "description": "Executado no lugar do shell ao abrir o terminal. Vazio usa um shell normal."
             },
             "sudo_source": {
-              "label": "Origem das credenciais sudo",
+              "label": "Credenciais sudo",
               "options": {
                 "custom": "Personalizado (esta conexão)",
                 "global": "Perfil Quick Sudo global",
                 "off": "Desativado"
               },
-              "description": "De onde vêm as credenciais sudo: os valores desta conexão, um perfil global compartilhado, ou desativado. Ignorado em conexões somente leitura."
+              "description": "Escolha a origem das credenciais sudo. Ignorado em conexões somente leitura."
             },
             "sudo_profile": {
               "label": "Perfil Quick Sudo",
-              "description": "Perfil global Quick Sudo a vincular; se vazio, usa o vínculo do workbench. Hosts sem opções dinâmicas mostram um campo de texto (nome ou id do perfil)."
+              "description": "Perfil global Quick Sudo opcional."
             },
             "read_only": {
               "label": "Somente leitura",
-              "description": "Rejeita toda operação de escrita (alterações SFTP, uploads, comandos sudo) nesta conexão; o Quick Sudo permanece desligado enquanto ativo."
+              "description": "Rejeita operações de escrita nesta conexão."
             },
             "sudo_whitelist": {
               "label": "Lista de permissões sudo",
-              "description": "Lista de permissões em estilo sudoers para comandos privilegiados, uma entrada por linha (ou separada por ';'). Tokens correspondem exatamente, '*' corresponde a um argumento, um '*' final corresponde ao restante (ex.: 'systemctl restart *'). Quando definida, o sudo só é executado para comandos correspondentes; deixe vazio para desativar."
+              "description": "Lista opcional de comandos sudo, um por linha. Vazia permite todos."
             },
             "auth_flow_mode": {
-              "description": "Desativado (padrão para novas conexões) nunca envia códigos OTP automaticamente - responda aos prompts de 2FA você mesmo. Os demais modos permitem que o plugin responda aos prompts de senha e OTP para login e sudo; somente senha ignora segredos OTP. Conexões existentes mantêm o modo salvo. Os perfis globais Quick Sudo usam suas próprias configurações.",
-              "label": "Fluxo de 2FA",
+              "description": "Escolha como tratar OTP no login e no sudo. Desativado mantém o OTP manual.",
+              "label": "2FA",
               "options": {
                 "off": "Desativado (responder OTP manualmente)",
                 "password_then_otp": "Senha primeiro, depois OTP",
@@ -1066,36 +1184,44 @@
               }
             },
             "sudo_password": {
-              "label": "Senha sudo alternativa",
-              "description": "Senha passada ao sudo via pipe; deixe vazio para reutilizar a senha de login."
+              "label": "Senha sudo",
+              "description": "Senha para o sudo; vazia, reutiliza a senha de login."
             },
             "sudo_use_pty": {
               "label": "Solicitar PTY para sudo",
-              "description": "Alguns stacks PAM só perguntam corretamente com um TTY. Um perfil global vinculado tem preferência com sua própria configuração."
+              "description": "Solicita um TTY para os prompts do sudo."
             },
             "totp_secret": {
               "label": "Segredos TOTP",
-              "description": "Um segredo por linha: URI otpauth://, chave base32 ou código estático. A seleção rotativa evita reutilizar um código na mesma janela. Também responde à 2FA interativa por teclado no login."
+              "description": "Um por linha: URI otpauth://, chave base32 ou código estático."
             },
             "password_prompt_hint": {
-              "label": "Identificador do prompt de senha",
-              "description": "Subtexto personalizado que identifica prompts de senha (ex.: 'identity token')."
+              "label": "Prompt de senha",
+              "description": "Texto opcional para reconhecer prompts de senha."
             },
             "totp_prompt_hint": {
-              "label": "Identificador do prompt OTP",
-              "description": "Subtexto personalizado que identifica prompts de OTP (ex.: 'duo passcode')."
+              "label": "Prompt de OTP",
+              "description": "Texto opcional para reconhecer prompts de OTP."
             },
             "connect_timeout_secs": {
-              "label": "Tempo limite de conexão (segundos)",
-              "description": "Tempo limite para handshake SSH e autenticação. Aumente para hosts Windows/macOS lentos ou de alta latência."
+              "label": "Tempo limite SSH (segundos)",
+              "description": "Tempo limite do handshake e da autenticação SSH."
             },
             "keepalive_interval_secs": {
-              "label": "Intervalo de keepalive (segundos)",
-              "description": "Intervalo das sondas de keepalive; 3 sondas sem resposta encerram a sessão. 0 desativa as sondas."
+              "label": "Keepalive SSH (segundos)",
+              "description": "Intervalo do keepalive SSH; 0 desativa."
             },
             "terminal_keepalive_secs": {
-              "label": "Keepalive de atividade do terminal (segundos)",
-              "description": "Injeta espaço+backspace no terminal interativo nesse intervalo para que políticas de ociosidade do servidor (TMOUT, auditoria do bastion) nunca sejam acionadas. 0 desativa."
+              "label": "Keepalive do terminal (segundos)",
+              "description": "Keepalive de ociosidade do terminal; 0 desativa."
+            },
+            "triggers_enabled": {
+              "label": "Ativar respostas automáticas",
+              "description": "Ativa regras Expect de tssh/JSON. Desativado por padrão; regras salvas ficam inativas."
+            },
+            "advanced_options": {
+              "label": "Mostrar opções avançadas",
+              "description": "Mostra configurações opcionais de SSH, sudo, automação e comandos. Desativado por padrão."
             }
           },
           "actions": {
@@ -1166,71 +1292,71 @@
               "description": "可选的 SSH_AUTH_SOCK 覆盖；留空则使用环境默认值（Windows 下为 Pageant）。"
             },
             "connect_timeout_secs": {
-              "label": "连接超时（秒）",
-              "description": "SSH 握手与认证超时。Windows/macOS 较慢或高延迟的主机可调大。"
+              "label": "SSH 超时（秒）",
+              "description": "SSH 握手和认证超时时间。"
             },
             "keepalive_interval_secs": {
-              "label": "Keepalive 间隔（秒）",
-              "description": "Keepalive 探测间隔；连续 3 次未响应即断开会话。0 表示关闭探测。"
+              "label": "SSH 保活（秒）",
+              "description": "SSH 保活探测间隔；0 关闭。"
             },
             "terminal_keepalive_secs": {
-              "label": "终端活动保活（秒）",
-              "description": "按该间隔向交互终端注入空格+退格（不产生命令痕迹），避免服务器侧空闲策略（TMOUT、堡垒机审计）断开终端。0 表示关闭。"
+              "label": "终端保活（秒）",
+              "description": "终端空闲保活间隔；0 关闭。"
             },
             "set_env": {
               "label": "环境变量（SetEnv）",
-              "description": "每行一条 KEY=VALUE（也可用分号分隔），在终端、exec 与 sudo 通道上发送给服务器。重复的键以最后一条为准；条目非法时连接直接失败。取值仅来自本配置，不会透传本地环境变量。",
+              "description": "发送到终端、exec 和 sudo 通道的可选 KEY=VALUE。",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
             "triggers": {
-              "label": "自动交互触发器",
-              "description": "expect 式自动交互：各阶段正则按序匹配终端输出，命中即自动回发——sendText（\\r 代表回车）、sendSecretKey（下方触发器密文槽的键名，自动补回车）或 sendCommand（本地命令的标准输出）。占位符为最小单阶段示例；留空关闭。风险：恶意服务器可伪造匹配提示，骗取终端回发配置的内容（含密文槽）。JSON 非法、超过上限（最多 16 阶段）或正则无法编译时连接直接失败。同时兼容 tssh（trzsz-ssh）文本规则（可带 #!! 前缀）：ExpectCount（0 即关闭）、ExpectTimeout、ExpectSleepMS、ExpectPassSleep、ExpectPatternN、ExpectSendTextN、ExpectSendOtpN（= sendCommand）、ExpectCaseSendTextN；非法正则按字面量匹配兜底，tssh 密文/TOTP 应答（--enc-secret）不受支持并报错。JSON 可携带 \"enabled\": false 在保留规则的同时显式关闭。",
-              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+              "label": "自动应答规则",
+              "description": "用于自动应答的 tssh/JSON Expect 规则。恶意服务器可能伪造提示并收到配置的应答；留空关闭。",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
             },
             "trigger_answer_1": {
-              "label": "触发器密文槽 1",
-              "description": "触发器密文槽 1：在阶段的 sendSecretKey 里引用（值为 trigger_answer_1）。对应 pattern 命中时自动回发给服务器并补回车；恶意服务器可能伪造该提示骗取此内容。"
+              "label": "密文槽 1",
+              "description": "被 sendSecretKey 引用时发送的密文；服务器可能伪造提示获取它。"
             },
             "trigger_answer_2": {
-              "label": "触发器密文槽 2",
-              "description": "触发器密文槽 2：在阶段的 sendSecretKey 里引用（值为 trigger_answer_2）。对应 pattern 命中时自动回发给服务器并补回车；恶意服务器可能伪造该提示骗取此内容。"
+              "label": "密文槽 2",
+              "description": "被 sendSecretKey 引用时发送的密文；服务器可能伪造提示获取它。"
             },
             "password_command": {
               "label": "密码命令",
-              "description": "登录密码缺失时在本地运行该命令，从外部密码管理器（gopass、1Password CLI、oathtool 等）取回；stdout 去掉单个结尾换行即为密码。占位符：%h 主机、%u 用户名、%p 端口、%n 连接名、%% 字面 %。显式凭据优先于命令。风险：命令在本地以你的用户权限执行。"
+              "description": "登录密码缺失时执行的本地命令。使用 stdout（去掉一个结尾换行）；命令以当前用户权限运行。"
             },
             "passphrase_command": {
               "label": "私钥口令命令",
-              "description": "私钥口令缺失时在本地运行该命令取回；stdout 去掉单个结尾换行即为口令。占位符：%h 主机、%u 用户名、%p 端口、%n 连接名、%% 字面 %。风险：命令在本地以你的用户权限执行。"
+              "description": "私钥口令缺失时执行的本地命令。使用 stdout（去掉一个结尾换行）；命令以当前用户权限运行。"
             },
             "remote_command": {
-              "label": "远程命令（RemoteCommand）",
-              "description": "终端会话建立时执行该命令替代 shell（PTY 照常申请）。留空则为普通交互 shell；重连会重新执行同一条命令。"
+              "label": "远程命令",
+              "description": "打开终端时替代 shell 执行。留空使用普通 shell。"
             },
             "sudo_source": {
-              "label": "Sudo 凭据来源",
+              "label": "Sudo 凭据",
               "options": {
                 "custom": "自定义（本连接）",
                 "global": "全局 Quick Sudo 配置",
                 "off": "关闭"
               },
-              "description": "Sudo 凭据的来源：本连接自带的配置、共享的全局配置，或关闭。只读连接上忽略此设置。"
+              "description": "选择 sudo 凭据来源。只读连接上忽略。"
             },
             "sudo_profile": {
               "label": "Quick Sudo 配置",
-              "description": "选择要绑定的全局 Quick Sudo 配置；留空时回退到工作台绑定。宿主不支持动态选项时显示文本框（填写配置名称或 ID）。"
+              "description": "可选的全局 Quick Sudo 配置。"
             },
             "sudo_password": {
-              "label": "sudo 密码覆盖",
-              "description": "通过管道传给 sudo 的密码；留空则复用登录密码。"
+              "label": "sudo 密码",
+              "description": "传给 sudo 的密码；留空复用登录密码。"
             },
             "totp_secret": {
               "label": "TOTP 密钥",
-              "description": "每行一条：otpauth:// URI、base32 密钥或静态码。轮换选用可避免在同一时间窗内重复使用验证码；也用于应答登录时的键盘交互式 2FA。"
+              "description": "每行一条：otpauth:// URI、base32 密钥或静态码。"
             },
             "auth_flow_mode": {
-              "label": "2FA 认证流程",
-              "description": "关闭（新连接的默认值）时不自动发送 OTP 验证码，2FA 提示由用户手动输入；其余模式由插件自动应答登录和 sudo 的密码/OTP 提示，仅密码模式不使用 OTP 密钥。已创建连接保留原有设置；全局 Quick Sudo 配置使用自身设置。",
+              "label": "2FA",
+              "description": "选择登录和 sudo 如何处理 OTP。关闭时手动输入；已有连接保留原设置。",
               "options": {
                 "off": "关闭（手动输入 OTP）",
                 "password_then_otp": "先密码，再 OTP",
@@ -1239,24 +1365,32 @@
               }
             },
             "password_prompt_hint": {
-              "label": "密码提示词",
-              "description": "用于识别密码提示的自定义子串（如 'identity token'）。"
+              "label": "密码提示",
+              "description": "用于识别密码提示的可选文本。"
             },
             "totp_prompt_hint": {
-              "label": "OTP 提示词",
-              "description": "用于识别 OTP 提示的自定义子串（如 'duo passcode'）。"
+              "label": "OTP 提示",
+              "description": "用于识别 OTP 提示的可选文本。"
             },
             "sudo_use_pty": {
-              "label": "sudo 命令请求 PTY",
-              "description": "部分 PAM 模块只有在分配 TTY 时才能正确弹出提示。绑定了全局配置时，以其自身的设置为准。"
+              "label": "sudo 请求 PTY",
+              "description": "为 sudo 提示申请 TTY。"
             },
             "read_only": {
               "label": "只读",
-              "description": "在该连接上拒绝一切写操作（SFTP 变更、上传、sudo 命令）；启用期间 Quick Sudo 强制关闭。"
+              "description": "拒绝此连接上的写操作。"
             },
             "sudo_whitelist": {
-              "label": "sudo 命令白名单",
-              "description": "按 sudoers 风格为提权命令设置白名单，每行一条（也可用分号分隔）。词条精确匹配，'*' 匹配一个参数，结尾 '*' 匹配其余部分（如 'systemctl restart *'）。设置后 sudo 仅对匹配的命令执行；留空表示不限制。"
+              "label": "sudo 白名单",
+              "description": "可选的 sudo 命令白名单，每行一条。留空允许所有命令。"
+            },
+            "triggers_enabled": {
+              "label": "启用自动应答",
+              "description": "启用 tssh/JSON Expect 规则。默认关闭，已保存规则不会运行。"
+            },
+            "advanced_options": {
+              "label": "显示高级选项",
+              "description": "显示 SSH、sudo、自动化和命令等可选设置，默认关闭。"
             }
           },
           "actions": {
@@ -1327,71 +1461,71 @@
               "description": "選用的 SSH_AUTH_SOCK 覆寫；留空則使用環境預設值（Windows 下為 Pageant）。"
             },
             "connect_timeout_secs": {
-              "label": "連線逾時（秒）",
-              "description": "SSH 交握與認證逾時。Windows/macOS 較慢或高延遲的主機可調大。"
+              "label": "SSH 逾時（秒）",
+              "description": "SSH 交握與認證逾時時間。"
             },
             "keepalive_interval_secs": {
-              "label": "Keepalive 間隔（秒）",
-              "description": "Keepalive 探測間隔；連續 3 次未回應即中斷連線。0 表示關閉探測。"
+              "label": "SSH 保活（秒）",
+              "description": "SSH 保活探測間隔；0 表示關閉。"
             },
             "terminal_keepalive_secs": {
-              "label": "終端活動保活（秒）",
-              "description": "按該間隔向互動終端注入空格+退格鍵（不產生命令痕跡），避免伺服器端閒置策略（TMOUT、堡壘機稽核）中斷終端。0 表示關閉。"
+              "label": "終端保活（秒）",
+              "description": "終端閒置保活間隔；0 表示關閉。"
             },
             "set_env": {
               "label": "環境變數（SetEnv）",
-              "description": "每行一條 KEY=VALUE（也可以分號分隔），在終端、exec 與 sudo 通道上傳送給伺服器。重複的鍵以最後一條為準；條目非法時連線直接失敗。取值僅來自本設定，不會傳送本地環境變數。",
+              "description": "傳送到終端、exec 與 sudo 通道的選用 KEY=VALUE。",
               "placeholder": "LANG=zh_CN.UTF-8"
             },
             "triggers": {
-              "label": "自動互動觸發器",
-              "description": "expect 式自動互動：各階段正規表示式按序比對終端輸出，命中即自動回傳——sendText（\\r 代表 Enter）、sendSecretKey（下方觸發器密文槽的鍵名，自動補 Enter）或 sendCommand（本地命令的標準輸出）。佔位符為最小單階段範例；留空關閉。風險：惡意伺服器可偽造比對提示，騙取終端回傳設定的內容（含密文槽）。JSON 非法、超過上限（最多 16 階段）或正規表示式無法編譯時連線直接失敗。同時相容 tssh（trzsz-ssh）文字規則（可帶 #!! 前綴）：ExpectCount（0 即關閉）、ExpectTimeout、ExpectSleepMS、ExpectPassSleep、ExpectPatternN、ExpectSendTextN、ExpectSendOtpN（= sendCommand）、ExpectCaseSendTextN；非法正規表示式按字面量比對兜底，tssh 密文/TOTP 應答（--enc-secret）不支援並報錯。JSON 可攜帶 \"enabled\": false 在保留規則的同時顯式關閉。",
-              "placeholder": "{\"stages\":[{\"pattern\":\"(?i)verification code\",\"sendText\":\"654321\\\\r\"}]}"
+              "label": "自動回應規則",
+              "description": "用於自動回應的 tssh/JSON Expect 規則。惡意伺服器可能偽造提示並收到設定的回應；留空關閉。",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
             },
             "trigger_answer_1": {
-              "label": "觸發器密文槽 1",
-              "description": "觸發器密文槽 1：在階段的 sendSecretKey 裡引用（值為 trigger_answer_1）。對應 pattern 命中時自動回傳給伺服器並補 Enter；惡意伺服器可能偽造該提示騙取此內容。"
+              "label": "密文槽 1",
+              "description": "被 sendSecretKey 引用時傳送的密文；伺服器可能偽造提示取得它。"
             },
             "trigger_answer_2": {
-              "label": "觸發器密文槽 2",
-              "description": "觸發器密文槽 2：在階段的 sendSecretKey 裡引用（值為 trigger_answer_2）。對應 pattern 命中時自動回傳給伺服器並補 Enter；惡意伺服器可能偽造該提示騙取此內容。"
+              "label": "密文槽 2",
+              "description": "被 sendSecretKey 引用時傳送的密文；伺服器可能偽造提示取得它。"
             },
             "password_command": {
               "label": "密碼命令",
-              "description": "登入密碼缺失時在本地執行該命令，從外部密碼管理器（gopass、1Password CLI、oathtool 等）取回；stdout 去掉單個結尾換行即為密碼。佔位符：%h 主機、%u 使用者名稱、%p 連接埠、%n 連線名稱、%% 字面 %。明確憑據優先於命令。風險：命令在本地以你的使用者權限執行。"
+              "description": "登入密碼缺失時執行的本機命令。使用 stdout（去掉一個結尾換行）；命令以目前使用者權限執行。"
             },
             "passphrase_command": {
               "label": "私鑰通關密語命令",
-              "description": "私鑰通關密語缺失時在本地執行該命令取回；stdout 去掉單個結尾換行即為通關密語。佔位符：%h 主機、%u 使用者名稱、%p 連接埠、%n 連線名稱、%% 字面 %。風險：命令在本地以你的使用者權限執行。"
+              "description": "私鑰通關密語缺失時執行的本機命令。使用 stdout（去掉一個結尾換行）；命令以目前使用者權限執行。"
             },
             "remote_command": {
-              "label": "遠端命令（RemoteCommand）",
-              "description": "終端工作階段建立時執行該命令替代 shell（PTY 照常要求）。留空則為一般互動 shell；重新連線會重新執行同一條命令。"
+              "label": "遠端命令",
+              "description": "開啟終端時取代 shell 執行。留空使用一般 shell。"
             },
             "sudo_source": {
-              "label": "Sudo 憑據來源",
+              "label": "Sudo 憑據",
               "options": {
                 "custom": "自訂（本連線）",
                 "global": "全域 Quick Sudo 設定",
                 "off": "關閉"
               },
-              "description": "Sudo 憑據的來源：本連線自帶的設定、共用的全域設定，或關閉。唯讀連線上忽略此設定。"
+              "description": "選擇 sudo 憑據來源。唯讀連線上忽略。"
             },
             "sudo_profile": {
               "label": "Quick Sudo 設定",
-              "description": "選擇要綁定的全域 Quick Sudo 設定；留空時回退到工作台綁定。宿主不支援動態選項時顯示文字框（填寫設定名稱或 ID）。"
+              "description": "選用的全域 Quick Sudo 設定。"
             },
             "sudo_password": {
-              "label": "sudo 密碼覆寫",
-              "description": "以管線傳給 sudo 的密碼；留空則重用登入密碼。"
+              "label": "sudo 密碼",
+              "description": "傳給 sudo 的密碼；留空則重用登入密碼。"
             },
             "totp_secret": {
               "label": "TOTP 金鑰",
-              "description": "每行一條：otpauth:// URI、base32 金鑰或靜態碼。輪換選用可避免在同一時間窗內重複使用驗證碼；也用於應答登入時的鍵盤互動式 2FA。"
+              "description": "每行一條：otpauth:// URI、base32 金鑰或靜態碼。"
             },
             "auth_flow_mode": {
-              "label": "2FA 認證流程",
-              "description": "關閉（新連線的預設值）時不自動傳送 OTP 驗證碼，2FA 提示由使用者手動輸入；其餘模式由外掛自動應答登入及 sudo 的密碼/OTP 提示，僅密碼模式不使用 OTP 金鑰。已建立連線保留原有設定；全域 Quick Sudo 設定使用自身設定。",
+              "label": "2FA",
+              "description": "選擇登入與 sudo 如何處理 OTP。關閉時手動輸入；現有連線保留原設定。",
               "options": {
                 "off": "關閉（手動輸入 OTP）",
                 "password_then_otp": "先密碼，再 OTP",
@@ -1400,24 +1534,32 @@
               }
             },
             "password_prompt_hint": {
-              "label": "密碼提示詞",
-              "description": "用於識別密碼提示的自訂子字串（如 'identity token'）。"
+              "label": "密碼提示",
+              "description": "用於識別密碼提示的選用文字。"
             },
             "totp_prompt_hint": {
-              "label": "OTP 提示詞",
-              "description": "用於識別 OTP 提示的自訂子字串（如 'duo passcode'）。"
+              "label": "OTP 提示",
+              "description": "用於識別 OTP 提示的選用文字。"
             },
             "sudo_use_pty": {
-              "label": "sudo 命令請求 PTY",
-              "description": "部分 PAM 模組只有在配置 TTY 時才能正確彈出提示。綁定了全域設定時，以其自身的設定為準。"
+              "label": "sudo 請求 PTY",
+              "description": "為 sudo 提示請求 TTY。"
             },
             "read_only": {
               "label": "唯讀",
-              "description": "在該連線上拒絕一切寫入操作（SFTP 變更、上傳、sudo 命令）；啟用期間 Quick Sudo 強制關閉。"
+              "description": "拒絕此連線上的寫入操作。"
             },
             "sudo_whitelist": {
-              "label": "sudo 命令白名單",
-              "description": "以 sudoers 風格為提權命令設定白名單，每行一條（也可用分號分隔）。詞條精確匹配，'*' 匹配一個參數，結尾 '*' 匹配其餘部分（如 'systemctl restart *'）。設定後 sudo 僅對匹配的命令執行；留空表示不限制。"
+              "label": "sudo 白名單",
+              "description": "選用的 sudo 命令白名單，每行一條。留空允許所有命令。"
+            },
+            "triggers_enabled": {
+              "label": "啟用自動回應",
+              "description": "啟用 tssh/JSON Expect 規則。預設關閉，已儲存規則不會執行。"
+            },
+            "advanced_options": {
+              "label": "顯示進階選項",
+              "description": "顯示 SSH、sudo、自動化與命令等選用設定，預設關閉。"
             }
           },
           "actions": {

@@ -17,6 +17,8 @@ export interface AuditEntry {
   connection?: string;
   sessionId?: string;
   command?: string;
+  /** 命令输出尾部（后端截断 1024 字符；旧行/被拒行无此字段）。 */
+  output?: string;
   decision?: string;
   /** 审批轨迹：none|prompt|approved|denied|timeout|remembered（并行批次形状）。 */
   approval?: string;
@@ -32,11 +34,14 @@ export interface AuditEntry {
   error?: string;
 }
 
-/** 已知 kind → i18n key 查表（`auditLog.kind.*` 组）；未知 kind 回退原文。 */
+/** 已知 kind → i18n key 查表（`auditLog.kind.*` 组）；未知 kind 回退原文。
+ *  `ssh_exec` / `ssh_exec_sudo` 是并行批次行的 tool 原名（kind 即 tool）。 */
 export const AUDIT_KIND_TO_I18N: Readonly<Record<string, string>> = {
   "mcp.tool": "auditLog.kind.mcpTool",
   "mcp.gate": "auditLog.kind.mcpGate",
   "exec": "auditLog.kind.exec",
+  "ssh_exec": "auditLog.kind.exec",
+  "ssh_exec_sudo": "auditLog.kind.execSudo",
   "agent.challenge": "auditLog.kind.agentChallenge",
   "terminal.auto_sudo": "auditLog.kind.autoSudo",
 };
@@ -85,7 +90,7 @@ export function sanitizeAuditEntries(raw: unknown, limit = 200): AuditEntry[] {
     const entry: AuditEntry = { ts, kind };
     const tool = optionalString(record.tool);
     if (tool !== undefined) entry.tool = tool;
-    const optionalStrings = ["gate", "sessionId", "command", "decision", "approval", "risk", "mode", "kind2", "outcome", "error"] as const;
+    const optionalStrings = ["gate", "sessionId", "command", "output", "decision", "approval", "risk", "mode", "kind2", "outcome", "error"] as const;
     for (const field of optionalStrings) {
       const value = optionalString(record[field]);
       if (value !== undefined) entry[field] = value;

@@ -890,6 +890,20 @@ impl McpState {
             } else {
                 audit_log::ExecMode::Stdio
             },
+            // The exec family carries `command` in and returns `output` —
+            // record both (clamped in audit_log::append) so the ledger replays
+            // what ran and what it printed. Other gated tools simply carry no
+            // such fields and stay null.
+            command: arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            output: result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("output"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
             error: result
                 .as_ref()
                 .err()
@@ -3833,6 +3847,7 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         // SetEnv / RemoteCommand are workbench connection-form features.
         set_env: Vec::new(),
         remote_command: String::new(),
+        triggers_enabled: triggers.is_some(),
         triggers,
         password_command,
         passphrase_command,
@@ -3943,7 +3958,7 @@ fn connection_properties(extra: &[(&str, &str, &str)]) -> Value {
         "passwordPromptHint": { "type": "string", "description": PASSWORD_PROMPT_HINT_DESCRIPTION },
         "totpPromptHint": { "type": "string", "description": TOTP_PROMPT_HINT_DESCRIPTION },
         "jumpHosts": { "type": "array", "description": "ProxyJump chain (up to 3): [{\"host\":\"bastion\",\"port\":22,\"username\":\"ops\",\"password\":\"…\"}] with snake_case fields; replaces direct dialing" },
-        "triggers": { "type": "string", "description": "Expect-style terminal triggers as a JSON string, e.g. {\"stages\":[{\"pattern\":\"(?i)code\",\"sendText\":\"654321\\\\r\"}]}; each stage answers sendText, sendSecretKey (trigger_answer_1/2, unavailable on inline dials) or sendCommand (local command) when its ordered regex matches the PTY output. Invalid JSON, limits (max 16 stages) or an uncompileable regex fails the dial. A malicious server can fake a matching prompt to harvest the configured reply" },
+        "triggers": { "type": "string", "description": "Expect-style terminal triggers as a JSON or tssh text string. Official syntax reference: https://github.com/trzsz/trzsz-ssh. Example: {\"stages\":[{\"pattern\":\"(?i)code\",\"sendText\":\"654321\\\\r\"}]}; each stage answers sendText, sendSecretKey (trigger_answer_1/2, unavailable on inline dials) or sendCommand (local command) when its ordered regex matches the PTY output. Invalid JSON/tssh rules, limits (max 16 stages) or an uncompileable regex fails the dial. A malicious server can fake a matching prompt to harvest the configured reply" },
         "passwordCommand": { "type": "string", "description": "Local command run only when no explicit password is set; its stdout minus one trailing newline is the login password. Placeholders: %h host, %u username, %p port, %% a literal %. Explicit credentials win" },
         "passphraseCommand": { "type": "string", "description": "Local command run only when an encrypted private key cannot be decoded without a passphrase; its stdout minus one trailing newline is the passphrase. Placeholders: %h host, %u username, %p port, %% a literal %" },
     });

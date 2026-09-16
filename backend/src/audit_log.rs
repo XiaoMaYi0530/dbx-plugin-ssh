@@ -36,6 +36,14 @@ const TAIL_LIMIT_CAP: usize = 500;
 /// Cap of the `error` field, in characters, applied before writing.
 const MAX_ERROR_CHARS: usize = 1024;
 
+/// Cap of the `command` field, in characters, applied before writing.
+const MAX_COMMAND_CHARS: usize = 512;
+
+/// Cap of the `output` field, in characters, applied before writing. The
+/// audit ledger is a replay of *what ran*, not a full transcript: a tail of
+/// the output is enough to see what a command did.
+const MAX_OUTPUT_CHARS: usize = 1024;
+
 /// Which branch of the existing exec gate sequence produced this entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateOutcome {
@@ -93,7 +101,8 @@ pub enum ExecMode {
 /// One audit record. Serde shape is the `ssh/audit/list` entry contract:
 /// camelCase keys, enum string values exactly as in PROTOCOL, and `None`
 /// serialized as `null` (no `skip_serializing_if`) so every line keeps the
-/// same shape.
+/// same shape. `command`/`output` carry the audited command text and its
+/// (truncated) result — clamped at both the write sites and in [`append`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditEntry {
     pub ts_ms: u64,
@@ -105,6 +114,8 @@ pub struct AuditEntry {
     pub exit_code: Option<i64>,
     pub duration_ms: u64,
     pub mode: ExecMode,
+    pub command: Option<String>,
+    pub output: Option<String>,
     pub error: Option<String>,
 }
 
@@ -293,7 +304,7 @@ impl ExecMode {
 impl serde::Serialize for AuditEntry {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("AuditEntry", 10)?;
+        let mut state = serializer.serialize_struct("AuditEntry", 12)?;
         state.serialize_field("tsMs", &self.ts_ms)?;
         state.serialize_field("tool", &self.tool)?;
         state.serialize_field("connectionId", &self.connection_id)?;
@@ -303,13 +314,17 @@ impl serde::Serialize for AuditEntry {
         state.serialize_field("exitCode", &self.exit_code)?;
         state.serialize_field("durationMs", &self.duration_ms)?;
         state.serialize_field("mode", &self.mode)?;
+        state.serialize_field("command", &self.command)?;
+        state.serialize_field("output", &self.output)?;
         state.serialize_field("error", &self.error)?;
         state.end()
     }
 }
 
 /// Deserialize through a camelCase-named bridge struct; all fields required
-/// (missing `exitCode`/`error` is a bad line, skipped by `tail`).
+/// (missing `exitCode`/`error` is a bad line, skipped by `tail`). The newer
+/// `command`/`output` fields default to `None` so pre-0.4.77 lines (which
+/// never carried them) keep replaying.
 impl<'de> serde::Deserialize<'de> for AuditEntry {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
@@ -324,6 +339,10 @@ impl<'de> serde::Deserialize<'de> for AuditEntry {
             exit_code: Option<i64>,
             duration_ms: u64,
             mode: ExecMode,
+            #[serde(default)]
+            command: Option<String>,
+            #[serde(default)]
+            output: Option<String>,
             error: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
@@ -337,6 +356,8 @@ impl<'de> serde::Deserialize<'de> for AuditEntry {
             exit_code: wire.exit_code,
             duration_ms: wire.duration_ms,
             mode: wire.mode,
+            command: wire.command,
+            output: wire.output,
             error: wire.error,
         })
     }
@@ -379,10 +400,16 @@ pub fn append(data_dir: &Path, entry: &AuditEntry) -> Result<(), String> {
             let _ = std::fs::rename(&path, rotated_path(data_dir));
         }
     }
-    // Clamp before writing so one bad error string cannot blow up the line.
+    // Clamp before writing so one bad string cannot blow up the line.
     let mut clamped = entry.clone();
     if let Some(error) = clamped.error.take() {
         clamped.error = Some(error.chars().take(MAX_ERROR_CHARS).collect());
+    }
+    if let Some(command) = clamped.command.take() {
+        clamped.command = Some(command.chars().take(MAX_COMMAND_CHARS).collect());
+    }
+    if let Some(output) = clamped.output.take() {
+        clamped.output = Some(output.chars().take(MAX_OUTPUT_CHARS).collect());
     }
     let mut line = serde_json::to_string(&clamped)
         .map_err(|error| format!("Failed to encode audit entry: {error}"))?;
@@ -475,6 +502,8 @@ mod tests {
             exit_code: Some(0),
             duration_ms: 12,
             mode: ExecMode::Embedded,
+            command: Some("echo hi".to_string()),
+            output: Some("hi".to_string()),
             error: None,
         }
     }
@@ -578,6 +607,7 @@ mod tests {
             keys,
             [
                 "approval",
+                "command",
                 "connectionId",
                 "durationMs",
                 "error",
@@ -585,6 +615,7 @@ mod tests {
                 "gate",
                 "mode",
                 "outcome",
+                "output",
                 "tool",
                 "tsMs"
             ]
@@ -605,6 +636,8 @@ mod tests {
             "\"exitCode\":",
             "\"durationMs\":",
             "\"mode\":",
+            "\"command\":",
+            "\"output\":",
             "\"error\":",
         ] {
             let at = line[cursor..]
@@ -627,6 +660,8 @@ mod tests {
         denied.exit_code = None;
         denied.duration_ms = 340;
         denied.mode = ExecMode::Terminal;
+        denied.command = Some("rm -rf /tmp/scratch".to_string());
+        denied.output = None;
         denied.error = Some("needs confirmation".to_string());
         append(&dir, &denied).unwrap();
 
@@ -642,6 +677,8 @@ mod tests {
         assert_eq!(first.exit_code, Some(0));
         assert_eq!(first.duration_ms, 12);
         assert_eq!(first.mode, ExecMode::Embedded);
+        assert_eq!(first.command.as_deref(), Some("echo hi"));
+        assert_eq!(first.output.as_deref(), Some("hi"));
         assert_eq!(first.error, None);
 
         assert_eq!(second.ts_ms, 2_000);
@@ -653,6 +690,8 @@ mod tests {
         assert_eq!(second.exit_code, None, "None survives as null");
         assert_eq!(second.duration_ms, 340);
         assert_eq!(second.mode, ExecMode::Terminal);
+        assert_eq!(second.command.as_deref(), Some("rm -rf /tmp/scratch"));
+        assert_eq!(second.output, None);
         assert_eq!(second.error.as_deref(), Some("needs confirmation"));
 
         // Raw line keeps nulls in place (stable row shape).
@@ -718,6 +757,51 @@ mod tests {
         let loaded = tail(&dir, 10, None).unwrap();
         let error = loaded[0].error.as_deref().unwrap();
         assert_eq!(error.chars().count(), MAX_ERROR_CHARS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_clamps_command_and_output_text() {
+        let dir = temp_dir("clamp-cmd");
+        let mut entry = sample_entry(1_000);
+        entry.command = Some("c".repeat(2_048));
+        entry.output = Some("o".repeat(4_096));
+        append(&dir, &entry).unwrap();
+        let loaded = tail(&dir, 10, None).unwrap();
+        assert_eq!(
+            loaded[0]
+                .command
+                .as_deref()
+                .map(str::chars)
+                .map(Iterator::count),
+            Some(MAX_COMMAND_CHARS)
+        );
+        assert_eq!(
+            loaded[0]
+                .output
+                .as_deref()
+                .map(str::chars)
+                .map(Iterator::count),
+            Some(MAX_OUTPUT_CHARS)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_lines_without_command_output_still_replay() {
+        // 0.4.77 之前的行没有 command/output 字段：tail 必须继续回放（缺省
+        // 为 null），老审计文件不能因为新字段作废。
+        let dir = temp_dir("legacy");
+        let path = audit_path(&dir);
+        std::fs::write(
+            &path,
+            "{\"tsMs\":1000,\"tool\":\"ssh_exec\",\"connectionId\":\"conn-1\",\"gate\":\"pass\",\"approval\":\"none\",\"outcome\":\"ok\",\"exitCode\":0,\"durationMs\":12,\"mode\":\"embedded\",\"error\":null}\n",
+        )
+        .unwrap();
+        let entries = tail(&dir, 10, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, None);
+        assert_eq!(entries[0].output, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -3,10 +3,19 @@
 //! 用户在连接上配置有序阶段规则（对齐 tssh `ExpectPattern1..N`）：PTY 输出
 //! 经 `normalize_auth_prompt_text` 归一化后进入 ≤8 KiB 滚动缓冲，按序匹配
 //! 正则，命中后生成应答发送计划（`TriggerDecision.segments`），由终端读
-//! 循环负责分段 `tokio::sleep` 写回 channel。每阶段应答三选一：
+//! 循环负责分段 `tokio::sleep` 写回 channel。每阶段应答五选一：
 //! - 明文 `sendText`（`\r`/`\n`/`\t` 转义、`\|` 分段停顿 `sleepMs`）；
 //! - 密文引用 `sendSecretKey`（解析宿主 secret binding 槽位，自动补 `\r`）；
-//! - 本地命令 `sendCommand`（shell 执行取 stdout，自动补 `\r`）。
+//! - 字面密文 `sendSecret`（tssh `ExpectSendPassN` 解密产物，自动补 `\r`）；
+//! - TOTP `sendTotp`（RFC 6238 SHA1/6 位/30 s，命中时按当前时间生成，
+//!   对齐 tssh `ExpectSendTotpN` / `ExpectSendEncTotpN`，自动补 `\r`）；
+//! - 本地命令 `sendCommand`（shell 执行取 stdout，自动补 `\r`；
+//!   对齐 tssh `ExpectSendOtpN` / `ExpectSendEncOtpN`）。
+//!
+//! tssh 文本形态完全兼容（0.4.77 起）：`ExpectSendPassN` /
+//! `ExpectCaseSendPassN` / `ExpectSendEncTotpN` / `ExpectSendEncOtpN` 的
+//! `--enc-secret` 密文按 tssh `decodeSecret` 同款算法解密（AES-256-GCM、
+//! 固定内嵌密钥，见 [`decode_tssh_enc_secret`]）——与 tssh 同为混淆而非加密。
 //!
 //! 复位语义（契约 D3）：行尾 `$`/`#` 的 shell 提示（复用 `exec::has_shell_prompt`）
 //! 即阶段游标归零；阶段超时（秒级，`now` 由调用方注入便于测试）同样归零并
@@ -16,7 +25,7 @@
 //! 命中不推进游标，答完继续等本阶段 pattern。
 //!
 //! 安全红线：应答内容只存在于发送计划里，绝不进日志、事件或错误信息；
-//! `TriggersConfig` 的 `Debug` 实现对密文应答脱敏。
+//! `TriggersConfig` 的 `Debug` 实现对密文应答（`Secret`/`Totp`）脱敏。
 
 use std::fmt;
 use std::future::Future;
@@ -24,7 +33,13 @@ use std::pin::Pin;
 use std::process::Output;
 use std::time::Duration;
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use hmac::{Hmac, Mac};
 use regex::Regex;
+use sha1::Sha1;
 use zeroize::Zeroizing;
 
 use crate::exec::{has_shell_prompt, normalize_auth_prompt_text};
@@ -55,6 +70,14 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SECRET_SLOT_KEYS: &[&str] = &["trigger_answer_1", "trigger_answer_2"];
 /// Rolling match buffer ceiling (contract D2).
 const MAX_BUFFER_BYTES: usize = 8 * 1024;
+/// TOTP secret ceiling after base32 decode (RFC 4226 recommends ≥16 bytes;
+/// 64 is a generous abuse cap).
+const MAX_TOTP_SECRET_BYTES: usize = 64;
+/// tssh (trzsz-ssh) `--enc-secret` obfuscation key, byte-for-byte identical to
+/// tssh's embedded `secretEncodeKey` (tssh/config.go): hex blobs are
+/// `nonce(12) || AES-256-GCM(ct||tag)` under this key. Obfuscation, not
+/// encryption — the same trust level tssh itself documents.
+const TSSH_ENC_SECRET_KEY: &[u8; 32] = b"THE_UNSAFE_KEY_FOR_ENCODING_ONLY";
 
 /// How secret/command answers are paced onto the wire (tssh `ExpectPassSleep`).
 /// Plain `sendText` answers are never paced by this knob (contract §2.1).
@@ -89,13 +112,17 @@ impl PassSleep {
 }
 
 /// One stage's answer, with secret slots already resolved to their values.
-/// Variants other than `Secret` carry user-authored configuration (plaintext
-/// by definition); `Secret` holds the fetched slot value and is redacted in
-/// `Debug` so a connection dump can never leak it.
+/// Variants other than `Secret`/`Totp` carry user-authored configuration
+/// (plaintext by definition); `Secret` holds a fetched slot value or a
+/// decrypted tssh blob and `Totp` holds a raw TOTP key — both are redacted in
+/// `Debug` so a connection dump can never leak them.
 #[derive(Clone, PartialEq, Eq)]
 pub enum StageAnswer {
     Text(String),
     Secret(String),
+    /// Raw RFC 4226 HMAC key (base32-decoded); the code is generated at match
+    /// time so a long-pending stage answers with a fresh one.
+    Totp(Vec<u8>),
     Command(String),
 }
 
@@ -106,7 +133,7 @@ impl StageAnswer {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Text(_) => "text",
-            Self::Secret(_) => "secret",
+            Self::Secret(_) | Self::Totp(_) => "secret",
             Self::Command(_) => "command",
         }
     }
@@ -117,6 +144,7 @@ impl fmt::Debug for StageAnswer {
         match self {
             Self::Text(text) => write!(formatter, "Text({text:?})"),
             Self::Secret(_) => formatter.write_str("Secret(\"<redacted>\")"),
+            Self::Totp(_) => formatter.write_str("Totp(\"<redacted>\")"),
             Self::Command(command) => write!(formatter, "Command({command:?})"),
         }
     }
@@ -354,6 +382,65 @@ pub fn run_credential_command<'a>(
     execute_command(&ShellExecutor, command, placeholders, COMMAND_TIMEOUT)
 }
 
+/// Decodes a TOTP shared secret: base32 (RFC 4648), tolerant of the shapes
+/// authenticator apps and tssh accept — spaces/hyphens dropped, case folded,
+/// missing `=` padding restored. Returns the raw HMAC key bytes.
+fn decode_base32_secret(text: &str) -> Result<Vec<u8>, String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|character| !matches!(character, ' ' | '-'))
+        .map(|character| character.to_ascii_uppercase())
+        .collect();
+    let unpadded = cleaned.trim_end_matches('=');
+    let mut padded = unpadded.to_string();
+    if !unpadded.len().is_multiple_of(8) {
+        let padding = 8 - (unpadded.len() % 8);
+        padded.push_str(&"=".repeat(padding));
+    }
+    data_encoding::BASE32
+        .decode(padded.as_bytes())
+        .map_err(|_| format!("invalid base32 TOTP secret (expected A-Z2-7, got '{text}')"))
+}
+
+/// Generates the RFC 6238 TOTP code: HMAC-SHA1, 6 digits, 30-second step —
+/// the pquerna/otp defaults tssh's `getTotpCode` uses, so codes are
+/// byte-compatible with `tssh ExpectSendTotpN`.
+fn totp_code(secret: &[u8], now_ms: u64) -> String {
+    let counter = (now_ms / 1000) / 30;
+    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(&counter.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[digest.len() - 1] & 0x0f) as usize;
+    let binary =
+        u32::from_be_bytes(digest[offset..offset + 4].try_into().expect("4 bytes")) & 0x7fff_ffff;
+    format!("{:06}", binary % 1_000_000)
+}
+
+/// Decrypts a tssh `--enc-secret` blob the exact way tssh's `decodeSecret`
+/// does: hex-decode, split off the 12-byte nonce, AES-256-GCM open under the
+/// fixed embedded key. `error_context` names the offending directive
+/// (`ExpectSendPass2`, …) for the connection error.
+fn decode_tssh_enc_secret(hex_text: &str, error_context: &str) -> Result<String, String> {
+    let blob = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(hex_text.trim().as_bytes())
+        .map_err(|_| format!("{error_context}: value is not a valid tssh --enc-secret hex blob"))?;
+    if blob.len() < 12 + 16 {
+        return Err(format!(
+            "{error_context}: tssh --enc-secret blob is too short (expected nonce + ciphertext + tag)"
+        ));
+    }
+    let cipher = Aes256Gcm::new(TSSH_ENC_SECRET_KEY.into());
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&blob[..12]), &blob[12..])
+        .map_err(|_| {
+            format!(
+                "{error_context}: tssh --enc-secret blob failed to decrypt (was it produced by tssh --enc-secret?)"
+            )
+        })?;
+    String::from_utf8(plaintext)
+        .map_err(|_| format!("{error_context}: decrypted secret is not valid UTF-8"))
+}
+
 /// Parses `external_config.triggers` into a validated [`TriggersConfig`].
 /// Accepts three input shapes:
 /// - the raw JSON object (host lifecycle payloads, smoke tests);
@@ -576,10 +663,12 @@ fn tssh_pattern_value(value: &str, line_no: usize) -> Result<String, String> {
 /// `ExpectSleepMS` / `ExpectPassSleep` globals plus per-stage
 /// `ExpectPatternN` / `ExpectSendTextN` / `ExpectSendOtpN` and
 /// `ExpectCaseSendTextN <pattern> <text>`. `ExpectCount 0` explicitly
-/// disables the engine; tssh's ciphertext/TOTP answer directives
-/// (`ExpectSendPass*`, `ExpectSend*Totp*`, `ExpectCaseSend*` secret forms)
-/// are rejected with a portable-replacement hint because only tssh can
-/// decrypt `--enc-secret` output.
+/// disables the engine. The tssh ciphertext/TOTP answer directives are fully
+/// supported (0.4.77): `ExpectSendPassN` / `ExpectCaseSendPassN` /
+/// `ExpectSendEncTotpN` / `ExpectSendEncOtpN` decrypt `--enc-secret` blobs
+/// exactly like tssh (`decode_tssh_enc_secret`), and `ExpectSendTotpN`
+/// generates RFC 6238 codes — both mapping onto the plugin's
+/// `sendSecret` / `sendTotp` / `sendCommand` answers.
 fn parse_tssh_text(
     text: &str,
     secrets: &dyn Fn(&str) -> Option<String>,
@@ -590,6 +679,35 @@ fn parse_tssh_text(
     let mut pass_sleep: Option<PassSleep> = None;
     let mut stages: std::collections::BTreeMap<usize, serde_json::Map<String, serde_json::Value>> =
         std::collections::BTreeMap::new();
+
+    // Inserts one answer field after enforcing the one-answer-per-stage rule
+    // (tssh resolves duplicates by directive priority; a paste carrying two
+    // answers for the same stage is pathological, so reject it).
+    let insert_answer = |stages: &mut std::collections::BTreeMap<
+        usize,
+        serde_json::Map<String, serde_json::Value>,
+    >,
+                         number: usize,
+                         field: &str,
+                         value: String,
+                         line_no: usize|
+     -> Result<(), String> {
+        let stage = stages.entry(number).or_default();
+        if [
+            "sendText",
+            "sendSecretKey",
+            "sendSecret",
+            "sendTotp",
+            "sendCommand",
+        ]
+        .iter()
+        .any(|key| stage.contains_key(*key))
+        {
+            return Err(tssh_error(line_no, "duplicate stage answer"));
+        }
+        stage.insert(field.to_string(), serde_json::Value::String(value));
+        Ok(())
+    };
 
     for (offset, raw_line) in text.lines().enumerate() {
         let line_no = offset + 1;
@@ -670,17 +788,36 @@ fn parse_tssh_text(
                     "sendCommand"
                 };
                 let number = stage_number()?;
-                let stage = stages.entry(number).or_default();
-                if stage.contains_key("sendText")
-                    || stage.contains_key("sendCommand")
-                    || stage.contains_key("sendSecretKey")
-                {
-                    return Err(tssh_error(line_no, "duplicate stage answer"));
-                }
-                stage.insert(
-                    field.to_string(),
-                    serde_json::Value::String(value.to_string()),
-                );
+                insert_answer(&mut stages, number, field, value.to_string(), line_no)?;
+            }
+            // tssh ExpectSendPassN: --enc-secret blob, decrypted with tssh's
+            // own fixed key and sent as a secret (Enter appended).
+            "expectsendpass" => {
+                let number = stage_number()?;
+                let decoded = decode_tssh_enc_secret(value, &format!("ExpectSendPass{number}"))?;
+                insert_answer(&mut stages, number, "sendSecret", decoded, line_no)?;
+            }
+            // tssh ExpectSendTotpN: plaintext base32 secret; the code is
+            // generated at match time.
+            "expectsendtotp" => {
+                let number = stage_number()?;
+                decode_base32_secret(value).map_err(|error| tssh_error(line_no, &error))?;
+                insert_answer(&mut stages, number, "sendTotp", value.to_string(), line_no)?;
+            }
+            // tssh ExpectSendEncTotpN: --enc-secret blob whose plaintext is
+            // the base32 TOTP secret.
+            "expectsendenctotp" => {
+                let number = stage_number()?;
+                let decoded = decode_tssh_enc_secret(value, &format!("ExpectSendEncTotp{number}"))?;
+                decode_base32_secret(&decoded).map_err(|error| tssh_error(line_no, &error))?;
+                insert_answer(&mut stages, number, "sendTotp", decoded, line_no)?;
+            }
+            // tssh ExpectSendEncOtpN: --enc-secret blob whose plaintext is a
+            // local command producing the dynamic password.
+            "expectsendencotp" => {
+                let number = stage_number()?;
+                let decoded = decode_tssh_enc_secret(value, &format!("ExpectSendEncOtp{number}"))?;
+                insert_answer(&mut stages, number, "sendCommand", decoded, line_no)?;
             }
             "expectcasesendtext" => {
                 let number = stage_number()?;
@@ -702,11 +839,37 @@ fn parse_tssh_text(
                     serde_json::Value::String(case_text.trim().to_string()),
                 );
             }
+            // tssh ExpectCaseSendPassN: case pre-match answering a decrypted
+            // --enc-secret secret.
+            "expectcasesendpass" => {
+                let number = stage_number()?;
+                let (case_pattern, case_value) =
+                    value.split_once(char::is_whitespace).ok_or_else(|| {
+                        tssh_error(line_no, "ExpectCaseSendPass requires '<pattern> <secret>'")
+                    })?;
+                let case_pattern = case_pattern.trim();
+                let decoded = decode_tssh_enc_secret(
+                    case_value.trim(),
+                    &format!("ExpectCaseSendPass{number}"),
+                )?;
+                let stage = stages.entry(number).or_default();
+                if stage.contains_key("casePattern") {
+                    return Err(tssh_error(line_no, "duplicate case rule"));
+                }
+                stage.insert(
+                    "casePattern".to_string(),
+                    serde_json::Value::String(tssh_pattern_value(case_pattern, line_no)?),
+                );
+                stage.insert(
+                    "caseSendSecret".to_string(),
+                    serde_json::Value::String(decoded),
+                );
+            }
             _ if name.starts_with("expectcasesend") || name.starts_with("expectsend") => {
                 return Err(tssh_error(
                     line_no,
                     &format!(
-                        "'{directive}' is not portable: tssh --enc-secret ciphertexts and in-trigger TOTP secrets have no plugin equivalent; use sendText, sendSecretKey (trigger_answer_1/2) or sendCommand instead"
+                        "'{directive}' is not a supported tssh directive; supported forms: ExpectSendTextN, ExpectSendPassN, ExpectSendTotpN, ExpectSendEncTotpN, ExpectSendOtpN, ExpectSendEncOtpN, ExpectCaseSendTextN, ExpectCaseSendPassN"
                     ),
                 ));
             }
@@ -822,22 +985,26 @@ fn parse_stage(
         .to_string();
     let pattern = compile_pattern(&pattern_text, &prefix("pattern"))?;
 
-    // Answer three-choose-one (contract §2.1).
+    // Answer five-choose-one (contract §2.1).
     let send_text = required_text(stage, "sendText")?;
     let send_secret_key = required_text(stage, "sendSecretKey")?;
+    let send_secret = required_text(stage, "sendSecret")?;
+    let send_totp = required_text(stage, "sendTotp")?;
     let send_command = required_text(stage, "sendCommand")?;
     let answer_count = usize::from(send_text.is_some())
         + usize::from(send_secret_key.is_some())
+        + usize::from(send_secret.is_some())
+        + usize::from(send_totp.is_some())
         + usize::from(send_command.is_some());
     if answer_count == 0 {
         return Err(format!(
-            "{}: exactly one of sendText, sendSecretKey or sendCommand is required",
+            "{}: exactly one of sendText, sendSecretKey, sendSecret, sendTotp or sendCommand is required",
             prefix("answer")
         ));
     }
     if answer_count > 1 {
         return Err(format!(
-            "{}: sendText, sendSecretKey and sendCommand are mutually exclusive",
+            "{}: sendText, sendSecretKey, sendSecret, sendTotp and sendCommand are mutually exclusive",
             prefix("answer")
         ));
     }
@@ -851,6 +1018,24 @@ fn parse_stage(
         StageAnswer::Text(text.to_string())
     } else if let Some(key) = send_secret_key {
         resolve_secret(key, &prefix("sendSecretKey"), secrets)?
+    } else if let Some(secret) = send_secret {
+        if secret.len() > MAX_SEND_TEXT_LEN {
+            return Err(format!(
+                "{}: answer exceeds {MAX_SEND_TEXT_LEN} characters",
+                prefix("sendSecret")
+            ));
+        }
+        StageAnswer::Secret(secret.to_string())
+    } else if let Some(secret) = send_totp {
+        let key = decode_base32_secret(secret)
+            .map_err(|error| format!("{}: {error}", prefix("sendTotp")))?;
+        if key.len() > MAX_TOTP_SECRET_BYTES {
+            return Err(format!(
+                "{}: TOTP secret exceeds {MAX_TOTP_SECRET_BYTES} bytes after base32 decoding",
+                prefix("sendTotp")
+            ));
+        }
+        StageAnswer::Totp(key)
     } else {
         let command = send_command.expect("answer_count == 1 guarantees one variant");
         if command.len() > MAX_COMMAND_LEN {
@@ -866,22 +1051,29 @@ fn parse_stage(
     let case_pattern_text = required_text(stage, "casePattern")?;
     let case_send_text = required_text(stage, "caseSendText")?;
     let case_send_secret_key = required_text(stage, "caseSendSecretKey")?;
-    let case_answer_count =
-        usize::from(case_send_text.is_some()) + usize::from(case_send_secret_key.is_some());
+    let case_send_secret = required_text(stage, "caseSendSecret")?;
+    let case_answer_count = usize::from(case_send_text.is_some())
+        + usize::from(case_send_secret_key.is_some())
+        + usize::from(case_send_secret.is_some());
     if case_answer_count > 0 && case_pattern_text.is_none() {
         return Err(format!(
-            "{}: caseSendText/caseSendSecretKey require casePattern",
+            "{}: caseSendText/caseSendSecretKey/caseSendSecret require casePattern",
             prefix("caseAnswer")
         ));
     }
     if case_pattern_text.is_some() && case_answer_count != 1 {
         return Err(format!(
-            "{}: exactly one of caseSendText or caseSendSecretKey is required alongside casePattern",
+            "{}: exactly one of caseSendText, caseSendSecretKey or caseSendSecret is required alongside casePattern",
             prefix("caseAnswer")
         ));
     }
-    let case = match (case_pattern_text, case_send_text, case_send_secret_key) {
-        (Some(pattern), Some(text), None) => {
+    let case = match (
+        case_pattern_text,
+        case_send_text,
+        case_send_secret_key,
+        case_send_secret,
+    ) {
+        (Some(pattern), Some(text), None, None) => {
             if text.len() > MAX_SEND_TEXT_LEN {
                 return Err(format!(
                     "{}: answer exceeds {MAX_SEND_TEXT_LEN} characters",
@@ -893,10 +1085,22 @@ fn parse_stage(
                 answer: StageAnswer::Text(text.to_string()),
             })
         }
-        (Some(pattern), None, Some(key)) => Some(CaseRule {
+        (Some(pattern), None, Some(key), None) => Some(CaseRule {
             pattern: compile_pattern(pattern, &prefix("casePattern"))?,
             answer: resolve_secret(key, &prefix("caseSendSecretKey"), secrets)?,
         }),
+        (Some(pattern), None, None, Some(secret)) => {
+            if secret.len() > MAX_SEND_TEXT_LEN {
+                return Err(format!(
+                    "{}: answer exceeds {MAX_SEND_TEXT_LEN} characters",
+                    prefix("caseSendSecret")
+                ));
+            }
+            Some(CaseRule {
+                pattern: compile_pattern(pattern, &prefix("casePattern"))?,
+                answer: StageAnswer::Secret(secret.to_string()),
+            })
+        }
         _ => None,
     };
 
@@ -1009,12 +1213,23 @@ pub fn pass_sleep_segments(
 type AnswerPlan = (TriggerKind, Vec<(Vec<u8>, u64)>, Option<String>);
 
 /// Builds the send plan plus decision kind for a resolved stage answer.
-fn answer_segments(answer: &StageAnswer, sleep_ms: u64, pass_sleep: PassSleep) -> AnswerPlan {
+/// `now_ms` timestamps TOTP generation (the code must be fresh at match time).
+fn answer_segments(
+    answer: &StageAnswer,
+    sleep_ms: u64,
+    pass_sleep: PassSleep,
+    now_ms: u64,
+) -> AnswerPlan {
     match answer {
         StageAnswer::Text(text) => (TriggerKind::Text, text_segments(text, sleep_ms), None),
         StageAnswer::Secret(value) => (
             TriggerKind::Secret,
             pass_sleep_segments(value, sleep_ms, pass_sleep),
+            None,
+        ),
+        StageAnswer::Totp(secret) => (
+            TriggerKind::Secret,
+            pass_sleep_segments(&totp_code(secret, now_ms), sleep_ms, pass_sleep),
             None,
         ),
         StageAnswer::Command(command) => {
@@ -1084,7 +1299,7 @@ impl TriggerEngine {
             return None;
         }
         // Case pre-match answers without advancing the cursor (contract §0).
-        if let Some(decision) = self.try_case_match() {
+        if let Some(decision) = self.try_case_match(now_ms) {
             return Some(decision);
         }
         if let Some(decision) = self.try_stage_match(now_ms) {
@@ -1114,11 +1329,15 @@ impl TriggerEngine {
         self.stage_since_ms = Some(now_ms);
     }
 
-    fn try_case_match(&mut self) -> Option<TriggerDecision> {
+    fn try_case_match(&mut self, now_ms: u64) -> Option<TriggerDecision> {
         let case = self.config.stages[self.stage_cursor].case.as_ref()?;
         let matched = case.pattern.find(&self.buffer)?;
-        let (kind, segments, command) =
-            answer_segments(&case.answer, self.config.sleep_ms, self.config.pass_sleep);
+        let (kind, segments, command) = answer_segments(
+            &case.answer,
+            self.config.sleep_ms,
+            self.config.pass_sleep,
+            now_ms,
+        );
         // Consume the matched text so the same case text cannot answer twice;
         // the stage cursor intentionally stays put.
         self.consume_buffer(matched.end());
@@ -1140,8 +1359,12 @@ impl TriggerEngine {
         };
         // D2: consume the matched text so later chunks continue past it.
         self.consume_buffer(match_end);
-        let (kind, segments, command) =
-            answer_segments(&answer, self.config.sleep_ms, self.config.pass_sleep);
+        let (kind, segments, command) = answer_segments(
+            &answer,
+            self.config.sleep_ms,
+            self.config.pass_sleep,
+            now_ms,
+        );
         let stage_number = self.stage_cursor + 1;
         // Advance (wrapping so a completed sequence can run again without a
         // shell prompt in between) and restart the next stage's timer.
@@ -1356,19 +1579,121 @@ mod tests {
     }
 
     #[test]
-    fn parse_tssh_rejects_ciphertext_and_totp_answers() {
-        // tssh --enc-secret 密文与触发器内 TOTP 密钥无法移植：显式报错并给出
-        // 可移植替代（sendText/sendSecretKey/sendCommand）。
+    fn parse_tssh_ciphertext_and_totp_answers_are_fully_supported() {
+        // tssh --enc-secret 密文与 TOTP 指令全兼容（0.4.77）：与 tssh 同款
+        // AES-256-GCM 固定密钥解密，TOTP 按 RFC 6238 生成。
+        fn tssh_encrypt(plaintext: &[u8]) -> String {
+            use aes_gcm::aead::Aead;
+            let cipher = Aes256Gcm::new(TSSH_ENC_SECRET_KEY.into());
+            let nonce = Nonce::from_slice(b"0123456789ab");
+            // tssh Seal(nonce, nonce, secret, nil) prefixes the nonce itself.
+            let mut blob = nonce.to_vec();
+            blob.extend_from_slice(&cipher.encrypt(nonce, plaintext).unwrap());
+            data_encoding::HEXLOWER.encode(&blob)
+        }
+        let pass_blob = tssh_encrypt(b"s3cret-pass");
+        let otp_blob = tssh_encrypt(b"oathtool --totp -b K");
+        let totp_blob = tssh_encrypt(b"GEZDGNBVGY3TQOJQ");
+
+        let text = format!(
+            "#!! ExpectCount 2\n\
+             #!! ExpectPattern1 *assword\n\
+             #!! ExpectSendPass1 {pass_blob}\n\
+             #!! ExpectCaseSendPass1 token {pass_blob}\n\
+             #!! ExpectPattern2 token:\n\
+             #!! ExpectSendEncTotp2 {totp_blob}"
+        );
+        let config = parse_triggers(Some(&json!(text)), &no_secrets)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config.stages[0].answer,
+            StageAnswer::Secret("s3cret-pass".into())
+        );
+        let case = config.stages[0].case.as_ref().expect("case rule parsed");
+        assert_eq!(case.answer, StageAnswer::Secret("s3cret-pass".into()));
+        assert_eq!(
+            config.stages[1].answer,
+            StageAnswer::Totp(b"1234567890".to_vec()),
+            "decrypted base32 secret is decoded to raw key bytes"
+        );
+
+        // ExpectSendEncOtpN 解密后是本地命令（= sendCommand）。
+        let text = format!("ExpectPattern1 token:\nExpectSendEncOtp1 {otp_blob}");
+        let config = parse_triggers(Some(&json!(text)), &no_secrets)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config.stages[0].answer,
+            StageAnswer::Command("oathtool --totp -b K".into())
+        );
+
+        // ExpectSendTotpN：明文 base32 密钥直接解码（GEZDGNBVGY3TQOJQ → "1234567890"）。
+        let config = parse_triggers(
+            Some(&json!(
+                "#!! ExpectPattern1 code\n#!! ExpectSendTotp1 gezd gnbv gy3t qojq"
+            )),
+            &no_secrets,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            config.stages[0].answer,
+            StageAnswer::Totp(b"1234567890".to_vec())
+        );
+    }
+
+    #[test]
+    fn totp_code_matches_rfc6238_sha1_vectors() {
+        // RFC 6238 附录 B（SHA1，8 位截 6 位）；密钥为 ASCII "12345678901234567890"。
+        let secret = b"12345678901234567890";
+        assert_eq!(totp_code(secret, 59_000), "287082");
+        assert_eq!(totp_code(secret, 1_111_111_109_000), "081804");
+        assert_eq!(totp_code(secret, 1_234_567_890_000), "005924");
+        assert_eq!(totp_code(secret, 2_000_000_000_000), "279037");
+    }
+
+    #[test]
+    fn engine_answers_totp_stage_with_fresh_code() {
+        // RFC 6238 向量密钥（ASCII "12345678901234567890" 的 base32）。
+        let config = parse_config(json!({
+            "stages": [{ "pattern": "token:", "sendTotp": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" }]
+        }));
+        let mut engine = TriggerEngine::new(config, CommandPlaceholders::new("h", "u", 22, "n"));
+        let decision = engine
+            .observe("Please enter token: ", 59_000)
+            .expect("stage must answer");
+        assert_eq!(decision.kind, TriggerKind::Secret);
+        assert_eq!(
+            decision.segments,
+            pass_sleep_segments("287082", 100, PassSleep::None),
+            "segments carry the code generated at match time"
+        );
+    }
+
+    #[test]
+    fn parse_tssh_ciphertext_and_totp_inputs_still_validate() {
+        // 非法 hex / 截断 blob / 非法 base32 → 明确报错（连接失败，D7）。
         for text in [
             "#!! ExpectSendPass1 d7983b4a",
-            "#!! ExpectSendTotp1 JBSWY3DPEHPK3PXP",
-            "#!! ExpectSendEncOtp2 oathtool --totp -b K",
-            "#!! ExpectCaseSendPass1 token d7983b4a",
+            "#!! ExpectSendEncTotp1 zznot-hex",
+            "#!! ExpectSendTotp1 not!base32",
         ] {
             let error =
                 parse_triggers(Some(&json!(text)), &no_secrets).expect_err("must be rejected");
-            assert!(error.contains("not portable"), "{error}");
+            assert!(
+                error.contains("enc-secret") || error.contains("base32"),
+                "{error}"
+            );
         }
+        let error = parse_triggers(
+            Some(&json!({
+                "stages": [{ "pattern": "code", "sendTotp": "not!base32" }]
+            })),
+            &no_secrets,
+        )
+        .unwrap_err();
+        assert!(error.contains("base32"), "{error}");
     }
 
     #[test]

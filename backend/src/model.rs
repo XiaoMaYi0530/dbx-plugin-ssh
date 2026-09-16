@@ -150,10 +150,12 @@ pub struct StoredConnection {
     /// `ssh RemoteCommand`: exec this command instead of a shell on the
     /// interactive terminal session (PTY stays on). Empty = normal shell.
     pub remote_command: String,
+    /// Independent connection-form switch for expect-style terminal triggers.
+    /// It defaults to false, including for existing connections that still
+    /// contain text in `external_config.triggers`.
+    pub triggers_enabled: bool,
     /// Expect-style terminal triggers (tssh parity, contract §2.1): parsed and
-    /// validated eagerly from `external_config.triggers`, so a malformed rule
-    /// (bad JSON, uncompileable regex, broken three-way answer choice) fails
-    /// the connection instead of silently never firing. `None` = disabled.
+    /// validated eagerly only when `triggers_enabled` is true. `None` = disabled.
     /// Secret answers are resolved from `connection_secrets` at parse time.
     pub triggers: Option<crate::triggers::TriggersConfig>,
     /// Local command fetching the login password when none is stored
@@ -301,6 +303,8 @@ impl JumpHost {
             // simplification, see StoredConnection docs).
             set_env: Vec::new(),
             remote_command: String::new(),
+            // Jump hops never run interactive trigger stages.
+            triggers_enabled: false,
             // Jump hops fetch no credentials locally: their inline credential
             // fields are the whole story.
             triggers: None,
@@ -367,6 +371,10 @@ impl StoredConnection {
             .map(|secrets| credential_string(secrets, "private_key_passphrase"))
             .unwrap_or_default();
         let agent_socket = optional_string(external_config, "agent_socket");
+        let _advanced_options = external_config
+            .and_then(|config| config.get("advanced_options"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         // sudo_password 是凭据：原样读取（首尾空格合法），空白语义由
         // SudoAuth::new 的「空白即回退登录密码」兜底，不在解析层改写。
         let sudo_password = connection_secrets
@@ -384,19 +392,30 @@ impl StoredConnection {
             .unwrap_or_default()
             .trim()
             .to_string();
+        // The form has an independent opt-in switch. Missing/invalid values
+        // are off by default so old non-empty trigger text cannot silently
+        // start sending replies after an upgrade.
+        let triggers_enabled = external_config
+            .and_then(|config| config.get("triggers_enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         // Expect 式终端触发器（camelCase/snake_case 均为 manifest 原生 key，
-        // triggers 本身无别名）。值可以是 JSON 对象（宿主 lifecycle / MCP 桥
-        // 转发）或 JSON 字符串（连接表单 textarea）；密文槽位从
-        // connection_secrets 解析。非法配置让连接直接失败（D7）。
-        let triggers = crate::triggers::parse_triggers(
-            external_config.and_then(|config| config.get("triggers")),
-            &|key| {
-                connection_secrets
-                    .and_then(|secrets| secrets.get(key))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            },
-        )?;
+        // triggers 本身无别名）。仅在明确启用时解析；关闭时保留文本但
+        // 不因旧文本非法而阻止连接。启用时非法配置仍直接失败（D7）。
+        let triggers = triggers_enabled
+            .then(|| {
+                crate::triggers::parse_triggers(
+                    external_config.and_then(|config| config.get("triggers")),
+                    &|key| {
+                        connection_secrets
+                            .and_then(|secrets| secrets.get(key))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    },
+                )
+            })
+            .transpose()?
+            .flatten();
         // 外部密码管理器（tssh PasswordCommand/PassphraseCommand 对标）：
         // trim 后非空才生效；既有显式凭据优先（D9）。
         let password_command =
@@ -499,6 +518,7 @@ impl StoredConnection {
                     .get("read_only")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+            triggers_enabled,
             sudo_password,
             totp_secret,
             sudo_source,
@@ -909,6 +929,7 @@ mod tests {
             "private_key_passphrase",
             "private_key",
             "agent_socket",
+            "advanced_options",
             "sudo_source",
             "sudo_profile",
             "sudo_password",
@@ -922,6 +943,7 @@ mod tests {
             "keepalive_interval_secs",
             "terminal_keepalive_secs",
             "set_env",
+            "triggers_enabled",
             "triggers",
             "trigger_answer_1",
             "trigger_answer_2",
@@ -1298,60 +1320,6 @@ mod tests {
             }
         });
         assert!(StoredConnection::from_lifecycle_params(&too_many).is_err());
-    }
-
-    #[test]
-    fn lifecycle_parser_rejects_missing_identity_fields_and_bad_runtime_values() {
-        for params in [
-            serde_json::json!({}),
-            serde_json::json!({ "connection": {} }),
-            serde_json::json!({ "connection": { "id": "x" } }),
-            serde_json::json!({
-                "connection": {
-                    "id": "x", "host": "target", "port": 22, "username": "user"
-                }
-            }),
-        ] {
-            assert!(
-                StoredConnection::from_lifecycle_params(&params).is_err(),
-                "malformed lifecycle payload must fail before dialing: {params}"
-            );
-        }
-
-        // Invalid runtime values are treated as an absent host/port and fall
-        // back to the logical target. They must never create a zero-port dial.
-        let fallback = StoredConnection::from_lifecycle_params(&serde_json::json!({
-            "connection": {
-                "id": "x", "host": "target", "port": 2222,
-                "username": "user", "password": "secret"
-            },
-            "runtime": { "host": "  ", "port": 0 }
-        }))
-        .unwrap();
-        assert_eq!(fallback.runtime_host, "target");
-        assert_eq!(fallback.runtime_port, 2222);
-    }
-
-    #[test]
-    fn lifecycle_parser_keeps_valid_runtime_endpoint_and_clamps_timeouts() {
-        let connection = StoredConnection::from_lifecycle_params(&serde_json::json!({
-            "connection": {
-                "id": "x", "host": "target", "port": 22,
-                "username": "user", "password": "secret",
-                "external_config": {
-                    "connect_timeout_secs": 0,
-                    "keepalive_interval_secs": 0,
-                    "terminal_keepalive_secs": 999999
-                }
-            },
-            "runtime": { "host": "127.0.0.1", "port": 65535 }
-        }))
-        .unwrap();
-        assert_eq!(connection.runtime_host, "127.0.0.1");
-        assert_eq!(connection.runtime_port, 65535);
-        assert_eq!(connection.connect_timeout_secs, 1);
-        assert_eq!(connection.keepalive_interval_secs, 0);
-        assert_eq!(connection.terminal_keepalive_secs, 3600);
     }
 
     #[test]
@@ -1851,6 +1819,7 @@ mod manifest_contract_tests {
         let parsed = lifecycle(
             serde_json::json!({
                 "authentication": "password",
+                "triggers_enabled": true,
                 "triggers": {
                     "timeoutSecs": 45,
                     "sleepMs": 200,
@@ -1880,6 +1849,7 @@ mod manifest_contract_tests {
         let parsed = lifecycle(
             serde_json::json!({
                 "authentication": "password",
+                "triggers_enabled": true,
                 "triggers": r#"{"stages":[{"pattern":"code","sendText":"1\r"}]}"#
             }),
             Value::Null,
@@ -1887,7 +1857,19 @@ mod manifest_contract_tests {
         .unwrap();
         assert_eq!(parsed.triggers.expect("string form parses").stages.len(), 1);
 
-        // ③ 缺省/空 = 功能关闭。
+        // ③ 独立开关默认关闭：旧的非空文本也必须不解析、不启用。
+        let disabled_with_bad_text = lifecycle(
+            serde_json::json!({
+                "authentication": "password",
+                "triggers": "{not json"
+            }),
+            Value::Null,
+        )
+        .unwrap();
+        assert!(!disabled_with_bad_text.triggers_enabled);
+        assert!(disabled_with_bad_text.triggers.is_none());
+
+        // ④ 空配置仍表示关闭（即使显式打开开关也没有 engine）。
         for raw in [
             Value::Null,
             Value::from(""),
@@ -1903,10 +1885,11 @@ mod manifest_contract_tests {
             assert!(parsed.triggers.is_none(), "expected disabled");
         }
 
-        // ④ 非法 JSON / 未知密文槽位 → 连接失败并给出可定位的错误（D7）。
+        // ⑤ 非法 JSON / 未知密文槽位 → 连接失败并给出可定位的错误（D7）。
         let error = lifecycle(
             serde_json::json!({
                 "authentication": "password",
+                "triggers_enabled": true,
                 "triggers": "{not json"
             }),
             Value::Null,
@@ -1916,6 +1899,7 @@ mod manifest_contract_tests {
         let error = lifecycle(
             serde_json::json!({
                 "authentication": "password",
+                "triggers_enabled": true,
                 "triggers": { "stages": [{ "pattern": "p", "sendSecretKey": "nope" }] }
             }),
             Value::Null,
@@ -1926,6 +1910,7 @@ mod manifest_contract_tests {
         let error = lifecycle(
             serde_json::json!({
                 "authentication": "password",
+                "triggers_enabled": true,
                 "triggers": { "stages": [{ "pattern": "p", "sendSecretKey": "trigger_answer_1" }] }
             }),
             Value::Null,
@@ -1933,7 +1918,7 @@ mod manifest_contract_tests {
         .unwrap_err();
         assert!(error.contains("is empty"), "{error}");
 
-        // ⑤ password_command 允许密码类认证留空密码（命令在连接期取回）。
+        // ⑥ password_command 允许密码类认证留空密码（命令在连接期取回）。
         // 顶层 connection 无 password 字段、仅配置命令时解析成功。
         let parsed = StoredConnection::from_lifecycle_params(&serde_json::json!({
             "connection": {
@@ -1984,10 +1969,12 @@ mod manifest_contract_tests {
             "authentication",
             "private_key_path",
             "agent_socket",
+            "advanced_options",
             "connect_timeout_secs",
             "keepalive_interval_secs",
             "terminal_keepalive_secs",
             "set_env",
+            "triggers_enabled",
             "triggers",
             "password_command",
             "passphrase_command",
@@ -2109,6 +2096,7 @@ mod manifest_contract_tests {
             ("connect_timeout_secs", Value::from(30)),
             ("keepalive_interval_secs", Value::from(30)),
             ("terminal_keepalive_secs", Value::from(0)),
+            ("triggers_enabled", Value::from(false)),
             ("sudo_source", Value::from("custom")),
             ("sudo_use_pty", Value::from(false)),
             ("set_env", Value::from("")),

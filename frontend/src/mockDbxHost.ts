@@ -230,12 +230,13 @@ const highlightRuleViews = () => [...highlightRulesState].sort((a, b) => a.creat
 // 权限档与连接作用域，镜像持久化 + 校验语义。
 const mcpSettingsState = { execPermissionMode: "autonomous", connectionScope: [] as string[] };
 // 镜像并行批次 ssh/audit/list 的真实形状（AuditEntry：tsMs/tool/connectionId/
-// gate/approval/outcome/exitCode/durationMs/mode/error，无 command 原文）；
-// 末条保留计划 §1.1 旧形状（ts 秒 + kind + command）验证前端双形状容忍。
+// gate/approval/outcome/exitCode/durationMs/mode/command/output/error，
+// 0.4.77 起带 command/output 尾部）；末条保留计划 §1.1 旧形状（ts 秒 + kind +
+// command）验证前端多形状容忍。
 const AUDIT_FIXTURE: Array<Record<string, unknown>> = [
-  { tsMs: 1786262400000, tool: "ssh_exec", connectionId: "Production SSH", gate: "pass", approval: "none", outcome: "ok", exitCode: 0, durationMs: 812, mode: "stdio" },
-  { tsMs: 1786262460000, tool: "ssh_exec_sudo", connectionId: "Production SSH", gate: "pass", approval: "prompt", outcome: "ok", exitCode: 0, durationMs: 2310, mode: "terminal" },
-  { tsMs: 1786262520000, tool: "ssh_exec", connectionId: "Production SSH", gate: "destructive-unconfirmed", approval: "none", outcome: "error", error: "destructive command requires confirmDestructive: true", durationMs: 3, mode: "stdio" },
+  { tsMs: 1786262400000, tool: "ssh_exec", connectionId: "Production SSH", gate: "pass", approval: "none", outcome: "ok", exitCode: 0, durationMs: 812, mode: "stdio", command: "df -h /data", output: "Filesystem Size Used Avail Capacity Mounted on\n/dev/vda1 98G 41G 52G 45% /data" },
+  { tsMs: 1786262460000, tool: "ssh_exec_sudo", connectionId: "Production SSH", gate: "pass", approval: "prompt", outcome: "ok", exitCode: 0, durationMs: 2310, mode: "terminal", command: "systemctl restart nginx" },
+  { tsMs: 1786262520000, tool: "ssh_exec", connectionId: "Production SSH", gate: "destructive-unconfirmed", approval: "none", outcome: "error", error: "destructive command requires confirmDestructive: true", durationMs: 3, mode: "stdio", command: "rm -rf /var/log/old" },
   { tsMs: 1786262580000, tool: "ssh_terminal_input", connectionId: "Production SSH", gate: "write-denied", approval: "none", outcome: "error", durationMs: 1, mode: "embedded" },
   { ts: 1786262640, kind: "agent.challenge", sessionId: "visual-session", command: "rm -rf /tmp/scratch", decision: "approved", risk: "elevated" },
 ];

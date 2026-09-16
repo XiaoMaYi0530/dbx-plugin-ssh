@@ -77,27 +77,47 @@ function state(overrides) {
   };
 }
 
-for (const authentication of options("authentication")) {
-  for (const sudo_source of options("sudo_source")) {
-    for (const auth_flow_mode of options("auth_flow_mode")) {
-      for (const read_only of [false, true]) {
-        const current = state({ authentication, sudo_source, auth_flow_mode, read_only });
-        const password = ["password", "private-key-password"].includes(authentication);
-        const privateKey = ["private-key", "private-key-password"].includes(authentication);
-        current.visible("password", password); current.required("password", password);
-        // The path is optional because the private_key secret field can carry
-        // pasted OpenSSH/PEM/PPK content and takes precedence over the path.
-        current.visible("private_key_path", privateKey); current.required("private_key_path", false);
-        current.visible("private_key_passphrase", privateKey); current.required("private_key_passphrase", false);
-        current.visible("agent_socket", authentication === "agent");
-        current.visible("sudo_password", sudo_source === "custom");
-        current.visible("sudo_profile", sudo_source === "global");
-        current.visible("auth_flow_mode", sudo_source !== "global");
-        // TOTP secret/hint only apply to modes that answer OTP prompts;
-        // "off" (manual 2FA) and "password_only" hide both.
-        const answersOtp = ["password_then_otp", "password_plus_otp"].includes(auth_flow_mode);
-        current.visible("totp_secret", sudo_source !== "global" && answersOtp);
-        current.visible("totp_prompt_hint", sudo_source !== "global" && answersOtp);
+assert.equal(byKey.advanced_options.type, "boolean");
+assert.equal(byKey.advanced_options.binding, "config");
+assert.equal(byKey.advanced_options.default, false, "advanced_options: must default to off");
+const advancedFields = [
+  "sudo_source", "connect_timeout_secs", "keepalive_interval_secs",
+  "terminal_keepalive_secs", "set_env", "triggers_enabled",
+  "password_command", "passphrase_command", "remote_command", "read_only",
+];
+for (const key of advancedFields) {
+  assert.deepEqual(byKey[key].visible_when, { field: "advanced_options", one_of: ["true"] },
+    `${key}: must be gated by advanced_options`);
+}
+
+for (const advanced_options of [false, true]) {
+  for (const authentication of options("authentication")) {
+    for (const sudo_source of options("sudo_source")) {
+      for (const auth_flow_mode of options("auth_flow_mode")) {
+        for (const read_only of [false, true]) {
+          const current = state({ advanced_options, authentication, sudo_source, auth_flow_mode, read_only });
+          const password = ["password", "private-key-password"].includes(authentication);
+          const privateKey = ["private-key", "private-key-password"].includes(authentication);
+          current.visible("password", password); current.required("password", password);
+          // The path is optional because the private_key secret field can carry
+          // pasted OpenSSH/PEM/PPK content and takes precedence over the path.
+          current.visible("private_key_path", privateKey); current.required("private_key_path", false);
+          current.visible("private_key_passphrase", privateKey); current.required("private_key_passphrase", false);
+          current.visible("agent_socket", authentication === "agent");
+          current.visible("sudo_password", advanced_options && sudo_source === "custom");
+          current.visible("sudo_profile", advanced_options && sudo_source === "global");
+          current.visible("auth_flow_mode", advanced_options && sudo_source !== "global");
+          // TOTP secret/hint only apply to modes that answer OTP prompts;
+          // "off" (manual 2FA) and "password_only" hide both.
+          const answersOtp = ["password_then_otp", "password_plus_otp"].includes(auth_flow_mode);
+          current.visible("totp_secret", advanced_options && sudo_source !== "global" && answersOtp);
+          current.visible("totp_prompt_hint", advanced_options && sudo_source !== "global" && answersOtp);
+          current.visible("triggers_enabled", advanced_options);
+          current.visible("password_command", advanced_options);
+          current.visible("passphrase_command", advanced_options);
+          current.visible("remote_command", advanced_options);
+          current.visible("read_only", advanced_options);
+        }
       }
     }
   }
@@ -106,9 +126,10 @@ for (const authentication of options("authentication")) {
 assert.equal(byKey.sudo_whitelist.type, "textarea");
 
 // Package B: ssh/trigger + external password manager fields (manifest §2.2).
-// Key names, types and bindings are frozen by the implementation contract.
-const TRIGGER_FIELDS = ["triggers", "trigger_answer_1", "trigger_answer_2", "password_command", "passphrase_command"];
+// Triggers are one tssh/JSON text area gated by a separate, default-off switch.
+const TRIGGER_FIELDS = ["triggers_enabled", "triggers", "trigger_answer_1", "trigger_answer_2", "password_command", "passphrase_command"];
 const TRIGGER_TYPES = {
+  triggers_enabled: "boolean",
   triggers: "textarea",
   trigger_answer_1: "password",
   trigger_answer_2: "password",
@@ -116,6 +137,7 @@ const TRIGGER_TYPES = {
   passphrase_command: "text",
 };
 const TRIGGER_BINDINGS = {
+  triggers_enabled: "config",
   triggers: "config",
   trigger_answer_1: "secret",
   trigger_answer_2: "secret",
@@ -127,18 +149,23 @@ for (const key of TRIGGER_FIELDS) {
   assert(field, `missing ssh/trigger field ${key}`);
   assert.equal(field.type, TRIGGER_TYPES[key], `${key}: type changed`);
   assert.equal(field.binding, TRIGGER_BINDINGS[key], `${key}: binding changed`);
-  assert.equal(field.visible_when, undefined, `${key}: must stay unconditional (no visible_when)`);
   assert(field.description?.trim(), `${key}: base description required`);
-  assert(byKey.triggers && fields.indexOf(field) < fields.indexOf(byKey.remote_command),
+  assert(fields.indexOf(field) < fields.indexOf(byKey.remote_command),
     `${key}: must sit near set_env (before remote_command)`);
 }
-// The triggers placeholder must be valid JSON with a minimal usable stage
-// example (one stage: pattern + sendText) so copy-paste just works.
-const placeholderExample = JSON.parse(byKey.triggers.placeholder);
-assert(Array.isArray(placeholderExample.stages) && placeholderExample.stages.length === 1,
-  "triggers.placeholder: expected a one-stage example");
-assert(typeof placeholderExample.stages[0].pattern === "string", "triggers.placeholder: pattern missing");
-assert(typeof placeholderExample.stages[0].sendText === "string", "triggers.placeholder: sendText missing");
+assert.equal(byKey.triggers_enabled.default, false, "triggers_enabled: must default to off");
+assert.deepEqual(byKey.triggers.visible_when, { field: "triggers_enabled", one_of: ["true"] });
+for (const key of ["triggers", "trigger_answer_1", "trigger_answer_2"]) {
+  assert.deepEqual(byKey[key].visible_when, { field: "triggers_enabled", one_of: ["true"] },
+    `${key}: must be gated by triggers_enabled`);
+}
+// The triggers placeholder must be a usable tssh (trzsz-ssh) text example so
+// copy-paste just works (the backend parses tssh text rules natively; the
+// JSON form remains available alongside).
+const placeholderExample = String(byKey.triggers.placeholder);
+assert(placeholderExample.includes("ExpectCount"), "triggers.placeholder: expected a tssh ExpectCount example");
+assert(placeholderExample.includes("ExpectPattern1"), "triggers.placeholder: expected ExpectPattern1");
+assert(placeholderExample.includes("ExpectSendText1"), "triggers.placeholder: expected ExpectSendText1");
 // Descriptions (risk + placeholder docs) must be provided in all seven locales.
 for (const key of TRIGGER_FIELDS) {
   for (const locale of locales) {
@@ -147,7 +174,17 @@ for (const key of TRIGGER_FIELDS) {
     assert(localized?.description?.trim(), `${locale}/${key}: missing description`);
   }
 }
-// The new fields carry no visible_when: they stay visible in every option
-// combination (any authentication / sudo_source / auth_flow_mode choice).
-for (const key of TRIGGER_FIELDS) state({}).visible(key, true);
+state({ advanced_options: false, triggers_enabled: false }).visible("triggers", false);
+state({ advanced_options: false, triggers_enabled: false }).visible("trigger_answer_1", false);
+state({ advanced_options: false, triggers_enabled: false }).visible("trigger_answer_2", false);
+state({ advanced_options: true, triggers_enabled: false }).visible("triggers", false);
+state({ advanced_options: true, triggers_enabled: false }).visible("trigger_answer_1", false);
+state({ advanced_options: true, triggers_enabled: false }).visible("trigger_answer_2", false);
+state({ advanced_options: true, triggers_enabled: true }).visible("triggers", true);
+state({ advanced_options: true, triggers_enabled: true }).visible("trigger_answer_1", true);
+state({ advanced_options: true, triggers_enabled: true }).visible("trigger_answer_2", true);
+state({ advanced_options: false }).visible("password_command", false);
+state({ advanced_options: false }).visible("passphrase_command", false);
+state({ advanced_options: true }).visible("password_command", true);
+state({ advanced_options: true }).visible("passphrase_command", true);
 console.log(`PASS SSH connection form: ${scenarios} combinations; field ordering and seven-language labels/options`);

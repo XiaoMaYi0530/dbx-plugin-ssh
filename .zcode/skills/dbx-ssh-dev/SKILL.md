@@ -37,7 +37,8 @@ export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$HOME/Library/pnpm:$HOME/.car
 npm install -g @dbx-app/plugin-cli @dbx-app/cli @dbx-app/mcp-server
 # 插件本地打包不需要 DBX 源码：npm CLI 自带 SDK（sdk-root）
 # 仅测试宿主/安装进 DBX 数据目录的集成验证才需要外部 DBX host worktree；
-# 通过 DBX_HOST_WORKTREE 显式传入，不由本仓库自动猜测 sibling 路径。
+# 安装脚本会优先使用 DBX_HOST_WORKTREE，未设置时自动寻找 Codex worktree
+#（~/.codex/worktrees/*/dbx）和常见本地 host 路径。
 ```
 
 ## 开发规范（硬性约定）
@@ -100,8 +101,8 @@ scripts/test.sh --skip-host               # 无 host worktree 时的独立验证
 
 ## 可选的 DBX host 集成
 
-- 设置 `DBX_HOST_WORKTREE=/path/to/dbx` 后，才运行宿主安装管线；本仓库不会
-  修改、同步或 reset 该 worktree。
+- 设置 `DBX_HOST_WORKTREE=/path/to/dbx` 可固定宿主安装管线；未设置时安装脚本
+  会自动发现候选 host。本仓库不会修改、同步或 reset 该 worktree。
 - 宿主/插件并行开发时按目录划界（本仓库的 `backend/` 与 `frontend/`，host
   worktree 独立仓）；本仓库只提交插件代码和对应文档。
 

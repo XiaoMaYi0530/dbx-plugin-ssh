@@ -71,6 +71,23 @@ impl Plugin {
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         match method {
+            "triggers/validate" => {
+                let raw = params.get("triggers");
+                let format = trigger_input_format(raw);
+                let secrets = params.get("secretSlots").and_then(Value::as_object);
+                let parsed = triggers::parse_triggers(raw, &|key| {
+                    secrets
+                        .and_then(|values| values.get(key))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })?;
+                Ok(json!({
+                    "valid": true,
+                    "enabled": parsed.is_some(),
+                    "format": format,
+                    "stages": parsed.as_ref().map(|config| config.stages.len()).unwrap_or(0),
+                }))
+            }
             "connection/test" => {
                 let connection = StoredConnection::from_lifecycle_params(&params)?;
                 let operation_id = operation_id(&params);
@@ -950,6 +967,29 @@ fn parse<T: DeserializeOwned>(value: Value) -> Result<T, String> {
     serde_json::from_value(value).map_err(|error| format!("Invalid request parameters: {error}"))
 }
 
+fn trigger_input_format(raw: Option<&Value>) -> &'static str {
+    match raw {
+        None | Some(Value::Null) => "empty",
+        Some(Value::Object(_)) => "json",
+        Some(Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                "empty"
+            } else if serde_json::from_str::<serde_json::Map<String, Value>>(trimmed).is_ok() {
+                "json"
+            } else if trimmed.lines().any(|line| {
+                line.trim_start_matches(['#', '!', ' '])
+                    .starts_with("Expect")
+            }) {
+                "tssh"
+            } else {
+                "json"
+            }
+        }
+        Some(_) => "invalid",
+    }
+}
+
 fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
     params
         .get(key)
@@ -1149,6 +1189,30 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_validation_reports_format_without_secret_content() {
+        assert_eq!(trigger_input_format(None), "empty");
+        assert_eq!(trigger_input_format(Some(&json!(""))), "empty");
+        assert_eq!(trigger_input_format(Some(&json!({ "stages": [] }))), "json");
+        assert_eq!(
+            trigger_input_format(Some(&json!("#!! ExpectCount 1\n#!! ExpectPattern1 code"))),
+            "tssh"
+        );
+        assert_eq!(trigger_input_format(Some(&json!(42))), "invalid");
+
+        let parsed = triggers::parse_triggers(
+            Some(&json!(
+                r#"{"stages":[{"pattern":"code","sendSecretKey":"trigger_answer_1"}]}"#
+            )),
+            &|key| (key == "trigger_answer_1").then(|| "do-not-return-this".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.stages.len(), 1);
+        let debug = format!("{parsed:?}");
+        assert!(!debug.contains("do-not-return-this"));
+    }
 
     #[test]
     fn preview_byte_limits_are_bounded() {

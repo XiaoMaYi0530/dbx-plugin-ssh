@@ -12,11 +12,66 @@
 #
 # Environment:
 #   DBX_HOST_WORKTREE   host checkout used for the installer binary
-#                       (must be supplied explicitly for host integration)
+#                       (optional; defaults to a Codex worktree or the
+#                       sibling ../dbx checkout when omitted)
 #   DBX_TEST_APP        DBX.app bundle to relaunch (default: probe the host
 #                       worktree, then `open -a DBX`)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+REPO_ROOT="$PWD"
+
+host_worktree_is_valid() {
+  local candidate="$1"
+  [ -d "$candidate" ] || return 1
+  [ -f "$candidate/Cargo.toml" ] || return 1
+  [ -f "$candidate/crates/dbx-core/Cargo.toml" ] || return 1
+  git -C "$candidate" rev-parse --show-toplevel >/dev/null 2>&1
+}
+
+resolve_host_worktree() {
+  local candidate
+  local candidate_list=()
+  local user_home="${HOME:-}"
+  local codex_worktrees="$user_home/.codex/worktrees"
+  local sibling_root
+
+  # An explicit path is authoritative. Do not silently fall back when it is
+  # set but invalid: that could install into an unintended DBX checkout.
+  if [ -n "${DBX_HOST_WORKTREE:-}" ]; then
+    if host_worktree_is_valid "$DBX_HOST_WORKTREE"; then
+      printf '%s\n' "$DBX_HOST_WORKTREE"
+      return 0
+    fi
+    echo "DBX_HOST_WORKTREE is not a valid DBX host worktree: $DBX_HOST_WORKTREE" >&2
+    echo "Expected Cargo.toml and crates/dbx-core/Cargo.toml in a Git checkout." >&2
+    return 1
+  fi
+
+  # Codex-managed host worktrees are preferred because they are isolated from
+  # the plugin checkout and commonly already contain the installer binary.
+  if [ -d "$codex_worktrees" ]; then
+    for candidate in "$codex_worktrees"/*/dbx; do
+      [ -e "$candidate" ] || continue
+      host_worktree_is_valid "$candidate" && candidate_list+=("$candidate")
+    done
+  fi
+
+  # Use the sibling DBX checkout for the local development layout.
+  sibling_root="$(dirname "$REPO_ROOT")"
+  for candidate in "$sibling_root/dbx"; do
+    host_worktree_is_valid "$candidate" && candidate_list+=("$candidate")
+  done
+
+  [ "${#candidate_list[@]}" -gt 0 ] || {
+    echo "DBX host worktree not found." >&2
+    echo "Set DBX_HOST_WORKTREE explicitly, or place a host checkout under:" >&2
+    echo "  $codex_worktrees/<worktree>/dbx" >&2
+    echo "  $sibling_root/dbx" >&2
+    return 1
+  }
+
+  printf '%s\n' "${candidate_list[0]}"
+}
 
 APP_DATA="${DBX_APP_DATA:-$HOME/Library/Application Support/com.dbx.app}"
 REINSTALL=0
@@ -36,10 +91,9 @@ DBXP="$(ls -t dist/*.dbxp 2>/dev/null | head -1 || true)"
 [ -n "$DBXP" ] || { echo "no .dbxp in dist/ — run scripts/build.sh first" >&2; exit 1; }
 VERSION="$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")"
 
-[ -n "${DBX_HOST_WORKTREE:-}" ] && [ -d "$DBX_HOST_WORKTREE" ] || {
-  echo "DBX host worktree not found; set DBX_HOST_WORKTREE explicitly for install integration" >&2
-  exit 1
-}
+DBX_HOST_WORKTREE="$(resolve_host_worktree)"
+export DBX_HOST_WORKTREE
+echo "==> using DBX host worktree: $DBX_HOST_WORKTREE"
 export PATH="$HOME/.cargo/bin:$PATH"
 
 INSTALLER="$DBX_HOST_WORKTREE/target/release/examples/install_plugin"

@@ -550,6 +550,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .audit-kind-badge.k-mcp-tool, .audit-kind-badge.k-mcp-gate { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
 .audit-connection { flex: 0 1 auto; max-width: 20ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .audit-command { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-output { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); }
 .audit-outcome { flex: 0 0 auto; font-weight: 600; }
 .audit-outcome.error { color: var(--destructive); }
 .audit-outcome.ok { color: var(--success, var(--primary)); }

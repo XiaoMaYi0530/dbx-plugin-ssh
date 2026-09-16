@@ -114,7 +114,7 @@ import {
 import { browseCommandHistory, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
 import { normalizeQuickCommands, QUICK_COMMANDS_LIMIT, type QuickCommand } from "./lib/quickCommands";
 import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
-import { formatLatency, formatAuthMethodLabel, type KnownAuthMethod } from "./lib/connectionInfo";
+import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
 import { clampFontSize } from "./lib/terminalZoom";
 import { commandMarkerTooltip, formatCommandDuration, Osc633CommandParser, runningCommandElapsedMs, type Osc633StreamUpdates } from "./lib/terminalCommandMarkers";
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress, type BatchProgressState } from "./lib/sftpBatchProgress";
@@ -850,15 +850,24 @@ const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle
 
 const locale = ref("zh-CN");
 const t = (key: string, values: Record<string, string | number> = {}) => workbenchMessage(locale.value, key, values);
-const connectionId = computed(() => String(hostContext.value.connectionId || ""));
+const connectionId = computed(() => normalizeConnectionText(hostContext.value.connectionId));
 // Host API 1.1 provides a stable workbenchId in the host context; on 1.0 a
 // locally generated id keeps session scoping per workbench instance.
 const fallbackWorkbenchId = crypto.randomUUID();
-const workbenchId = computed(() => String(hostContext.value.workbenchId || fallbackWorkbenchId));
+const workbenchId = computed(() => normalizeConnectionText(hostContext.value.workbenchId) || fallbackWorkbenchId);
 const restored = computed(() => hostContext.value.restored === true);
 const connection = computed<ConnectionSummary>(() => {
   const value = hostContext.value.connection;
-  return value && typeof value === "object" ? (value as ConnectionSummary) : {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const raw = value as Record<string, unknown>;
+  return {
+    name: normalizeConnectionText(raw.name),
+    host: normalizeConnectionText(raw.host),
+    port: normalizeConnectionPort(raw.port),
+    username: normalizeConnectionText(raw.username),
+    color: normalizeConnectionText(raw.color),
+    readOnly: raw.readOnly === true,
+  };
 });
 const canWrite = computed(() => !connection.value.readOnly && !connectionReadOnly.value);
 const selectedEntry = computed(() => entries.value.find((entry) => entry.uri === selectedPath.value));
@@ -926,7 +935,7 @@ const commandMarkerDetails = computed(() => commandMarkerTooltip(
   },
 ));
 const connectionIdentity = computed(() => {
-  const host = connection.value.host || connection.value.name || connectionId.value;
+  const host = connection.value.host || connection.value.name || connectionId.value || "–";
   const identity = connection.value.username ? `${connection.value.username}@${host}` : host;
   const port = connection.value.port && connection.value.port !== 22 ? `:${connection.value.port}` : "";
   return `${identity}${port}`;
@@ -2151,11 +2160,35 @@ async function refreshTransferHistory() {
     transferHistory.value = sanitizeTransferHistoryTasks(result?.tasks);
     transferHistoryFailed.value = false;
   } catch {
-    // 历史是 best-effort UX 数据：后端未升级/读取失败仅显示加载失败提示，不阻塞面板。
-    transferHistory.value = [];
+    // 历史是 best-effort UX 数据：后端未升级/读取失败仅提示加载失败，
+    // 保留上一次快照——一次瞬时错误不能把用户可见的记录清空。
     transferHistoryFailed.value = true;
   } finally {
     transferHistoryLoading.value = false;
+  }
+}
+
+/**
+ * 面板打开时对账活跃任务：逐个向后端查询 `sftp/transfer/status`，后端已不
+ * 认识的任务（sidecar 重启、页面重载后错过终态事件的“僵尸行”）标记为失败，
+ * 终态以服务端为准。查询失败视为任务已死——存活任务的状态查询总会成功。
+ * 不在每次历史刷新时做：新任务可能在快照之后才登记，避免误判。
+ */
+async function reconcileActiveTransfers() {
+  for (const task of Object.values(transferTasks)) {
+    if (task.status !== "queued" && task.status !== "running") continue;
+    try {
+      const status = await window.dbxPlugin.invoke<{ transferred?: number; status: string }>("sftp/transfer/status", { taskId: task.taskId });
+      const normalized = normalizeTransferStatus(status.status, "running");
+      // task.status 此处必为 queued/running（上方守卫），终态即差异。
+      if (normalized !== "queued" && normalized !== "running") {
+        task.status = normalized;
+        if (status.transferred) task.transferred = status.transferred;
+      }
+    } catch {
+      task.status = "failed";
+      task.error = t("transfersHistory.interrupted");
+    }
   }
 }
 
@@ -2200,11 +2233,21 @@ async function clearTransferHistory() {
   }
 }
 
+/** Refresh every data source rendered by the transfer popover. */
+async function refreshTransferPanel() {
+  await Promise.all([
+    refreshTransferHistory(),
+    refreshResumableUploads(),
+    restoreTransfers(),
+  ]);
+  await reconcileActiveTransfers();
+}
+
 // 打开传输面板或最后一个活动任务结束时拉取历史：历史区常驻展示，活跃任务只影响列表而不遮挡快照。
+// 打开面板的同时对账活跃任务，防止错过终态事件的行永远卡在 running。
 watch(transferPanelOpen, (open) => {
   if (open) {
-    void refreshTransferHistory();
-    void refreshResumableUploads();
+    void refreshTransferPanel();
   }
 });
 watch(activeTransfers, (count, previous) => {
@@ -6335,13 +6378,13 @@ onBeforeUnmount(() => {
             <div class="transfer-history-head">
               <h3 class="transfer-history-title">{{ t("transfersHistory.title") }}</h3>
               <span class="transfer-history-actions">
-                <button class="icon-button" :title="t('refresh')" :disabled="transferHistoryLoading" @click="refreshTransferHistory"><RefreshCw :class="{ spinning: transferHistoryLoading }" /></button>
-                <button class="icon-button" :title="t('transfersHistory.clear')" :disabled="!transferHistory.length" @click="clearTransferHistory"><Trash2 /></button>
+                <button type="button" class="icon-button" :title="t('refresh')" :disabled="transferHistoryLoading || resumableLoading" @click.stop="refreshTransferPanel"><RefreshCw :class="{ spinning: transferHistoryLoading || resumableLoading }" /></button>
+                <button type="button" class="icon-button" :title="t('transfersHistory.clear')" :disabled="!transferHistory.length" @click.stop="clearTransferHistory"><Trash2 /></button>
               </span>
             </div>
             <div v-if="transferHistoryFailed" class="empty compact">
               <span>{{ t("transfersHistory.loadFailed") }}</span>
-              <button class="link-button" @click="refreshTransferHistory">{{ t("refresh") }}</button>
+              <button type="button" class="link-button" @click.stop="refreshTransferPanel">{{ t("refresh") }}</button>
             </div>
             <div v-else-if="transferHistoryLoading && !transferHistory.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
             <div v-else-if="!transferHistory.length" class="empty compact">{{ t("transfersHistory.empty") }}</div>
@@ -7310,6 +7353,7 @@ onBeforeUnmount(() => {
                 <span class="audit-kind-badge" :class="auditRowKindClass(entry.kind)">{{ auditKindLabel(entry.kind, t) }}</span>
                 <span v-if="entry.connection || entry.sessionId" class="audit-connection mono" :title="entry.connection || entry.sessionId">{{ entry.connection || entry.sessionId }}</span>
                 <span v-if="entry.command" class="audit-command mono" :title="entry.command">{{ entry.command }}</span>
+                <span v-if="entry.output" class="audit-output mono" :title="entry.output">{{ entry.output }}</span>
                 <span v-if="entry.gate" class="audit-gate mono">{{ entry.gate }}</span>
                 <span v-if="auditOutcomeLabel(entry, t)" class="audit-outcome" :class="{ error: entry.outcome === 'error' || entry.decision === 'denied' || entry.decision === 'timeout', ok: entry.outcome === 'ok' || entry.decision === 'approved' }">{{ auditOutcomeLabel(entry, t) }}</span>
                 <span v-if="entry.exitCode != null" class="audit-time">{{ t("auditLog.exitCode", { code: entry.exitCode }) }}</span>
