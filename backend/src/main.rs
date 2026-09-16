@@ -54,12 +54,6 @@ struct Plugin {
 impl Plugin {
     fn new() -> Result<Self, String> {
         let data_dir = plugin_data_dir();
-        std::fs::create_dir_all(&data_dir).map_err(|error| {
-            format!(
-                "Failed to create plugin data directory {}: {error}",
-                data_dir.display()
-            )
-        })?;
         let runtime =
             Runtime::new().map_err(|error| format!("Failed to create async runtime: {error}"))?;
         let ssh = Arc::new(SshRuntime::new(data_dir));
@@ -1086,11 +1080,52 @@ fn resolve_plugin_data_dir(lookup: impl Fn(&str) -> Option<OsString>) -> PathBuf
 
 fn plugin_data_dir() -> PathBuf {
     // Closure (not the generic `var_os` fn item) so the HRTB bound unifies.
-    let data_dir = resolve_plugin_data_dir(|key| std::env::var_os(key));
+    let requested = resolve_plugin_data_dir(|key| std::env::var_os(key));
+    // Docker deployments may provide a read-only or not-yet-mounted DBX data
+    // directory. Keep startup viable by falling back to the OS temp directory;
+    // the warning makes the loss of persistence explicit to the host logs.
+    match prepare_plugin_data_dir(&requested) {
+        Ok(data_dir) => data_dir,
+        Err(request_error) => {
+            let fallback = std::env::temp_dir()
+                .join("dbx-plugin-data")
+                .join("io.dbx.ssh");
+            match prepare_plugin_data_dir(&fallback) {
+                Ok(data_dir) => {
+                    eprintln!(
+                        "[ssh-sftp-plugin] data directory {} is unavailable: {request_error}; using temporary directory {}",
+                        requested.display(),
+                        data_dir.display()
+                    );
+                    data_dir
+                }
+                Err(fallback_error) => {
+                    eprintln!(
+                        "[ssh-sftp-plugin] failed to prepare data directories {} ({request_error}) and {} ({fallback_error})",
+                        requested.display(),
+                        fallback.display()
+                    );
+                    requested
+                }
+            }
+        }
+    }
+}
+
+fn prepare_plugin_data_dir(data_dir: &std::path::Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| format!("{}: {error}", data_dir.display()))?;
+    let probe = data_dir.join(format!(".dbx-plugin-write-test-{}", uuid::Uuid::new_v4()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| format!("{} is not writable: {error}", data_dir.display()))?;
+    std::fs::remove_file(&probe)
+        .map_err(|error| format!("failed to remove write probe {}: {error}", probe.display()))?;
     // The env vars are the plugin's only path inputs; resolve symlinks and `..`
     // once at the boundary so every store path below it is canonical.
-    let _ = std::fs::create_dir_all(&data_dir);
-    std::fs::canonicalize(&data_dir).unwrap_or(data_dir)
+    std::fs::canonicalize(data_dir).map_err(|error| format!("{}: {error}", data_dir.display()))
 }
 
 fn main() -> std::io::Result<()> {
