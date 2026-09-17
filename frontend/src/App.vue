@@ -57,6 +57,7 @@ import {
   ShieldCheck,
   Siren,
   Square,
+  SquarePlus,
   SquareTerminal,
   Star,
   TextSelect,
@@ -2369,6 +2370,22 @@ async function reconnectNow() {
   reconnectPending.value = false;
   reconnectAttempt = 0;
   await openSession();
+}
+
+// 新建会话（同连接第二个 tab）：桥 openWorkbench 不查重、每次新开 tab，
+// context 复制当前一份并换发新 workbenchId——后端按 workbenchId 开独立 PTY
+// （#41 会话隔离），两个 tab 互不干扰、boot 恢复各回各的会话。克隆的
+// workbenchState 摘掉 sessionId/terminalSequence，避免新 tab 尝试回附旧会话。
+function openNewSessionTab() {
+  const api = window.dbxPlugin;
+  if (!api.openWorkbench || !connectionId.value) return;
+  const context: Record<string, unknown> = { ...hostContext.value, workbenchId: crypto.randomUUID() };
+  const persisted = context.workbenchState;
+  if (persisted && typeof persisted === "object") {
+    const { sessionId: _sessionId, terminalSequence: _terminalSequence, ...rest } = persisted as Record<string, unknown>;
+    context.workbenchState = rest;
+  }
+  void api.openWorkbench("io.dbx.ssh.workbench", context);
 }
 
 async function restoreTransfers() {
@@ -6874,6 +6891,7 @@ onBeforeUnmount(() => {
         <button class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
+        <button class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
         <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting' && !reconnectPending" @click="reconnectNow"><PlugZap /></button>
         <!-- 一键 sudo -v：向当前 PTY 写入命令刷新 sudo 凭据缓存；quick sudo 自动应答
              是否启用由连接设置决定（设置弹窗），工作台不再提供开关。 -->

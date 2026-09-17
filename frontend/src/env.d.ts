@@ -52,6 +52,7 @@ interface DbxPluginApi {
   request<T = unknown>(method: string, params?: unknown): Promise<T>;
   invoke<T = unknown>(method: string, params?: unknown, options?: { timeoutMs?: number }): Promise<T>;
   notify(method: string, params?: unknown): Promise<void>;
+  openWorkbench?(contributionId: string, context?: Record<string, unknown>): Promise<void>;
   sendBinary(channel: string, data: Uint8Array | ArrayBuffer | string): Promise<void>;
   onEvent(listener: (event: DbxPluginEvent) => void): () => void;
   onBinary(listener: (event: DbxPluginBinaryEvent) => void): () => void;
