@@ -798,6 +798,12 @@ window.dbxPlugin = {
   request,
   invoke,
   notify: async () => undefined,
+  // 新建会话按钮的桥调用：mock 只记录参数（控制台可见），不真的开 tab。
+  openWorkbench: async (contributionId, childContext) => {
+    console.info("[mock] openWorkbench", contributionId, childContext);
+    (window as unknown as { __dbxMockOpenWorkbench?: unknown[] }).__dbxMockOpenWorkbench ??= [];
+    (window as unknown as { __dbxMockOpenWorkbench: unknown[] }).__dbxMockOpenWorkbench.push({ contributionId, context: childContext });
+  },
   sendBinary: async (channel, data) => {
     if (channel.startsWith("sftp/upload/")) {
       const bytes = typeof data === "string" ? Uint8Array.from(atob(data), (value) => value.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
