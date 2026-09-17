@@ -1100,7 +1100,8 @@ function persistState() {
 // 全局接管 title 属性：悬停时把值挪到 data-tooltip（抑制原生慢速灰框），
 // 350ms 后显示主题化气泡；下方空间不足翻到上方。模板无需改动，所有现有
 // 和未来的 title 自动生效。
-const tooltip = ref<{ text: string; x: number; y: number; above: boolean } | null>(null);
+const tooltip = ref<{ text: string; x: number; y: number; above: boolean; arrowOffset: number } | null>(null);
+const tooltipBubble = ref<HTMLElement>();
 let tooltipEl: HTMLElement | null = null;
 let tooltipTimer = 0;
 
@@ -1130,12 +1131,20 @@ function onTooltipOver(event: MouseEvent) {
     if (!target.isConnected) return;
     const rect = target.getBoundingClientRect();
     const above = rect.bottom + 34 > window.innerHeight && rect.top > 34;
-    tooltip.value = {
-      text,
-      x: Math.max(12, Math.min(rect.left + rect.width / 2, window.innerWidth - 12)),
-      y: above ? rect.top - 6 : rect.bottom + 6,
-      above,
-    };
+    const center = rect.left + rect.width / 2;
+    tooltip.value = { text, x: center, y: above ? rect.top - 6 : rect.bottom + 6, above, arrowOffset: 0 };
+    // 量出气泡实际宽度后重新钳位，保证整框（而非仅中心点）落在视口内；
+    // 小三角按钳位偏差反向偏移，继续对准触发元素。
+    void nextTick(() => {
+      const bubble = tooltipBubble.value;
+      const current = tooltip.value;
+      if (!bubble || !current) return;
+      const half = bubble.offsetWidth / 2;
+      const clamped = Math.max(half + 8, Math.min(current.x, window.innerWidth - half - 8));
+      if (clamped !== current.x) {
+        tooltip.value = { ...current, x: clamped, arrowOffset: center - clamped };
+      }
+    });
   }, 350);
 }
 
@@ -6976,7 +6985,7 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div v-if="tooltip" class="app-tooltip" :class="{ 'app-tooltip-above': tooltip.above }" :style="{ left: `${tooltip.x}px`, top: `${tooltip.y}px` }" role="tooltip">{{ tooltip.text }}</div>
+    <div v-if="tooltip" ref="tooltipBubble" class="app-tooltip" :class="{ 'app-tooltip-above': tooltip.above }" :style="{ left: `${tooltip.x}px`, top: `${tooltip.y}px`, '--arrow-offset': `${tooltip.arrowOffset}px` }" role="tooltip">{{ tooltip.text }}</div>
     <div v-if="notice" class="notice">
       <span>{{ notice }}</span>
       <button v-for="action in noticeActions" :key="action.label" class="notice-action" @click="action.run()">{{ action.label }}</button>

@@ -167,7 +167,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    不能加 overflow-wrap:anywhere（CJK 下 min-content 会退化成单字宽，
    tooltip 逐字竖排）。 */
 .app-tooltip { position: fixed; z-index: 100; width: max-content; max-width: 260px; transform: translateX(-50%); border-radius: 6px; padding: 4px 10px; background: var(--foreground); color: var(--background); font-size: 11px; line-height: 1.45; text-align: center; pointer-events: none; box-shadow: 0 4px 14px rgb(0 0 0 / 18%); }
-.app-tooltip::before { content: ""; position: absolute; top: -3px; left: 50%; width: 7px; height: 7px; transform: translateX(-50%) rotate(45deg); background: var(--foreground); }
+.app-tooltip::before { content: ""; position: absolute; top: -3px; left: calc(50% + var(--arrow-offset, 0px)); width: 7px; height: 7px; transform: translateX(-50%) rotate(45deg); background: var(--foreground); }
 .app-tooltip.app-tooltip-above { transform: translateX(-50%) translateY(-100%); }
 .app-tooltip-above::before { top: auto; bottom: -3px; }
 .error-banner { top: 42px; border: 1px solid var(--border); padding: 6px 10px; }
