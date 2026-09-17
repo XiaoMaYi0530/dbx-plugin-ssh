@@ -78,7 +78,14 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
   align-items: center;
 }
 
+/* 标识区 + Info 按钮的左组容器：弹层锚点在外层（identity 自身 overflow
+   hidden 负责长主机名截断，弹层不会被裁）。 */
+.identity-side { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; gap: 4px; }
 .identity { min-width: 0; overflow: hidden; gap: 6px; }
+/* 空间不足时 Info 按钮也可折叠（先缩主机名，再缩它到 0），不再硬顶
+   右侧按钮组造成叠印。 */
+.identity-side > .icon-button { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.popover-left { right: auto; left: 0; }
 .identity > * { flex: 0 0 auto; }
 .identity strong { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
 .connection-color { width: 4px; height: 16px; flex: 0 0 4px; border-radius: 999px; }
@@ -93,7 +100,10 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .toolbar-actions > * { flex: 0 0 auto; }
 
 .icon-button, .link-button, .file-header button, .context-menu button,
-.modal button, .path-toolbar button {
+/* 弹窗/路径栏按钮统一去默认样式；开关（switch-control）自带轨道背景与描边，
+   必须排除——该选择器特异性更高，会把开关轨道抹成透明（弹窗内开关隐形
+   而工具栏正常的根因）。 */
+.modal button:not(.switch-control), .path-toolbar button:not(.switch-control) {
   border: 0;
   background: transparent;
   cursor: pointer;
@@ -124,9 +134,12 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .follow-directory-control { gap: 5px; margin-right: 2px; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
 .toolbar-separator { width: 1px; height: 16px; flex: 0 0 1px; margin: 0 3px; background: var(--border); }
 .icon-button.is-active { background: var(--accent); box-shadow: inset 0 0 0 1px var(--border); }
-.switch-control { position: relative; width: 26px; height: 14px; flex: 0 0 26px; border: 0; border-radius: 999px; padding: 0; background: color-mix(in srgb, var(--muted-foreground) 32%, transparent); cursor: pointer; transition: background-color 120ms ease; }
-.switch-control span { position: absolute; top: 2px; left: 2px; width: 10px; height: 10px; border-radius: 50%; background: var(--background); box-shadow: 0 1px 2px rgb(0 0 0 / 28%); transition: transform 120ms ease; }
-.switch-control[aria-checked="true"] { background: var(--primary); }
+/* 关态轨道从 foreground 派生透明度色：亮色主题（foreground 近黑）是可见灰轨，
+   暗色主题（foreground 近白）是可见浅轨——muted/border 在亮色规范色板里
+   分别是 #f5f5f5/#e5e5e5，白底下会直接隐形。 */
+.switch-control { position: relative; width: 26px; height: 14px; flex: 0 0 26px; border: 1px solid color-mix(in srgb, var(--foreground) 38%, transparent); border-radius: 999px; padding: 0; background: color-mix(in srgb, var(--foreground) 22%, transparent); cursor: pointer; transition: background-color 120ms ease; }
+.switch-control span { position: absolute; top: 1px; left: 1px; width: 10px; height: 10px; border-radius: 50%; background: var(--background); box-shadow: 0 1px 2px rgb(0 0 0 / 28%); transition: transform 120ms ease; }
+.switch-control[aria-checked="true"] { border-color: var(--primary); background: var(--primary); }
 .switch-control[aria-checked="true"] span { transform: translateX(12px); background: var(--primary-foreground); }
 .switch-control:disabled { opacity: .45; }
 .columns-popover input, .remember input { width: 13px; height: 13px; margin: 0; accent-color: var(--primary); }
@@ -145,7 +158,16 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .notice, .error-banner { position: absolute; z-index: 15; left: 50%; max-width: min(720px, calc(100% - 32px)); transform: translateX(-50%); gap: 10px; border-radius: var(--radius); box-shadow: 0 6px 24px rgb(0 0 0 / 24%); }
 /* toast 通知与错误横幅同一横幅体系：令牌色弹层底 + 边框，不再反色；
    字号对齐全局 12px（原 14px 比模态标题还大）。 */
-.notice { position: fixed; bottom: 24px; z-index: 90; border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 14px; background: var(--popover); color: var(--foreground); font-size: 12px; box-shadow: var(--shadow-popover); }
+.notice { position: fixed; bottom: 24px; z-index: 90; display: flex; align-items: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 14px; background: var(--popover); color: var(--foreground); font-size: 12px; box-shadow: var(--shadow-popover); }
+.notice-action { flex: 0 0 auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 2px 8px; background: transparent; color: var(--primary); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.notice-action:hover { background: var(--accent); }
+
+/* 自定义 tooltip：反色气泡 + 小三角（对齐 DBX 宿主观感），pointer-events
+   关闭避免遮挡 hover；above 变体翻到元素上方。 */
+.app-tooltip { position: fixed; z-index: 100; max-width: 260px; transform: translateX(-50%); border-radius: 6px; padding: 4px 10px; background: var(--foreground); color: var(--background); font-size: 11px; line-height: 1.45; text-align: center; overflow-wrap: anywhere; pointer-events: none; box-shadow: 0 4px 14px rgb(0 0 0 / 18%); }
+.app-tooltip::before { content: ""; position: absolute; top: -3px; left: 50%; width: 7px; height: 7px; transform: translateX(-50%) rotate(45deg); background: var(--foreground); }
+.app-tooltip.app-tooltip-above { transform: translateX(-50%) translateY(-100%); }
+.app-tooltip-above::before { top: auto; bottom: -3px; }
 .error-banner { top: 42px; border: 1px solid var(--border); padding: 6px 10px; }
 .error-banner { justify-content: space-between; border-color: color-mix(in srgb, var(--destructive) 60%, var(--border)); background: color-mix(in srgb, var(--destructive) 16%, var(--popover)); color: color-mix(in srgb, var(--destructive) 45%, var(--foreground)); }
 .error-banner button { display: grid; width: 20px; height: 20px; border: 0; padding: 0; place-items: center; background: transparent; color: inherit; cursor: pointer; }
@@ -446,7 +468,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .file-footer span:nth-child(2) { color: var(--muted-foreground); }
 
 /* SSH settings dialog */
-.settings-modal { width: min(680px, 100%); }
+.settings-modal { width: min(680px, 100%); height: min(620px, calc(100vh - 48px)); }
 .settings-body { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 14px; overflow-y: auto; padding-right: 4px; }
 /* 分类导航布局（对齐宿主设置页）：左栏分类 + 右栏内容；右栏滚动，左栏不滚。 */
 .settings-layout { display: flex; min-height: 0; flex: 1 1 auto; margin: 0 -16px; border-top: 1px solid var(--border); }
@@ -467,7 +489,27 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 /* 开关行恢复横向布局：.settings-field 的 column 会让 .switch-control 在列向
    flex 里被 stretch/flex-basis 拉成方块、文字掉到下一行（WebGL 开关）。 */
 .settings-switch-row { flex-direction: row; align-items: center; gap: 8px; }
+.settings-radio-row { flex-direction: row; align-items: center; gap: 8px; }
+.settings-radio-row input { margin: 0; }
 .settings-field input, .settings-field select, .settings-field textarea { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+/* 目录输入 + 浏览按钮同行：输入框吃满剩余宽度，图标按钮与输入框等高。 */
+.settings-dir-row { display: flex; align-items: center; gap: 6px; }
+.settings-dir-row input { min-width: 0; flex: 1 1 auto; }
+.browse-button { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); cursor: pointer; }
+.browse-button:hover { background: var(--accent); }
+.browse-button svg { width: 16px; height: 16px; flex: 0 0 16px; }
+
+/* ---- 应用内目录选择器（local/fs/browse，沙箱 iframe 无原生目录选择 API）---- */
+.folder-picker-modal { width: min(520px, 100%); height: min(460px, calc(100vh - 64px)); gap: 10px; }
+.folder-picker-path input { width: 100%; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.folder-picker-list { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; gap: 1px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; }
+.folder-picker-row { display: flex; align-items: center; gap: 8px; border: 0; border-radius: var(--radius); padding: 6px 8px; background: transparent; color: var(--foreground); font-size: 12px; text-align: left; cursor: pointer; }
+.folder-picker-row:hover { background: var(--accent); }
+.folder-picker-row svg { width: 14px; height: 14px; flex: 0 0 14px; color: var(--primary); }
+.folder-picker-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-picker-hint { display: flex; align-items: center; gap: 6px; margin: 0; padding: 8px; color: var(--muted-foreground); font-size: 11px; }
+.folder-picker-hint svg { width: 12px; height: 12px; }
+.folder-picker-current { min-width: 0; flex: 1 1 auto; overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .settings-field textarea { resize: vertical; font-family: var(--terminal-font-family); }
 .settings-note { margin: 0; font-size: 10px; }
 .settings-section-title { margin: 6px 0 0; border-top: 1px solid var(--border); padding-top: 12px; font-size: 12px; }
@@ -481,6 +523,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 /* 全局 quick sudo 配置：来源选择行、列表操作列、内联表单操作列。 */
 .credential-source-row { display: flex; flex: 1; align-items: center; gap: 8px; min-width: 0; }
 .credential-source-row select { flex: 1; min-width: 0; }
+/* 「管理全局配置」入口：裸文字链接放表单行里太像半成品，升级为紧凑描边按钮。 */
+.credential-source-row .link-button { flex: 0 0 auto; align-self: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 3px 10px; background: var(--background); color: var(--foreground); font-size: 11px; white-space: nowrap; }
+.credential-source-row .link-button:hover { background: var(--accent); }
 .settings-list-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; }
 .profiles-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin: 4px 0 0; }
 .mcp-limits { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }

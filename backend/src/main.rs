@@ -8,12 +8,14 @@ mod highlight_rules;
 mod host_key;
 mod keys;
 mod local_downloads;
+mod local_fs;
 mod mcp;
 mod mcp_safety;
 mod metrics;
 mod metrics_history;
 mod model;
 mod multi_exec;
+mod preferences;
 mod quick_commands;
 mod session_recording;
 mod sftp_bookmarks;
@@ -467,6 +469,22 @@ impl Plugin {
                     .map_err(|error| format!("Failed to delete recording: {error}"))?;
                 Ok(json!({ "success": true }))
             }
+            // 一键清空：只删 recordings 目录里的 .cast 文件，返回删除数量。
+            "ssh/recording/clear" => {
+                let deleted = session_recording::clear_recordings(&self.ssh.data_dir());
+                Ok(json!({ "success": true, "deleted": deleted }))
+            }
+            // 在文件管理器中定位录制文件：按 recordingId 解析路径（校验过
+            // 遍历），不暴露任意路径打开原语。
+            "ssh/recording/reveal" => {
+                let recording_id = required_string(&params, "recordingId")?;
+                let path = session_recording::cast_path(&self.ssh.data_dir(), recording_id)?;
+                if !path.exists() {
+                    return Err("Recording file no longer exists".to_string());
+                }
+                local_downloads::reveal_in_file_manager(&path)?;
+                Ok(json!({ "success": true }))
+            }
             "mcp/tools" => Ok(mcp::tool_definitions()),
             "mcp/call" => self
                 .runtime
@@ -720,12 +738,14 @@ impl Plugin {
                     .get("downloadDir")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                let conflict = params.get("conflict").and_then(Value::as_str);
                 self.runtime.block_on(self.ssh.start_download(
                     session_id,
                     remote_path,
                     offset,
                     save_to_local,
                     download_dir.as_deref(),
+                    conflict,
                     emitter,
                 ))
             }
@@ -755,6 +775,42 @@ impl Plugin {
                     "downloadsDir": downloads_dir.to_string_lossy(),
                     "platform": local_downloads::platform_name(),
                 }))
+            }
+            // 通用本机落盘：不经过 SFTP 传输链的本地产物（录制 GIF 导出等）。
+            // 与下载共用目录语义；targetDir 缺省落下载目录，必须绝对路径。
+            "local/saveFile" => {
+                let name = required_string(&params, "name")?;
+                let data_base64 = required_string(&params, "dataBase64")?;
+                let data = BASE64_STANDARD
+                    .decode(data_base64)
+                    .map_err(|error| format!("dataBase64 is not valid base64: {error}"))?;
+                let target_dir = params.get("targetDir").and_then(Value::as_str);
+                let conflict = params.get("conflict").and_then(Value::as_str);
+                local_downloads::save_local_file(
+                    &plugin_data_dir(),
+                    name,
+                    &data,
+                    target_dir,
+                    conflict,
+                )
+            }
+            // 插件级 UI 偏好（下载目录、「每次询问」等）：工作台 iframe 是
+            // sandbox="allow-scripts"（opaque origin），localStorage 不可用，
+            // sidecar 的 preferences.json 是唯一持久存储。固定键白名单。
+            "local/preferences/get" => Ok(preferences::load_preferences(&plugin_data_dir())),
+            "local/preferences/set" => preferences::save_preferences(&plugin_data_dir(), &params),
+            // 应用内目录选择器的本机浏览：只列目录（永不返回文件内容）；
+            // drives 供 Windows「此电脑」盘符页，其他平台为空。
+            "local/fs/browse" => {
+                let path = params.get("path").and_then(Value::as_str);
+                local_fs::browse_local_dir(path, &plugin_data_dir())
+            }
+            "local/fs/drives" => Ok(json!({ "drives": local_fs::list_local_drives() })),
+            // 「询问我」冲突策略的预检：目标目录下同名文件是否已存在。
+            "local/fs/exists" => {
+                let dir = required_string(&params, "dir")?;
+                let name = required_string(&params, "name")?;
+                local_fs::target_exists(dir, name)
             }
             // 在文件管理器中定位已完成的下载。只允许 reveal 传输历史里
             // 记录过的 localPath，不能成为任意路径打开原语。

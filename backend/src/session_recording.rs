@@ -201,6 +201,28 @@ pub fn list_recordings(data_dir: &Path) -> Vec<Value> {
     items.into_iter().map(|(_, item)| item).collect()
 }
 
+/// Deletes every `.cast` recording (one-click "clear all" from the workbench).
+/// Only `.cast` files inside the recordings dir are touched; a file that
+/// cannot be removed (e.g. an in-progress recording still open on Windows)
+/// is skipped rather than failing the whole batch. Returns the deleted count.
+pub fn clear_recordings(data_dir: &Path) -> usize {
+    let dir = recordings_dir(data_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut deleted = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("cast") {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
 /// Reads one recording's header and last event into a list row.
 fn describe_recording(path: &Path, recording_id: &str) -> Option<Value> {
     let mut lines = std::io::BufReader::new(std::fs::File::open(path).ok()?).lines();
@@ -281,6 +303,23 @@ mod tests {
             std::env::temp_dir().join(format!("dbx-session-recording-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn clear_recordings_deletes_only_cast_files() {
+        let dir = temp_dir();
+        let recordings = recordings_dir(&dir);
+        std::fs::create_dir_all(&recordings).unwrap();
+        std::fs::write(recordings.join("a.cast"), "{}").unwrap();
+        std::fs::write(recordings.join("b.cast"), "{}").unwrap();
+        std::fs::write(recordings.join("keep.txt"), "not a recording").unwrap();
+        assert_eq!(clear_recordings(&dir), 2);
+        assert!(!recordings.join("a.cast").exists());
+        assert!(!recordings.join("b.cast").exists());
+        assert!(recordings.join("keep.txt").exists());
+        // 目录不存在时安全返回 0。
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(clear_recordings(&dir), 0);
     }
 
     #[test]

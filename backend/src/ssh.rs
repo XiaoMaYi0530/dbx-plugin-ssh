@@ -748,6 +748,8 @@ struct UploadState {
 struct DownloadSink {
     part_path: PathBuf,
     final_dir: PathBuf,
+    /// 冲突策略："overwrite" 直接覆盖同名文件，否则撞名让位（" (n)"）。
+    overwrite: bool,
     file: AsyncMutex<tokio::fs::File>,
 }
 
@@ -4039,6 +4041,7 @@ impl SshRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_download(
         &self,
         session_id: &str,
@@ -4046,6 +4049,7 @@ impl SshRuntime {
         offset: u64,
         save_to_local: bool,
         download_dir: Option<&str>,
+        conflict: Option<&str>,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         let remote_path = normalize_remote_path(remote_path)?;
@@ -4122,6 +4126,7 @@ impl SshRuntime {
             Some(Arc::new(DownloadSink {
                 part_path,
                 final_dir,
+                overwrite: matches!(conflict, Some("overwrite")),
                 file: AsyncMutex::new(file),
             }))
         } else {
@@ -4350,7 +4355,8 @@ impl SshRuntime {
                 .await
                 .map_err(|error| format!("Failed to flush local download file: {error}"))?;
         }
-        let final_path = local_downloads::pick_download_path(&sink.final_dir, file_name);
+        let final_path =
+            local_downloads::final_download_path(&sink.final_dir, file_name, sink.overwrite);
         if std::fs::rename(&sink.part_path, &final_path).is_ok() {
             return Ok(final_path);
         }

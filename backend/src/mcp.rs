@@ -2076,7 +2076,7 @@ impl McpState {
         timeout_secs: Option<Duration>,
     ) -> Value {
         let arguments = json!({ "connectionId": target.connection_id });
-        let result: Result<Value, String> = (|| async {
+        let result: Result<Value, String> = async {
             let stored = self
                 .registered_connection_by_ref(&arguments)
                 .await?
@@ -2094,7 +2094,7 @@ impl McpState {
             )
             .await?;
             Ok(json!({ "output": outcome.output, "exitCode": outcome.exit_code }))
-        })()
+        }
         .await;
         match result {
             Ok(outcome) => json!({
