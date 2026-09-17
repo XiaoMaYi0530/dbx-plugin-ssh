@@ -229,6 +229,8 @@ const highlightRuleViews = () => [...highlightRulesState].sort((a, b) => a.creat
 // MCP 设置（mcp/settings/get|set）新字段（IMPL_PLAN_NETCATTY_PARITY §1.3）：
 // 权限档与连接作用域，镜像持久化 + 校验语义。
 const mcpSettingsState = { execPermissionMode: "autonomous", connectionScope: [] as string[] };
+// 插件级 UI 偏好（local/preferences/get|set）：镜像 sidecar preferences.json 的合并语义。
+const localPrefsState = { downloadDir: "", downloadUseDefaultDir: true, downloadConflictPolicy: "rename" };
 // 镜像并行批次 ssh/audit/list 的真实形状（AuditEntry：tsMs/tool/connectionId/
 // gate/approval/outcome/exitCode/durationMs/mode/command/output/error，
 // 0.4.77 起带 command/output 尾部）；末条保留计划 §1.1 旧形状（ts 秒 + kind +
@@ -396,6 +398,8 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { events, total: RECORDING_FIXTURE_EVENTS.length, hasMore: offset + events.length < RECORDING_FIXTURE_EVENTS.length };
   }
   else if (method === "ssh/recording/delete") result = { success: true };
+  else if (method === "ssh/recording/clear") result = { success: true, deleted: 1 };
+  else if (method === "ssh/recording/reveal") result = { success: true };
   else if (method === "sftp/transfer/history") {
     // ?err=transferHistory 模拟历史查询失败，供面板 loadFailed+重试态走查。
     if (fixtureParams.get("err") === "transferHistory") throw new Error("sftp: transfer history unavailable");
@@ -418,6 +422,32 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { success: true };
   }
   else if (method === "local/capabilities") result = { canSaveLocal: false, downloadsDir: "" };
+  else if (method === "local/preferences/get") result = { ...localPrefsState };
+  else if (method === "local/fs/drives") result = { drives: ["C:\\", "D:\\"] };
+  else if (method === "local/fs/exists") result = { exists: false, path: "" };
+  else if (method === "local/fs/browse") {
+    // 目录选择器的假目录树：覆盖盘符页 → Downloads 的完整导航路径。
+    const input = params as Record<string, unknown>;
+    const p = typeof input.path === "string" && input.path.trim() ? input.path.trim() : "C:\\Users\\demo\\Downloads";
+    const trees: Record<string, { parent: string | null; dirs: string[] }> = {
+      "C:\\": { parent: null, dirs: ["Users", "Windows", "Temp"] },
+      "D:\\": { parent: null, dirs: ["Downloads", "Work"] },
+      "C:\\Users": { parent: "C:\\", dirs: ["demo"] },
+      "C:\\Users\\demo": { parent: "C:\\Users", dirs: ["Downloads", "Documents"] },
+      "C:\\Users\\demo\\Downloads": { parent: "C:\\Users\\demo", dirs: [] },
+      "C:\\Users\\demo\\Documents": { parent: "C:\\Users\\demo", dirs: [] },
+    };
+    const node = trees[p];
+    if (!node) throw new Error(`Cannot open '${p}': no such directory (mock)`);
+    result = { path: p, parent: node.parent, entries: node.dirs.map((name) => ({ name, path: `${p.replace(/[\\/]+$/, "")}\\${name}`, is_dir: true })) };
+  }
+  else if (method === "local/preferences/set") {
+    const input = params as Record<string, unknown>;
+    if (typeof input.downloadDir === "string") localPrefsState.downloadDir = input.downloadDir.trim();
+    if (typeof input.downloadUseDefaultDir === "boolean") localPrefsState.downloadUseDefaultDir = input.downloadUseDefaultDir;
+    if (typeof input.downloadConflictPolicy === "string" && ["rename", "ask", "overwrite"].includes(input.downloadConflictPolicy)) localPrefsState.downloadConflictPolicy = input.downloadConflictPolicy;
+    result = { ...localPrefsState };
+  }
   else if (method === "sftp/upload/start") result = { taskId: `visual-upload-${++fixtureUploadCount.value}`, chunkSize: 262144 };
   else if (method === "sftp/upload/finish") result = { success: true };
   else if (method === "sftp/transfer/cancel") result = { success: true };

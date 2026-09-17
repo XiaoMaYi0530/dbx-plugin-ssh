@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { CanvasAddon } from "@xterm/addon-canvas";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
@@ -34,6 +35,7 @@ import {
   FolderOpen,
   FolderPlus,
   Gauge,
+  ImagePlay,
   History,
   Home,
   Info,
@@ -54,6 +56,7 @@ import {
   Settings,
   ShieldCheck,
   Siren,
+  Square,
   SquareTerminal,
   Star,
   TextSelect,
@@ -164,6 +167,7 @@ import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type Di
 import { workbenchMessage } from "./lib/i18n";
 import TextPreview from "./components/TextPreview.vue";
 import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
+import FolderPickerDialog from "./components/FolderPickerDialog.vue";
 import SideNavPanel, { type SftpSideQuickPath } from "./components/SideNavPanel.vue";
 
 interface SessionInfo {
@@ -407,6 +411,21 @@ const SFTP_PANE_OPEN_KEY = "ssh-sftp-pane-open";
 const SFTP_SIDE_TAB_KEY = "ssh-sftp-side-tab";
 const SFTP_SIDE_COLLAPSED_KEY = "ssh-sftp-side-collapsed";
 const DOWNLOAD_DIR_KEY = "ssh-download-directory";
+// 是否默认下载到「下载保存目录」（默认开）；关闭则每次下载打开目录选择窗口。
+const DOWNLOAD_USE_DEFAULT_KEY = "ssh-download-use-default-dir";
+// 文件已存在时的处理策略：rename（自动重命名，默认）/ ask（询问我）/ overwrite（覆盖）。
+const DOWNLOAD_CONFLICT_KEY = "ssh-download-conflict-policy";
+type DownloadConflictPolicy = "rename" | "ask" | "overwrite";
+// 下载偏好的内存权威态：setup 早期（downloadUseDefaultDraft 初始化）就会被读，
+// 必须声明在所有读取点之前（存储语义见下方 loadDownloadDir 一带的注释）。
+const downloadDirState = ref("");
+const downloadUseDefaultState = ref(true);
+const downloadConflictState = ref<DownloadConflictPolicy>("rename");
+const DOWNLOAD_CONFLICT_POLICIES: readonly DownloadConflictPolicy[] = ["rename", "ask", "overwrite"];
+
+function sanitizeConflictPolicy(value: unknown): DownloadConflictPolicy {
+  return value === "ask" || value === "overwrite" ? value : "rename";
+}
 // 终端交互：选中复制 + 右键粘贴（localStorage 全局偏好，默认开，"false" 关闭）。
 const SELECT_COPY_KEY = "ssh-terminal-select-copy";
 // 关键词高亮总开关（IMPL_PLAN_NETCATTY_PARITY §3-B1）：localStorage 全局持久化，
@@ -433,7 +452,9 @@ const appearance = ref(resolveAppearance());
 const terminalState = ref<"connecting" | "connected" | "disconnected" | "error">("connecting");
 const terminalError = ref("");
 const sftpError = ref("");
+const sftpErrorRetry = ref<(() => void) | null>(null);
 const notice = ref("");
+const noticeActions = ref<Array<{ label: string; run: () => void }>>([]);
 const session = ref<SessionInfo>();
 const currentPath = ref("/");
 const entries = ref<SftpEntry[]>([]);
@@ -697,6 +718,8 @@ const settingsDraft = reactive({
   rememberedCommands: [] as string[],
 });
 const downloadDirDraft = ref("");
+const downloadUseDefaultDraft = ref(loadDownloadUseDefaultDir());
+const downloadConflictDraft = ref<DownloadConflictPolicy>("rename");
 // 全局 quick sudo 配置集中管理：列表与编辑弹窗状态（密钥只在提交时发送）。
 const sudoProfiles = ref<SudoProfileView[]>([]);
 const sudoProfilesLoading = ref(false);
@@ -850,6 +873,7 @@ let replayNoProgress = 0;
 let binaryInputChain = Promise.resolve();
 let terminalInputSequence = 0;
 let noticeTimer = 0;
+let errorTimer = 0;
 let commandMarkerTimer = 0;
 let agentPromptTimer = 0;
 let zmodemSentry: ZmodemSentry | null = null;
@@ -1072,18 +1096,97 @@ function persistState() {
   }, 150);
 }
 
-function showNotice(message: string) {
-  notice.value = message;
-  window.clearTimeout(noticeTimer);
-  noticeTimer = window.setTimeout(() => (notice.value = ""), 3500);
+// —— 自定义 tooltip（对齐 DBX 宿主的气泡提示）——
+// 全局接管 title 属性：悬停时把值挪到 data-tooltip（抑制原生慢速灰框），
+// 350ms 后显示主题化气泡；下方空间不足翻到上方。模板无需改动，所有现有
+// 和未来的 title 自动生效。
+const tooltip = ref<{ text: string; x: number; y: number; above: boolean; arrowOffset: number } | null>(null);
+const tooltipBubble = ref<HTMLElement>();
+let tooltipEl: HTMLElement | null = null;
+let tooltipTimer = 0;
+
+function hideTooltip() {
+  window.clearTimeout(tooltipTimer);
+  tooltipTimer = 0;
+  tooltip.value = null;
+  tooltipEl = null;
 }
 
-function showError(cause: unknown, target: "terminal" | "sftp" = "sftp") {
+function onTooltipOver(event: MouseEvent) {
+  const target = (event.target as HTMLElement | null)?.closest?.("[title], [data-tooltip]") as HTMLElement | null;
+  if (target === tooltipEl) return;
+  hideTooltip();
+  if (!target) return;
+  // title → data-tooltip：Vue 绑定只在值变化时重写 title，下次悬停再挪一次。
+  const title = target.getAttribute("title");
+  if (title !== null) {
+    target.setAttribute("data-tooltip", title);
+    target.removeAttribute("title");
+  }
+  const text = target.getAttribute("data-tooltip")?.trim();
+  if (!text) return;
+  tooltipEl = target;
+  tooltipTimer = window.setTimeout(() => {
+    tooltipTimer = 0;
+    if (!target.isConnected) return;
+    const rect = target.getBoundingClientRect();
+    const above = rect.bottom + 34 > window.innerHeight && rect.top > 34;
+    const center = rect.left + rect.width / 2;
+    tooltip.value = { text, x: center, y: above ? rect.top - 6 : rect.bottom + 6, above, arrowOffset: 0 };
+    // 量出气泡实际宽度后重新钳位，保证整框（而非仅中心点）落在视口内；
+    // 小三角按钳位偏差反向偏移，继续对准触发元素。
+    void nextTick(() => {
+      const bubble = tooltipBubble.value;
+      const current = tooltip.value;
+      if (!bubble || !current) return;
+      const half = bubble.offsetWidth / 2;
+      const clamped = Math.max(half + 8, Math.min(current.x, window.innerWidth - half - 8));
+      if (clamped !== current.x) {
+        tooltip.value = { ...current, x: clamped, arrowOffset: center - clamped };
+      }
+    });
+  }, 350);
+}
+
+function onTooltipOut(event: MouseEvent) {
+  if (!tooltipEl) return;
+  const related = event.relatedTarget as HTMLElement | null;
+  if (related && tooltipEl.contains(related)) return;
+  hideTooltip();
+}
+
+// 通知/错误横幅的动作按钮（下载完成的「打开文件/打开目录」、失败的「重试」）。
+interface BannerAction {
+  label: string;
+  run: () => void;
+}
+function showNotice(message: string, actions: BannerAction[] = []) {
+  notice.value = message;
+  noticeActions.value = actions;
+  window.clearTimeout(noticeTimer);
+  // 带动作的通知留得更久，给用户点按钮的时间。
+  noticeTimer = window.setTimeout(() => {
+    notice.value = "";
+    noticeActions.value = [];
+  }, actions.length ? 8000 : 3500);
+}
+
+function showError(cause: unknown, target: "terminal" | "sftp" = "sftp", retry?: () => void) {
   const message = cause instanceof Error ? cause.message : String(cause);
   // 常见错误（权限不足/文件不存在）翻成友好文案；其余原样透出。
   const display = friendlySftpError(message, (key) => t(key)) ?? message;
   if (target === "terminal") terminalError.value = display;
-  else sftpError.value = display;
+  else {
+    sftpError.value = display;
+    sftpErrorRetry.value = retry ?? null;
+    // 错误横幅与通知同款自动消失（保留手动关闭），时限放宽到 8s：
+    // 错误信息通常更长，需要读完的时间。
+    window.clearTimeout(errorTimer);
+    errorTimer = window.setTimeout(() => {
+      sftpError.value = "";
+      sftpErrorRetry.value = null;
+    }, 8000);
+  }
 }
 
 function terminalTheme() {
@@ -1764,17 +1867,60 @@ function onTrzszPickCancel() {
 
 /**
  * 下载落盘：优先宿主 fileTransfer API（optional 1.1 特性，逐文件 beginSave/
- * write/finish），web/docker 模式缺失时回退浏览器 <a download>（与 SFTP
- * 下载链路同一兜底写法）。
+ * write/finish）；沙箱 iframe（fileTransfer 缺失）走 sidecar 落盘——与 GIF
+ * 导出同路，支持下载目录设置与「每次询问」；web/docker（sidecar 不在本机）
+ * 回退浏览器 <a download>（与 SFTP 下载链路同一兜底写法）。
  */
 async function saveTrzszDownloadedFiles(files: readonly TrzszDownloadFile[]) {
   const fileTransfer = window.dbxPlugin.fileTransfer;
-  for (const file of files) {
-    if (file.isDirectory || !file.byteLength) continue;
-    if (!fileTransfer) {
-      saveBrowserDownload(file.chunks, file.fileName);
-      continue;
+  const saving = files.filter((file) => !file.isDirectory && file.byteLength > 0);
+  if (!saving.length) return;
+  if (!fileTransfer) {
+    const local = await probeLocalCapabilities();
+    if (!local?.canSaveLocal) {
+      for (const file of saving) saveBrowserDownload(file.chunks, file.fileName);
+      return;
     }
+    // 「使用默认地址」关闭时按批次只问一次，整批落同一目录；取消则整批不保存。
+    let targetDir = "";
+    let setDefaultAfter = false;
+    if (!loadDownloadUseDefaultDir()) {
+      const chosen = await askDownloadTarget(saving[0].fileName);
+      if (chosen === undefined) return;
+      targetDir = chosen.dir.trim();
+      setDefaultAfter = chosen.setDefault;
+    }
+    const dir = targetDir || loadDownloadDir() || undefined;
+    let lastSaved: { localPath: string; name: string } | undefined;
+    for (const file of saving) {
+      // 冲突策略逐文件生效：ask 撞名逐个询问，取消只跳过该文件。
+      const conflict = await resolveDownloadConflictFor(dir || "", file.fileName);
+      if (conflict === undefined) continue;
+      const merged = new Uint8Array(file.byteLength);
+      let offset = 0;
+      for (const chunk of file.chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
+      lastSaved = await window.dbxPlugin.invoke<{ localPath: string; name: string }>("local/saveFile", {
+        name: file.fileName,
+        dataBase64: window.dbxPlugin.encodeBase64(merged),
+        targetDir: dir,
+        conflict: conflict === "overwrite" ? "overwrite" : undefined,
+      });
+    }
+    if (lastSaved) {
+      const savedPath = lastSaved.localPath;
+      showNotice(saving.length === 1
+        ? t("downloadedTo", { name: lastSaved.name, path: savedPath })
+        : t("downloadedToDir", { count: saving.length, path: dir || savedPath.replace(/[\\/][^\\/]+$/, "") }), [
+        { label: t("revealInFolder"), run: () => void revealTransferTarget(savedPath) },
+      ]);
+    }
+    if (setDefaultAfter) applyChosenDirAsDefault(targetDir);
+    return;
+  }
+  for (const file of saving) {
     const target = await fileTransfer.beginSave({ name: file.fileName, size: file.byteLength });
     try {
       let offset = 0;
@@ -3072,21 +3218,171 @@ function loadSftpPaneDefaultOpen(): boolean {
   }
 }
 
+// 下载偏好（保存目录 + 每次询问）：权威存储在 sidecar preferences.json——
+// 工作台 iframe 是 sandbox="allow-scripts"（opaque origin），localStorage
+// 直接抛 SecurityError；localStorage 仅作 web 浏览器直连场景的同步缓存。
+let downloadPrefsHydrated = false;
+
 function loadDownloadDir(): string {
-  try {
-    return window.localStorage.getItem(DOWNLOAD_DIR_KEY)?.trim() || "";
-  } catch {
-    return "";
-  }
+  return downloadDirState.value;
 }
 
 function persistDownloadDir(value: string) {
+  downloadDirState.value = value.trim();
+  void syncDownloadPrefs();
+}
+
+function loadDownloadUseDefaultDir(): boolean {
+  return downloadUseDefaultState.value;
+}
+
+function persistDownloadUseDefaultDir(value: boolean) {
+  downloadUseDefaultState.value = value;
+  void syncDownloadPrefs();
+}
+
+function loadDownloadConflictPolicy(): DownloadConflictPolicy {
+  return downloadConflictState.value;
+}
+
+function persistDownloadConflictPolicy(value: DownloadConflictPolicy) {
+  downloadConflictState.value = sanitizeConflictPolicy(value);
+  void syncDownloadPrefs();
+}
+
+function cacheDownloadPrefs() {
   try {
-    const normalized = value.trim();
-    if (normalized) window.localStorage.setItem(DOWNLOAD_DIR_KEY, normalized);
+    if (downloadDirState.value) window.localStorage.setItem(DOWNLOAD_DIR_KEY, downloadDirState.value);
     else window.localStorage.removeItem(DOWNLOAD_DIR_KEY);
+    // 默认开：只在关闭时落键（"0"），未来默认策略变化时老用户不被钉死。
+    if (!downloadUseDefaultState.value) window.localStorage.setItem(DOWNLOAD_USE_DEFAULT_KEY, "0");
+    else window.localStorage.removeItem(DOWNLOAD_USE_DEFAULT_KEY);
+    if (downloadConflictState.value !== "rename") window.localStorage.setItem(DOWNLOAD_CONFLICT_KEY, downloadConflictState.value);
+    else window.localStorage.removeItem(DOWNLOAD_CONFLICT_KEY);
   } catch {
-    // localStorage 不可用时偏好仅对当前会话生效。
+    // opaque origin：缓存跳过，内存态仍支撑本次会话。
+  }
+}
+
+async function syncDownloadPrefs() {
+  cacheDownloadPrefs();
+  try {
+    await window.dbxPlugin.invoke("local/preferences/set", {
+      downloadDir: downloadDirState.value,
+      downloadUseDefaultDir: downloadUseDefaultState.value,
+      downloadConflictPolicy: downloadConflictState.value,
+    });
+  } catch {
+    // 旧 sidecar 无此方法：本次会话内存态兜底。
+  }
+}
+
+async function hydrateDownloadPrefs() {
+  if (downloadPrefsHydrated) return;
+  downloadPrefsHydrated = true;
+  try {
+    downloadDirState.value = window.localStorage.getItem(DOWNLOAD_DIR_KEY)?.trim() || "";
+    downloadUseDefaultState.value = window.localStorage.getItem(DOWNLOAD_USE_DEFAULT_KEY) !== "0";
+    downloadConflictState.value = sanitizeConflictPolicy(window.localStorage.getItem(DOWNLOAD_CONFLICT_KEY));
+  } catch {
+    // 同上：等待 sidecar 权威值。
+  }
+  try {
+    const prefs = await window.dbxPlugin.invoke<{ downloadDir?: unknown; downloadUseDefaultDir?: unknown; downloadConflictPolicy?: unknown }>("local/preferences/get", {});
+    if (typeof prefs.downloadDir === "string") downloadDirState.value = prefs.downloadDir.trim();
+    if (typeof prefs.downloadUseDefaultDir === "boolean") downloadUseDefaultState.value = prefs.downloadUseDefaultDir;
+    if (prefs.downloadConflictPolicy !== undefined) downloadConflictState.value = sanitizeConflictPolicy(prefs.downloadConflictPolicy);
+    cacheDownloadPrefs();
+  } catch {
+    // 旧 sidecar：保留 localStorage 种子或默认。
+  }
+}
+
+// 「使用默认地址」关闭时，下载/导出前弹出目录选择小窗。resolve 语义：
+// { dir, setDefault } = 用户确认（dir 空串 = 默认下载目录；setDefault =
+// 勾选了「将此次目录设为默认地址」）；undefined = 取消本次下载。
+interface DownloadPrompt {
+  fileName: string;
+  dir: string;
+  setDefault: boolean;
+  resolve: (result: { dir: string; setDefault: boolean } | undefined) => void;
+}
+const downloadPrompt = ref<DownloadPrompt | null>(null);
+
+function askDownloadTarget(fileName: string): Promise<{ dir: string; setDefault: boolean } | undefined> {
+  return new Promise((resolve) => {
+    downloadPrompt.value = {
+      fileName,
+      dir: loadDownloadDir() || localDownloadDir.value,
+      setDefault: false,
+      resolve,
+    };
+  });
+}
+
+function resolveDownloadPrompt(result?: { dir: string; setDefault: boolean }) {
+  downloadPrompt.value?.resolve(result);
+  downloadPrompt.value = null;
+}
+
+// 勾选「设为默认地址」后的闭环回写：目录成为新默认 + 自动打开
+// 「使用默认地址」开关（设置页草稿同步，弹窗开着也能立即看到）。
+function applyChosenDirAsDefault(dir: string) {
+  const normalized = dir.trim();
+  if (normalized) {
+    persistDownloadDir(normalized);
+    downloadDirDraft.value = normalized;
+  }
+  persistDownloadUseDefaultDir(true);
+  downloadUseDefaultDraft.value = true;
+}
+
+// 「浏览」按钮打开应用内目录选择器（FolderPickerDialog，sidecar 列本机
+// 目录）：沙箱 iframe 没有目录选择 API，原生系统对话框有窗口层级问题。
+// target 记录选中值回填到哪——下载询问弹窗还是设置页草稿。
+const folderPickerTarget = ref<"prompt" | "settings" | null>(null);
+
+function onFolderPicked(path: string) {
+  if (folderPickerTarget.value === "prompt" && downloadPrompt.value) {
+    downloadPrompt.value.dir = path;
+  } else if (folderPickerTarget.value === "settings") {
+    downloadDirDraft.value = path;
+  }
+  folderPickerTarget.value = null;
+}
+
+// 「询问我」冲突策略：目标目录已有同名文件时弹确认（自动重命名/覆盖/取消）。
+interface DownloadConflictPrompt {
+  fileName: string;
+  path: string;
+  resolve: (choice: "rename" | "overwrite" | undefined) => void;
+}
+const downloadConflictPrompt = ref<DownloadConflictPrompt | null>(null);
+
+function askDownloadConflict(fileName: string, path: string) {
+  return new Promise<"rename" | "overwrite" | undefined>((resolve) => {
+    downloadConflictPrompt.value = { fileName, path, resolve };
+  });
+}
+
+function resolveDownloadConflict(choice: "rename" | "overwrite" | undefined) {
+  downloadConflictPrompt.value?.resolve(choice);
+  downloadConflictPrompt.value = null;
+}
+
+// 落盘前的冲突解析：返回传给后端的冲突模式，undefined = 用户取消。
+// rename/overwrite 策略直接放行；ask 仅在确实撞名时打断，预检失败不阻断。
+async function resolveDownloadConflictFor(dir: string, fileName: string): Promise<"rename" | "overwrite" | undefined> {
+  const policy = loadDownloadConflictPolicy();
+  if (policy !== "ask") return policy;
+  const targetDir = dir || loadDownloadDir() || localDownloadDir.value;
+  if (!targetDir) return "rename";
+  try {
+    const probe = await window.dbxPlugin.invoke<{ exists: boolean; path: string }>("local/fs/exists", { dir: targetDir, name: fileName });
+    if (!probe.exists) return "rename";
+    return await askDownloadConflict(fileName, probe.path);
+  } catch {
+    return "rename";
   }
 }
 
@@ -3988,11 +4284,13 @@ function waitForUploadAck(taskId: string, nextOffset: number) {
 // canSaveLocal=false 时回退浏览器 <a download>。结果按工作台生命周期缓存。
 let localCapabilities: Promise<{ canSaveLocal: boolean; downloadsDir: string } | undefined> | undefined;
 const localDownloadDir = ref("");
+const localCanSave = ref(false);
 function probeLocalCapabilities() {
   localCapabilities ??= window.dbxPlugin
     .invoke<{ canSaveLocal: boolean; downloadsDir: string }>("local/capabilities")
     .then((result) => {
       localDownloadDir.value = result.downloadsDir || "";
+      localCanSave.value = result.canSaveLocal;
       return result;
     })
     .catch(() => undefined);
@@ -4009,6 +4307,19 @@ async function downloadEntry(entry: SftpEntry) {
   // local filesystem is unavailable (web/docker).
   const local = await probeLocalCapabilities();
   const saveToLocal = !!local?.canSaveLocal;
+  // 「使用默认地址」关闭时先选保存目录；取消则整次下载不发生。
+  // 仅本地落盘可指定目录——web/docker 浏览器下载由浏览器决定位置。
+  let dirOverride = "";
+  let setDefaultAfter = false;
+  if (saveToLocal && !loadDownloadUseDefaultDir()) {
+    const chosen = await askDownloadTarget(entry.name);
+    if (chosen === undefined) return;
+    dirOverride = chosen.dir.trim();
+    setDefaultAfter = chosen.setDefault;
+  }
+  // 冲突策略：ask 且确实撞名时先问，取消则整次下载不发生（仅本地落盘可查本机目录）。
+  const conflict = saveToLocal ? await resolveDownloadConflictFor(dirOverride, entry.name) : undefined;
+  if (saveToLocal && conflict === undefined) return;
   const fileTransfer = saveToLocal ? undefined : window.dbxPlugin.fileTransfer;
   // Web/Docker mode has no local sink and no host save dialog; the whole file
   // is buffered in browser memory before saving, so warn before large ones.
@@ -4021,7 +4332,8 @@ async function downloadEntry(entry: SftpEntry) {
       sessionId: session.value.sessionId,
       remotePath: pathFromUri(entry.uri),
       saveToLocal,
-      downloadDir: loadDownloadDir() || undefined,
+      downloadDir: dirOverride || loadDownloadDir() || undefined,
+      conflict: conflict === "overwrite" ? "overwrite" : undefined,
     });
     transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued" };
     target = fileTransfer ? await fileTransfer.beginSave({ name: info.fileName, size: info.size }) : undefined;
@@ -4075,7 +4387,17 @@ async function downloadEntry(entry: SftpEntry) {
       task.transferred = info.size;
       if (localPath) task.localPath = localPath;
     }
-    showNotice(localPath ? t("downloadedTo", { name: info.fileName, path: localPath }) : t("downloaded", { name: info.fileName }));
+    // 完成闭环：本机落盘的下载给出「打开文件 / 打开目录」动作。
+    if (localPath) {
+      const savedPath = localPath;
+      showNotice(t("downloadedTo", { name: info.fileName, path: savedPath }), [
+        { label: t("openDownloadedFile"), run: () => void openTransferTarget(savedPath) },
+        { label: t("revealInFolder"), run: () => void revealTransferTarget(savedPath) },
+      ]);
+    } else {
+      showNotice(t("downloaded", { name: info.fileName }));
+    }
+    if (setDefaultAfter) applyChosenDirAsDefault(dirOverride);
   } catch (cause) {
     if (info) {
       const waiter = downloadChunkWaiters.get(info.taskId);
@@ -4091,7 +4413,8 @@ async function downloadEntry(entry: SftpEntry) {
       if (task) task.status = "cancelled";
       showNotice(t("transferStatus.cancelled"));
     } else {
-      showError(cause);
+      // 失败闭环：横幅带「重试」，按原入口完整重跑（含询问/冲突流程）。
+      showError(cause, "sftp", () => void downloadEntry(entry));
     }
   }
 }
@@ -5024,7 +5347,8 @@ async function killProcessRow(row: ProcessRow, signal: 15 | 9) {
 // —— F3：终端录制 + 回放（asciicast v2）———
 
 // 录制开始倒计时（录制软件惯例）：点击后 3→2→1 动画，归零才真正
-// recording/start；Esc/点击遮罩取消。录制中工具栏按钮变红色胶囊显示时长。
+// recording/start；Esc/点击遮罩取消。录制中工具栏按钮变红，终端区底部
+// 浮出控制条（呼吸点 + 时长 + 停止）。
 const recordCountdown = ref<number | null>(null);
 const recordingStartedAt = ref<number | null>(null);
 const recordingElapsedSec = ref(0);
@@ -5110,7 +5434,20 @@ async function loadRecordings() {
 
 function toggleRecordings() {
   recordingsOpen.value = !recordingsOpen.value;
-  if (recordingsOpen.value) void loadRecordings();
+  if (recordingsOpen.value) {
+    void probeLocalCapabilities();
+    void loadRecordings();
+  }
+}
+
+// 打开录制文件所在目录：仅在桌面端（sidecar 在本机）有意义，
+// web/docker 的录制文件在远端服务器上。
+async function revealRecording(item: RecordingSummary) {
+  try {
+    await window.dbxPlugin.invoke("ssh/recording/reveal", { recordingId: item.recordingId });
+  } catch (cause) {
+    showError(cause);
+  }
 }
 
 function deleteRecording(item: RecordingSummary) {
@@ -5129,6 +5466,26 @@ async function confirmRecordingDelete() {
     showError(cause);
   } finally {
     recordingDeleteSubmitting.value = false;
+  }
+}
+
+// 一键清空：应用内确认弹窗（沙箱 iframe confirm 恒 false），确认后
+// ssh/recording/clear 全删 .cast，重载列表并提示删除数量。
+const recordingClearAllOpen = ref(false);
+const recordingClearAllSubmitting = ref(false);
+
+async function confirmRecordingClearAll() {
+  if (recordingClearAllSubmitting.value) return;
+  recordingClearAllSubmitting.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ deleted?: number }>("ssh/recording/clear", {});
+    recordingClearAllOpen.value = false;
+    await loadRecordings();
+    showNotice(t("recordingsCleared", { count: result.deleted ?? 0 }));
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    recordingClearAllSubmitting.value = false;
   }
 }
 
@@ -5271,9 +5628,17 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
     term.open(host);
     // xterm 默认 DOM 渲染器不产生 canvas，逐帧取像素必须挂 WebGL renderer
     // （addon 内部 preserveDrawingBuffer，drawImage 出来的帧才稳定）。渲染器
-    // 随终端 dispose，不长期占用浏览器有限的 WebGL context；挂载失败
-    // （headless/无 WebGL）走 !screen 分支给出明确错误，而不是永远空帧。
-    attachWebglRenderer(term, () => new WebglAddon());
+    // 随终端 dispose，不长期占用浏览器有限的 WebGL context；WebGL 不可用
+    // （GPU 被禁/context 耗尽）时回退 Canvas 渲染器（同样产出真实 canvas），
+    // 两者都挂不上才走 !screen 分支给出明确错误，而不是永远空帧。
+    const webgl = attachWebglRenderer(term, () => new WebglAddon());
+    if (!webgl) {
+      try {
+        term.loadAddon(new CanvasAddon());
+      } catch {
+        // 最终由下方 !screen 分支报 replayExportFailed。
+      }
+    }
     const screen = host.querySelector("canvas") as HTMLCanvasElement | null;
     const canvas = document.createElement("canvas");
     const context = canvas.getContext("2d");
@@ -5323,10 +5688,40 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
         await fileTransfer.cancel(target.handleId).catch(() => undefined);
         throw cause;
       }
+      showNotice(t("replayExported"));
     } else {
-      // Old web/docker hosts have no native picker; retain the browser's
-      // download behavior as the last-resort compatibility path.
-      saveBrowserDownload([gif], fileName);
+      // 沙箱 iframe（宿主 fileTransfer 缺失）下的可靠路径：sidecar 落盘到
+      // 下载目录（或「每次询问」选择的目录），完成后提示完整路径。
+      // web/docker（sidecar 不在本机）仍回退浏览器 <a download>。
+      const local = await probeLocalCapabilities();
+      if (!local?.canSaveLocal) {
+        saveBrowserDownload([gif], fileName);
+        showNotice(t("replayExported"));
+        return;
+      }
+      let targetDir = "";
+      let setDefaultAfter = false;
+      if (!loadDownloadUseDefaultDir()) {
+        const chosen = await askDownloadTarget(fileName);
+        if (chosen === undefined) return;
+        targetDir = chosen.dir.trim();
+        setDefaultAfter = chosen.setDefault;
+      }
+      const conflict = await resolveDownloadConflictFor(targetDir, fileName);
+      if (conflict === undefined) return;
+      const saved = await window.dbxPlugin.invoke<{ localPath: string; name: string }>("local/saveFile", {
+        name: fileName,
+        dataBase64: window.dbxPlugin.encodeBase64(gif),
+        targetDir: targetDir || loadDownloadDir() || undefined,
+        conflict: conflict === "overwrite" ? "overwrite" : undefined,
+      });
+      const savedPath = saved.localPath;
+      showNotice(t("downloadedTo", { name: saved.name, path: savedPath }), [
+        { label: t("openDownloadedFile"), run: () => void openTransferTarget(savedPath) },
+        { label: t("revealInFolder"), run: () => void revealTransferTarget(savedPath) },
+      ]);
+      if (setDefaultAfter) applyChosenDirAsDefault(targetDir);
+      return;
     }
     showNotice(t("replayExported"));
   } finally {
@@ -5439,7 +5834,10 @@ function beginChmod(entry: SftpEntry) {
 
 async function openSettings() {
   settingsOpen.value = true;
+  await hydrateDownloadPrefs();
   downloadDirDraft.value = loadDownloadDir();
+  downloadUseDefaultDraft.value = loadDownloadUseDefaultDir();
+  downloadConflictDraft.value = loadDownloadConflictPolicy();
   void probeLocalCapabilities();
   if (settingsLoading.value || settingsSaving.value) return;
   settingsLoading.value = true;
@@ -5719,6 +6117,8 @@ async function saveSettings() {
   settingsSaving.value = true;
   try {
     persistDownloadDir(downloadDirDraft.value);
+    persistDownloadUseDefaultDir(downloadUseDefaultDraft.value);
+    persistDownloadConflictPolicy(downloadConflictDraft.value);
     if (profileEditing.value) await saveProfileDraft();
     const updates: Record<string, unknown> = {
       quickSudo: settingsDraft.quickSudo,
@@ -5948,13 +6348,17 @@ function trackStableFocus(event: FocusEvent) {
 // 参与聚焦与 Tab 陷阱，但不参与 Esc 关闭）。按模板出现顺序排列，
 // 计数变化驱动聚焦/归还；同层互斥由交互保证。
 const modalOpenStates = computed(() => [
+  folderPickerTarget.value !== null,
   previewOpen.value,
   pasteConfirm.value,
   dropUploadPrompt.value,
+  downloadPrompt.value !== null,
+  downloadConflictPrompt.value !== null,
   attrsTarget.value,
   deleteTarget.value,
   batchDeleteOpen.value,
   recordingDeleteTarget.value !== null,
+  recordingClearAllOpen.value,
   chmodTarget.value,
   newFileDialog.value,
   operationDialog.value,
@@ -6038,12 +6442,24 @@ function onDocumentKeydown(event: KeyboardEvent) {
     return;
   }
   // ---- 对话框（安全取消语义；hostKey/agent 审批等安全弹窗不在此列）----
+  if (folderPickerTarget.value) {
+    folderPickerTarget.value = null;
+    return;
+  }
   if (pasteConfirm.value) {
     resolvePasteConfirm(false);
     return;
   }
   if (dropUploadPrompt.value) {
     resolveDropUpload("cancel");
+    return;
+  }
+  if (downloadPrompt.value) {
+    resolveDownloadPrompt(undefined);
+    return;
+  }
+  if (downloadConflictPrompt.value) {
+    resolveDownloadConflict(undefined);
     return;
   }
   if (attrsTarget.value) {
@@ -6060,6 +6476,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
   }
   if (recordingDeleteTarget.value) {
     if (!recordingDeleteSubmitting.value) recordingDeleteTarget.value = null;
+    return;
+  }
+  if (recordingClearAllOpen.value) {
+    if (!recordingClearAllSubmitting.value) recordingClearAllOpen.value = false;
     return;
   }
   if (chmodTarget.value) {
@@ -6266,8 +6686,13 @@ onMounted(() => {
   document.addEventListener("mousedown", onDocumentMouseDownCapture, true);
   document.addEventListener("keydown", onDocumentKeydown);
   document.addEventListener("focusin", trackStableFocus);
+  document.addEventListener("mouseover", onTooltipOver);
+  document.addEventListener("mouseout", onTooltipOut);
+  document.addEventListener("pointerdown", hideTooltip, true);
+  document.addEventListener("wheel", hideTooltip, true);
   void hydrateQuickCommands();
   void hydrateHighlightRules();
+  void hydrateDownloadPrefs();
   void initialize().catch((cause) => {
     terminalState.value = "error";
     showError(cause, "terminal");
@@ -6276,12 +6701,19 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   disposed = true;
+  document.removeEventListener("mouseover", onTooltipOver);
+  document.removeEventListener("mouseout", onTooltipOut);
+  document.removeEventListener("pointerdown", hideTooltip, true);
+  document.removeEventListener("wheel", hideTooltip, true);
+  hideTooltip();
   window.clearTimeout(persistTimer);
+  window.clearInterval(recordCountdownTimer);
   void writeWorkbenchState();
   window.clearTimeout(resizeTimer);
   window.clearTimeout(reconnectTimer);
   window.clearInterval(reconnectCountdownTimer);
   window.clearTimeout(noticeTimer);
+  window.clearTimeout(errorTimer);
   window.clearTimeout(zmodemDetectionTimer);
   window.clearTimeout(trzszDetectionTimer);
   window.clearTimeout(trzszWatchdogTimer);
@@ -6337,11 +6769,31 @@ onBeforeUnmount(() => {
 <template>
   <main class="workbench">
     <header class="toolbar" :style="toolbarStyle">
-      <div class="identity">
-        <span v-if="connection.color" class="connection-color" :style="{ backgroundColor: connection.color }" />
-        <strong>{{ connectionIdentity }}</strong>
-        <span v-if="connection.readOnly || connectionReadOnly" class="read-only-badge">{{ t("readOnly") }}</span>
-        <span class="session-pill" :class="`session-${sessionStatus}`"><span class="session-dot" aria-hidden="true" />{{ t(`sessionStatus.${sessionStatus}`) }}<span v-if="sessionStatus === 'reconnecting' && reconnectCountdown" class="session-pill-countdown mono">{{ t("sessionStatus.reconnectCountdown", { seconds: reconnectCountdown.seconds, attempt: reconnectCountdown.attempt }) }}</span></span>
+      <!-- 连接信息入口：Info 图标按钮紧跟标识区（状态徽章右侧），弹层锚在左侧 -->
+      <div class="identity-side menu-anchor">
+        <div class="identity">
+          <span v-if="connection.color" class="connection-color" :style="{ backgroundColor: connection.color }" />
+          <strong>{{ connectionIdentity }}</strong>
+          <span v-if="connection.readOnly || connectionReadOnly" class="read-only-badge">{{ t("readOnly") }}</span>
+          <span class="session-pill" :class="`session-${sessionStatus}`"><span class="session-dot" aria-hidden="true" />{{ t(`sessionStatus.${sessionStatus}`) }}<span v-if="sessionStatus === 'reconnecting' && reconnectCountdown" class="session-pill-countdown mono">{{ t("sessionStatus.reconnectCountdown", { seconds: reconnectCountdown.seconds, attempt: reconnectCountdown.attempt }) }}</span></span>
+        </div>
+        <button type="button" class="icon-button icon-neutral" :title="t('connectionInfo')" :aria-expanded="connectionInfoOpen" @click.stop="toggleConnectionInfo"><Info /></button>
+        <section v-if="connectionInfoOpen" class="popover popover-left connection-info-popover" @click.stop>
+          <h3>{{ t("connectionInfo") }}</h3>
+          <dl class="connection-info-grid">
+            <dt>{{ t("connectionInfoHost") }}</dt><dd class="mono"><span v-if="metricsDistroBadge" class="distro-badge" :style="{ backgroundColor: metricsDistroBadge.color }" :title="metricsDistroBadge.name">{{ metricsDistroBadge.label }}</span> {{ connection.host || connection.name || "–" }}</dd>
+            <dt>{{ t("connectionInfoPort") }}</dt><dd class="mono">{{ connection.port || 22 }}</dd>
+            <dt>{{ t("connectionInfoUser") }}</dt><dd class="mono">{{ connection.username || "–" }}</dd>
+            <dt>{{ t("connectionInfoAuth") }}</dt><dd>{{ connectionAuthMethodLabel }}</dd>
+            <template v-if="connection.readOnly || connectionReadOnly"><dt>{{ t("readOnly") }}</dt><dd>{{ t("yes") }}</dd></template>
+            <dt>{{ t("connectionInfoLatency") }}</dt>
+            <dd>
+              <span class="mono">{{ connectionLatencyBusy ? t("connectionInfoMeasuring") : formatLatency(connectionLatency) }}</span>
+              <span v-if="connectionLatencyFailed && !connectionLatencyBusy" class="task-error">{{ t("connectionInfoFailed") }}</span>
+              <button class="link-button" :disabled="connectionLatencyBusy || !connected" @click="measureLatency">{{ t("connectionInfoMeasure") }}</button>
+            </dd>
+          </dl>
+        </section>
       </div>
       <div class="toolbar-actions">
         <button class="icon-button icon-neutral" :title="paneOrder === 'terminal-left' ? t('moveSftpLeft') : t('moveTerminalLeft')" @click="togglePaneOrder"><ArrowLeftRight /></button>
@@ -6468,27 +6920,8 @@ onBeforeUnmount(() => {
           </section>
         </div>
         <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
-        <button class="icon-button" :class="{ 'is-recording': recordingActive, 'recording-live': recordingActive }" :title="t('recordingTitle')" :disabled="!connected" @click="toggleRecording"><Disc /><span v-if="recordingActive" class="recording-elapsed mono">{{ formatDuration(recordingElapsedSec) }}</span></button>
+        <button class="icon-button" :class="{ 'is-recording': recordingActive }" :title="recordingActive ? t('recordingStop') : t('recordingTitle')" :disabled="!connected" @click="toggleRecording"><Disc /></button>
         <button class="icon-button" :class="{ 'is-active': recordingsOpen }" :title="t('recordingsTitle')" @click="toggleRecordings"><Film /></button>
-        <div class="menu-anchor">
-          <button class="icon-button icon-neutral" :title="t('connectionInfo')" @click.stop="toggleConnectionInfo"><Info /></button>
-          <section v-if="connectionInfoOpen" class="popover connection-info-popover" @click.stop>
-            <h3>{{ t("connectionInfo") }}</h3>
-            <dl class="connection-info-grid">
-              <dt>{{ t("connectionInfoHost") }}</dt><dd class="mono"><span v-if="metricsDistroBadge" class="distro-badge" :style="{ backgroundColor: metricsDistroBadge.color }" :title="metricsDistroBadge.name">{{ metricsDistroBadge.label }}</span> {{ connection.host || connection.name || "–" }}</dd>
-              <dt>{{ t("connectionInfoPort") }}</dt><dd class="mono">{{ connection.port || 22 }}</dd>
-              <dt>{{ t("connectionInfoUser") }}</dt><dd class="mono">{{ connection.username || "–" }}</dd>
-              <dt>{{ t("connectionInfoAuth") }}</dt><dd>{{ connectionAuthMethodLabel }}</dd>
-              <template v-if="connection.readOnly || connectionReadOnly"><dt>{{ t("readOnly") }}</dt><dd>{{ t("yes") }}</dd></template>
-              <dt>{{ t("connectionInfoLatency") }}</dt>
-              <dd>
-                <span class="mono">{{ connectionLatencyBusy ? t("connectionInfoMeasuring") : formatLatency(connectionLatency) }}</span>
-                <span v-if="connectionLatencyFailed && !connectionLatencyBusy" class="task-error">{{ t("connectionInfoFailed") }}</span>
-                <button class="link-button" :disabled="connectionLatencyBusy || !connected" @click="measureLatency">{{ t("connectionInfoMeasure") }}</button>
-              </dd>
-            </dl>
-          </section>
-        </div>
         <button class="icon-button icon-violet" :title="t('settings')" :disabled="!connected" @click="openSettings"><Settings /></button>
         <button class="icon-button icon-amber" :title="t('auditLog.title')" @click="openAuditLog"><FileText /></button>
         <div class="menu-anchor">
@@ -6552,8 +6985,12 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div v-if="notice" class="notice">{{ notice }}</div>
-    <div v-if="sftpError" class="error-banner"><span>{{ sftpError }}</span><button :title="t('close')" @click="sftpError = ''"><X /></button></div>
+    <div v-if="tooltip" ref="tooltipBubble" class="app-tooltip" :class="{ 'app-tooltip-above': tooltip.above }" :style="{ left: `${tooltip.x}px`, top: `${tooltip.y}px`, '--arrow-offset': `${tooltip.arrowOffset}px` }" role="tooltip">{{ tooltip.text }}</div>
+    <div v-if="notice" class="notice">
+      <span>{{ notice }}</span>
+      <button v-for="action in noticeActions" :key="action.label" class="notice-action" @click="action.run()">{{ action.label }}</button>
+    </div>
+    <div v-if="sftpError" class="error-banner"><span>{{ sftpError }}</span><button v-if="sftpErrorRetry" class="notice-action" @click="sftpErrorRetry()">{{ t("retry") }}</button><button :title="t('close')" @click="sftpError = ''; sftpErrorRetry = null"><X /></button></div>
 
     <section ref="paneContainer" :class="orderedPaneClass">
       <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
@@ -6579,6 +7016,12 @@ onBeforeUnmount(() => {
           <span v-if="reconnectCountdown" class="reconnect-attempt">{{ t("reconnectBanner.attempt", { attempt: reconnectCountdown.attempt }) }}</span>
           <progress v-if="reconnectCountdown" :value="reconnectCountdown.percent" max="100" />
           <button class="reconnect-now" @click="reconnectNow">{{ t("reconnectNow") }}</button>
+        </div>
+        <!-- 录制中悬浮控制条：底部居中，红色呼吸点 + 时长 + 停止 -->
+        <div v-if="recordingActive" class="recording-float" role="status">
+          <Disc class="recording-float-dot" />
+          <span class="recording-elapsed mono">{{ formatDuration(recordingElapsedSec) }}</span>
+          <button class="recording-stop" @click="toggleRecording"><Square />{{ t("recordingStop") }}</button>
         </div>
         <!-- 录制开始倒计时遮罩：大数字 3→2→1（:key 重触发放缩动画），Esc/点击取消 -->
         <div v-if="recordCountdown !== null" class="record-countdown-overlay" role="status" @click="cancelRecordCountdown">
@@ -6748,6 +7191,7 @@ onBeforeUnmount(() => {
         <section v-if="recordingsOpen" class="metrics-float recordings-float">
           <header>
             <h2>{{ t("recordingsTitle") }}</h2>
+            <button v-if="recordings.length" class="icon-button recording-delete" :title="t('recordingsClear')" :disabled="recordingClearAllSubmitting" @click="recordingClearAllOpen = true"><Trash2 /></button>
             <button :title="t('close')" class="icon-button" @click="toggleRecordings"><X /></button>
           </header>
           <div class="metrics-float-body">
@@ -6762,7 +7206,8 @@ onBeforeUnmount(() => {
               <span class="recording-duration mono">{{ formatDuration(item.durationSecs ?? 0) }}</span>
               <div class="recording-actions">
                 <button class="icon-button compact" :title="t('replayOpen')" @click="openReplay(item)"><Play /></button>
-                <button class="icon-button compact" :title="t('replayExportGif')" :disabled="replayExporting" @click="exportRecordingFromList(item)"><Loader2 v-if="recordingExportingId === item.recordingId" class="spinning" /><Download v-else /></button>
+                <button class="icon-button compact" :title="t('replayExportGif')" :disabled="replayExporting" @click="exportRecordingFromList(item)"><Loader2 v-if="recordingExportingId === item.recordingId" class="spinning" /><ImagePlay v-else /></button>
+                <button v-if="localCanSave" class="icon-button compact" :title="t('revealInFolder')" :aria-label="t('revealInFolder')" @click="revealRecording(item)"><FolderOpen /></button>
                 <button class="icon-button compact recording-delete" :title="t('recordingDelete')" @click="deleteRecording(item)"><Trash2 /></button>
               </div>
             </article>
@@ -7200,11 +7645,58 @@ onBeforeUnmount(() => {
     </section>
 
     <!-- 录制删除确认：应用内弹窗替代 window.confirm（宿主沙箱 iframe 无 allow-modals，confirm 恒 false） -->
+    <!-- 下载/导出前的保存目录选择（设置里开启「每次询问」时出现） -->
+    <section v-if="downloadPrompt" class="modal-backdrop" @mousedown.self="resolveDownloadPrompt(undefined)">
+      <article class="modal small-modal">
+        <header><h2>{{ t("downloadSettings.askTitle") }}</h2><button class="icon-button" :title="t('close')" @click="resolveDownloadPrompt(undefined)"><X /></button></header>
+        <p class="muted mono">{{ downloadPrompt.fileName }}</p>
+        <label class="settings-field">
+          <span>{{ t("downloadSettings.directory") }}</span>
+          <span class="settings-dir-row">
+            <input v-model="downloadPrompt.dir" class="mono" spellcheck="false" autofocus @keydown.enter="resolveDownloadPrompt({ dir: downloadPrompt.dir, setDefault: downloadPrompt.setDefault })" />
+            <button v-if="localCanSave" type="button" class="browse-button" :title="t('downloadSettings.browse')" :aria-label="t('downloadSettings.browse')" @click="folderPickerTarget = 'prompt'"><FolderOpen /></button>
+          </span>
+        </label>
+        <label class="settings-field settings-switch-row">
+          <input v-model="downloadPrompt.setDefault" type="checkbox" />
+          <span>{{ t("downloadSettings.setDefaultThisTime") }}</span>
+        </label>
+        <p class="muted settings-note">{{ t("downloadSettings.askHint") }}</p>
+        <footer>
+          <button @click="resolveDownloadPrompt(undefined)">{{ t("cancel") }}</button>
+          <button class="primary-button" @click="resolveDownloadPrompt({ dir: downloadPrompt.dir, setDefault: downloadPrompt.setDefault })">{{ t("save") }}</button>
+        </footer>
+      </article>
+    </section>
+
+    <!-- 「询问我」冲突策略：目标目录已有同名文件时的选择 -->
+    <section v-if="downloadConflictPrompt" class="modal-backdrop" @mousedown.self="resolveDownloadConflict(undefined)">
+      <article class="modal small-modal">
+        <header><h2>{{ t("downloadConflict.title") }}</h2><button class="icon-button" :title="t('close')" @click="resolveDownloadConflict(undefined)"><X /></button></header>
+        <p>{{ t("downloadConflict.message", { name: downloadConflictPrompt.fileName }) }}</p>
+        <p class="muted mono">{{ downloadConflictPrompt.path }}</p>
+        <footer>
+          <button @click="resolveDownloadConflict(undefined)">{{ t("cancel") }}</button>
+          <button class="danger-button" @click="resolveDownloadConflict('overwrite')">{{ t("downloadSettings.conflict.overwrite") }}</button>
+          <button class="primary-button" @click="resolveDownloadConflict('rename')">{{ t("downloadSettings.conflict.rename") }}</button>
+        </footer>
+      </article>
+    </section>
+
     <section v-if="recordingDeleteTarget" class="modal-backdrop" @mousedown.self="recordingDeleteTarget = null">
       <article class="modal small-modal destructive-modal">
         <header><h2>{{ t("recordingDelete") }}</h2><button :title="t('close')" class="icon-button" @click="recordingDeleteTarget = null"><X /></button></header>
         <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("recordingDeleteConfirm", { host: recordingDeleteTarget.host || recordingDeleteTarget.recordingId }) }}</strong><p class="muted">{{ formatRecordedAt(recordingDeleteTarget.startedAt) }} · {{ formatDuration(recordingDeleteTarget.durationSecs ?? 0) }}</p></div></div>
         <footer><button @click="recordingDeleteTarget = null" :disabled="recordingDeleteSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="recordingDeleteSubmitting" @click="confirmRecordingDelete"><Loader2 v-if="recordingDeleteSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
+      </article>
+    </section>
+
+    <!-- 录制一键清空确认：应用内弹窗（沙箱 iframe confirm 恒 false） -->
+    <section v-if="recordingClearAllOpen" class="modal-backdrop" @mousedown.self="recordingClearAllOpen = false">
+      <article class="modal small-modal destructive-modal">
+        <header><h2>{{ t("recordingsClear") }}</h2><button :title="t('close')" class="icon-button" @click="recordingClearAllOpen = false"><X /></button></header>
+        <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("recordingsClearConfirm", { count: recordings.length }) }}</strong></div></div>
+        <footer><button @click="recordingClearAllOpen = false" :disabled="recordingClearAllSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="recordingClearAllSubmitting" @click="confirmRecordingClearAll"><Loader2 v-if="recordingClearAllSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
       </article>
     </section>
 
@@ -7409,8 +7901,22 @@ onBeforeUnmount(() => {
             <h3 class="settings-section-title">{{ t("downloadSettings.title") }}</h3>
             <label class="settings-field">
               <span>{{ t("downloadSettings.directory") }}</span>
-              <input v-model="downloadDirDraft" class="mono" spellcheck="false" :placeholder="localDownloadDir || t('downloadSettings.default')" />
+              <span class="settings-dir-row">
+                <input v-model="downloadDirDraft" class="mono" spellcheck="false" :placeholder="localDownloadDir || t('downloadSettings.default')" />
+                <button v-if="localCanSave" type="button" class="browse-button" :title="t('downloadSettings.browse')" :aria-label="t('downloadSettings.browse')" @click="folderPickerTarget = 'settings'"><FolderOpen /></button>
+              </span>
             </label>
+            <label class="settings-field settings-switch-row">
+              <button class="switch-control" type="button" role="switch" :aria-checked="downloadUseDefaultDraft" @click="downloadUseDefaultDraft = !downloadUseDefaultDraft"><span /></button>
+              <span>{{ t("downloadSettings.useDefaultDir") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("downloadSettings.useDefaultDirHint") }}</p>
+            <h3 class="settings-section-title">{{ t("downloadSettings.conflictTitle") }}</h3>
+            <label v-for="policy in DOWNLOAD_CONFLICT_POLICIES" :key="policy" class="settings-field settings-radio-row">
+              <input v-model="downloadConflictDraft" type="radio" name="download-conflict-policy" :value="policy" />
+              <span>{{ t(`downloadSettings.conflict.${policy}`) }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("downloadSettings.conflictHint") }}</p>
             <p class="muted settings-note">{{ t("downloadSettings.hint") }}</p>
             </div>
 
@@ -7744,6 +8250,16 @@ onBeforeUnmount(() => {
       </article>
     </section>
 
+    <!-- 目录选择器：DOM 末尾渲染，保证叠在设置弹窗/下载询问弹窗之上。
+         不传 initialPath：默认从「此电脑」盘符页开始（macOS/Linux 无盘符概念，
+         回退到默认下载目录），与 kimi-code-desktop 的选择器行为对齐。 -->
+    <FolderPickerDialog
+      v-if="folderPickerTarget"
+      :locale="locale"
+      @select="onFolderPicked"
+      @close="folderPickerTarget = null"
+    />
+
     <input ref="uploadInput" class="hidden" type="file" multiple @change="onUploadInput" />
     <input ref="zmodemInput" class="hidden" type="file" multiple @change="onZmodemInput" />
     <input ref="trzszInput" class="hidden" type="file" multiple @change="onTrzszPickInput" @cancel="onTrzszPickCancel" />
@@ -7888,10 +8404,15 @@ onBeforeUnmount(() => {
 .agent-prompt-countdown { padding-bottom: 10px; }
 /* —— 断点续传 / 进程管理 / 会话录制（F1-F3）—— */
 .is-recording { color: var(--destructive); }
-/* 录制中：图标按钮扩成红色胶囊，图标呼吸 + 时长计数（mono 等宽不跳动）。 */
-.icon-button.recording-live { width: auto; gap: 4px; padding: 0 7px; }
-.icon-button.recording-live svg { animation: record-pulse 1.6s ease-in-out infinite; }
-.recording-elapsed { font-size: 11px; font-variant-numeric: tabular-nums; }
+/* 录制中：悬浮控制条（红色呼吸点 + 时长 mono 等宽不跳动 + 停止按钮）。
+   锚定视口而非终端面板：面板底边可能探出可视区（批量栏等会推高布局），
+   绝对定位会被裁掉半截；fixed 与 toast 通知同款，已验证可靠。 */
+.recording-float { position: fixed; z-index: 40; bottom: 64px; left: 50%; display: flex; align-items: center; gap: 8px; transform: translateX(-50%); border: 1px solid color-mix(in srgb, var(--destructive) 45%, var(--border)); border-radius: 999px; padding: 5px 7px 5px 12px; background: color-mix(in srgb, var(--background) 92%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); font-size: 11px; }
+.recording-float-dot { width: 12px; height: 12px; flex: 0 0 12px; color: var(--destructive); animation: record-pulse 1.6s ease-in-out infinite; }
+.recording-elapsed { color: var(--foreground); font-size: 11px; font-variant-numeric: tabular-nums; }
+.recording-stop { display: inline-flex; align-items: center; gap: 4px; height: 24px; border: 1px solid var(--border); border-radius: 999px; padding: 0 10px; background: var(--background); color: var(--destructive); font-size: 11px; cursor: pointer; }
+.recording-stop:hover { background: var(--accent); }
+.recording-stop svg { width: 11px; height: 11px; }
 @keyframes record-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
 /* 录制开始倒计时遮罩：终端区中央大数字逐级放缩淡入，点击/Esc 取消。 */
