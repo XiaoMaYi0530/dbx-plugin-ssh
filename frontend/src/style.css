@@ -190,7 +190,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 /* 内边距必须挂在 .xterm（terminal.element）而非宿主 div 上：FitAddon 只读
    element 自身的 padding 做行数扣减，挂在宿主上会多算一行、底行溢出可视区
    （命令条打开时正好被压在条下）。底部 8px 是常驻呼吸间距。 */
-.terminal-host { position: absolute; inset: 0; background: var(--ssh-terminal-background); }
+/* z-index: 0 为宿主建立层叠上下文：xterm 内部图层（文字/选择/关键词高亮
+   decoration，xterm.css 里 z-index 高达 10）会被关在里面，否则高亮装饰层
+   会穿透 z-index: 2 的 .terminal-overlay——连接/成功动画期间 replay 写入的
+   内容其高亮块（如 Last login 的 IP）会浮到卡片遮罩之上。 */
+.terminal-host { position: absolute; z-index: 0; inset: 0; background: var(--ssh-terminal-background); }
 .terminal-host .xterm { height: 100%; padding: 5px 0 8px 10px; background: var(--ssh-terminal-background); }
 .terminal-host .xterm-viewport { scrollbar-width: none !important; }
 .terminal-overlay { position: absolute; z-index: 2; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 24px; background: var(--ssh-terminal-background); color: var(--muted-foreground); text-align: center; }
