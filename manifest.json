@@ -125,8 +125,7 @@
           "label": "Private key path",
           "type": "text",
           "binding": "config",
-          "options_action": "keys/discover/options",
-          "description": "Desktop: local path. Web/Docker: path on the DBX server or container. When the host supports dynamic options, a dropdown lists private keys discovered under ~/.ssh (path, algorithm, fingerprint); otherwise type the path manually.",
+          "description": "Type the key path, or pick a key discovered under ~/.ssh from the dropdown on the right (desktop). Pasting content into \"Private key content\" below takes precedence over this path.",
           "visible_when": {
             "field": "authentication",
             "one_of": [
@@ -610,7 +609,7 @@
             },
             "private_key_path": {
               "label": "Ruta de clave privada",
-              "description": "Escritorio: ruta local. Web/Docker: ruta en el servidor o contenedor de DBX. Si el host admite opciones dinámicas, un desplegable lista las claves privadas halladas en ~/.ssh (ruta, algoritmo, huella); si no, escribe la ruta a mano."
+              "description": "Escriba la ruta de la clave o elija una clave encontrada en ~/.ssh con el desplegable de la derecha (escritorio). Pegar el contenido en «Contenido de la clave privada» tiene prioridad sobre esta ruta."
             },
             "private_key_passphrase": {
               "label": "Frase de contraseña de la clave",
@@ -783,7 +782,7 @@
             },
             "private_key_path": {
               "label": "Percorso chiave privata",
-              "description": "Desktop: percorso locale. Web/Docker: percorso sul server o contenitore DBX. Se l'host supporta le opzioni dinamiche, un menu a tendina elenca le chiavi private trovate in ~/.ssh (percorso, algoritmo, fingerprint); altrimenti digita il percorso manualmente."
+              "description": "Digita il percorso della chiave o scegli una chiave trovata in ~/.ssh dal menu a destra (desktop). Incollare il contenuto in «Contenuto chiave privata» ha la precedenza su questo percorso."
             },
             "private_key_passphrase": {
               "label": "Passphrase chiave privata",
@@ -956,7 +955,7 @@
             },
             "private_key_path": {
               "label": "秘密鍵のパス",
-              "description": "デスクトップ：ローカルパス。Web/Docker：DBX サーバーまたはコンテナ上のパス。ホストが動的オプションに対応している場合、~/.ssh 配下で検出された秘密鍵（パス・アルゴリズム・フィンガープリント）のドロップダウンを表示します。未対応の場合は手入力してください。"
+              "description": "パスを直接入力するか、右側のドロップダウンで ~/.ssh から検出された鍵を選択します（デスクトップ）。下の「秘密鍵の内容」に貼り付けた場合はこのパスより優先されます。"
             },
             "private_key_passphrase": {
               "label": "秘密鍵のパスフレーズ",
@@ -1129,7 +1128,7 @@
             },
             "private_key_path": {
               "label": "Caminho da chave privada",
-              "description": "Desktop: caminho local. Web/Docker: caminho no servidor ou contêiner DBX. Se o host suportar opções dinâmicas, uma lista suspensa mostra as chaves privadas encontradas em ~/.ssh (caminho, algoritmo, impressão digital); caso contrário, digite o caminho manualmente."
+              "description": "Digite o caminho da chave ou escolha uma chave encontrada em ~/.ssh no menu à direita (desktop). Colar o conteúdo em «Conteúdo da chave privada» tem precedência sobre este caminho."
             },
             "private_key_passphrase": {
               "label": "Frase secreta da chave",
@@ -1302,7 +1301,7 @@
             },
             "private_key_path": {
               "label": "私钥路径",
-              "description": "桌面端：本地路径。Web/Docker：DBX 服务器或容器上的路径。宿主支持动态选项时会以下拉列出 ~/.ssh 下发现的私钥（路径、算法、指纹）；否则请手动填写路径。"
+              "description": "可直接输入密钥路径，或用右侧下拉选择本机 ~/.ssh 下发现的私钥（桌面端）。在下方「私钥内容」粘贴私钥时优先于路径生效。"
             },
             "private_key_passphrase": {
               "label": "私钥口令",
@@ -1475,7 +1474,7 @@
             },
             "private_key_path": {
               "label": "私鑰路徑",
-              "description": "桌面端：本機路徑。Web/Docker：DBX 伺服器或容器上的路徑。宿主支援動態選項時會以下拉列出 ~/.ssh 下發現的私鑰（路徑、演算法、指紋）；否則請手動填寫路徑。"
+              "description": "可直接輸入私鑰路徑，或用右側下拉選擇本機 ~/.ssh 下發現的私鑰（桌面端）。在下方「私鑰內容」貼上私鑰時優先於路徑生效。"
             },
             "private_key_passphrase": {
               "label": "私鑰密語",
