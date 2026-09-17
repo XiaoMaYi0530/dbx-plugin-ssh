@@ -1,0 +1,5 @@
+# 统一 LF 换行：frontend 源码中的多行注释会被编译进 ui/index.html 产物，
+# Windows 工作区若为 CRLF，构建产物与 CI（Linux）不一致，导致 ui/ 新鲜度检查失败。
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.dbxp binary
