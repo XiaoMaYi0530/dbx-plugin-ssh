@@ -170,6 +170,10 @@
           "label": "Private key path",
           "type": "text",
           "binding": "config",
+          "picker": {
+            "kind": "file",
+            "content_field": "private_key"
+          },
           "description": "Type the key path, or pick a key discovered under ~/.ssh from the dropdown on the right (desktop). Pasting content into \"Private key content\" below takes precedence over this path.",
           "visible_when": {
             "field": "authentication",
@@ -199,7 +203,7 @@
           "type": "textarea",
           "binding": "secret",
           "required": false,
-          "description": "Paste the private key contents (OpenSSH, PEM, or PPK format) instead of a file path. Provide either this content or the key path above - at least one of the two. A non-empty key content takes precedence over the key path; it is kept in the secret store and never displayed again.",
+          "description": "Paste the private key contents (OpenSSH, PEM, or PPK format) instead of a file path; in Web/Docker builds the file button above uploads the key here. Provide either this content or the key path above - at least one of the two. A non-empty key content takes precedence over the key path; it is kept in the secret store and never displayed again. Choosing a key file above clears this field.",
           "visible_when": {
             "field": "authentication",
             "one_of": [
@@ -658,7 +662,7 @@
             },
             "private_key": {
               "label": "Contenido de la clave privada",
-              "description": "Alternativa a la ruta de arriba: indica la ruta o pega el contenido, al menos uno de los dos. Pega el contenido de la clave privada (formato OpenSSH, PEM o PPK) en lugar de una ruta de archivo. Un contenido no vacío tiene prioridad sobre la ruta; se guarda en el almacén de secretos y no se vuelve a mostrar."
+              "description": "Alternativa a la ruta de arriba: indica la ruta o pega el contenido, al menos uno de los dos. Pega el contenido de la clave privada (formato OpenSSH, PEM o PPK) en lugar de una ruta de archivo; en Web/Docker el botón de archivo de arriba sube la clave aquí. Un contenido no vacío tiene prioridad sobre la ruta; se guarda en el almacén de secretos y no se vuelve a mostrar. Elegir un archivo arriba borra este campo."
             },
             "agent_socket": {
               "label": "Socket del agente",
@@ -841,7 +845,7 @@
             },
             "private_key": {
               "label": "Contenuto della chiave privata",
-              "description": "Alternativa al percorso qui sopra: indica il percorso o incolla il contenuto, almeno uno dei due. Incolla il contenuto della chiave privata (formato OpenSSH, PEM o PPK) invece di un percorso file. Un contenuto non vuoto ha precedenza sul percorso; viene conservato nell'archivio segreti e non mostrato più."
+              "description": "Alternativa al percorso qui sopra: indica il percorso o incolla il contenuto, almeno uno dei due. Incolla il contenuto della chiave privata (formato OpenSSH, PEM o PPK) invece di un percorso file; in Web/Docker il pulsante file qui sopra carica la chiave in questo campo. Un contenuto non vuoto ha precedenza sul percorso; viene conservato nell'archivio segreti e non mostrato più. Scegliere un file qui sopra cancella questo campo."
             },
             "agent_socket": {
               "label": "Socket agent",
@@ -1024,7 +1028,7 @@
             },
             "private_key": {
               "label": "秘密鍵の内容",
-              "description": "上のパスとの二択です。パスか内容のどちらか一方は必須です。ファイルパスの代わりに秘密鍵の内容（OpenSSH・PEM・PPK 形式）を貼り付けます。内容が空でなければパスより優先されます。シークレットストアに保存され、再表示されません。"
+              "description": "上のパスとの二択です。パスか内容のどちらか一方は必須です。ファイルパスの代わりに秘密鍵の内容（OpenSSH・PEM・PPK 形式）を貼り付けます。Web/Docker では上のファイル選択ボタンで選んだ内容がここに入ります。内容が空でなければパスより優先されます。シークレットストアに保存され、再表示されません。上で鍵ファイルを選ぶとこの欄は消去されます。"
             },
             "agent_socket": {
               "label": "エージェントソケット",
@@ -1207,7 +1211,7 @@
             },
             "private_key": {
               "label": "Conteúdo da chave privada",
-              "description": "Alternativa ao caminho acima: informe o caminho ou cole o conteúdo, pelo menos um dos dois. Cole o conteúdo da chave privada (formato OpenSSH, PEM ou PPK) em vez de um caminho de arquivo. Um conteúdo não vazio tem precedência sobre o caminho; fica no cofre de segredos e nunca é exibido novamente."
+              "description": "Alternativa ao caminho acima: informe o caminho ou cole o conteúdo, pelo menos um dos dois. Cole o conteúdo da chave privada (formato OpenSSH, PEM ou PPK) em vez de um caminho de arquivo; em Web/Docker o botão de arquivo acima envia a chave para este campo. Um conteúdo não vazio tem precedência sobre o caminho; fica no cofre de segredos e nunca é exibido novamente. Escolher um arquivo acima apaga este campo."
             },
             "agent_socket": {
               "label": "Socket do agente",
@@ -1390,7 +1394,7 @@
             },
             "private_key": {
               "label": "私钥内容",
-              "description": "与「私钥路径」二选一：至少填一项。直接粘贴私钥内容（OpenSSH/PEM/PPK 格式）代替文件路径；内容非空时优先于路径生效，保存在密钥库中，不再回显。"
+              "description": "与「私钥路径」二选一：至少填一项。直接粘贴私钥内容（OpenSSH/PEM/PPK 格式）代替文件路径；Web/Docker 下上方文件按钮上传的内容也写入这里。内容非空时优先于路径生效，保存在密钥库中，不再回显；在上方选择密钥文件会清空本字段。"
             },
             "agent_socket": {
               "label": "Agent Socket",
@@ -1573,7 +1577,7 @@
             },
             "private_key": {
               "label": "私鑰內容",
-              "description": "與「私鑰路徑」二選一：至少填一項。直接貼上私鑰內容（OpenSSH/PEM/PPK 格式）代替檔案路徑；內容非空時優先於路徑生效，儲存在金鑰庫中，不再回顯。"
+              "description": "與「私鑰路徑」二選一：至少填一項。直接貼上私鑰內容（OpenSSH/PEM/PPK 格式）代替檔案路徑；Web/Docker 下上方檔案按鈕上傳的內容也會寫入這裡。內容非空時優先於路徑生效，儲存在金鑰庫中，不再回顯；在上方選擇金鑰檔案會清空本欄位。"
             },
             "agent_socket": {
               "label": "Agent Socket",
