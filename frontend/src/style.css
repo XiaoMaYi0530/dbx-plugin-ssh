@@ -163,8 +163,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .notice-action:hover { background: var(--accent); }
 
 /* 自定义 tooltip：反色气泡 + 小三角（对齐 DBX 宿主观感），pointer-events
-   关闭避免遮挡 hover；above 变体翻到元素上方。 */
-.app-tooltip { position: fixed; z-index: 100; max-width: 260px; transform: translateX(-50%); border-radius: 6px; padding: 4px 10px; background: var(--foreground); color: var(--background); font-size: 11px; line-height: 1.45; text-align: center; overflow-wrap: anywhere; pointer-events: none; box-shadow: 0 4px 14px rgb(0 0 0 / 18%); }
+   关闭避免遮挡 hover；above 变体翻到元素上方。宽度按内容自然展开——
+   不能加 overflow-wrap:anywhere（CJK 下 min-content 会退化成单字宽，
+   tooltip 逐字竖排）。 */
+.app-tooltip { position: fixed; z-index: 100; width: max-content; max-width: 260px; transform: translateX(-50%); border-radius: 6px; padding: 4px 10px; background: var(--foreground); color: var(--background); font-size: 11px; line-height: 1.45; text-align: center; pointer-events: none; box-shadow: 0 4px 14px rgb(0 0 0 / 18%); }
 .app-tooltip::before { content: ""; position: absolute; top: -3px; left: 50%; width: 7px; height: 7px; transform: translateX(-50%) rotate(45deg); background: var(--foreground); }
 .app-tooltip.app-tooltip-above { transform: translateX(-50%) translateY(-100%); }
 .app-tooltip-above::before { top: auto; bottom: -3px; }
