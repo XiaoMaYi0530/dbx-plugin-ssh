@@ -22,6 +22,74 @@ pub const LOCAL_SAVE_ENV: &str = "DBX_SSH_LOCAL_SAVE";
 /// Overrides the base directory downloads are saved into (also used by the
 /// smoke tests to keep them out of the developer's real Downloads folder).
 pub const DOWNLOAD_DIR_ENV: &str = "DBX_SSH_DOWNLOAD_DIR";
+/// 单次本机落盘的体积上限（GIF 导出等内存编码产物理应远小于此）。
+pub const LOCAL_SAVE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// 通用本机落盘（`local/saveFile`）：供不经过 SFTP 传输链的本地产物
+/// （录制 GIF 导出等）复用下载目录语义。文件名消毒 + 撞名让位 +
+/// 记入传输历史（`local/reveal`、`local/open` 才能定位它）。
+/// `target_dir` 为 None/空时落到下载目录；显式目录必须是绝对路径。
+/// `conflict` 为 "overwrite" 时直接覆盖同名文件，默认撞名让位（" (n)"）。
+pub fn save_local_file(
+    data_dir: &Path,
+    name: &str,
+    data: &[u8],
+    target_dir: Option<&str>,
+    conflict: Option<&str>,
+) -> Result<Value, String> {
+    if data.is_empty() {
+        return Err("Nothing to save".to_string());
+    }
+    if data.len() > LOCAL_SAVE_MAX_BYTES {
+        return Err(format!(
+            "Local save is limited to {LOCAL_SAVE_MAX_BYTES} bytes"
+        ));
+    }
+    let safe_name = sanitize_file_name(name);
+    let dir = target_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| downloads_base_dir(|key| std::env::var_os(key), data_dir));
+    if !dir.is_absolute() {
+        return Err("Download directory must be an absolute path".to_string());
+    }
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "Failed to create download directory '{}': {error}",
+            dir.display()
+        )
+    })?;
+    let path = final_download_path(&dir, &safe_name, matches!(conflict, Some("overwrite")));
+    std::fs::write(&path, data)
+        .map_err(|error| format!("Failed to write '{}': {error}", path.display()))?;
+    let final_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| safe_name.clone());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or_default();
+    crate::transfer_history::record_transition(
+        data_dir,
+        &serde_json::json!({
+            "taskId": format!("local-save-{}", uuid::Uuid::new_v4()),
+            "direction": "download",
+            "fileName": final_name,
+            "size": data.len(),
+            "transferred": data.len(),
+            "status": "completed",
+            "startedAt": now_ms,
+            "finishedAt": now_ms,
+            "localPath": path.to_string_lossy(),
+        }),
+    )?;
+    Ok(serde_json::json!({
+        "localPath": path.to_string_lossy(),
+        "name": final_name,
+    }))
+}
 
 fn env_value(lookup: &impl Fn(&str) -> Option<OsString>, key: &str) -> Option<OsString> {
     lookup(key).filter(|value| !value.to_string_lossy().trim().is_empty())
@@ -99,6 +167,16 @@ pub fn sanitize_file_name(name: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Resolves the final local path for a finished download: `overwrite` writes
+/// straight to the sanitized name (replacing an existing file); otherwise a
+/// non-colliding " (n)" name is picked like browsers do.
+pub fn final_download_path(base: &Path, file_name: &str, overwrite: bool) -> PathBuf {
+    if overwrite {
+        return base.join(sanitize_file_name(file_name));
+    }
+    pick_download_path(base, file_name)
 }
 
 /// Picks a non-colliding path in `base` for `file_name`, appending " (n)"
@@ -236,6 +314,64 @@ mod tests {
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| OsString::from(*value))
         }
+    }
+
+    #[test]
+    fn save_local_file_writes_records_history_and_yields_name() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("target");
+        let result = save_local_file(
+            data_dir.path(),
+            "session.gif",
+            b"GIF89a",
+            Some(target.path().to_str().unwrap()),
+            None,
+        )
+        .expect("save");
+        let local_path = result["localPath"].as_str().unwrap().to_string();
+        assert_eq!(std::fs::read(&local_path).unwrap(), b"GIF89a");
+        // 记入传输历史（local/reveal、local/open 的合法路径来源）。
+        let history = crate::transfer_history::load_history(data_dir.path());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["localPath"].as_str().unwrap(), local_path);
+        assert_eq!(history[0]["status"].as_str().unwrap(), "completed");
+        // 撞名让位：同名再保存得到 " (1)" 后缀而不是覆盖。
+        let again = save_local_file(
+            data_dir.path(),
+            "session.gif",
+            b"GIF89b",
+            Some(target.path().to_str().unwrap()),
+            None,
+        )
+        .expect("save again");
+        assert!(again["localPath"]
+            .as_str()
+            .unwrap()
+            .ends_with("session (1).gif"));
+        assert_eq!(std::fs::read(&local_path).unwrap(), b"GIF89a");
+        // 覆盖策略：同名直接替换，不让位。
+        let replaced = save_local_file(
+            data_dir.path(),
+            "session.gif",
+            b"GIF89c",
+            Some(target.path().to_str().unwrap()),
+            Some("overwrite"),
+        )
+        .expect("overwrite");
+        assert!(replaced["localPath"]
+            .as_str()
+            .unwrap()
+            .ends_with("session.gif"));
+        assert_eq!(std::fs::read(&local_path).unwrap(), b"GIF89c");
+    }
+
+    #[test]
+    fn save_local_file_rejects_relative_dir_and_empty_payload() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            save_local_file(data_dir.path(), "a.gif", b"x", Some("relative/dir"), None).is_err()
+        );
+        assert!(save_local_file(data_dir.path(), "a.gif", b"", None, None).is_err());
     }
 
     #[test]

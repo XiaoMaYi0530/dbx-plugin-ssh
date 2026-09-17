@@ -10,6 +10,48 @@ use serde_json::{json, Value};
 
 use crate::host_key::HostKeyVerifier;
 
+/// `connection/action` 的「从文件导入私钥」：读取并校验密钥文件，返回原文
+/// 供回填表单的 private_key 字段（保存时进 vault）。识别规则与 discover
+/// 一致（OpenSSH/PEM/PPK 头 + 可解码性）；加密私钥合法——口令走表单另一
+/// 字段。公钥、非密钥文本、超大文件一律拒绝。
+pub const IMPORT_MAX_BYTES: u64 = 64 * 1024;
+
+pub fn read_private_key_file(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("Cannot read '{}': {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err("The selected path is not a file".to_string());
+    }
+    if metadata.len() > IMPORT_MAX_BYTES {
+        return Err(format!(
+            "The selected file is too large to be a private key (limit {IMPORT_MAX_BYTES} bytes)"
+        ));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("Cannot read '{}': {error}", path.display()))?;
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("-----BEGIN") && !trimmed.starts_with("PuTTY-User-Key-File-") {
+        return Err("Not a private key file (OpenSSH/PEM/PPK expected)".to_string());
+    }
+    if trimmed.contains(" PUBLIC KEY-----") {
+        return Err("That is a public key; select the private key file".to_string());
+    }
+    match decode_secret_key(&text, None) {
+        Ok(_) => Ok(text),
+        Err(error) => {
+            // 加密私钥：OpenSSH 报 KeyIsEncrypted，PKCS#1/8 带 ENCRYPTED 标记——
+            // 均视为合法，口令在表单里填。
+            let encrypted =
+                matches!(error, russh::keys::Error::KeyIsEncrypted) || text.contains("ENCRYPTED");
+            if encrypted {
+                Ok(text)
+            } else {
+                Err(format!("Unrecognized private key format: {error}"))
+            }
+        }
+    }
+}
+
 /// Candidate file names OpenSSH clients try in `~/.ssh` by default.
 const CONVENTIONAL_KEY_NAMES: &[&str] = &[
     "id_rsa",
@@ -309,6 +351,35 @@ mod tests {
                 Some(value) => std::env::set_var(var, value),
                 None => std::env::remove_var(var),
             }
+        }
+    }
+
+    #[test]
+    fn read_private_key_file_validates_before_returning_content() {
+        let dir = tempfile::tempdir().unwrap();
+        // 不依赖 ssh-keygen 的拒绝路径：纯文本、公钥、超大文件、目录。
+        let text_file = dir.path().join("notes.txt");
+        std::fs::write(&text_file, "hello").unwrap();
+        assert!(read_private_key_file(&text_file).is_err());
+        let pub_file = dir.path().join("id_ed25519.pub");
+        std::fs::write(
+            &pub_file,
+            "-----BEGIN PUBLIC KEY-----\nxx\n-----END PUBLIC KEY-----",
+        )
+        .unwrap();
+        assert!(read_private_key_file(&pub_file).is_err());
+        let big = dir.path().join("big.pem");
+        std::fs::write(&big, vec![b'x'; (IMPORT_MAX_BYTES + 1) as usize]).unwrap();
+        assert!(read_private_key_file(&big).is_err());
+        assert!(read_private_key_file(dir.path()).is_err());
+        // 真实密钥（ssh-keygen 可用时）：未加密与加密的都应读回原文。
+        let plain = dir.path().join("id_ed25519");
+        if generate_key(&plain, "") {
+            let content = read_private_key_file(&plain).unwrap();
+            assert!(content.contains("BEGIN OPENSSH PRIVATE KEY"));
+            let locked = dir.path().join("locked.pem");
+            assert!(generate_key(&locked, "phrase"));
+            assert!(read_private_key_file(&locked).is_ok());
         }
     }
 
