@@ -2799,9 +2799,10 @@ function toggleHighlightMenu() {
 }
 
 // ---- decoration 引擎 ----
-// onRender({start,end}) 只给重渲染的视口行区间：合并进 pending 区间，经
-// setTimeout 节流（≤30fps）后统一扫描。alt buffer 与 normal buffer 走同一
-// 路径（buffer.active 直接扫描）。
+// onRender({start,end}) 给的是"本帧实际重绘的行区间"（输入时常常只有光标一行），
+// 不是整个视口：合并进 pending 区间，经 setTimeout 节流（≤30fps）后统一扫描；
+// 扫描时装饰去留按 buffer.viewportY 的真实视口判定（见 scanHighlightRange）。
+// alt buffer 与 normal buffer 走同一路径（buffer.active 直接扫描）。
 let highlightRenderDisposable: { dispose(): void } | undefined;
 // 每行一个组（marker + decorations）；行滚出视口整组 dispose。
 const highlightDecorationsByRow = new Map<number, { dispose(): void }>();
@@ -2857,11 +2858,16 @@ function scanHighlightRange(start: number, end: number) {
   const term = terminal;
   if (!term) return;
   const buffer = term.buffer.active;
-  const from = Math.max(0, Math.min(start, buffer.length - 1));
-  const to = Math.max(from, Math.min(end, buffer.length - 1));
-  // 行滚出本帧视口：整组 dispose（Map 不同步收缩会拖着全局上限走）。
+  const dirtyFrom = Math.max(0, Math.min(start, buffer.length - 1));
+  const dirtyTo = Math.max(dirtyFrom, Math.min(end, buffer.length - 1));
+  // onRender 给的是"本帧重绘的行"（输入时常常只有光标行），不是视口——装饰的
+  // 去留必须按视口判定，否则每次击键都把整屏高亮 dispose 掉再异步补回（可见闪烁）。
+  const vpFrom = Math.max(0, Math.min(buffer.viewportY, buffer.length - 1));
+  const vpTo = Math.min(buffer.length - 1, vpFrom + term.rows - 1);
   for (const [row, entry] of highlightDecorationsByRow) {
-    if (row < from || row > to) {
+    // 视口外：整组 dispose（Map 不同步收缩会拖着全局上限走）；本帧重绘过的行：
+    // 先 dispose，下面按新文本重扫，让高亮跟随编辑而不是停留在旧位置。
+    if (row < vpFrom || row > vpTo || (row >= dirtyFrom && row <= dirtyTo)) {
       entry.dispose();
       highlightDecorationsByRow.delete(row);
     }
@@ -2871,7 +2877,7 @@ function scanHighlightRange(start: number, end: number) {
   // registerMarker 的 offset 相对光标绝对行（baseY + cursorY）；marker dispose 时
   // xterm 会连带 dispose 挂在其上的 decoration。
   const base = buffer.baseY + buffer.cursorY;
-  for (let row = from; row <= to; row++) {
+  for (let row = vpFrom; row <= vpTo; row++) {
     if (highlightDecorationsByRow.has(row)) continue;
     if (highlightDecorationCount >= HIGHLIGHT_DECORATION_LIMIT) return;
     const lineText = buffer.getLine(row)?.translateToString(true) ?? "";
@@ -2882,8 +2888,12 @@ function scanHighlightRange(start: number, end: number) {
     if (!marker) continue;
     const disposables: Array<{ dispose(): void }> = [marker];
     const entry = {
+      decorations: 0,
       dispose() {
         for (const disposable of disposables.splice(0)) disposable.dispose();
+        // 计数只增不减会顶到全局上限、高亮逐渐不再出现（看起来像闪烁后消失）。
+        highlightDecorationCount -= entry.decorations;
+        entry.decorations = 0;
       },
     };
     for (const match of matches) {
@@ -2897,6 +2907,7 @@ function scanHighlightRange(start: number, end: number) {
           element.style.backgroundColor = highlightFillStyle(match.color);
         });
         disposables.push(decoration);
+        entry.decorations++;
         highlightDecorationCount++;
       }
     }
