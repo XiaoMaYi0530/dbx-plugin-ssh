@@ -94,6 +94,7 @@ import {
   type TerminalSearchOptions,
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
+import { createTerminalInputQueue } from "./lib/terminalInputQueue";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
 import { decideConnectRetry } from "./lib/connectRetry";
@@ -119,7 +120,7 @@ import {
   validateBookmarkInput,
   type SftpBookmark,
 } from "./lib/sftpBookmarks";
-import { browseCommandHistory, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
+import { browseCommandHistory, commandInputAction, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
 import { filterQuickCommands, normalizeQuickCommands, QUICK_COMMANDS_LIMIT, quickCommandText, type QuickCommand } from "./lib/quickCommands";
 import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
@@ -128,6 +129,7 @@ import { commandMarkerTooltip, formatCommandDuration, Osc633CommandParser, runni
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress, type BatchProgressState } from "./lib/sftpBatchProgress";
 import { describeWorkbenchSessionStatus, type WorkbenchSessionStatus } from "./lib/sessionStatus";
 import { sanitizeCommandOutput } from "./lib/terminalOutputText";
+import { normalizeTerminalInputBytes } from "./lib/terminalInput";
 import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI, type DbxPluginAppearanceInput } from "./lib/appearance";
@@ -870,8 +872,6 @@ let replayInFlight = false;
 // closes cannot self-heal by retrying — after a few attempts the drain must
 // resync past the hole instead of spinning the replay loop forever.
 let replayNoProgress = 0;
-let binaryInputChain = Promise.resolve();
-let terminalInputSequence = 0;
 let noticeTimer = 0;
 let errorTimer = 0;
 let commandMarkerTimer = 0;
@@ -893,7 +893,6 @@ let trzszPickResolver: ((files: File[] | undefined) => void) | undefined;
 let pendingTerminalInput = "";
 let activeTerminalSessionId = "";
 const pendingTerminalFrames = new Map<number, { stream: number; data: Uint8Array }>();
-const terminalInputAckWaiters = new Map<number, { resolve: () => void; reject: (error: Error) => void; timer: number }>();
 const uploadAckWaiters = new Map<string, { nextOffset: number; resolve: () => void; reject: (error: Error) => void; timer: number }>();
 const downloadChunkWaiters = new Map<string, { offset: number; resolve: (bytes: Uint8Array) => void; reject: (error: Error) => void; timer: number }>();
 const transferSamples = new Map<string, TransferSpeedSample>();
@@ -909,6 +908,10 @@ const commandMarkerParser = new Osc633CommandParser();
 // reads `terminal` lazily so it also works across terminal recreation.
 const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle({
   sink: (data) => terminal?.write(data),
+});
+const terminalInputQueue = createTerminalInputQueue({
+  send: (sessionId, payload) => window.dbxPlugin.sendBinary(`ssh/terminal/in/${sessionId}`, payload),
+  onError: (cause) => showError(cause, "terminal"),
 });
 
 const locale = ref("zh-CN");
@@ -1473,27 +1476,7 @@ function trackPendingInput(data: string) {
 function sendTerminalBytes(data: Uint8Array) {
   const sessionId = session.value?.sessionId;
   if (!sessionId) return;
-  const sequence = ++terminalInputSequence;
-  const payload = new Uint8Array(8 + data.byteLength);
-  writeU64(payload, 0, sequence);
-  payload.set(data, 8);
-  binaryInputChain = binaryInputChain
-    .then(async () => {
-      const acknowledged = waitForTerminalInputAck(sequence);
-      await window.dbxPlugin.sendBinary(`ssh/terminal/in/${sessionId}`, payload);
-      await acknowledged;
-    })
-    .catch((cause) => showError(cause, "terminal"));
-}
-
-function waitForTerminalInputAck(sequence: number) {
-  return new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      terminalInputAckWaiters.delete(sequence);
-      reject(new Error(t("errors.terminalInputAckTimeout")));
-    }, 15_000);
-    terminalInputAckWaiters.set(sequence, { resolve, reject, timer });
-  });
+  terminalInputQueue.enqueue(sessionId, normalizeTerminalInputBytes(data));
 }
 
 function scheduleFit() {
@@ -2033,16 +2016,6 @@ function handleEvent(event: DbxPluginEvent) {
     if (params.source && params.source !== batchBarSourceId) applyRemoteBatchBarState(params);
     return;
   }
-  if (event.method === "ssh/terminal/inputAck") {
-    const sequence = Number(event.params.sequence);
-    const waiter = terminalInputAckWaiters.get(sequence);
-    if (waiter) {
-      window.clearTimeout(waiter.timer);
-      terminalInputAckWaiters.delete(sequence);
-      waiter.resolve();
-    }
-    return;
-  }
   if (event.method === "ssh/host-key/prompt" || event.method === "connection/challenge") {
     hostKeyPrompt.value = event.params as unknown as HostKeyPrompt;
     return;
@@ -2295,7 +2268,7 @@ async function closeSession(updateStatus = true) {
   teardownTrzsz();
   pendingTerminalFrames.clear();
   lastSequence = 0;
-  terminalInputSequence = 0;
+  terminalInputQueue.reset();
   reconnectPending.value = false;
   resetCommandMarker();
   if (sessionId) await window.dbxPlugin.invoke("ssh/session/close", { sessionId }).catch(() => undefined);
@@ -4742,6 +4715,30 @@ function browseCommandHistoryDown() {
   commandDraft.value = step.draft;
 }
 
+function handleCommandInputKeydown(event: KeyboardEvent) {
+  const target = event.currentTarget;
+  if (!(target instanceof HTMLTextAreaElement)) return;
+  const action = commandInputAction({
+    key: event.key,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    shiftKey: event.shiftKey,
+    selectionStart: target.selectionStart,
+    selectionEnd: target.selectionEnd,
+    valueLength: target.value.length,
+  });
+  if (action === "run") {
+    event.preventDefault();
+    void runCommand();
+  } else if (action === "history-up") {
+    event.preventDefault();
+    browseCommandHistoryUp();
+  } else if (action === "history-down") {
+    event.preventDefault();
+    browseCommandHistoryDown();
+  }
+}
+
 // 一键重发：把历史条目回填输入框并立即执行。
 function rerunHistoryCommand(command: string) {
   if (commandRunning.value) return;
@@ -6651,10 +6648,9 @@ async function initialize() {
   }
   if (typeof state.sessionId === "string" && state.sessionId) await attachSession(state.sessionId);
   else {
-    // 宿主切 tab / 左侧菜单重开会整体重建工作台 webview，且不回传
-    // workbenchState（桥未实现）、每次重开还换新 workbenchId——持久化
-    // sessionId 的 attach 路径永远不命中。改为向 sidecar 查询该连接的
-    // 存活会话并 attach（replay 恢复终端内容），避免全新拨号重置连接。
+    // 宿主切 tab / 左侧菜单重开可能整体重建工作台 webview。只恢复
+    // 同一 workbench 的 live session；不能按 connectionId 复用任意会话，
+    // 否则打开同一连接的新 Tab 会接管已有 Tab 的 PTY。
     const reattach = await findReattachSession();
     if (reattach) await attachSession(reattach, reattach);
     // bootRestore: 宿主启动恢复 tab 时会异步重放 connect（见 queryStore
@@ -6665,9 +6661,9 @@ async function initialize() {
 }
 
 /**
- * Asks the sidecar for a live session bound to this connection (sidecar
- * `ssh/sessions/list`); "" when none — caller dials fresh. Failures degrade
- * to a fresh open instead of blocking the workbench.
+ * Asks the sidecar for the live session bound to this workbench and connection
+ * (sidecar `ssh/sessions/list`); "" when none — caller dials a fresh session.
+ * Failures degrade to a fresh open instead of blocking the workbench.
  */
 async function findReattachSession(): Promise<string> {
   try {
@@ -6752,10 +6748,6 @@ onBeforeUnmount(() => {
   detachHighlightRender();
   terminal?.dispose();
   for (const waiter of uploadAckWaiters.values()) {
-    window.clearTimeout(waiter.timer);
-    waiter.reject(new Error(t("errors.workbenchDetached")));
-  }
-  for (const waiter of terminalInputAckWaiters.values()) {
     window.clearTimeout(waiter.timer);
     waiter.reject(new Error(t("errors.workbenchDetached")));
   }
@@ -7563,16 +7555,15 @@ onBeforeUnmount(() => {
     <section v-if="commandOpen" class="modal-backdrop" @mousedown.self="commandOpen = false">
       <article class="modal command-modal">
         <header><h2>{{ t("commandTitle") }}</h2><button :title="t('close')" class="icon-button" @click="commandOpen = false"><X /></button></header>
-        <input
+        <textarea
           v-model="commandDraft"
           class="mono"
+          rows="5"
           spellcheck="false"
           autofocus
           :placeholder="t('commandPlaceholder')"
           :disabled="commandRunning"
-          @keydown.enter="runCommand"
-          @keydown.up.prevent="browseCommandHistoryUp"
-          @keydown.down.prevent="browseCommandHistoryDown"
+          @keydown="handleCommandInputKeydown"
         />
         <div v-if="commandHistory.length" class="command-history">
           <div class="command-history-header">
