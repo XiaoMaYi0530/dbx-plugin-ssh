@@ -2172,17 +2172,17 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       return;
     }
     activeTerminalSessionId = info.sessionId;
-    session.value = info;
     lastSequence = 0;
     // A fresh session restarts sequence numbering: buffered frames from the
     // dead session belong to a different stream and must not poison the
     // in-order drain (a stale higher sequence would fake a permanent hole).
     pendingTerminalFrames.clear();
     replayNoProgress = 0;
-    directoryTrackingSupported.value = info.directoryTrackingSupported ?? true;
     // 成功过渡（Termius 式）：先切 success 卡片——进度线填满到顶、终端图标变
     // 对号；replay 在动画期间并行拉取，hold 播完才置 connected 进终端，避免
     // 连接成功瞬间生硬跳变。reduced-motion 下不 hold，立即进终端。
+    // 注意 session/directoryTrackingSupported 等响应式状态在 hold 结束后才写入：
+    // 提前写入会让 SFTP/工具栏等 watcher 在动画播放期间就开始渲染（画面抖动）。
     connectSucceeded.value = true;
     const successShownAt = Date.now();
     connectLog.push("info", t("connectCard.log.connected", { seconds: ((Date.now() - attemptStarted) / 1000).toFixed(1) }));
@@ -2195,6 +2195,8 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     const remainMs = holdMs - (Date.now() - successShownAt);
     if (remainMs > 0) await new Promise((resolve) => window.setTimeout(resolve, remainMs));
     connectSucceeded.value = false;
+    session.value = info;
+    directoryTrackingSupported.value = info.directoryTrackingSupported ?? true;
     terminalState.value = "connected";
     await afterSessionConnected();
   } catch (cause) {
