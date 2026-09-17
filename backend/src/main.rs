@@ -668,6 +668,28 @@ impl Plugin {
                         let connection_id = params.get("id").and_then(Value::as_str);
                         Ok(self.ssh.profiles_action_summary(connection_id))
                     }
+                    // 「从文件导入私钥」：桌面端弹系统文件选择框，读取校验后
+                    // 回填表单 private_key 字段；取消安静返回；web/docker
+                    // sidecar 不在本机，指引粘贴内容。
+                    "import-private-key" => {
+                        if !local_downloads::can_save_local(|key| std::env::var_os(key)) {
+                            return Err(
+                                "File import is only available on desktop — paste the key content instead"
+                                    .to_string(),
+                            );
+                        }
+                        match local_fs::pick_file()? {
+                            None => Ok(json!({ "message": "", "fieldValues": null })),
+                            Some(path) => {
+                                let content =
+                                    keys::read_private_key_file(std::path::Path::new(&path))?;
+                                Ok(json!({
+                                    "message": format!("Imported private key from {path}"),
+                                    "fieldValues": { "private_key": content },
+                                }))
+                            }
+                        }
+                    }
                     other => Err(format!("Unknown connection action: {other}")),
                 }
             }

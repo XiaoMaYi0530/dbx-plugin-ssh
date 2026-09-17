@@ -77,6 +77,119 @@ pub fn browse_local_dir(path: Option<&str>, data_dir: &Path) -> Result<Value, St
     }))
 }
 
+/// Opens the OS-native file picker (defaulting to `~/.ssh` where the platform
+/// allows it) and returns the chosen absolute path; `None` when the user
+/// cancels. Used by the connection form's "import private key" action — the
+/// host-rendered form cannot pick files itself.
+pub fn pick_file() -> Result<Option<String>, String> {
+    pick_file_platform().map(|picked| {
+        picked
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+    })
+}
+
+#[cfg(windows)]
+fn pick_file_platform() -> Result<Option<String>, String> {
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine;
+
+    // OpenFileDialog 需要 STA；默认目录 ~/.ssh 不存在时退回用户目录；
+    // -EncodedCommand 传 base64(UTF-16LE) 规避引号转义，输出 UTF-8。
+    const SCRIPT: &str = concat!(
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;",
+        "Add-Type -AssemblyName System.Windows.Forms;",
+        "$ssh=[IO.Path]::Combine($env:USERPROFILE,'.ssh');",
+        "$d=New-Object System.Windows.Forms.OpenFileDialog;",
+        "$d.InitialDirectory=$(if(Test-Path $ssh){$ssh}else{$env:USERPROFILE});",
+        "$d.Filter='Key files (*.pem;*.ppk;*.key;id_*)|*.pem;*.ppk;*.key;id_*|All files (*.*)|*.*';",
+        "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.FileName)}"
+    );
+    let mut utf16le = Vec::with_capacity(SCRIPT.len() * 2);
+    for unit in SCRIPT.encode_utf16() {
+        utf16le.extend_from_slice(&unit.to_le_bytes());
+    }
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-EncodedCommand",
+            &BASE64_STANDARD.encode(utf16le),
+        ])
+        .output()
+        .map_err(|error| format!("Failed to launch the file picker: {error}"))?;
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if path.is_empty() { None } else { Some(path) })
+}
+
+#[cfg(target_os = "macos")]
+fn pick_file_platform() -> Result<Option<String>, String> {
+    // 默认定位 ~/.ssh（不存在时退回用户主目录）；用户取消时非零退出。
+    let output = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "set homeDir to path to home folder",
+            "-e",
+            "set defaultDir to homeDir",
+            "-e",
+            "try",
+            "-e",
+            "set defaultDir to alias ((POSIX path of homeDir) & \".ssh\")",
+            "-e",
+            "end try",
+            "-e",
+            "POSIX path of (choose file default location defaultDir)",
+        ])
+        .output()
+        .map_err(|error| format!("Failed to launch the file picker: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if path.is_empty() { None } else { Some(path) })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pick_file_platform() -> Result<Option<String>, String> {
+    let home = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".ssh"))
+        .filter(|dir| dir.is_dir());
+    let zenity_default = home
+        .as_ref()
+        .map(|dir| format!("{}/", dir.to_string_lossy()))
+        .unwrap_or_default();
+    let pickers: Vec<(&str, Vec<String>)> = vec![
+        (
+            "zenity",
+            vec![
+                "--file-selection".to_string(),
+                format!("--filename={zenity_default}"),
+            ],
+        ),
+        (
+            "kdialog",
+            vec![
+                "--getopenfilename".to_string(),
+                home.map(|dir| dir.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| ".".to_string()),
+            ],
+        ),
+    ];
+    for (program, args) in pickers {
+        match std::process::Command::new(program).args(&args).output() {
+            Ok(output) => {
+                if !output.status.success() {
+                    return Ok(None);
+                }
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                return Ok(if path.is_empty() { None } else { Some(path) });
+            }
+            Err(_) => continue,
+        }
+    }
+    Err("No file picker available (install zenity or kdialog)".to_string())
+}
+
 /// Pre-download conflict probe for the "ask me" policy: reports whether
 /// `<dir>/<sanitized name>` already exists, plus the exact candidate path so
 /// the prompt can show it verbatim.
