@@ -572,6 +572,7 @@ mod tests {
         assert!(keys[0].path.ends_with("id_ed25519"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn identity_file_directives_resolve_paths() {
         let ssh_dir = Path::new("/home/tester/.ssh");
@@ -592,6 +593,27 @@ IdentityFile
                 PathBuf::from("/absolute/from/equals.pem"),
                 ssh_dir.join("quoted key"),
                 PathBuf::from("/home/tester/dotslash_key"),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_file_directives_resolve_windows_and_unicode_paths() {
+        let home = PathBuf::from(r"C:\Users\测试");
+        let ssh_dir = home.join(".ssh");
+        let config = "\
+IdentityFile C:\\Keys\\生产\\id_ed25519\r\n\
+IdentityFile \\\\server\\share\\运维.key\r\n\
+IdentityFile ~\\.ssh\\id_fallback\r\n";
+        let paths = identity_files_from_config(config, &ssh_dir);
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"C:\Keys\生产\id_ed25519"),
+                PathBuf::from(r"\\server\share\运维.key"),
+                home.join(".ssh").join("id_fallback"),
             ]
         );
     }

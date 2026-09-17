@@ -6120,10 +6120,10 @@ mod tests {
         let defaults = McpLimits::load(&path);
         assert_eq!(defaults.local_transfer_root, "");
         let mut updated = defaults;
-        updated.local_transfer_root = "/tmp/transfers".to_string();
+        updated.local_transfer_root = ABS_TEST_ROOT.to_string();
         write_settings_document(&path, &updated, &McpPermission::default()).unwrap();
         let reloaded = McpLimits::load(&path);
-        assert_eq!(reloaded.local_transfer_root, "/tmp/transfers");
+        assert_eq!(reloaded.local_transfer_root, ABS_TEST_ROOT);
         let _ = std::fs::remove_file(&path);
     }
 

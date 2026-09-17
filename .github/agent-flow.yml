@@ -27,11 +27,10 @@ validation:
     - cargo fmt --manifest-path backend/Cargo.toml --check
     - cargo clippy --locked --manifest-path backend/Cargo.toml --all-targets -- -D warnings
     - cargo test --locked --manifest-path backend/Cargo.toml
-  ci_required: [validate, frontend, backend, ssh-smoke, candidates-check]
+  ci_required: [validate, frontend, backend, windows-regression, ssh-smoke, candidates-check]
 security:
   secrets: no_real_credentials
   production_access: forbidden
   install_and_restart: human_only
   command_execution_changes: human_review_required
   generated_artifacts: integrator_only
-

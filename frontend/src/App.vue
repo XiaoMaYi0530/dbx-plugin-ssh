@@ -7819,7 +7819,7 @@ onBeforeUnmount(() => {
     </section>
 
     <section v-if="settingsOpen" class="modal-backdrop" @mousedown.self="settingsOpen = false">
-      <article class="modal settings-modal">
+      <article class="modal settings-modal settings-nav-modal">
         <header><h2>{{ t("settings") }}</h2><button :title="t('close')" class="icon-button" @click="settingsOpen = false"><X /></button></header>
         <div class="settings-body">
           <div v-if="settingsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>

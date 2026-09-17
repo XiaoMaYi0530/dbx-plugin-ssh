@@ -12,3 +12,6 @@
 
 # git worktrees (feature isolation)
 .worktrees/
+
+# Codex planning artifacts
+.zcode/
