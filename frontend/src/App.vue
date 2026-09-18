@@ -3173,12 +3173,18 @@ const visibleAuditEntries = computed(() => {
   return auditEntries.value.filter((entry) => entry.kind === auditKindFilter.value);
 });
 
-async function clearAuditLog() {
-  if (!window.confirm(t("auditLog.clearConfirm"))) return;
+// 应用内弹窗确认：宿主沙箱 iframe 无 allow-modals，window.confirm 恒 false
+const auditClearOpen = ref(false);
+const auditClearSubmitting = ref(false);
+async function confirmAuditClear() {
+  auditClearSubmitting.value = true;
   try {
     await window.dbxPlugin.invoke("ssh/audit/clear", {});
+    auditClearOpen.value = false;
   } catch {
     // 清空失败静默：保留现列表，用户可再次尝试或刷新。
+  } finally {
+    auditClearSubmitting.value = false;
   }
   await loadAuditEntries();
 }
@@ -6607,6 +6613,7 @@ const modalOpenStates = computed(() => [
   commandOpen.value,
   profilesOpen.value,
   auditOpen.value,
+  auditClearOpen.value,
   settingsOpen.value,
   alertTriageOpen.value,
   hostKeyPrompt.value,
@@ -6747,6 +6754,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
     return;
   }
   if (auditOpen.value) {
+    if (auditClearOpen.value) {
+      if (!auditClearSubmitting.value) auditClearOpen.value = false;
+      return;
+    }
     auditOpen.value = false;
     return;
   }
@@ -8380,31 +8391,30 @@ onBeforeUnmount(() => {
     </Dialog>
 
     <Dialog :open="auditOpen" @update:open="(open) => { if (!open) auditOpen = false; }">
-      <DialogContent class="modal settings-modal" @escape-key-down.prevent>
+      <DialogContent class="modal audit-modal" @escape-key-down.prevent>
         <header><DialogTitle>{{ t("auditLog.title") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="auditOpen = false"><X /></button></header>
         <div class="settings-body">
           <div class="audit-toolbar">
-            <label class="highlight-editor-flag">
-              <span>{{ t("auditLog.kindFilter") }}</span>
-              <Select :model-value="auditKindFilter || SELECT_EMPTY_SENTINEL" @update:model-value="(v) => (auditKindFilter = v === SELECT_EMPTY_SENTINEL ? '' : String(v))">
-                <SelectTrigger size="xs" class="audit-kind-select">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem :value="SELECT_EMPTY_SENTINEL">{{ t("auditLog.kindAll") }}</SelectItem>
-                  <SelectItem v-for="kind in auditKindOptions(auditEntries)" :key="kind" :value="kind">{{ auditKindLabel(kind, t) }}</SelectItem>
-                </SelectContent>
-              </Select>
-            </label>
-            <button class="icon-button" :title="t('refresh')" :disabled="auditLoading" @click="loadAuditEntries"><RefreshCw :class="{ spinning: auditLoading }" /></button>
-            <button class="icon-button" :title="t('auditLog.clear')" @click="clearAuditLog"><Trash2 /></button>
+            <Select :model-value="auditKindFilter || SELECT_EMPTY_SENTINEL" @update:model-value="(v) => (auditKindFilter = v === SELECT_EMPTY_SENTINEL ? '' : String(v))">
+              <SelectTrigger size="xs" class="audit-kind-select" :aria-label="t('auditLog.kindFilter')">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem :value="SELECT_EMPTY_SENTINEL">{{ t("auditLog.kindAll") }}</SelectItem>
+                <SelectItem v-for="kind in auditKindOptions(auditEntries)" :key="kind" :value="kind">{{ auditKindLabel(kind, t) }}</SelectItem>
+              </SelectContent>
+            </Select>
+            <div class="audit-actions">
+              <button class="icon-button" :title="t('refresh')" :disabled="auditLoading" @click="loadAuditEntries"><RefreshCw :class="{ spinning: auditLoading }" /></button>
+              <button class="icon-button" :title="t('auditLog.clear')" :disabled="!auditEntries.length" @click="auditClearOpen = true"><Trash2 /></button>
+            </div>
           </div>
-          <div v-if="auditLoading && !auditEntries.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
-          <div v-else-if="auditLoadFailed" class="empty compact">
+          <div v-if="auditLoading && !auditEntries.length" class="empty compact audit-empty"><Loader2 class="spinning" />{{ t("loading") }}</div>
+          <div v-else-if="auditLoadFailed" class="empty compact audit-empty">
             <span>{{ t("auditLog.loadFailed") }}</span>
             <button class="link-button" @click="loadAuditEntries">{{ t("refresh") }}</button>
           </div>
-          <div v-else-if="!visibleAuditEntries.length" class="empty compact">{{ t("auditLog.empty") }}</div>
+          <div v-else-if="!visibleAuditEntries.length" class="audit-empty"><FileText /><span>{{ t("auditLog.empty") }}</span></div>
           <template v-else>
             <ul class="audit-list">
               <li v-for="(entry, index) in visibleAuditEntries" :key="`${entry.ts}-${entry.kind}-${index}`" class="audit-row">
@@ -8422,6 +8432,15 @@ onBeforeUnmount(() => {
           </template>
         </div>
         <footer><button @click="auditOpen = false">{{ t("close") }}</button></footer>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 审计日志清空确认：应用内弹窗（沙箱 iframe confirm 恒 false） -->
+    <Dialog :open="auditClearOpen" @update:open="(open) => { if (!open) auditClearOpen = false; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("auditLog.clear") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="auditClearOpen = false"><X /></button></header>
+        <div class="destructive-copy"><div><strong>{{ t("auditLog.clearConfirm") }}</strong></div></div>
+        <footer><button @click="auditClearOpen = false" :disabled="auditClearSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="auditClearSubmitting" @click="confirmAuditClear"><Loader2 v-if="auditClearSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
       </DialogContent>
     </Dialog>
 
