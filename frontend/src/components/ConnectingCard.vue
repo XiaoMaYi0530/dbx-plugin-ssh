@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { Check, ChevronDown, ChevronUp, Server, SquareTerminal } from "@lucide/vue";
+import { Check, ChevronDown, ChevronUp, SquareTerminal } from "@lucide/vue";
+import PluginLogo from "./PluginLogo.vue";
 import { workbenchMessage } from "../lib/i18n";
 import type { ConnectLogEntry } from "../lib/connectLog";
 
@@ -44,7 +45,7 @@ function formatLogTime(ts: number) {
 <template>
   <div class="connect-card" :data-state="state" role="status">
     <header class="connect-card-header">
-      <span class="connect-card-badge" aria-hidden="true"><Server /></span>
+      <span class="connect-card-badge" aria-hidden="true"><PluginLogo /></span>
       <div class="connect-card-heading">
         <strong class="connect-card-name" :title="name">{{ name }}</strong>
         <span class="connect-card-identity" :title="identity">SSH {{ identity }}</span>
@@ -58,7 +59,7 @@ function formatLogTime(ts: number) {
     <div class="connect-card-track" aria-hidden="true">
       <span class="connect-card-endpoint connect-card-endpoint-server">
         <svg class="connect-card-arc" viewBox="0 0 36 36"><circle class="connect-card-arc-track" cx="18" cy="18" r="16" /><circle class="connect-card-arc-spin" cx="18" cy="18" r="16" /></svg>
-        <Server />
+        <PluginLogo />
       </span>
       <span class="connect-card-line"><span class="connect-card-flow" /><span class="connect-card-fill" /></span>
       <span class="connect-card-endpoint connect-card-endpoint-target"><Check v-if="state === 'success'" /><SquareTerminal v-else /></span>
