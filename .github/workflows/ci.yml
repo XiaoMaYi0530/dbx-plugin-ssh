@@ -233,13 +233,16 @@ jobs:
         run: |
           if [ -n "$RUST_TARGET" ]; then export CARGO_BUILD_TARGET="$RUST_TARGET"; fi
           cargo build --locked --release --manifest-path backend/Cargo.toml
-      # cargo 带 target 时输出在 target/<triple>/release/，而 SIDECAR_BINARY 与
-      # 打包 CLI 可能都指向裸 target/release/——预放一份 musl 产物兜底。
+      # cargo 带 target 时输出在 target/<triple>/release/；打包 CLI 的拷贝源固定是
+      # dist/.build-rust-<target>/release/（实测不受 CARGO_TARGET_DIR 影响）——
+      # 两个路径都预放 musl 产物，缺后者会报 "Failed to copy Rust backend ...
+      # No such file or directory"。
       - name: Stage musl binary at the default target path
         if: matrix.os == 'linux'
         run: |
-          mkdir -p backend/target/release
+          mkdir -p backend/target/release "dist/.build-rust-${{ matrix.target }}/release"
           cp -f "backend/target/${{ matrix.rust_target }}/release/dbx-plugin-ssh" backend/target/release/dbx-plugin-ssh
+          cp -f "backend/target/${{ matrix.rust_target }}/release/dbx-plugin-ssh" "dist/.build-rust-${{ matrix.target }}/release/dbx-plugin-ssh"
       - name: Offline MCP smoke
         run: ${{ matrix.python }} scripts/smoke_mcp.py --binary "$SIDECAR_BINARY"
       - run: npm install --global "@dbx-app/plugin-cli@${PLUGIN_CLI_VERSION}"

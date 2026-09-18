@@ -98,15 +98,18 @@ jobs:
         run: |
           if [ -n "$RUST_TARGET" ]; then export CARGO_BUILD_TARGET="$RUST_TARGET"; fi
           cargo build --locked --release --manifest-path backend/Cargo.toml
-      # CLI 打包时可能到 backend/target/release/ 找二进制，而带
-      # CARGO_BUILD_TARGET 的 cargo 输出在 backend/target/<triple>/release/。
-      # 预放一份 musl 产物到裸 release/ 路径兜底；打包后的静态校验会抓住
-      # 任何走错路径的情况。
+      # CLI 打包时的拷贝源固定是 dist/.build-rust-<target>/release/（实测不受
+      # CARGO_TARGET_DIR 影响），而带 CARGO_BUILD_TARGET 的 cargo 输出在
+      # backend/target/<triple>/release/。把 musl 产物预放到 CLI 的拷贝源路径，
+      # 否则打包报 "Failed to copy Rust backend ... No such file or directory"；
+      # 裸 backend/target/release/ 兜底保留，打包后的静态校验会抓住任何走错
+      # 路径的情况。
       - name: Stage musl binary at the CLI's expected path
         if: matrix.os == 'linux'
         run: |
-          mkdir -p backend/target/release
+          mkdir -p backend/target/release "dist/.build-rust-${{ matrix.target }}/release"
           cp -f "backend/target/${{ matrix.rust_target }}/release/dbx-plugin-ssh" backend/target/release/dbx-plugin-ssh
+          cp -f "backend/target/${{ matrix.rust_target }}/release/dbx-plugin-ssh" "dist/.build-rust-${{ matrix.target }}/release/dbx-plugin-ssh"
       - run: npm install --global "@dbx-app/plugin-cli@${PLUGIN_CLI_VERSION}"
       - name: Package .dbxp candidate
         # CARGO_TARGET_DIR points the CLI's own cargo build at the warm
