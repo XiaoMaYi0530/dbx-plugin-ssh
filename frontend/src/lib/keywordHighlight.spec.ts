@@ -5,6 +5,8 @@ import {
   matchesInLine,
   normalizeHighlightRules,
   sanitizeHighlightRuleInput,
+  shouldRebuildHighlightRow,
+  toAbsoluteRowRange,
   HIGHLIGHT_COLOR_DEFAULT,
   HIGHLIGHT_RULE_PATTERN_MAX,
   type HighlightRuleView,
@@ -175,5 +177,48 @@ describe("keyword highlight decoration fill", () => {
     expect(highlightFillStyle("red")).toBe("rgba(245, 158, 11, 0.35)");
     expect(highlightFillStyle("#12345")).toBe("rgba(245, 158, 11, 0.35)");
     expect(highlightFillStyle("")).toBe("rgba(245, 158, 11, 0.35)");
+  });
+});
+
+describe("keyword highlight render row mapping", () => {
+  it("treats onRender rows as viewport-relative", () => {
+    // 视口贴底（viewportY=0）：相对行号即绝对行号。
+    expect(toAbsoluteRowRange(0, 37, 0, 200)).toEqual({ from: 0, to: 37 });
+    // 缓冲区滚过一屏后必须加 viewportY，否则脏行判定永远不命中。
+    expect(toAbsoluteRowRange(0, 37, 120, 200)).toEqual({ from: 120, to: 157 });
+    expect(toAbsoluteRowRange(37, 37, 120, 200)).toEqual({ from: 157, to: 157 });
+  });
+
+  it("clamps the mapped range to the buffer", () => {
+    expect(toAbsoluteRowRange(0, 40, 990, 1000)).toEqual({ from: 990, to: 999 });
+    expect(toAbsoluteRowRange(-5, 10, 0, 100)).toEqual({ from: 0, to: 10 });
+    expect(toAbsoluteRowRange(5, 2, 0, 100)).toEqual({ from: 5, to: 5 });
+  });
+});
+
+describe("keyword highlight row rebuild policy", () => {
+  const base = { row: 10, viewportFrom: 0, viewportTo: 37, dirty: false, previousText: "ERROR", currentText: "ERROR" };
+
+  it("keeps decorations when a repainted row's text is unchanged", () => {
+    // 反闪烁核心：xterm 因装饰注册/销毁再触发整幅重绘时，文本没变就整组保留，
+    // 否则会陷入"重绘→扫描→拆建→重绘"的自激回路（实测 30fps 持续闪烁）。
+    expect(shouldRebuildHighlightRow({ ...base, dirty: true })).toBe(false);
+  });
+
+  it("rebuilds decorations when a repainted row's text changed", () => {
+    expect(shouldRebuildHighlightRow({ ...base, dirty: true, currentText: "plain text" })).toBe(true);
+  });
+
+  it("rebuilds decorations for rows scrolled out of the viewport", () => {
+    expect(shouldRebuildHighlightRow({ ...base, row: 38 })).toBe(true);
+    expect(shouldRebuildHighlightRow({ ...base, row: -1 })).toBe(true);
+    // 视口边界行保留，避免滚动时分界行反复拆建。
+    expect(shouldRebuildHighlightRow({ ...base, row: 0 })).toBe(false);
+    expect(shouldRebuildHighlightRow({ ...base, row: 37 })).toBe(false);
+  });
+
+  it("keeps dirty rows that were not repainted in this frame", () => {
+    // 只有本帧真正重绘的行才按文本比对，否则击键时的光标行重绘会牵动全屏。
+    expect(shouldRebuildHighlightRow({ ...base, dirty: false, currentText: "plain text" })).toBe(false);
   });
 });

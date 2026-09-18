@@ -49,6 +49,43 @@ export const HIGHLIGHT_MATCHES_PER_LINE_LIMIT = 20;
  */
 export const HIGHLIGHT_FILL_ALPHA = 0.35;
 
+/**
+ * `Terminal.onRender` 的 `start/end` 是**视口相对**行号（契约写明 0..rows-1），
+ * 而装饰表里的 row 与 `buffer.viewportY` 是**缓冲绝对**行号。缓冲区滚过一屏后
+ * （viewportY > 0）直接比较两者永远不会命中，被原地改写（进度行、`\r` 覆盖）
+ * 的行会留下旧色块——这里做一次换算并按缓冲行数裁剪。
+ */
+export function toAbsoluteRowRange(start: number, end: number, viewportY: number, bufferLength: number): { from: number; to: number } {
+  const lastLine = Math.max(0, bufferLength - 1);
+  const from = Math.max(0, Math.min(viewportY + start, lastLine));
+  return { from, to: Math.max(from, Math.min(viewportY + end, lastLine)) };
+}
+
+export interface HighlightRowRebuildInput {
+  row: number;
+  viewportFrom: number;
+  viewportTo: number;
+  /** 该行是否落在本帧重绘区间（已换算成绝对行号）。 */
+  dirty: boolean;
+  previousText: string;
+  currentText: string;
+}
+
+/**
+ * 单行装饰组是否要拆掉重建：
+ * - 行滚出视口 → 拆（Map 不同步收缩会拖着全局上限走）；
+ * - 行在本帧重绘且文本变了 → 拆（下面按新文本重扫，让高亮跟随编辑）；
+ * - 其余（尤其"本帧重绘但文本没变"）→ 留。
+ *
+ * 最后一条是防闪烁的关键：xterm 在装饰注册/销毁后会再触发整幅重绘，无脑拆建
+ * 会让空闲终端陷入"重绘→扫描→拆建→重绘"的自激回路（实测 30fps 持续整屏
+ * 重绘 + 装饰 DOM 每秒拆建数百次），高亮层反复摘挂即用户看到的闪烁。
+ */
+export function shouldRebuildHighlightRow(input: HighlightRowRebuildInput): boolean {
+  if (input.row < input.viewportFrom || input.row > input.viewportTo) return true;
+  return input.dirty && input.previousText !== input.currentText;
+}
+
 /** `#rrggbb` 规则色 → 带透明度的 rgba 填充色（非法形状回退默认色）。 */
 export function highlightFillStyle(color: string): string {
   const hex = HIGHLIGHT_COLOR_PATTERN.test(color) ? color : HIGHLIGHT_COLOR_DEFAULT;

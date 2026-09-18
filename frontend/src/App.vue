@@ -142,6 +142,8 @@ import {
   matchesInLine,
   normalizeHighlightRules,
   sanitizeHighlightRuleInput,
+  shouldRebuildHighlightRow,
+  toAbsoluteRowRange,
   HIGHLIGHT_COLOR_DEFAULT,
   HIGHLIGHT_RULES_LIMIT,
   type HighlightRuleView,
@@ -2967,8 +2969,11 @@ function toggleHighlightMenu() {
 // 扫描时装饰去留按 buffer.viewportY 的真实视口判定（见 scanHighlightRange）。
 // alt buffer 与 normal buffer 走同一路径（buffer.active 直接扫描）。
 let highlightRenderDisposable: { dispose(): void } | undefined;
-// 每行一个组（marker + decorations）；行滚出视口整组 dispose。
-const highlightDecorationsByRow = new Map<number, { dispose(): void }>();
+// 每行一个组（marker + decorations + 该行登记时的文本）；行滚出视口整组 dispose。
+// text 用于"文本未变则整组保留"：xterm 在装饰 dispose/注册后自身会再触发整幅
+// 重绘（实测 30fps 持续循环），无脑拆建会让空闲终端陷入"重绘→扫描→拆建→重绘"
+// 的自激回路，高亮层反复摘挂即是用户看到的闪烁。
+const highlightDecorationsByRow = new Map<number, { text: string; dispose(): void }>();
 let highlightDecorationCount = 0;
 let highlightScanScheduled = false;
 let highlightLastScanAt = 0;
@@ -3021,19 +3026,21 @@ function scanHighlightRange(start: number, end: number) {
   const term = terminal;
   if (!term) return;
   const buffer = term.buffer.active;
-  const dirtyFrom = Math.max(0, Math.min(start, buffer.length - 1));
-  const dirtyTo = Math.max(dirtyFrom, Math.min(end, buffer.length - 1));
+  // onRender 的 start/end 是视口相对行号，这里的 row / viewportY 是缓冲绝对行号
+  // （换算与裁剪见 toAbsoluteRowRange：漏了这步，滚过一屏后脏行判定永不命中）。
+  const dirty = toAbsoluteRowRange(start, end, buffer.viewportY, buffer.length);
   // onRender 给的是"本帧重绘的行"（输入时常常只有光标行），不是视口——装饰的
   // 去留必须按视口判定，否则每次击键都把整屏高亮 dispose 掉再异步补回（可见闪烁）。
   const vpFrom = Math.max(0, Math.min(buffer.viewportY, buffer.length - 1));
   const vpTo = Math.min(buffer.length - 1, vpFrom + term.rows - 1);
   for (const [row, entry] of highlightDecorationsByRow) {
-    // 视口外：整组 dispose（Map 不同步收缩会拖着全局上限走）；本帧重绘过的行：
-    // 先 dispose，下面按新文本重扫，让高亮跟随编辑而不是停留在旧位置。
-    if (row < vpFrom || row > vpTo || (row >= dirtyFrom && row <= dirtyTo)) {
-      entry.dispose();
-      highlightDecorationsByRow.delete(row);
-    }
+    // 拆组条件（视口外 / 本帧重绘且文本变了）见 shouldRebuildHighlightRow；
+    // "重绘但文本没变就保留"是掐断"拆建→重绘"自激回路的关键。
+    const dirtyRow = row >= dirty.from && row <= dirty.to;
+    const currentText = dirtyRow ? buffer.getLine(row)?.translateToString(true) ?? "" : entry.text;
+    if (!shouldRebuildHighlightRow({ row, viewportFrom: vpFrom, viewportTo: vpTo, dirty: dirtyRow, previousText: entry.text, currentText })) continue;
+    entry.dispose();
+    highlightDecorationsByRow.delete(row);
   }
   const compiled = compiledHighlightRules.value;
   if (!compiled.length) return;
@@ -3051,6 +3058,7 @@ function scanHighlightRange(start: number, end: number) {
     if (!marker) continue;
     const disposables: Array<{ dispose(): void }> = [marker];
     const entry = {
+      text: lineText,
       decorations: 0,
       dispose() {
         for (const disposable of disposables.splice(0)) disposable.dispose();
