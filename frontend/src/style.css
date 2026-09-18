@@ -463,7 +463,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .destructive-copy { display: flex; min-width: 0; align-items: flex-start; gap: 12px; }
 .destructive-copy:not(:has(p)) { align-items: center; }
 .destructive-copy > div { min-width: 0; }
-.destructive-copy strong { display: block; overflow-wrap: anywhere; }
+.destructive-copy strong { display: block; overflow-wrap: anywhere; font-weight: 400; }
+.destructive-copy.warning strong { font-weight: 600; }
 .destructive-copy p { margin: 5px 0 0; line-height: 1.5; }
 .destructive-icon { display: grid; width: 32px; height: 32px; flex: 0 0 32px; place-items: center; border-radius: 999px; background: color-mix(in srgb, var(--destructive) 12%, transparent); color: var(--destructive); }
 .destructive-icon svg { width: 16px; height: 16px; }
@@ -786,11 +787,18 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .metrics-float .distro-badge { width: 18px; height: 18px; flex-basis: 18px; font-size: 11px; }
 
 /* ---- 审计日志（IMPL_PLAN_NETCATTY_PARITY §3-B4，独立弹窗）---- */
+.audit-modal { width: min(680px, 100%); height: min(560px, calc(100vh - 48px)); }
 .audit-toolbar { display: flex; align-items: center; gap: 8px; }
 .audit-toolbar .audit-kind-select { min-width: 150px; }
+.audit-toolbar .audit-actions { display: flex; gap: 4px; margin-left: auto; }
+.audit-empty { display: flex; flex: 1 1 auto; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--muted-foreground); font-size: 12px; }
+.audit-empty > svg { width: 28px; height: 28px; opacity: 0.5; }
 .audit-truncated { font-size: 10px; }
-.audit-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
-.audit-row { display: flex; align-items: baseline; gap: 8px; font-size: 10px; }
+/* 标准列表项（同录制记录）：行间单条发丝分隔线、行 hover 底色。 */
+.audit-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; overflow-y: auto; }
+.audit-row { display: flex; align-items: baseline; gap: 8px; border-radius: var(--radius); padding: 7px 8px; font-size: 12px; }
+.audit-row + .audit-row { border-top: 1px solid color-mix(in srgb, var(--border) 45%, transparent); }
+.audit-row:hover { background: var(--accent); }
 .audit-time { flex: 0 0 auto; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
 .audit-kind-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; font-size: 10px; font-weight: 600; color: var(--muted-foreground); }
 .audit-kind-badge.k-exec { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
