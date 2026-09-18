@@ -10,7 +10,7 @@
   "homepage": "https://github.com/jinpy666/dbx-plugin-ssh",
   "icon": "assets/plugin.svg",
   "engines": {
-    "dbx": ">=0.6.14",
+    "dbx": ">=0.6.16",
     "host_api": ">=1.0.0"
   },
   "permissions": [
@@ -230,7 +230,7 @@
           "label": "Sudo credentials",
           "type": "select",
           "binding": "config",
-          "default": "off",
+          "default": "custom",
           "options": [
             {
               "value": "custom",

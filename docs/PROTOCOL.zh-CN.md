@@ -514,7 +514,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - 桌面宿主打开原生对话框，把**绝对路径**写回 `private_key_path`（sidecar 与用户同机，自己读文件）；浏览器宿主（dbx-web / Docker）拿不到客户端路径，同一个按钮变成上传：DBX 读取文件内容（上限 1 MiB）写入 `private_key` 并清空路径。
 - 两个槽位互斥：任一方写入会清空另一方，保存时对应地从 `external_config` / `connection_secrets` 删除。sidecar 侧 `private_key` 内容优先于路径（`resolve_private_key_text`），两条通道共用同一套解析（OpenSSH/PEM/PPK，CRLF 归一化）。
 - 刻意不声明 `picker.accept`：私钥常见名为 `id_rsa` / `id_ed25519`（无扩展名），原生对话框的扩展名过滤会把它们置灰、而不是列出来。
-- **兼容性**：`picker` 是新增字段属性，而宿主 manifest 解析器带 `deny_unknown_fields`——不认识该属性的宿主会拒绝整份 manifest。因此**发布前必须把 `engines.dbx` 抬到含该能力的宿主发行版**（宿主 README 的原话：keep `engines.dbx` at or above that release）；本分支暂未提前抬高，因为（a）含该能力的宿主构建目前仍报上一版本号，提前抬高会把本地端到端验证挡在门外；（b）解析失败先于版本检查发生，抬高对旧宿主没有实际保护作用。用 `host_api` 也无法门控该能力：`SUPPORTED_PLUGIN_HOST_API_VERSION` 在 picker 之前就已是 `1.1.0`。
+- **兼容性**：`picker` 是新增字段属性，而宿主 manifest 解析器带 `deny_unknown_fields`——不认识该属性的宿主会拒绝整份 manifest，且解析失败先于版本检查发生，因此版本下限只能声明事实、挡不住旧宿主。DBX **0.6.16 是首个带该能力的发行版**（0.6.15 及更早的 `PluginFormFieldDefinition` 没有 `picker`），本 manifest 的 `engines.dbx` 因此固定为 `>=0.6.16`，只允许上移（`scripts/connection-forms/verify.mjs` 断言）。用 `host_api` 无法门控该能力：`SUPPORTED_PLUGIN_HOST_API_VERSION` 在 picker 之前就已是 `1.1.0`。
 - **数据位置**：走上传通道时私钥内容会被复制到 DBX 服务端（容器）的连接密钥库（`plugin_connection.private_key`）；桌面端只记录路径，不复制密钥。
 
 ### ssh/knownHosts/list

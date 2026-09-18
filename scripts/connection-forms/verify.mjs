@@ -139,7 +139,10 @@ for (const key of advancedFields) {
 // and #30 - users could not find the TOTP field and gave up). Their *detail*
 // fields still open on demand, so the default form only gains two rows.
 assert.equal(byKey.sudo_source.visible_when, undefined, "sudo_source must stay visible without the advanced switch");
-assert.equal(byKey.sudo_source.default, "off", "sudo_source must default to Off so a new connection stays short");
+// Empty sudo password is not a no-op: the sidecar falls back to the login
+// password, so defaulting to Off would silently stop answering sudo prompts
+// for every new connection (`1a07ed3` flipped it, `de5ee09` flipped it back).
+assert.equal(byKey.sudo_source.default, "custom", "sudo_source must keep the custom default - Off would stop sudo orchestration on new connections");
 assert.deepEqual(byKey.auth_flow_mode.visible_when, { field: "sudo_source", one_of: ["custom", "off"] },
   "auth_flow_mode (2FA) must stay visible whenever sudo does not defer to a global profile");
 // Field order is the form's information architecture: the switch must sit
@@ -288,14 +291,11 @@ state({ advanced_options: false, authentication: "private-key" }).visible("passw
 // dialog filter greys those out instead of offering them.
 //
 // `picker` is additive but not forward compatible: hosts whose field parser
-// predates it reject the whole manifest (`deny_unknown_fields`). The
-// `engines.dbx` floor therefore has to move to the release that ships it before
-// this manifest is published - but the value cannot be guessed ahead of time (a
-// host built from the feature branch still reports the previous version), and
-// bumping it early would block exactly the local end-to-end check the attribute
-// exists for. It also cannot protect older hosts: parsing fails before the
-// version check runs. So this stays a release-time step, asserted only for
-// shape here.
+// predates it reject the whole manifest (`deny_unknown_fields`) — and parsing
+// fails before the version check runs, so the floor cannot protect older hosts,
+// only document them. DBX 0.6.16 is the first release that ships the attribute
+// (0.6.15 and earlier have no `picker` in `PluginFormFieldDefinition`), so the
+// floor is pinned there and may only move up.
 //
 // The field must stay *typable*. Declaring `options_action` makes the host
 // render a select-only control (`selectOptionsFor()` wins over the text input
@@ -330,8 +330,18 @@ assert(
   /^>=\d+\.\d+\.\d+$/.test(dbxFloor),
   `engines.dbx must stay a plain '>=x.y.z' floor (got '${dbxFloor}')`,
 );
-console.log(
-  `NOTE SSH connection form: 'picker' only parses on hosts that ship it — raise engines.dbx (currently ${dbxFloor}) to that release in the release commit.`,
+// 0.6.16 is the release that first parses `picker`; a lower floor would ship a
+// manifest that older hosts reject outright instead of merely hiding a button.
+const PICKER_RELEASE = [0, 6, 16];
+const floorParts = dbxFloor.replace(/^>=/, "").split(".").map((part) => Number(part));
+const floorAtLeastPickerRelease = floorParts.some((part, index) => {
+  const target = PICKER_RELEASE[index];
+  if (part !== target) return part > target;
+  return index === PICKER_RELEASE.length - 1;
+});
+assert(
+  floorAtLeastPickerRelease,
+  `engines.dbx must be >= ${PICKER_RELEASE.join(".")} — the first release whose form parser accepts 'picker' (got '${dbxFloor}')`,
 );
 // Both halves of the either-or must keep pointing at each other in every
 // locale: the file action only makes sense if the text also names where an

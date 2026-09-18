@@ -984,7 +984,6 @@ mod tests {
             "private_key_passphrase",
             "private_key",
             "agent_socket",
-            "advanced_options",
             "sudo_source",
             "sudo_profile",
             "sudo_password",
@@ -993,6 +992,8 @@ mod tests {
             "auth_flow_mode",
             "totp_secret",
             "totp_prompt_hint",
+            "advanced_options",
+            "read_only",
             "password_prompt_hint",
             "connect_timeout_secs",
             "keepalive_interval_secs",
@@ -1004,7 +1005,6 @@ mod tests {
             "trigger_answer_2",
             "passphrase_command",
             "remote_command",
-            "read_only",
         ];
         assert_eq!(keys, expected, "manifest field list drifted from parsing");
 
@@ -1119,6 +1119,9 @@ mod tests {
                 .find(|field| field["key"] == key)
                 .unwrap()
                 .get("visible_when")
+                // 复合条件（all_of/any_of/not）没有单字段形态，返回 None，由
+                // 调用点按各自结构单独断言。
+                .filter(|gate| !gate["field"].is_null())
                 .map(|gate| {
                     (
                         gate["field"].as_str().unwrap().to_string(),
@@ -1146,13 +1149,26 @@ mod tests {
             Some(("sudo_source".to_string(), vec!["global".to_string()])),
             "sudo_profile must show only for sudo_source=global"
         );
-        for key in ["auth_flow_mode", "password_prompt_hint"] {
-            assert_eq!(
-                visible_when(key),
-                Some(("sudo_source".to_string(), vec!["custom".to_string(), "off".to_string()])),
-                "{key} must hide under sudo_source=global (the bound profile owns the whole credential source) and stay visible otherwise"
-            );
-        }
+        let key = "auth_flow_mode";
+        assert_eq!(
+            visible_when(key),
+            Some(("sudo_source".to_string(), vec!["custom".to_string(), "off".to_string()])),
+            "{key} must hide under sudo_source=global (the bound profile owns the whole credential source) and stay visible otherwise"
+        );
+        // password_prompt_hint 同时跟随高级区与 sudo 来源，属于复合条件。
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field["key"] == "password_prompt_hint")
+                .unwrap()["visible_when"],
+            serde_json::json!({
+                "all_of": [
+                    { "field": "advanced_options", "one_of": ["true"] },
+                    { "field": "sudo_source", "one_of": ["custom", "off"] },
+                ]
+            }),
+            "password_prompt_hint must stay behind the advanced switch and follow the sudo source"
+        );
         for key in ["totp_secret", "totp_prompt_hint"] {
             assert_eq!(
                 visible_when(key),
@@ -2796,18 +2812,29 @@ mod manifest_contract_tests {
             Some(vec!["global".to_string()]),
             "sudo_profile must be visible only while sudo_source is global"
         );
-        for key in ["auth_flow_mode", "password_prompt_hint"] {
-            assert_eq!(
-                condition_field(&field(key), "visible_when"),
-                Some("sudo_source"),
-                "{key} must be gated on sudo_source"
-            );
-            assert_eq!(
-                condition_one_of(&field(key), "visible_when"),
-                Some(vec!["custom".to_string(), "off".to_string()]),
-                "{key} must hide under global (profile owns the source) and stay visible for custom/off"
-            );
-        }
+        let key = "auth_flow_mode";
+        assert_eq!(
+            condition_field(&field(key), "visible_when"),
+            Some("sudo_source"),
+            "{key} must be gated on sudo_source"
+        );
+        assert_eq!(
+            condition_one_of(&field(key), "visible_when"),
+            Some(vec!["custom".to_string(), "off".to_string()]),
+            "{key} must hide under global (profile owns the source) and stay visible for custom/off"
+        );
+        // password_prompt_hint 是精度旋钮：既要跟随 sudo 来源，又留在高级区
+        // （不随 sudo/2FA 一起常显），因此条件是复合式而不是单字段子句。
+        assert_eq!(
+            field("password_prompt_hint")["visible_when"],
+            serde_json::json!({
+                "all_of": [
+                    { "field": "advanced_options", "one_of": ["true"] },
+                    { "field": "sudo_source", "one_of": ["custom", "off"] },
+                ]
+            }),
+            "password_prompt_hint must follow both the advanced switch and the sudo source"
+        );
         for key in ["totp_secret", "totp_prompt_hint"] {
             assert_eq!(
                 condition_field(&field(key), "visible_when"),

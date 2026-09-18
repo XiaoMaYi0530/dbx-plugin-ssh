@@ -144,7 +144,9 @@
    属性，改在 7 语 description 写明范围与默认值。
 4. **依赖下限（P2）**：`engines.dbx` 从 `>=0.5.77` 抬到 `>=0.6.14`——条件
    显隐/条件必填是宿主 0.6.14 才实现的能力，低于该版本的表单会平铺全部字段、
-   忽略 `required_when`，与本契约声明的行为不符。
+   忽略 `required_when`，与本契约声明的行为不符。**2026-09-18 再次抬到
+   `>=0.6.16`**：私钥 `picker` 属性由 0.6.16 首次提供，而旧宿主的
+   `deny_unknown_fields` 会拒绝整份 manifest（0.6.15 及更早没有该字段）。
 5. **回归网**：新增 `model.rs` 契约测试
    `form_save_state_matches_parser_acceptance`——按宿主语义穷举
    advanced_options × authentication × password_source × sudo_source ×
