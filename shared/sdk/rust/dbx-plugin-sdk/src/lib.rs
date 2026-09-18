@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -177,9 +178,10 @@ impl<H: PluginHandler> PluginServer<H> {
     pub fn serve(self) -> io::Result<()> {
         let emitter = PluginEmitter { output: Arc::new(Mutex::new(Box::new(io::stdout()))), transport: self.transport };
         let workers = WorkerPool::new(self.worker_threads, self.work_queue_capacity)?;
+        let binary = ChannelExecutor::new(workers.clone());
         match self.transport {
             PluginTransport::JsonLines => self.serve_json_lines(BufReader::new(io::stdin()), emitter, &workers),
-            PluginTransport::Framed => self.serve_framed(io::stdin(), emitter, &workers),
+            PluginTransport::Framed => self.serve_framed(io::stdin(), emitter, &workers, &binary),
         }
     }
 
@@ -202,7 +204,13 @@ impl<H: PluginHandler> PluginServer<H> {
         }
     }
 
-    fn serve_framed<R: Read>(&self, mut input: R, emitter: PluginEmitter, workers: &WorkerPool) -> io::Result<()> {
+    fn serve_framed<R: Read>(
+        &self,
+        mut input: R,
+        emitter: PluginEmitter,
+        workers: &WorkerPool,
+        binary: &ChannelExecutor,
+    ) -> io::Result<()> {
         loop {
             let mut header = [0u8; 5];
             match input.read_exact(&mut header) {
@@ -225,7 +233,7 @@ impl<H: PluginHandler> PluginServer<H> {
                     }
                 }
                 FRAME_KIND_BINARY => {
-                    if let Err(error) = self.dispatch_binary(payload, emitter.clone(), workers) {
+                    if let Err(error) = self.dispatch_binary(payload, emitter.clone(), binary) {
                         eprintln!("[dbx-plugin-sdk] {error}");
                     }
                 }
@@ -274,7 +282,7 @@ impl<H: PluginHandler> PluginServer<H> {
         })
     }
 
-    fn dispatch_binary(&self, payload: Vec<u8>, emitter: PluginEmitter, workers: &WorkerPool) -> Result<(), String> {
+    fn dispatch_binary(&self, payload: Vec<u8>, emitter: PluginEmitter, binary: &ChannelExecutor) -> Result<(), String> {
         if payload.len() < 2 {
             return Err("invalid binary frame".to_string());
         }
@@ -288,11 +296,101 @@ impl<H: PluginHandler> PluginServer<H> {
         validate_protocol_name(&channel).map_err(|error| error.message)?;
         let data = payload[2 + channel_len..].to_vec();
         let handler = self.handler.clone();
-        workers.submit(move || {
-            if let Err(error) = handler.handle_binary(&channel, data, &emitter) {
+        let job_channel = channel.clone();
+        binary.submit(&channel, Box::new(move || {
+            if let Err(error) = handler.handle_binary(&job_channel, data, &emitter) {
                 eprintln!("[dbx-plugin-sdk] binary handler failed: {}", error.message);
             }
-        })
+        }))
+    }
+}
+
+/// Binary frames on one channel form an ordered stream (terminal keystrokes,
+/// upload chunks), so their handler runs must preserve wire order: a terminal
+/// that applies "l" and "s" out of order scrambles what the remote shell sees.
+/// The executor keeps one lane per channel; the lane's head job runs on the
+/// shared worker pool and the next job starts only after the previous returns,
+/// while different lanes stay fully concurrent. JSON requests are independent
+/// and bypass lanes entirely.
+#[derive(Clone)]
+struct ChannelExecutor {
+    lanes: Arc<Mutex<HashMap<String, ChannelLane>>>,
+    pool: WorkerPool,
+}
+
+#[derive(Default)]
+struct ChannelLane {
+    running: bool,
+    pending: VecDeque<PluginJob>,
+}
+
+impl ChannelExecutor {
+    fn new(pool: WorkerPool) -> Self {
+        Self { lanes: Arc::new(Mutex::new(HashMap::new())), pool }
+    }
+
+    fn submit(&self, channel: &str, job: PluginJob) -> Result<(), String> {
+        let head = {
+            let mut lanes = self
+                .lanes
+                .lock()
+                .map_err(|_| "plugin channel lanes are poisoned".to_string())?;
+            let lane = lanes.entry(channel.to_string()).or_default();
+            if lane.running {
+                lane.pending.push_back(job);
+                None
+            } else {
+                lane.running = true;
+                Some(job)
+            }
+        };
+        match head {
+            Some(job) => self.start(channel.to_string(), job),
+            None => Ok(()),
+        }
+    }
+
+    fn start(&self, channel: String, job: PluginJob) -> Result<(), String> {
+        let executor = self.clone();
+        let finish_channel = channel.clone();
+        let chained: PluginJob = Box::new(move || {
+            job();
+            executor.finish(finish_channel);
+        });
+        if let Err(error) = self.pool.submit(chained) {
+            // The pool is gone; free the lane so a restart is not blocked by a
+            // head job that will never run. Pending jobs die with the process.
+            self.release(&channel);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn finish(&self, channel: String) {
+        let next = {
+            let mut lanes = match self.lanes.lock() {
+                Ok(lanes) => lanes,
+                Err(_) => return,
+            };
+            let Some(lane) = lanes.get_mut(&channel) else { return };
+            match lane.pending.pop_front() {
+                Some(job) => job,
+                None => {
+                    lane.running = false;
+                    lanes.remove(&channel);
+                    return;
+                }
+            }
+        };
+        let _ = self.start(channel, next);
+    }
+
+    fn release(&self, channel: &str) {
+        if let Ok(mut lanes) = self.lanes.lock() {
+            if let Some(lane) = lanes.get_mut(channel) {
+                lane.running = false;
+            }
+        }
     }
 }
 
@@ -310,6 +408,7 @@ struct ProtocolRequest {
 
 type PluginJob = Box<dyn FnOnce() + Send + 'static>;
 
+#[derive(Clone)]
 struct WorkerPool {
     sender: mpsc::SyncSender<PluginJob>,
 }
@@ -369,16 +468,22 @@ fn validate_protocol_name(value: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+fn io_error(error: io::Error) -> PluginError {
+    PluginError::new(-32000, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{
-        read_limited_line, PluginError, PluginHandler, PluginMetadata, PluginServer, RequestContext, WorkerPool,
+        read_limited_line, ChannelExecutor, PluginEmitter, PluginError, PluginHandler, PluginMetadata, PluginServer,
+        PluginTransport, RequestContext, WorkerPool,
     };
-    use crate::PluginEmitter;
     use serde_json::Value;
 
     struct NoopHandler;
@@ -410,6 +515,121 @@ mod tests {
         assert_eq!(values, vec![0, 1, 2, 3]);
     }
 
+    /// Records the order in which binary frames were applied to the handler.
+    /// Sequence N sleeps `delays_ms[N]` before recording, with later sequences
+    /// sleeping less: on a concurrent pool the later frames finish first,
+    /// which is the terminal-input reordering seen as scrambled keystrokes.
+    struct ReorderingProbe {
+        order: Arc<Mutex<Vec<u64>>>,
+        delays_ms: [u64; 4],
+    }
+
+    impl PluginHandler for ReorderingProbe {
+        fn handle(
+            &self,
+            _context: RequestContext,
+            method: &str,
+            _params: Value,
+            _emitter: &PluginEmitter,
+        ) -> Result<Value, PluginError> {
+            Err(PluginError::method_not_found(method))
+        }
+
+        fn handle_binary(&self, _channel: &str, data: Vec<u8>, _emitter: &PluginEmitter) -> Result<(), PluginError> {
+            let sequence = u64::from_be_bytes(data[..8].try_into().unwrap());
+            thread::sleep(Duration::from_millis(self.delays_ms[sequence as usize]));
+            self.order.lock().unwrap().push(sequence);
+            Ok(())
+        }
+    }
+
+    fn binary_frame_payload(channel: &str, sequence: u64) -> Vec<u8> {
+        let channel = channel.as_bytes();
+        let mut payload = Vec::with_capacity(2 + channel.len() + 8);
+        payload.extend_from_slice(&(channel.len() as u16).to_be_bytes());
+        payload.extend_from_slice(channel);
+        payload.extend_from_slice(&sequence.to_be_bytes());
+        payload
+    }
+
+    fn test_emitter() -> PluginEmitter {
+        PluginEmitter {
+            output: Arc::new(Mutex::new(Box::new(Cursor::new(Vec::new())) as Box<dyn Write + Send>)),
+            transport: PluginTransport::Framed,
+        }
+    }
+
+    #[test]
+    fn binary_frames_on_one_channel_apply_in_submission_order() {
+        let handler = ReorderingProbe { order: Arc::new(Mutex::new(Vec::new())), delays_ms: [120, 90, 60, 30] };
+        let order = handler.order.clone();
+        let server = PluginServer::new(PluginMetadata::new("sample", "1.0.0"), handler);
+        let emitter = test_emitter();
+        let binary = ChannelExecutor::new(WorkerPool::new(4, 16).unwrap());
+
+        for sequence in 0..4u64 {
+            server
+                .dispatch_binary(binary_frame_payload("ssh/terminal/in/s1", sequence), emitter.clone(), &binary)
+                .unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while order.lock().unwrap().len() < 4 {
+            assert!(Instant::now() < deadline, "frames never completed");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    fn wait_for_length(order: &Mutex<Vec<&'static str>>, length: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while order.lock().unwrap().len() < length {
+            assert!(Instant::now() < deadline, "jobs never completed");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn channel_executor_keeps_lanes_independent_and_fifo() {
+        let executor = ChannelExecutor::new(WorkerPool::new(2, 8).unwrap());
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let gate = Arc::new(Mutex::new(false));
+
+        // Lane "a": the head job blocks on the gate, the follow-up is queued
+        // behind it. Lane "b" must complete even while "a" is stuck.
+        let blocked_order = order.clone();
+        let blocked_gate = gate.clone();
+        executor
+            .submit("a", Box::new(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !*blocked_gate.lock().unwrap() {
+                    assert!(Instant::now() < deadline, "gate never opened");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                blocked_order.lock().unwrap().push("a-head");
+            }))
+            .unwrap();
+        executor
+            .submit("a", {
+                let order = order.clone();
+                Box::new(move || order.lock().unwrap().push("a-queued"))
+            })
+            .unwrap();
+        executor
+            .submit("b", {
+                let order = order.clone();
+                Box::new(move || order.lock().unwrap().push("b-head"))
+            })
+            .unwrap();
+
+        wait_for_length(&order, 1);
+        assert_eq!(*order.lock().unwrap(), vec!["b-head"]);
+
+        *gate.lock().unwrap() = true;
+        wait_for_length(&order, 3);
+        assert_eq!(*order.lock().unwrap(), vec!["b-head", "a-head", "a-queued"]);
+    }
+
     #[test]
     fn server_configuration_clamps_zero_worker_values() {
         let server = PluginServer::new(PluginMetadata::new("sample", "1.0.0"), NoopHandler)
@@ -425,8 +645,4 @@ mod tests {
         let mut reader = Cursor::new(b"12345\n".to_vec());
         assert!(read_limited_line(&mut reader, 4).unwrap_err().to_string().contains("too large"));
     }
-}
-
-fn io_error(error: io::Error) -> PluginError {
-    PluginError::new(-32000, error.to_string())
 }
