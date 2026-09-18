@@ -36,12 +36,16 @@ pnpm --dir frontend build
 export CARGO_TARGET_DIR="$PWD/backend/target"
 
 echo "==> package .dbxp"
-unset DBX_PLUGIN_SDK_ROOT
+# CLI 打包的内部 cargo build 会把 Rust SDK patch 覆盖到 DBX_PLUGIN_SDK_ROOT；
+# 未设置时 npm 包装器注入 CLI 自带 sdk-root，vendored SDK（shared/sdk/）的本地
+# 修复进不了产物——用垫片把 SDK 根指回 vendored 副本，打完做字节级反例断言。
+export DBX_PLUGIN_SDK_ROOT="$(bash scripts/sdk_root_shim.sh)"
 if ! command -v dbx-plugin >/dev/null 2>&1; then
   echo "dbx-plugin CLI not found; install @dbx-app/plugin-cli or set PATH before packaging" >&2
   exit 1
 fi
 NO_COLOR=1 dbx-plugin package .
+python3 scripts/verify_packaged_sdk.py
 
 echo
 echo "Artifacts:"

@@ -4,7 +4,7 @@
 
 This file records user-facing changes for DBX SSH Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
-## [Unreleased]
+## [0.4.79] — 2026-09-18
 
 ### 改进 / Improved
 
@@ -19,6 +19,9 @@ This file records user-facing changes for DBX SSH Terminal. Unless noted otherwi
 
 ### 修复 / Fixed
 
+- **终端快速输入不再串字**：连续快敲时按键会被远端 shell 收成乱序串（如 `ls` 敲多次出现 `lllslllllllss`）。根因在 sidecar SDK 的二进制帧分发：帧虽按线序到达，却被无序地丢进多线程 worker 池，同一终端通道的相邻按键帧并发执行，应用顺序失去保证。现在同一通道（同一会话的终端输入 / 上传流）的帧严格按到达顺序执行，不同通道仍然并行，JSON 请求路径不变；新增 SDK 单测锁定「同通道 FIFO」与「跨通道并发」两个性质。
+  **Fast terminal typing no longer scrambles keystrokes:** rapid input used to reach the remote shell reordered (typing `ls` repeatedly could yield `lllslllllllss`). The cause was the sidecar SDK's binary-frame dispatch: frames arrive on the wire in order but were handed to a multi-threaded worker pool unsynchronized, so adjacent keystroke frames on one terminal channel could run concurrently and apply out of order. Frames on the same channel (a session's terminal input / upload stream) now execute strictly in arrival order, different channels stay concurrent, and the JSON request path is unchanged; new SDK tests pin both the per-channel FIFO and cross-channel concurrency properties.
+
 - **登录期 MFA（JumpServer / 堡垒机）**：`先密码，再 OTP` 在"密码或公钥先被服务器接受、再用 keyboard-interactive 问 MFA"的流程下不再把 OTP 提问留空；提问识别覆盖 koko 的 `[OTP Code]: ` 与 `Please Enter MFA Code.`，密码提示词也不会再劫持 OTP 提问（把登录密码当验证码回给服务器）；私钥 / SSH Agent 的 partial success 会续答 MFA，不再直接报"认证被拒"。登录提问的密码半边固定为登录口令（不再误用单独的 sudo 口令），`global` 模式下登录期 MFA 也能读到全局 Quick Sudo 配置的流程模式与 TOTP 密钥。认证失败信息会点名服务器提问并指路 2FA 配置。新增 `scripts/smoke_login_mfa_test.py`：10 个组合场景（四种提问形态 × 密码/私钥/全局配置 × 流程模式）端到端回归（issue #17 / #30）。
   **Login-time MFA (JumpServer / bastion hosts):** `Password first, then OTP` no longer leaves the MFA question blank when the password or public key is accepted first and keyboard-interactive follows; prompt recognition covers koko's `[OTP Code]: ` and `Please Enter MFA Code.`, a password hint can no longer hijack the OTP prompt (which used to send the login password as the code), and partial key / agent success continues into MFA instead of failing outright. Failure messages now name the server's prompt and point at the 2FA settings (issues #17 / #30).
 
@@ -30,10 +33,6 @@ This file records user-facing changes for DBX SSH Terminal. Unless noted otherwi
 
 - **依赖宿主 DBX ≥ 0.6.16**：连接表单的私钥 `picker`（文件选择/上传）与条件显隐/条件必填一起，把 `engines.dbx` 从 `>=0.6.14` 抬到 `>=0.6.16`——0.6.16 是首个解析 `picker` 的发行版，旧宿主的 `deny_unknown_fields` 会直接拒绝整份 manifest（解析先于版本检查，所以该下限只声明事实、由契约脚本断言只许上移）。
   **Requires DBX ≥ 0.6.16.** The private-key `picker` (file dialog / upload) needs a host parser that knows the attribute: older hosts reject the whole manifest via `deny_unknown_fields`, so `engines.dbx` moves from `>=0.6.14` to `>=0.6.16`, the first release that ships it. The contract script pins the floor so it can only move up.
-
-## [0.4.79] — 2026-09-18
-
-### 修复 / Fixed
 
 - **连接成功后 IP/关键词高亮一直闪**：0.4.78 的"连接后补一次重绘 + 重扫"只治了过渡丢帧，真正的病灶是装饰层自己喂出来的自激回路——每次重绘都把视口内的高亮装饰整组拆掉重建，而 xterm 在装饰注册/销毁后会再触发一次整幅重绘，于是"重绘 → 扫描 → 拆建 → 重绘"永不停歇（headless Chrome 实测：连接落定约 2.5 秒起，空闲终端 4 秒内 296 次整屏重绘、装饰 DOM 拆建各 2637 次；关掉高亮则 0 次）。现在只有"本帧重绘**且**文本确实变了"的行才重建装饰，滚出视口的行照旧释放，回路被掐断（同样场景：0 次拆建、0 次额外重绘）。顺带修正 `onRender` 视口相对行号与缓冲绝对行号的换算，避免缓冲区滚过一屏后原地改写（进度行、`\r` 覆盖）的行残留旧色块。
   **IP/keyword highlights kept flickering after a successful connect:** the 0.4.78 "force one repaint + rescan after connect" only papered over the dropped transition frame; the real cause was a self-sustaining loop in the decoration layer — every repaint tore down and rebuilt all in-viewport highlight decorations, and xterm fires another full repaint right after decoration registration/disposal, so "repaint → scan → rebuild → repaint" never stopped (headless Chrome: starting ~2.5s after the session settles, an idle terminal produced 296 full-screen repaints and 2637 decoration DOM add/remove pairs in 4s, versus 0 with highlighting off). Decorations are now rebuilt only for rows that were repainted *and* whose text actually changed, while rows scrolled out of the viewport are still released (same scenario: 0 rebuilds, 0 extra repaints). The viewport-relative → buffer-absolute mapping of `onRender` is also corrected so in-place rewrites (progress lines, `\r` overwrites) no longer leave stale colour blocks once the buffer has scrolled past one screen.

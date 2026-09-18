@@ -20,6 +20,11 @@ if ! command -v node >/dev/null 2>&1 || ! command -v pnpm >/dev/null 2>&1; then
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# 用一次性数据目录跑全套：known_hosts / Quick Sudo 配置等状态不落用户真实
+# 插件数据，主机密钥挑战类用例也可重复——否则测试容器一旦重建（host key
+# 变更），remembered 记录会把连接按 MITM 防护直接拒掉。
+export DBX_PLUGIN_DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dbx-ssh-test-data.XXXXXX")"
+
 echo "==> backend unit tests"
 node scripts/connection-forms/verify.mjs
 cargo test --manifest-path backend/Cargo.toml
@@ -45,9 +50,13 @@ echo "==> sidecar release build"
 cargo build --release --manifest-path backend/Cargo.toml
 
 echo "==> package .dbxp"
-unset DBX_PLUGIN_SDK_ROOT
+# CLI 打包的内部 cargo build 会把 Rust SDK patch 覆盖到 DBX_PLUGIN_SDK_ROOT；
+# 未设置时 npm 包装器注入 CLI 自带 sdk-root，vendored SDK（shared/sdk/）的本地
+# 修复进不了产物——用垫片把 SDK 根指回 vendored 副本，打完做字节级反例断言。
 if command -v dbx-plugin >/dev/null 2>&1; then
+  export DBX_PLUGIN_SDK_ROOT="$(bash scripts/sdk_root_shim.sh)"
   NO_COLOR=1 dbx-plugin package .
+  python3 scripts/verify_packaged_sdk.py
 else
   echo "SKIP: dbx-plugin CLI unavailable; install @dbx-app/plugin-cli to run package verification"
 fi
