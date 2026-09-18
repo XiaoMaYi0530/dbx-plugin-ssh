@@ -206,6 +206,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .connect-card-header { display: flex; align-items: center; gap: 11px; }
 .connect-card-badge { display: grid; width: 34px; height: 34px; flex: 0 0 34px; place-items: center; border-radius: 9px; background: var(--primary); color: var(--primary-foreground); }
 .connect-card-badge svg { width: 17px; height: 17px; stroke-width: 1.8; }
+/* PluginLogo 是 ?raw 引入的 assets/plugin.svg（宿主插件中心同款图形），外层为
+   span.plugin-logo 包装：块级化避免行内基线缝隙；svg 描边统一压成 currentColor
+   （覆盖原文件硬编码的 #0ea5e9，表示属性可被 CSS 规则覆盖），否则同色系徽标底
+   上不可读。尺寸不在此处定——由使用处规则给出（徽标 17px / 端点 15px），
+   裸 svg 无固有尺寸，缺上下文会落到 300×150 默认。 */
+.plugin-logo { display: block; line-height: 0; }
+.plugin-logo svg path { stroke: currentColor; }
 .connect-card-heading { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
 .connect-card-name { overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .connect-card-identity { overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
@@ -214,7 +221,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .connect-card-logs-toggle svg { width: 12px; height: 12px; }
 .connect-card-track { display: flex; align-items: center; gap: 12px; padding: 2px 4px; }
 .connect-card-endpoint { position: relative; display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center; border-radius: 50%; background: color-mix(in srgb, var(--muted) 60%, var(--background)); color: var(--muted-foreground); }
-.connect-card-endpoint > svg { width: 15px; height: 15px; stroke-width: 1.8; }
+.connect-card-endpoint > svg, .connect-card-endpoint .plugin-logo svg { width: 15px; height: 15px; stroke-width: 1.8; }
 .connect-card-endpoint-server { background: color-mix(in srgb, var(--primary) 14%, transparent); color: var(--primary); }
 /* 左侧端点旋转环：常显的整圆轨道（足够可见，任何时刻都读出"同心圆环"）+
    一段短亮弧在轨道上匀速旋转；环比图标大 8px，与图标间留出明显间隙。

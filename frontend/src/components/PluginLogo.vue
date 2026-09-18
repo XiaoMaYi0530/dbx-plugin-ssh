@@ -1,12 +1,11 @@
 <script setup lang="ts">
-// 插件品牌标记：与 assets/plugin.svg 同形（SSH 折线 + 光标横杠）。
-// 描边走 currentColor 以适配徽标底色与主题（原文件硬编码的天蓝在
-// --primary 底上不可读）；改形请与 assets/plugin.svg 两处同步。
+// 直接引用插件真实 logo（单一来源：assets/plugin.svg，宿主插件中心同款图形）。
+// 原文件硬编码的 #0ea5e9 描边落在 --primary 徽标底上不可读，由 style.css 的
+// .plugin-logo svg path 规则把 stroke 压成 currentColor（表示属性可被 CSS
+// 规则覆盖）——形状与宿主展示一致，颜色随使用处主题自适应。
+import pluginLogo from "../../../assets/plugin.svg?raw";
 </script>
 
 <template>
-  <svg class="plugin-logo" viewBox="0 0 64 64" aria-hidden="true">
-    <path d="M9 10 29 32 9 54" fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" />
-    <path d="M37 53h18" fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" />
-  </svg>
+  <span class="plugin-logo" aria-hidden="true" v-html="pluginLogo" />
 </template>

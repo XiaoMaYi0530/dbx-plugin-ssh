@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
 import ConnectingCard from "./ConnectingCard.vue";
+import rawPluginLogo from "../../../assets/plugin.svg?raw";
 
 function mountCard(state: "connecting" | "error" | "cancelled" | "success") {
   return mount(ConnectingCard, {
@@ -27,6 +28,13 @@ describe("ConnectingCard", () => {
     // 全卡恰好两处品牌标记：徽标 + 左端点；右端点在 connecting 态是终端图形。
     expect(wrapper.findAll(".plugin-logo")).toHaveLength(2);
     expect(wrapper.find(".connect-card-endpoint-target svg").classes().includes("plugin-logo")).toBe(false);
+    // 单一来源：渲染出的图形就是 assets/plugin.svg 原文（同路径数据，非复刻件）。
+    const badgeHtml = wrapper.find(".connect-card-badge .plugin-logo").html();
+    expect(badgeHtml).toContain('viewBox="0 0 64 64"');
+    for (const segment of ["M9 10 29 32 9 54", "M37 53h18"]) {
+      expect(badgeHtml).toContain(segment);
+      expect(rawPluginLogo).toContain(segment);
+    }
   });
 
   it("keeps the plugin logo across success and error states", () => {
