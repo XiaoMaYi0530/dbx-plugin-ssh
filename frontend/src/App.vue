@@ -2604,12 +2604,14 @@ function sanitizeTransferHistoryTasks(raw: unknown): TransferHistoryEntry[] {
   return out;
 }
 
-async function clearTransferHistory() {
-  if (!window.confirm(t("transfersHistory.clearConfirm"))) return;
+// 应用内弹窗确认：宿主沙箱 iframe 无 allow-modals，window.confirm 恒 false
+const transferHistoryClearOpen = ref(false);
+async function confirmTransferHistoryClear() {
   try {
     await window.dbxPlugin.invoke("sftp/transfer/history/clear", {});
     transferHistory.value = [];
     transferHistoryFailed.value = false;
+    transferHistoryClearOpen.value = false;
     showNotice(t("transfersHistory.cleared"));
   } catch (cause) {
     showError(cause);
@@ -6598,6 +6600,7 @@ const modalOpenStates = computed(() => [
   batchDeleteOpen.value,
   recordingDeleteTarget.value !== null,
   recordingClearAllOpen.value,
+  transferHistoryClearOpen.value,
   chmodTarget.value,
   newFileDialog.value,
   operationDialog.value,
@@ -6713,6 +6716,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
   }
   if (recordingClearAllOpen.value) {
     if (!recordingClearAllSubmitting.value) recordingClearAllOpen.value = false;
+    return;
+  }
+  if (transferHistoryClearOpen.value) {
+    transferHistoryClearOpen.value = false;
     return;
   }
   if (chmodTarget.value) {
@@ -7220,7 +7227,7 @@ onBeforeUnmount(() => {
               <h3 class="transfer-history-title">{{ t("transfersHistory.title") }}</h3>
               <span class="transfer-history-actions">
                 <button type="button" class="icon-button" :title="t('refresh')" :disabled="transferHistoryLoading || resumableLoading" @click.stop="refreshTransferPanel"><RefreshCw :class="{ spinning: transferHistoryLoading || resumableLoading }" /></button>
-                <button type="button" class="icon-button" :title="t('transfersHistory.clear')" :disabled="!transferHistory.length" @click.stop="clearTransferHistory"><Trash2 /></button>
+                <button type="button" class="icon-button" :title="t('transfersHistory.clear')" :disabled="!transferHistory.length" @click.stop="transferHistoryClearOpen = true"><Trash2 /></button>
               </span>
             </div>
             <div v-if="transferHistoryFailed" class="empty compact">
@@ -7948,7 +7955,7 @@ onBeforeUnmount(() => {
       <DialogContent class="modal small-modal" @escape-key-down.prevent>
         <template v-if="deleteTarget">
         <header><DialogTitle>{{ t("deleteTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="deleteTarget = undefined"><X /></button></header>
-        <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ deleteTarget.name }}</strong><p class="muted">{{ t("deleteMessage") }}</p></div></div>
+        <div class="destructive-copy"><div><strong>{{ deleteTarget.name }}</strong><p class="muted">{{ t("deleteMessage") }}</p></div></div>
         <footer><button @click="deleteTarget = undefined">{{ t("cancel") }}</button><button class="danger-button" :disabled="deleteSubmitting" @click="confirmDelete"><Trash2 />{{ t("delete") }}</button></footer>
         </template>
       </DialogContent>
@@ -7957,7 +7964,7 @@ onBeforeUnmount(() => {
     <Dialog :open="batchDeleteOpen" @update:open="(open) => { if (!open) batchDeleteOpen = false; }">
       <DialogContent class="modal small-modal" @escape-key-down.prevent>
         <header><DialogTitle>{{ t("sftpBatch.deleteTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="batchDeleteOpen = false"><X /></button></header>
-        <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("sftpBatch.selected", { count: selectedEntries.length }) }}</strong><p class="muted">{{ t("sftpBatch.deleteMessage") }}</p></div></div>
+        <div class="destructive-copy"><div><strong>{{ t("sftpBatch.selected", { count: selectedEntries.length }) }}</strong><p class="muted">{{ t("sftpBatch.deleteMessage") }}</p></div></div>
         <div v-if="batchProgress" class="batch-progress-row"><progress class="batch-progress-bar" :value="batchProgressPercent(batchProgress)" max="100" /><span class="batch-progress mono">{{ t("sftpBatch.progress", { done: batchProgress.done, total: batchProgress.total }) }}</span></div>
         <footer><button @click="batchDeleteOpen = false" :disabled="batchDeleteSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="batchDeleteSubmitting" @click="confirmBatchDelete"><Loader2 v-if="batchDeleteSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
       </DialogContent>
@@ -8010,7 +8017,7 @@ onBeforeUnmount(() => {
       <DialogContent class="modal small-modal" @escape-key-down.prevent>
         <template v-if="recordingDeleteTarget">
         <header><DialogTitle>{{ t("recordingDelete") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="recordingDeleteTarget = null"><X /></button></header>
-        <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("recordingDeleteConfirm", { host: recordingDeleteTarget.host || recordingDeleteTarget.recordingId }) }}</strong><p class="muted">{{ formatRecordedAt(recordingDeleteTarget.startedAt) }} · {{ formatDuration(recordingDeleteTarget.durationSecs ?? 0) }}</p></div></div>
+        <div class="destructive-copy"><div><strong>{{ t("recordingDeleteConfirm", { host: recordingDeleteTarget.host || recordingDeleteTarget.recordingId }) }}</strong><p class="muted">{{ formatRecordedAt(recordingDeleteTarget.startedAt) }} · {{ formatDuration(recordingDeleteTarget.durationSecs ?? 0) }}</p></div></div>
         <footer><button @click="recordingDeleteTarget = null" :disabled="recordingDeleteSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="recordingDeleteSubmitting" @click="confirmRecordingDelete"><Loader2 v-if="recordingDeleteSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
         </template>
       </DialogContent>
@@ -8020,8 +8027,17 @@ onBeforeUnmount(() => {
     <Dialog :open="recordingClearAllOpen" @update:open="(open) => { if (!open) recordingClearAllOpen = false; }">
       <DialogContent class="modal small-modal" @escape-key-down.prevent>
         <header><DialogTitle>{{ t("recordingsClear") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="recordingClearAllOpen = false"><X /></button></header>
-        <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("recordingsClearConfirm", { count: recordings.length }) }}</strong></div></div>
+        <div class="destructive-copy"><div><strong>{{ t("recordingsClearConfirm", { count: recordings.length }) }}</strong></div></div>
         <footer><button @click="recordingClearAllOpen = false" :disabled="recordingClearAllSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="recordingClearAllSubmitting" @click="confirmRecordingClearAll"><Loader2 v-if="recordingClearAllSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 传输历史清空确认：应用内弹窗（沙箱 iframe confirm 恒 false） -->
+    <Dialog :open="transferHistoryClearOpen" @update:open="(open) => { if (!open) transferHistoryClearOpen = false; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("transfersHistory.clear") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="transferHistoryClearOpen = false"><X /></button></header>
+        <div class="destructive-copy"><div><strong>{{ t("transfersHistory.clearConfirm") }}</strong></div></div>
+        <footer><button @click="transferHistoryClearOpen = false">{{ t("cancel") }}</button><button class="danger-button" @click="confirmTransferHistoryClear"><Trash2 />{{ t("delete") }}</button></footer>
       </DialogContent>
     </Dialog>
 
@@ -8565,7 +8581,7 @@ onBeforeUnmount(() => {
           <DialogTitle>{{ pasteConfirm.danger ? t("terminalDanger.title") : t("terminalPasteConfirm.title") }}</DialogTitle>
           <button :title="t('close')" class="icon-button" @click="resolvePasteConfirm(false)"><X /></button>
         </header>
-        <div v-if="pasteConfirm.danger" class="destructive-copy">
+        <div v-if="pasteConfirm.danger" class="destructive-copy warning">
           <span class="destructive-icon"><TriangleAlert /></span>
           <div>
             <strong>{{ t("terminalDanger.detected") }}</strong>
