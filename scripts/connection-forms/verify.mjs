@@ -128,12 +128,20 @@ assert.equal(byKey.advanced_options.default, false, "advanced_options: must defa
 const advancedFields = [
   "connect_timeout_secs", "keepalive_interval_secs",
   "terminal_keepalive_secs", "set_env", "triggers_enabled",
-  "passphrase_command", "remote_command", "read_only",
+  "remote_command", "read_only",
 ];
 for (const key of advancedFields) {
   assert.deepEqual(byKey[key].visible_when, { field: "advanced_options", one_of: ["true"] },
     `${key}: must be gated by advanced_options`);
 }
+// The passphrase command only feeds key decryption: with password or agent
+// auth it would be dead UI, so it additionally requires key-based auth.
+assert.deepEqual(byKey.passphrase_command.visible_when, {
+  all_of: [
+    { field: "advanced_options", one_of: ["true"] },
+    { field: "authentication", one_of: ["private-key", "private-key-password"] },
+  ],
+}, "passphrase_command must combine the advanced switch with key-based auth");
 // Sudo and 2FA are first-class entry points, not advanced trivia: hiding them
 // behind the switch is what made bastion/MFA setup undiscoverable (issues #17
 // and #30 - users could not find the TOTP field and gave up). Their *detail*
@@ -152,14 +160,22 @@ assert(fields.indexOf(byKey.advanced_options) > fields.indexOf(byKey.auth_flow_m
   "advanced_options must be declared after the sudo/2FA block");
 assert(fields.indexOf(byKey.advanced_options) > fields.indexOf(byKey.totp_prompt_hint),
   "advanced_options must be declared after the 2FA block it no longer gates");
-// The fine-tuning hint stays an advanced field: it only ever matters once the
-// server's prompt wording is unusual.
+// The password-prompt hint belongs to the 2FA trio (TOTP secret, OTP hint,
+// password hint): it renders next to them and only while OTP auto-answer is
+// on, so turning 2FA off folds the whole block - a stray password-hint row
+// under "Off" read as a broken condition. The sudo_source clause keeps it
+// hidden under a global profile (whose own hints take over); cascade makes
+// the auth_flow_mode clause follow automatically there.
 assert.deepEqual(byKey.password_prompt_hint.visible_when, {
   all_of: [
-    { field: "advanced_options", one_of: ["true"] },
     { field: "sudo_source", one_of: ["custom", "off"] },
+    { field: "auth_flow_mode", one_of: ["password_then_otp", "password_plus_otp"] },
   ],
-}, "password_prompt_hint must stay behind the advanced switch");
+}, "password_prompt_hint must track the 2FA trio and fold when OTP auto-answer is off");
+assert(fields.indexOf(byKey.password_prompt_hint) > fields.indexOf(byKey.totp_prompt_hint),
+  "password_prompt_hint must render inside the 2FA block, next to the OTP hint");
+assert(fields.indexOf(byKey.advanced_options) > fields.indexOf(byKey.password_prompt_hint),
+  "advanced_options must be declared after the 2FA trio");
 
 for (const advanced_options of [false, true]) {
   for (const authentication of options("authentication")) {
@@ -205,9 +221,9 @@ for (const advanced_options of [false, true]) {
             const answersOtp = ["password_then_otp", "password_plus_otp"].includes(auth_flow_mode);
             current.visible("totp_secret", sudo_source !== "global" && answersOtp);
             current.visible("totp_prompt_hint", sudo_source !== "global" && answersOtp);
-            current.visible("password_prompt_hint", advanced_options && sudo_source !== "global");
+            current.visible("password_prompt_hint", sudo_source !== "global" && answersOtp);
             current.visible("triggers_enabled", advanced_options);
-            current.visible("passphrase_command", advanced_options);
+            current.visible("passphrase_command", advanced_options && privateKey);
             current.visible("remote_command", advanced_options);
             current.visible("read_only", advanced_options);
           }
@@ -416,8 +432,16 @@ state({ advanced_options: true, triggers_enabled: false }).visible("trigger_answ
 state({ advanced_options: true, triggers_enabled: true }).visible("triggers", true);
 state({ advanced_options: true, triggers_enabled: true }).visible("trigger_answer_1", true);
 state({ advanced_options: true, triggers_enabled: true }).visible("trigger_answer_2", true);
-state({ advanced_options: false }).visible("passphrase_command", false);
-state({ advanced_options: true }).visible("passphrase_command", true);
+state({ advanced_options: false, authentication: "private-key" }).visible("passphrase_command", false);
+state({ advanced_options: true, authentication: "password" }).visible("passphrase_command", false);
+state({ advanced_options: true, authentication: "private-key" }).visible("passphrase_command", true);
+// The 2FA trio folds together: with OTP auto-answer off neither TOTP field
+// nor the password hint stays behind (the reported stray-row case).
+state({ sudo_source: "custom", auth_flow_mode: "off", advanced_options: true }).visible("password_prompt_hint", false);
+state({ sudo_source: "custom", auth_flow_mode: "password_only", advanced_options: true }).visible("password_prompt_hint", false);
+state({ sudo_source: "custom", auth_flow_mode: "password_then_otp", advanced_options: false }).visible("password_prompt_hint", true);
+state({ sudo_source: "global", auth_flow_mode: "password_then_otp" }).visible("password_prompt_hint", false);
+state({ sudo_source: "off", auth_flow_mode: "password_plus_otp" }).visible("password_prompt_hint", true);
 // Password command lives in the credential block now: it is driven by the
 // password source and no longer by the advanced switch.
 state({ advanced_options: false, authentication: "password", password_source: "command" }).visible("password_command", true);

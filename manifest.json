@@ -365,6 +365,31 @@
           "description": "Optional extra text for recognizing OTP prompts. Built-in patterns already cover common wording such as \"[OTP Code]\" or \"Please Enter MFA Code.\" — only add a hint when the server asks differently."
         },
         {
+          "key": "password_prompt_hint",
+          "label": "Password prompt",
+          "type": "text",
+          "binding": "config",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom",
+                  "off"
+                ]
+              },
+              {
+                "field": "auth_flow_mode",
+                "one_of": [
+                  "password_then_otp",
+                  "password_plus_otp"
+                ]
+              }
+            ]
+          },
+          "description": "Optional text for recognizing password prompts. OTP wording belongs in the OTP prompt field above — a hint filled here only ever matches password prompts."
+        },
+        {
           "key": "advanced_options",
           "label": "Show advanced options",
           "type": "boolean",
@@ -385,30 +410,6 @@
               "true"
             ]
           }
-        },
-        {
-          "key": "password_prompt_hint",
-          "label": "Password prompt",
-          "type": "text",
-          "binding": "config",
-          "visible_when": {
-            "all_of": [
-              {
-                "field": "advanced_options",
-                "one_of": [
-                  "true"
-                ]
-              },
-              {
-                "field": "sudo_source",
-                "one_of": [
-                  "custom",
-                  "off"
-                ]
-              }
-            ]
-          },
-          "description": "Optional text for recognizing password prompts. OTP wording belongs in the OTP prompt field above — a hint filled here only ever matches password prompts."
         },
         {
           "key": "connect_timeout_secs",
@@ -530,9 +531,20 @@
           "default": "",
           "description": "Local command to fetch a missing private-key passphrase. stdout minus one final newline is used. Runs with your user privileges.",
           "visible_when": {
-            "field": "advanced_options",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "private-key",
+                  "private-key-password"
+                ]
+              }
             ]
           }
         },

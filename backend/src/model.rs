@@ -992,9 +992,9 @@ mod tests {
             "auth_flow_mode",
             "totp_secret",
             "totp_prompt_hint",
+            "password_prompt_hint",
             "advanced_options",
             "read_only",
-            "password_prompt_hint",
             "connect_timeout_secs",
             "keepalive_interval_secs",
             "terminal_keepalive_secs",
@@ -1155,7 +1155,9 @@ mod tests {
             Some(("sudo_source".to_string(), vec!["custom".to_string(), "off".to_string()])),
             "{key} must hide under sudo_source=global (the bound profile owns the whole credential source) and stay visible otherwise"
         );
-        // password_prompt_hint 同时跟随高级区与 sudo 来源，属于复合条件。
+        // password_prompt_hint 属于 2FA 三件套（TOTP 密钥 / OTP 提示词 / 密码
+        // 提示词）：跟随 sudo 来源，且只在自动回码的两种 OTP 模式下出现——
+        // 2FA 关闭时整组折叠，不再残留一行孤零零的密码提示词。
         assert_eq!(
             fields
                 .iter()
@@ -1163,11 +1165,26 @@ mod tests {
                 .unwrap()["visible_when"],
             serde_json::json!({
                 "all_of": [
-                    { "field": "advanced_options", "one_of": ["true"] },
                     { "field": "sudo_source", "one_of": ["custom", "off"] },
+                    { "field": "auth_flow_mode", "one_of": ["password_then_otp", "password_plus_otp"] },
                 ]
             }),
-            "password_prompt_hint must stay behind the advanced switch and follow the sudo source"
+            "password_prompt_hint must follow the sudo source and fold with the 2FA trio when OTP auto-answer is off"
+        );
+        // passphrase_command 只服务密钥解密：密码 / agent 认证下是死 UI，
+        // 需要同时满足高级区与密钥类认证。
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field["key"] == "passphrase_command")
+                .unwrap()["visible_when"],
+            serde_json::json!({
+                "all_of": [
+                    { "field": "advanced_options", "one_of": ["true"] },
+                    { "field": "authentication", "one_of": ["private-key", "private-key-password"] },
+                ]
+            }),
+            "passphrase_command must combine the advanced switch with key-based auth"
         );
         for key in ["totp_secret", "totp_prompt_hint"] {
             assert_eq!(
@@ -2823,17 +2840,18 @@ mod manifest_contract_tests {
             Some(vec!["custom".to_string(), "off".to_string()]),
             "{key} must hide under global (profile owns the source) and stay visible for custom/off"
         );
-        // password_prompt_hint 是精度旋钮：既要跟随 sudo 来源，又留在高级区
-        // （不随 sudo/2FA 一起常显），因此条件是复合式而不是单字段子句。
+        // password_prompt_hint 是 2FA 三件套之一（TOTP 密钥 / OTP 提示词 /
+        // 密码提示词）：跟随 sudo 来源，且只在自动回码的两种 OTP 模式下出现
+        // ——2FA 关闭时整组折叠，不再残留一行孤零零的密码提示词。
         assert_eq!(
             field("password_prompt_hint")["visible_when"],
             serde_json::json!({
                 "all_of": [
-                    { "field": "advanced_options", "one_of": ["true"] },
                     { "field": "sudo_source", "one_of": ["custom", "off"] },
+                    { "field": "auth_flow_mode", "one_of": ["password_then_otp", "password_plus_otp"] },
                 ]
             }),
-            "password_prompt_hint must follow both the advanced switch and the sudo source"
+            "password_prompt_hint must follow the sudo source and fold with the 2FA trio when OTP auto-answer is off"
         );
         for key in ["totp_secret", "totp_prompt_hint"] {
             assert_eq!(
