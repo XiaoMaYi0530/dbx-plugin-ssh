@@ -2300,6 +2300,15 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     directoryTrackingSupported.value = info.directoryTrackingSupported ?? true;
     terminalState.value = "connected";
     await afterSessionConnected();
+    // WKWebView（macOS 宿主）在"卡片遮盖 → 终端显示"过渡后可能漏一帧重绘，
+    // 高亮装饰停留在过渡前状态直到首次交互（Mac 用户反馈"连接成功后 IP 高亮
+    // 闪烁、点一下就好"）。状态落定为 connected 后下一帧主动全量刷新并重扫
+    // 高亮，等价于那次点击；对 Chromium 是无害的一次多余重绘。
+    window.requestAnimationFrame(() => {
+      if (disposed || !terminal || terminalState.value !== "connected") return;
+      terminal.refresh(0, terminal.rows - 1);
+      rescanHighlightViewport();
+    });
   } catch (cause) {
     if (disposed) return;
     connectSucceeded.value = false;
