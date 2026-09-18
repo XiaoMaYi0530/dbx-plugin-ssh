@@ -1435,17 +1435,18 @@ impl SshRuntime {
             connection.connect_timeout_explicit,
         );
         let probe = self.connect_authenticated(connection, operation_id, Some(emitter));
-        let (handle, jumps) = match tokio::time::timeout(Duration::from_secs(budget_secs), probe).await {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                return Err(test_timeout_message(
-                    &connection.runtime_host,
-                    connection.runtime_port,
-                    budget_secs,
-                    !connection.connect_timeout_explicit,
-                ));
-            }
-        };
+        let (handle, jumps) =
+            match tokio::time::timeout(Duration::from_secs(budget_secs), probe).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    return Err(test_timeout_message(
+                        &connection.runtime_host,
+                        connection.runtime_port,
+                        budget_secs,
+                        !connection.connect_timeout_explicit,
+                    ));
+                }
+            };
         handle
             .disconnect(
                 Disconnect::ByApplication,
@@ -5424,8 +5425,14 @@ mod tests {
             "SSH connection to dbx-ssh-test:22 timed out after 29 seconds. Increase 'SSH timeout' under Advanced options and retry."
         );
         let fallback = test_timeout_message("dbx-ssh-test", 22, 9, true);
-        assert!(fallback.contains("timed out after 9 seconds (host default)"), "{fallback}");
-        assert!(fallback.contains("Increase 'SSH timeout' under Advanced options"), "{fallback}");
+        assert!(
+            fallback.contains("timed out after 9 seconds (host default)"),
+            "{fallback}"
+        );
+        assert!(
+            fallback.contains("Increase 'SSH timeout' under Advanced options"),
+            "{fallback}"
+        );
     }
 
     #[test]
