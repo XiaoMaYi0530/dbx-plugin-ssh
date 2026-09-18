@@ -3228,3 +3228,42 @@ manifest 新增 5 个表单字段（triggers textarea + 两个密文槽 password
 - 主会话收口：scripts/test.sh 全套 + 打包安装 + 双冒烟（结果见提交信息/下节）。
 - 合并注意：主检出区另有未提交的私钥录入改动（15 文件，key/model/mcp/
   manifest/App.vue/i18n 均重叠），两分支合并顺序由用户决定，冲突面局部。
+
+## 官方 docker 镜像 sidecar 启动即退（glibc 基线）修复（2026-09-18）
+
+**故障**：issue #8/#58——官方 DBX web docker 镜像（debian:bookworm-slim，
+glibc 2.36）安装插件后，新建 SSH 连接报
+`Plugin 'io.dbx.ssh' initialization failed: exited with status 1`；
+amd64 与 arm64 均有报告。
+
+**根因**（容器内复现实证）：发布候选在 `ubuntu-24.04`/`ubuntu-24.04-arm`
+（glibc 2.39）原生构建，linux sidecar 钉死 `GLIBC_2.38`（`__isoc23_sscanf`）
+与 `GLIBC_2.39`（`pidfd_spawnp`/`pidfd_getpid`），bookworm 动态加载器在
+`main()` 前失败 → exit 1。把 v0.4.77 linux-arm64 产物放进 bookworm-slim
+逐字复现 loader 报错与 exit=1；同一二进制在 ubuntu:24.04 正常启动。
+
+**修复**（跨插件统一，改动在上层仓）：
+
+- `build-candidates.yml` Linux runner：pip ziglang + cargo-zigbuild，
+  PATH 最前置 `cargo` 包装器把 CLI 裸调的 `cargo build` 转成
+  `cargo zigbuild --target <宿主triple>`（zig 链接低 glibc 基线，实测
+  2.30，仍为 runner 原生架构非伪装 target），并把产物从 `<triple>/release/`
+  镜像回 CLI 拷贝期待的 `<CARGO_TARGET_DIR>/release/`。**坑**：zigbuild
+  不带 `--target` 会退回宿主工具链（首轮端到端实测 CLI 打包产物钉
+  bookworm 级 2.34 而非 2.30，在 24.04 runner 上等于没修），必须显式传。
+  另导出 `CGO_ENABLED=0` 让 ldap/kafka 的 CLI 内部 `go build` 静态链接
+  （原先 cgo 构建钉 GLIBC_2.34+，bookworm 恰好够用属侥幸，与 deploy/web
+  打包方式对齐）。
+- ssh/files `scripts/build.sh`：`~/.cargo/bin` PATH 前置改条件式，
+  防止把 CI 包装器压回（否则 Linux 静默回到原生 glibc 构建）。
+- `shared/release/validate_artifact_set.py` 新增 Linux ELF 守卫：解包
+  candidate 校验最高 GLIBC 符号版本 ≤ 2.31（坏包实测被拦，zigbuild 产物
+  2.30 放行，Go 静态产物无版本要求直通）。
+- 文档：`docs/CI_MULTI_PLATFORM.{zh-CN,en}.md` 增「Linux glibc 基线」节。
+
+**验证**：本地 cargo zigbuild 交叉重建 sidecar（aarch64-linux-gnu），
+最高版本 2.30；bookworm-slim 容器运行正常进入 stdio 主循环（EOF exit 0）；
+守卫脚本四向测试（坏 ssh 包拦 / 坏 files 包拦 / zigbuild 产物过 /
+kafka 现网动态包按预期拦——修复后 CI 重建即静态）。CI 模拟容器
+（rust:1-bookworm + 同款 wrapper + 官方 CLI 0.1.3 打包）产出 linux dbxp
+端到端复验。桌面 macOS/Windows 产物不受影响，无需重发。
