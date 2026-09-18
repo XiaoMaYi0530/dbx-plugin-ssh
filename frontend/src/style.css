@@ -461,6 +461,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .small-modal { width: min(420px, 100%); }
 .small-modal > input { margin-top: 16px; margin-bottom: 16px; }
 .destructive-copy { display: flex; min-width: 0; align-items: flex-start; gap: 12px; }
+.destructive-copy:not(:has(p)) { align-items: center; }
 .destructive-copy > div { min-width: 0; }
 .destructive-copy strong { display: block; overflow-wrap: anywhere; }
 .destructive-copy p { margin: 5px 0 0; line-height: 1.5; }
