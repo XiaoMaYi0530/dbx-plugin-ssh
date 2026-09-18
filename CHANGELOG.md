@@ -4,7 +4,7 @@
 
 This file records user-facing changes for DBX SSH Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
-## [Unreleased]
+## [0.4.78] — 2026-09-18
 
 ### 新增 / Added
 
