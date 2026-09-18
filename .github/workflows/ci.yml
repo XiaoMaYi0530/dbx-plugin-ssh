@@ -66,7 +66,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev nasm
+        # libdbus-1-dev / nasm 已移除：secret-service（dbus）在 Linux 被 cfg
+        # 门控掉（走 keyfile 层），nasm 只服务 aws-lc-sys 的 MSVC 预置对象路径。
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -120,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev nasm
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -166,13 +168,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux 候选走全静态 musl（rust_target 喂 rustup targets 与
+          # CARGO_BUILD_TARGET）：glibc 构建在老发行版上动态加载失败。
           - os: linux
             runner: ubuntu-24.04
             target: linux-x64
+            rust_target: x86_64-unknown-linux-musl
             python: python3
           - os: linux
             runner: ubuntu-24.04-arm
             target: linux-arm64
+            rust_target: aarch64-unknown-linux-musl
             python: python3
           - os: macos
             runner: macos-15
@@ -196,7 +202,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install native dependencies
         if: matrix.os == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev nasm
+        # musl-tools 提供 musl-gcc（aws-lc-sys 在 musl target 下仍要编 C）。
+        # libdbus-1-dev / nasm 已移除：Linux 不走 secret-service，nasm 仅服务
+        # aws-lc-sys 的 MSVC 预置对象路径。
+        run: sudo apt-get update && sudo apt-get install -y pkg-config musl-tools
       - uses: pnpm/action-setup@v4
         with:
           version: 11.24.0
@@ -206,6 +215,8 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
       # rust-cache 的 key 自动包含 job 名与 matrix 值，五个 target 各自缓存；
       # 打包步骤的 CARGO_TARGET_DIR 也指向 backend/target，可一并复用。
       - uses: Swatinem/rust-cache@v2
@@ -214,7 +225,21 @@ jobs:
           cache-on-failure: true
       - run: pnpm --dir frontend install --frozen-lockfile
       - run: pnpm --dir frontend build
-      - run: cargo build --locked --release --manifest-path backend/Cargo.toml
+      # CARGO_BUILD_TARGET 经环境变量传导给本步与 package 步内 CLI 的
+      # cargo build（CLI 不传 --target）；非 linux 条目 RUST_TARGET 为空。
+      - name: Build sidecar
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          if [ -n "$RUST_TARGET" ]; then export CARGO_BUILD_TARGET="$RUST_TARGET"; fi
+          cargo build --locked --release --manifest-path backend/Cargo.toml
+      # cargo 带 target 时输出在 target/<triple>/release/，而 SIDECAR_BINARY 与
+      # 打包 CLI 可能都指向裸 target/release/——预放一份 musl 产物兜底。
+      - name: Stage musl binary at the default target path
+        if: matrix.os == 'linux'
+        run: |
+          mkdir -p backend/target/release
+          cp -f "backend/target/${{ matrix.rust_target }}/release/dbx-plugin-ssh" backend/target/release/dbx-plugin-ssh
       - name: Offline MCP smoke
         run: ${{ matrix.python }} scripts/smoke_mcp.py --binary "$SIDECAR_BINARY"
       - run: npm install --global "@dbx-app/plugin-cli@${PLUGIN_CLI_VERSION}"
@@ -223,9 +248,46 @@ jobs:
         # backend/target from the step above instead of a throwaway staging dir.
         env:
           DBX_PLUGIN_TARGET: ${{ matrix.target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/backend/target
           NO_COLOR: "1"
-        run: dbx-plugin package .
+        run: |
+          if [ -n "$RUST_TARGET" ]; then export CARGO_BUILD_TARGET="$RUST_TARGET"; fi
+          dbx-plugin package .
+      # 出货把关一：包内 Linux 二进制必须全静态（glibc 地板修复）。
+      - name: Verify packaged linux binary is statically linked
+        if: matrix.os == 'linux'
+        run: |
+          pkg="$(ls -t dist/*.dbxp | head -1)"
+          tmp="$(mktemp -d)"
+          unzip -q "$pkg" -d "$tmp"
+          bin="$(find "$tmp/bin" -type f -name dbx-plugin-ssh | head -1)"
+          [ -n "$bin" ] || { echo "FAIL: packaged dbx-plugin-ssh binary missing under $tmp/bin"; exit 1; }
+          file "$bin"
+          if file "$bin" | grep -q "dynamically linked"; then
+            echo "FAIL: packaged linux binary is dynamically linked; expected a static musl build" >&2
+            exit 1
+          fi
+      # 出货把关二：包内二进制在老 glibc（debian:11 = 2.31）与 musl 系统
+      # （alpine）里真实执行 --mcp（stdin EOF 即退出 0），复现并证明修复了
+      # 用户报的 "exited with status exit status: 1" 动态加载失败。
+      - name: Old-glibc and musl container smoke
+        if: matrix.os == 'linux'
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "docker unavailable in this job context; skipping container smoke"
+            exit 0
+          fi
+          pkg="$(ls -t dist/*.dbxp | head -1)"
+          tmp="$(mktemp -d)"
+          unzip -q "$pkg" -d "$tmp"
+          bin="$(find "$tmp/bin" -type f -name dbx-plugin-ssh | head -1)"
+          chmod +x "$bin"
+          for image in debian:11 alpine:3; do
+            echo "==> $image"
+            docker run --rm -v "$bin:/sidecar:ro" "$image" sh -c '/sidecar --mcp </dev/null'
+            echo "$image: sidecar executed and exited 0"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: dbx-plugin-ssh-${{ matrix.target }}

@@ -6,6 +6,8 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 
 第一阶段不声明 `test` 能力。真实 SSH 握手在 `ssh/session/open` 发起，主机密钥确认完成前不会调用密码认证。
 
+`connection/test`（宿主发起，带 RPC 截止 = 宿主有效连接超时）的拨号预算与宿主截止对齐并留 1s 余量：`connect_timeout_secs` 显式时预算 = 该值 − 1s；缺省时宿主按 dbx-core `default_connect_timeout_secs()` 回退 10s（`crates/dbx-core/src/models/connection.rs:501`，stored 0 → 宿主 10s，与本插件 manifest 默认 30s 分叉），预算取 9s，超时错误附带「高级选项调大 SSH timeout」的指引。工作台 `ssh/session/open` 由插件前端发起、无宿主截止，仍按连接配置的完整超时拨号。
+
 ## RPC
 
 | 方法 | 作用 |
@@ -55,6 +57,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/quickCommands/list`、`ssh/quickCommands/save`、`ssh/quickCommands/delete` | 全局快速命令管理（用户自定义常用命令片段，插件数据目录持久化，所有连接/工作台共享） |
 | `ssh/terminal/batchInput` | 批量发送：把同一条命令写入多个已打开会话的交互终端（PTY 键盘语义），返回逐会话发送结果 |
 | `ssh/batchBar/state`（notify） | 批量发送命令条的跨工作台状态同步：工作台把 `{ source, draft, quickPickId, open }` 以通知送达 sidecar，sidecar 原样以同名事件广播给所有插件 webview，各端按 `source` 过滤自己的回声；纯转发不落存储，旧版 sidecar 未注册时调用方静默降级 |
+| `local/preferences/get`、`local/preferences/set` | 工作台级 UI 偏好（`<plugin_data_dir>/preferences.json`，固定键白名单、原子写入，非法类型报错、非白名单键丢弃）：`downloadDir`（string，≤512 字符）、`downloadUseDefaultDir`（bool，默认 true）、`downloadConflictPolicy`（`rename`/`ask`/`overwrite`，默认 `rename`）。兼容：set 为部分合并，缺省键不变；旧 sidecar 缺少的键前端按缺省处理 |
 
 ## 运行时设置
 

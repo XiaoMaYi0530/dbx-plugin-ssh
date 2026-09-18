@@ -3,6 +3,8 @@
 > 扫描角色：场景驱动的 UI 体验扫描 agent（只读扫描 + 报告，不实施修复）。
 > 扫描对象：`ssh/frontend`（mock.html 可视化夹具 + App.vue/组件源码交叉核对）。本报告只记录发现与建议，不含代码修改。
 
+> **迁移注记（2026-09-17）**：前端 UI 基元已全部迁移到 reka-ui wrapper（`frontend/src/components/ui/`：Dialog/Popover/Select/ContextMenu/Switch 等）+ Tailwind 工具类。本文各轮次中提到的 `.modal-backdrop` 弹层壳、手写 popover/右键菜单/原生 select、以及 `onDocumentKeydown` 的 Tab 焦点陷阱分支，描述的都是迁移前实现；现状为：弹窗壳 = reka Dialog（portal 到 body，Tab 圈定由 FocusScope 承担，标题用 DialogTitle），弹出层 = reka Popover（floating-ui 定位），下拉 = reka Select，右键菜单 = reka ContextMenu。Esc 分层关闭链、焦点进入/归还（modalTriggerStack）与幽灵点击守卫仍在 App.vue 自持，语义不变。阅读时请以各条目的修复日期为准。
+
 ## 一、扫描环境
 
 | 项 | 值 |

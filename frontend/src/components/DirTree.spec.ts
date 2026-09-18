@@ -81,11 +81,11 @@ describe("DirTree", () => {
     expect(rows[1].find("svg.lucide-folder").exists()).toBe(true);
   });
 
-  it("right-click emits context with the node and pointer coordinates", async () => {
+  it("right-click emits context with the node", async () => {
     const target = node({ path: "/var", name: "var" });
     const wrapper = mountTree([target]);
     await wrapper.find(".sftp-tree-row").trigger("contextmenu", { clientX: 120, clientY: 80 });
-    expect(wrapper.emitted("context")?.[0]).toEqual([{ node: target, x: 120, y: 80 }]);
+    expect(wrapper.emitted("context")?.[0]).toEqual([{ node: target }]);
   });
 
   it("renders expanded children one level deeper and bubbles their events to the parent emits", async () => {
@@ -102,7 +102,7 @@ describe("DirTree", () => {
     await rows[1].find(".sftp-tree-caret").trigger("click");
     expect(wrapper.emitted("toggle")?.[0]).toEqual([child]);
     await rows[1].trigger("contextmenu", { clientX: 5, clientY: 9 });
-    expect(wrapper.emitted("context")?.[0]).toEqual([{ node: child, x: 5, y: 9 }]);
+    expect(wrapper.emitted("context")?.[0]).toEqual([{ node: child }]);
   });
 
   it("does not render child rows for an expanded node whose children are empty", () => {

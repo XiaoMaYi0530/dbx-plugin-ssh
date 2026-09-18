@@ -25,6 +25,37 @@ TARGET_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 IDENTITY_FIELDS = ("id", "name", "description", "publisher", "version")
 
+PT_INTERP = 3
+
+
+def elf_is_statically_linked(data: bytes) -> bool | None:
+    """True when the ELF has no PT_INTERP program header (fully static or
+    static-pie); False when it names a dynamic loader; None when the bytes
+    are not a parseable ELF. Linux sidecars ship as static musl binaries so
+    hosts with glibc older than the build image can still run them.
+    """
+    if len(data) < 0x40 or data[:4] != b"\x7fELF":
+        return None
+    elf64 = data[4] == 2
+    endian = "little" if data[5] == 1 else "big"
+    if elf64:
+        phoff = int.from_bytes(data[0x20:0x28], endian)
+        phentsize = int.from_bytes(data[0x36:0x38], endian)
+        phnum = int.from_bytes(data[0x38:0x3A], endian)
+    else:
+        phoff = int.from_bytes(data[0x1C:0x20], endian)
+        phentsize = int.from_bytes(data[0x2A:0x2C], endian)
+        phnum = int.from_bytes(data[0x2C:0x2E], endian)
+    if phentsize < 4:
+        return None
+    for index in range(phnum):
+        offset = phoff + index * phentsize
+        if offset + 4 > len(data):
+            return None
+        if int.from_bytes(data[offset:offset + 4], endian) == PT_INTERP:
+            return False
+    return True
+
 
 def package_name_from_url(url: str) -> str:
     return pathlib.PurePosixPath(urlparse(url).path).name
@@ -111,6 +142,22 @@ def main() -> int:
         except (KeyError, zipfile.BadZipFile, json.JSONDecodeError) as error:
             errors.append(f"{package_name}: unreadable manifest.json: {error}")
             continue
+
+        # Linux sidecars must be fully static musl binaries: a dynamic glibc
+        # build fails the loader on distros older than the build image
+        # (user-reported "exited with status exit status: 1").
+        if target.startswith("linux-"):
+            member = f"bin/{target}/dbx-plugin-ssh"
+            try:
+                with zipfile.ZipFile(package) as archive:
+                    sidecar = archive.read(member)
+            except (KeyError, zipfile.BadZipFile) as error:
+                errors.append(f"{package_name}: unreadable sidecar {member!r}: {error}")
+            else:
+                static = elf_is_statically_linked(sidecar)
+                if static is not True:
+                    detail = "not an ELF" if static is None else "dynamically linked (PT_INTERP present)"
+                    errors.append(f"{package_name}: linux sidecar must be statically linked ({detail})")
 
         identity = {field: manifest.get(field) for field in IDENTITY_FIELDS}
         identity["permissions"] = sorted(manifest.get("permissions") or [])

@@ -5,6 +5,7 @@
 // 压缩），由 App.vue 弹菜单。
 import { ChevronsLeft, ChevronsRight, Folder, FolderTree, Home, RefreshCw, Star } from "@lucide/vue";
 import DirTree from "./DirTree.vue";
+import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 import type { DirTreeNode } from "../lib/sftpDirTree";
 
 export interface SftpSideQuickPath {
@@ -29,23 +30,29 @@ const emit = defineEmits<{
   (event: "navigate", path: string): void;
   (event: "toggle-node", node: DirTreeNode): void;
   (event: "refresh-tree"): void;
-  (event: "node-context", payload: { path: string; x: number; y: number }): void;
+  (event: "node-context", payload: { path: string }): void;
 }>();
 
-function onTreeContext(payload: { node: DirTreeNode; x: number; y: number }) {
-  emit("node-context", { path: payload.node.path, x: payload.x, y: payload.y });
+function onTreeContext(payload: { node: DirTreeNode }) {
+  emit("node-context", { path: payload.node.path });
+}
+
+function onTabChange(value: string | number) {
+  emit("update:tab", value as "tree" | "quick");
 }
 </script>
 
 <template>
   <div v-if="!collapsed" class="sftp-side-panel">
-    <div class="sftp-side-tabs">
-      <button type="button" :class="{ 'is-active': tab === 'tree' }" :title="t('sftpSide.tree')" @click="emit('update:tab', 'tree')">
-        <FolderTree />
-      </button>
-      <button type="button" :class="{ 'is-active': tab === 'quick' }" :title="t('sftpQuickPath.title')" @click="emit('update:tab', 'quick')">
-        <Star />
-      </button>
+    <Tabs :model-value="tab" class="sftp-side-tabs" @update:model-value="onTabChange">
+      <TabsList class="sftp-side-tab-list">
+        <TabsTrigger value="tree" class="sftp-side-tab" :title="t('sftpSide.tree')">
+          <FolderTree />
+        </TabsTrigger>
+        <TabsTrigger value="quick" class="sftp-side-tab" :title="t('sftpQuickPath.title')">
+          <Star />
+        </TabsTrigger>
+      </TabsList>
       <span class="sftp-side-spacer" />
       <button v-if="tab === 'tree'" type="button" :title="t('refresh')" @click="emit('refresh-tree')">
         <RefreshCw />
@@ -53,7 +60,7 @@ function onTreeContext(payload: { node: DirTreeNode; x: number; y: number }) {
       <button type="button" :title="t('sftpSide.collapse')" @click="emit('update:collapsed', true)">
         <ChevronsLeft />
       </button>
-    </div>
+    </Tabs>
     <div class="sftp-side-body">
       <DirTree
         v-if="tab === 'tree' && treeRoot"
@@ -73,7 +80,7 @@ function onTreeContext(payload: { node: DirTreeNode; x: number; y: number }) {
           :class="{ 'is-current': qp.path === currentPath }"
           :title="qp.path"
           @click="emit('navigate', qp.path)"
-          @contextmenu.prevent.stop="emit('node-context', { path: qp.path, x: $event.clientX, y: $event.clientY })"
+          @contextmenu="emit('node-context', { path: qp.path })"
         >
           <Home v-if="qp.home" aria-hidden="true" />
           <Folder v-else aria-hidden="true" />

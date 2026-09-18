@@ -52,7 +52,9 @@ interface DbxPluginApi {
   request<T = unknown>(method: string, params?: unknown): Promise<T>;
   invoke<T = unknown>(method: string, params?: unknown, options?: { timeoutMs?: number }): Promise<T>;
   notify(method: string, params?: unknown): Promise<void>;
-  openWorkbench?(contributionId: string, context?: Record<string, unknown>): Promise<void>;
+  openWorkbench?(contributionId: string, context?: Record<string, unknown>, options?: { forceNew?: boolean }): Promise<void>;
+  /** 请宿主按当前最新配置重开连接（含 vault 最新凭据回推）。Host API 1.2+；旧宿主无此方法。 */
+  reopenConnection?(connectionId: string): Promise<unknown>;
   sendBinary(channel: string, data: Uint8Array | ArrayBuffer | string): Promise<void>;
   onEvent(listener: (event: DbxPluginEvent) => void): () => void;
   onBinary(listener: (event: DbxPluginBinaryEvent) => void): () => void;

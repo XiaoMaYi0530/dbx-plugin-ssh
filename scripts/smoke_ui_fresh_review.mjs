@@ -5,16 +5,35 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname;
+const root = fileURLToPath(new URL("..", import.meta.url));
+// 依赖门槛与 smoke_ui_mock.mjs 同规：playwright-core 装在仓库外（%TMP%/dbx-ui-mock
+// 或 /tmp/dbx-ui-mock），Chrome 取系统安装；缺任一则 SKIP（exit 0）。
 let chromium;
-try {
-  ({ chromium } = await import("file:///tmp/dbx-ui-mock/node_modules/playwright-core/index.mjs"));
-} catch {
-  console.log("SKIP: existing /tmp/dbx-ui-mock playwright-core is unavailable");
+const playwrightCandidates = process.platform === "win32"
+  ? [join(tmpdir(), "dbx-ui-mock"), "C:\\tmp\\dbx-ui-mock", "D:\\tmp\\dbx-ui-mock"]
+  : ["/tmp/dbx-ui-mock"];
+for (const dir of playwrightCandidates) {
+  try {
+    ({ chromium } = await import(pathToFileURL(join(dir, "node_modules/playwright-core/index.mjs")).href));
+    break;
+  } catch { /* try next candidate */ }
+}
+if (!chromium) {
+  console.log("SKIP: playwright-core unavailable (npm install --prefix /tmp/dbx-ui-mock playwright-core)");
   process.exit(0);
 }
-if (!existsSync("/Applications/Google Chrome.app")) {
+const chromeCandidates = process.platform === "win32"
+  ? [
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      join(process.env.LOCALAPPDATA ?? "", "Google\\Chrome\\Application\\chrome.exe"),
+    ]
+  : ["/Applications/Google Chrome.app", "/Applications/Chromium.app"];
+if (!chromeCandidates.some((p) => p && existsSync(p))) {
   console.log("SKIP: system Chrome is unavailable");
   process.exit(0);
 }
@@ -24,7 +43,11 @@ let browser;
 try {
   let url = process.env.DBX_SSH_MOCK_URL;
   if (!url) {
-    vite = spawn("pnpm", ["--dir", "frontend", "exec", "vite", "--host", "127.0.0.1"], { cwd: root });
+    vite = spawn("pnpm", ["--dir", "frontend", "exec", "vite", "--host", "127.0.0.1"], {
+      cwd: root,
+      // Windows: pnpm 是 .cmd 包装，无 shell 直接 spawn 报 EINVAL。
+      shell: process.platform === "win32",
+    });
     let output = "";
     vite.stdout.on("data", data => { output += data; });
     vite.stderr.on("data", data => process.stderr.write(data));
@@ -115,7 +138,19 @@ try {
   console.log("PASS alerts: editing clears stale results; pending / failure / retry stay in the dialog");
 
   await reload();
-  for (const [key, modifiers] of [["f", { ctrlKey: true }], ["Escape", {}], ["f", { metaKey: true }], ["Escape", {}], ["0", { ctrlKey: true }], ["v", { metaKey: true }], ["V", { ctrlKey: true, shiftKey: true }]]) {
+  // 粘贴组合键（mod+V）keydown 不 preventDefault 是有意设计：放行浏览器原生
+  // paste 事件（自带真实 clipboardData），由 terminalHost 捕获拦截器统一走风险
+  // 确认（App.vue interceptTerminalPaste）；keydown 只 stopPropagation + 让 xterm
+  // 跳过。故逐键分开断言：搜索/缩放键 cancelled，粘贴键不 cancelled 但不冒泡。
+  for (const [key, modifiers, expected] of [
+    ["f", { ctrlKey: true }, { cancelled: true, bubbled: false }],
+    ["Escape", {}, { cancelled: true, bubbled: false }],
+    ["f", { metaKey: true }, { cancelled: true, bubbled: false }],
+    ["Escape", {}, { cancelled: true, bubbled: false }],
+    ["0", { ctrlKey: true }, { cancelled: true, bubbled: false }],
+    ["v", { metaKey: true }, { cancelled: false, bubbled: false }],
+    ["V", { ctrlKey: true, shiftKey: true }, { cancelled: false, bubbled: false }],
+  ]) {
     const result = await page.evaluate(({ key, modifiers }) => {
       let bubbled = false;
       const listener = () => { bubbled = true; };
@@ -125,8 +160,22 @@ try {
       document.removeEventListener("keydown", listener);
       return { cancelled: event.defaultPrevented, bubbled };
     }, { key, modifiers });
-    assert.deepEqual(result, { cancelled: true, bubbled: false }, `owned shortcut ${key}`);
+    assert.deepEqual(result, expected, `owned shortcut ${key}`);
   }
+  // 粘贴链路的另一端：原生 paste 事件必须在捕获阶段被拦截（取消默认 + 不冒泡），
+  // 与 keydown 的放行配合保证「只走风险确认一次」。
+  const pasteResult = await page.evaluate(() => {
+    let bubbled = false;
+    const listener = () => { bubbled = true; };
+    document.addEventListener("paste", listener);
+    const transfer = new DataTransfer();
+    transfer.setData("text/plain", "echo fresh-review-paste");
+    const event = new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true });
+    document.querySelector(".xterm-helper-textarea").dispatchEvent(event);
+    document.removeEventListener("paste", listener);
+    return { cancelled: event.defaultPrevented, bubbled };
+  });
+  assert.deepEqual(pasteResult, { cancelled: true, bubbled: false }, "paste event captured by risk-confirm interceptor");
   await page.evaluate(() => {
     const base = window.dbxPlugin.sendBinary;
     window.__freshReview = { input: [] };
@@ -147,5 +196,16 @@ try {
   console.log("PASS round4 fresh review UI smoke");
 } finally {
   await browser?.close();
-  vite?.kill("SIGTERM");
+  if (vite) {
+    if (process.platform === "win32") {
+      // vite 经 cmd shell → pnpm.cmd → node 三层包裹，必须 taskkill /T 杀整棵树。
+      try {
+        spawn("taskkill", ["/F", "/T", "/PID", String(vite.pid)], { stdio: "ignore" }).unref();
+      } catch { /* already gone */ }
+    } else {
+      vite.kill("SIGTERM");
+    }
+    vite.stdout?.destroy();
+    vite.stderr?.destroy();
+  }
 }

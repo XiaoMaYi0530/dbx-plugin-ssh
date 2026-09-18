@@ -53,10 +53,10 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 
 .toolbar {
   position: relative;
-  /* 工具栏弹层（.popover）随本层叠上下文整体参与根级排序：必须高于终端
-     xterm 内部层（关键词高亮装饰 .xterm-decoration z=6、.xterm-helpers z=5）
-     与指标/录制浮动卡（.metrics-float z=6），否则弹窗下探部分会被这些层
-     盖住；仍低于 context-menu(50)/modal(80)/回放(90)。 */
+  /* 本层叠上下文仍须高于终端 xterm 内部层（关键词高亮装饰 .xterm-decoration
+     z=6、.xterm-helpers z=5）与指标/录制浮动卡（.metrics-float z=6），否则
+     工具栏本身会被这些层盖住；工具栏 popover 已 portal 到 body（z-50），不再
+     随本上下文排序，仍低于 modal(80)/回放(90)。 */
   z-index: 40;
   isolation: isolate;
   overflow: visible;
@@ -72,7 +72,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 }
 
 .identity, .toolbar-actions, .follow-directory-control, .icon-button,
-.file-name, .transfer-title, .transfer-meta, .notice, .error-banner,
+.file-name, .transfer-title, .transfer-meta,
 .modal header, .modal footer, .file-footer {
   display: flex;
   align-items: center;
@@ -85,7 +85,6 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 /* 空间不足时 Info 按钮也可折叠（先缩主机名，再缩它到 0），不再硬顶
    右侧按钮组造成叠印。 */
 .identity-side > .icon-button { flex: 0 1 auto; min-width: 0; overflow: hidden; }
-.popover-left { right: auto; left: 0; }
 .identity > * { flex: 0 0 auto; }
 .identity strong { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
 .connection-color { width: 4px; height: 16px; flex: 0 0 4px; border-radius: 999px; }
@@ -99,11 +98,13 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .toolbar-actions { flex: 0 0 auto; justify-content: flex-end; gap: 2px; }
 .toolbar-actions > * { flex: 0 0 auto; }
 
-.icon-button, .link-button, .file-header button, .context-menu button,
-/* 弹窗/路径栏按钮统一去默认样式；开关（switch-control）自带轨道背景与描边，
-   必须排除——该选择器特异性更高，会把开关轨道抹成透明（弹窗内开关隐形
-   而工具栏正常的根因）。 */
-.modal button:not(.switch-control), .path-toolbar button:not(.switch-control) {
+.icon-button, .link-button, .file-header button,
+/* 弹窗/路径栏按钮统一去默认样式；开关（data-slot="switch"）、下拉触发钮
+   （data-slot="select-trigger"）与页签触发钮（data-slot="tabs-trigger"）自带
+   轨道/边框/选中样式，必须排除——:not() 按参数计特异性（每条 (0,1,0)），
+   该选择器实际特异性 (0,3,1)，会把这些控件的背景抹成透明
+   （设置侧栏选中项白字无药丸、弹窗内控件隐形而工具栏正常的根因）。 */
+.modal button:not([data-slot="switch"]):not([data-slot="select-trigger"]):not([data-slot="tabs-trigger"]), .path-toolbar button:not([data-slot="switch"]):not([data-slot="select-trigger"]):not([data-slot="tabs-trigger"]) {
   border: 0;
   background: transparent;
   cursor: pointer;
@@ -121,9 +122,9 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 }
 .icon-button.compact { width: 20px; height: 20px; }
 .icon-button:hover:not(:disabled),
-.file-header button:hover, .context-menu button:hover:not(:disabled) { background: var(--accent); }
+.file-header button:hover { background: var(--accent); }
 .icon-button:disabled, button:disabled { cursor: default; opacity: .42; }
-.icon-button svg, .path-toolbar svg, .context-menu svg,
+.icon-button svg, .path-toolbar svg,
 .file-header svg, .file-name svg, .transfer-title svg, .drop-overlay svg {
   width: 14px;
   height: 14px;
@@ -134,14 +135,6 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .follow-directory-control { gap: 5px; margin-right: 2px; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
 .toolbar-separator { width: 1px; height: 16px; flex: 0 0 1px; margin: 0 3px; background: var(--border); }
 .icon-button.is-active { background: var(--accent); box-shadow: inset 0 0 0 1px var(--border); }
-/* 关态轨道从 foreground 派生透明度色：亮色主题（foreground 近黑）是可见灰轨，
-   暗色主题（foreground 近白）是可见浅轨——muted/border 在亮色规范色板里
-   分别是 #f5f5f5/#e5e5e5，白底下会直接隐形。 */
-.switch-control { position: relative; width: 26px; height: 14px; flex: 0 0 26px; border: 1px solid color-mix(in srgb, var(--foreground) 38%, transparent); border-radius: 999px; padding: 0; background: color-mix(in srgb, var(--foreground) 22%, transparent); cursor: pointer; transition: background-color 120ms ease; }
-.switch-control span { position: absolute; top: 1px; left: 1px; width: 10px; height: 10px; border-radius: 50%; background: var(--background); box-shadow: 0 1px 2px rgb(0 0 0 / 28%); transition: transform 120ms ease; }
-.switch-control[aria-checked="true"] { border-color: var(--primary); background: var(--primary); }
-.switch-control[aria-checked="true"] span { transform: translateX(12px); background: var(--primary-foreground); }
-.switch-control:disabled { opacity: .45; }
 .columns-popover input, .remember input { width: 13px; height: 13px; margin: 0; accent-color: var(--primary); }
 /* 复选/单选全局对齐主色（UA 默认蓝色与宿主主题脱节）。 */
 input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
@@ -155,10 +148,16 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .icon-teal { color: color-mix(in srgb, var(--success) 55%, var(--info)); }
 .icon-violet { color: color-mix(in srgb, var(--info) 60%, var(--destructive)); }
 
-.notice, .error-banner { position: absolute; z-index: 15; left: 50%; max-width: min(720px, calc(100% - 32px)); transform: translateX(-50%); gap: 10px; border-radius: var(--radius); box-shadow: 0 6px 24px rgb(0 0 0 / 24%); }
+/* reka Toast viewport（ol）：定位与层级在这里；toast 本体（li）只带视觉样式。
+   通知在视口底部居中 z90（tooltip 100 之下、modal 80 之上）；错误横幅在顶栏下
+   居中 z15（保持迁移前被模态遮罩覆盖的语义）。 */
+.notice-viewport, .error-viewport { position: fixed; left: 50%; width: max-content; max-width: min(720px, calc(100vw - 32px)); transform: translateX(-50%); margin: 0; padding: 0; list-style: none; }
+.notice-viewport { bottom: 24px; z-index: 90; }
+.error-viewport { top: 42px; z-index: 15; }
+.notice, .error-banner { display: flex; align-items: center; gap: 10px; border-radius: var(--radius); box-shadow: 0 6px 24px rgb(0 0 0 / 24%); }
 /* toast 通知与错误横幅同一横幅体系：令牌色弹层底 + 边框，不再反色；
    字号对齐全局 12px（原 14px 比模态标题还大）。 */
-.notice { position: fixed; bottom: 24px; z-index: 90; display: flex; align-items: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 14px; background: var(--popover); color: var(--foreground); font-size: 12px; box-shadow: var(--shadow-popover); }
+.notice { border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 14px; background: var(--popover); color: var(--foreground); font-size: 12px; box-shadow: var(--shadow-popover); }
 .notice-action { flex: 0 0 auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 2px 8px; background: transparent; color: var(--primary); font-size: 11px; white-space: nowrap; cursor: pointer; }
 .notice-action:hover { background: var(--accent); }
 
@@ -170,8 +169,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .app-tooltip::before { content: ""; position: absolute; top: -3px; left: calc(50% + var(--arrow-offset, 0px)); width: 7px; height: 7px; transform: translateX(-50%) rotate(45deg); background: var(--foreground); }
 .app-tooltip.app-tooltip-above { transform: translateX(-50%) translateY(-100%); }
 .app-tooltip-above::before { top: auto; bottom: -3px; }
-.error-banner { top: 42px; border: 1px solid var(--border); padding: 6px 10px; }
-.error-banner { justify-content: space-between; border-color: color-mix(in srgb, var(--destructive) 60%, var(--border)); background: color-mix(in srgb, var(--destructive) 16%, var(--popover)); color: color-mix(in srgb, var(--destructive) 45%, var(--foreground)); }
+.error-banner { justify-content: space-between; border: 1px solid color-mix(in srgb, var(--destructive) 60%, var(--border)); padding: 6px 10px; background: color-mix(in srgb, var(--destructive) 16%, var(--popover)); color: color-mix(in srgb, var(--destructive) 45%, var(--foreground)); }
 .error-banner button { display: grid; width: 20px; height: 20px; border: 0; padding: 0; place-items: center; background: transparent; color: inherit; cursor: pointer; }
 .error-banner svg { width: 13px; height: 13px; }
 
@@ -280,11 +278,14 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .sftp-main { position: relative; display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; }
 
 .sftp-side-panel { display: flex; flex: 0 0 148px; min-height: 0; flex-direction: column; border-right: 1px solid var(--border); background: color-mix(in srgb, var(--muted) 28%, var(--background)); }
-.sftp-side-tabs { display: flex; align-items: center; gap: 2px; border-bottom: 1px solid var(--border); padding: 4px 5px; }
-.sftp-side-tabs button { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; color: var(--muted-foreground); padding: 0; }
+/* tab 头行（reka Tabs 根）：unlayered 规则压过 wrapper 的 Tailwind 分层工具类
+   （data-horizontal:flex-col / flex-1 / h-8 / bg-muted / data-active:shadow-sm 等）。 */
+.sftp-side-tabs { display: flex; flex-direction: row; align-items: center; gap: 2px; border-bottom: 1px solid var(--border); padding: 4px 5px; }
+.sftp-side-tab-list { display: flex; align-items: center; gap: 2px; height: auto; padding: 0; background: transparent; }
+.sftp-side-tabs button { display: inline-flex; flex: 0 0 22px; align-items: center; justify-content: center; width: 22px; height: 22px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; color: var(--muted-foreground); padding: 0; box-shadow: none; }
 .sftp-side-tabs button svg { width: 13px; height: 13px; }
 .sftp-side-tabs button:hover { background: var(--accent); color: var(--foreground); }
-.sftp-side-tabs button.is-active { background: var(--accent); color: var(--primary); }
+.sftp-side-tabs button[data-state="active"] { background: var(--accent); color: var(--primary); box-shadow: none; }
 .sftp-side-spacer { flex: 1 1 auto; }
 .sftp-side-body { flex: 1 1 auto; overflow: auto; overflow-x: hidden; padding: 4px 3px; }
 .sftp-side-quick { display: flex; flex-direction: column; gap: 1px; }
@@ -312,7 +313,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .sftp-side-rail button:hover { background: var(--accent); color: var(--foreground); }
 
 /* 窄面板（SFTP 置左 + 小窗口）下工具栏折行到第二行，按钮不再溢出压到终端；
-   不用 overflow-x 滚动：会形成滚动容器把书签/历史弹层裁掉。 */
+   不用 overflow-x 滚动：折行即可容纳全部按钮（弹层已 portal 到 body，
+   不再有滚动容器裁切问题，但折行布局本身仍是更稳的窄面板形态）。 */
 .path-toolbar { display: flex; height: auto; min-height: 38px; flex-wrap: wrap; align-items: center; gap: 4px; border-bottom: 1px solid var(--border); padding: 3px 7px; }
 .path-toolbar .sudo-label { margin-left: 2px; }
 /* 容器查询按面板宽度（而非视口）整理窄面板布局：图标按 DOM 序自然折行，
@@ -326,8 +328,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
   .path-toolbar .sudo-label > span:last-child { display: none; }
   .path-toolbar .sudo-label { margin-left: 0; }
 }
-.path-toolbar input, .modal input, .modal select, .modal textarea,
-.popover select, .popover textarea, .replay-modal select {
+.path-toolbar input, .modal input, .modal textarea,
+.popover textarea {
   min-width: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -337,8 +339,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
   color: var(--foreground);
 }
 .path-toolbar input { height: 26px; flex: 1; min-width: 110px; font-family: var(--terminal-font-family); }
-.path-toolbar input:focus, .modal input:focus, .modal select:focus, .modal textarea:focus,
-.popover select:focus, .popover textarea:focus, .replay-modal select:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
+/* 原生 select 已全部迁到 reka Select（触发钮外观由 wrapper 工具类负责）；
+   焦点描边由全局 button:focus-visible 规则覆盖触发钮。 */
+.path-toolbar input:focus, .modal input:focus, .modal textarea:focus,
+.popover textarea:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
 
 .file-table { display: flex; min-height: 0; flex: 1; flex-direction: column; }
 .file-header, .file-row { display: grid; min-width: 100%; align-items: center; column-gap: 6px; padding: 0 8px; }
@@ -360,6 +364,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    省略（完整值走 title），条目数固定不缩，避免换行把 26px 页脚挤错位。 */
 .file-footer span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-footer span:first-child { flex: 0 0 auto; }
+.file-footer span:nth-child(2) { color: var(--muted-foreground); }
 .file-footer span:last-child { font-family: var(--terminal-font-family); }
 .empty { display: flex; min-height: 120px; align-items: center; justify-content: center; gap: 8px; padding: 16px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
 .empty.compact { min-height: 42px; padding: 8px; }
@@ -367,13 +372,23 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .drop-overlay { position: absolute; z-index: 12; inset: 4px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; border: 2px dashed var(--primary); border-radius: var(--radius); background: color-mix(in srgb, var(--primary) 11%, var(--background)); color: var(--foreground); pointer-events: none; }
 .drop-overlay svg { width: 28px; height: 28px; }
 
-.menu-anchor { position: relative; }
-.popover { position: absolute; z-index: 30; top: calc(100% + 5px); right: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--popover); box-shadow: var(--shadow-popover); }
+/* 工具栏 popover 已迁移 reka Popover：内容 portal 到 body、floating-ui 定位 +
+   碰撞翻转，基础壳（背景/边框/阴影/圆角）由 wrapper 工具类提供；此处只保留
+   各弹层的尺寸与内部布局。`.popover` 类保留为后代选择器钩子（无基础规则）。 */
 .columns-popover { display: flex; width: 220px; flex-direction: column; gap: 1px; padding: 8px; }
+/* 以下五个弹层根规则原在 App.vue scoped：portal 后内容根不带 scopeId，必须全局。
+   gap:0 的三者旧为块级/无间距布局，抵消 wrapper 的 gap-2.5。 */
+.quick-commands-popover { display: flex; width: min(360px, calc(100vw - 24px)); max-height: min(480px, calc(100vh - 60px)); flex-direction: column; gap: 4px; padding: 8px; overflow: auto; }
+.connection-info-popover { gap: 0; width: min(300px, calc(100vw - 24px)); padding: 8px 12px 12px; }
+.agent-mode-popover { gap: 0; width: min(280px, calc(100vw - 24px)); padding: 8px 12px 12px; }
+.bookmark-save-popover { display: flex; width: 250px; flex-direction: column; gap: 6px; padding: 8px; }
+.path-history-popover { display: flex; gap: 0; width: 250px; max-height: min(320px, 50vh); flex-direction: column; padding: 8px; overflow: auto; }
 .columns-popover label { display: flex; height: 28px; align-items: center; gap: 8px; border-radius: 4px; padding: 0 7px; cursor: pointer; }
 .columns-popover label:hover { background: var(--accent); }
 .columns-popover-separator { width: 100%; height: 1px; margin: 4px 0; border: 0; background: var(--border); }
-.transfer-popover { z-index: 60; width: min(340px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 52px)); padding: 8px; overflow: auto; }
+/* 旧 z60 是为了在工具栏层叠上下文里压过 xterm 装饰层；portal 后由 wrapper
+   z-50 统一参与根级排序，与右键菜单同档（菜单后挂载 DOM 序靠后自然盖住）。 */
+.transfer-popover { gap: 0; width: min(340px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 52px)); padding: 8px; overflow: auto; }
 .transfer-popover h3 { margin: 2px 4px 8px; font-size: 12px; }
 .transfer-card { display: grid; grid-template: "title actions" auto "progress progress" auto "meta meta" auto "path path" auto "error error" auto / minmax(0, 1fr) auto; position: relative; column-gap: 6px; row-gap: 4px; border-top: 1px solid var(--border); padding: 7px 4px; }
 .transfer-title { grid-area: title; min-width: 0; gap: 6px; }
@@ -391,12 +406,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .task-error { margin: 0; color: var(--destructive); font-size: 10px; overflow-wrap: anywhere; }
 .activity-dot { position: absolute; top: 4px; right: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 0 1px var(--background); }
 
-.context-menu { position: fixed; z-index: 50; display: flex; min-width: 160px; max-width: 280px; flex-direction: column; gap: 1px; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; background: var(--popover); box-shadow: var(--shadow-popover); color: var(--foreground); }
-.context-menu button:hover:not(:disabled) { background: var(--accent); }
-.context-menu button:disabled { color: var(--muted-foreground); }
-.context-menu button { display: flex; width: 100%; height: 29px; align-items: center; gap: 8px; overflow: hidden; border-radius: var(--radius); padding: 0 8px; text-align: left; white-space: nowrap; }
-.context-menu button.danger { color: var(--destructive); }
-.context-menu hr { width: 100%; height: 1px; margin: 3px 0; border: 0; background: var(--border); }
+/* reka 右键菜单紧凑化：对齐旧 .context-menu 视觉（unlayered 覆盖 layered 工具类；
+   z-index 走 wrapper 的 z-50，落在弹层阶梯 context-menu(50) 一档）。 */
+[data-slot="context-menu-content"] { min-width: 160px; max-width: 280px; }
+[data-slot="context-menu-item"] { min-height: 29px; padding-top: 0; padding-bottom: 0; }
+[data-slot="context-menu-item"] svg { width: 14px; height: 14px; flex: 0 0 14px; }
 
 .zmodem-status { position: absolute; z-index: 3; right: 8px; bottom: 8px; left: 8px; display: flex; align-items: center; gap: 7px; border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border)); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 92%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); color: var(--foreground); font-size: 11px; pointer-events: none; }
 .zmodem-status svg { width: 14px; height: 14px; flex: 0 0 14px; }
@@ -426,7 +440,6 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .reconnect-banner .reconnect-now { flex: 0 0 auto; height: 24px; border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border)); border-radius: var(--radius); padding: 0 8px; background: transparent; color: var(--warning); font-size: 11px; cursor: pointer; }
 .reconnect-banner .reconnect-now:hover { background: color-mix(in srgb, var(--warning) 14%, transparent); }
 
-.modal-backdrop { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; padding: 16px; background: var(--overlay); }
 .modal { position: relative; display: flex; width: min(560px, 100%); max-height: calc(100vh - 32px); flex-direction: column; gap: 16px; border: 1px solid var(--border); border-radius: var(--radius-lg, 8px); padding: 16px; background: var(--popover); color: var(--foreground); box-shadow: var(--shadow-modal); }
 .modal header { min-height: 24px; justify-content: space-between; gap: 12px; padding: 0; }
 .modal header > .icon-button { position: absolute; top: 8px; right: 8px; }
@@ -497,13 +510,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .batch-bar-targets { display: inline-flex; flex: 0 1 auto; min-width: 0; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; white-space: nowrap; }
 .batch-bar-targets:hover { background: color-mix(in srgb, var(--muted) 55%, transparent); }
 .batch-bar-targets span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.batch-bar-quick { flex: 0 1 170px; min-width: 0; height: 26px; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.batch-bar-quick { flex: 0 1 170px; min-width: 0; }
 .batch-bar-input { flex: 1 1 auto; min-width: 60px; height: 26px; border: 1px solid var(--border); border-radius: 4px; padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
 .batch-bar-input:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
 .batch-bar .icon-button { flex: 0 0 auto; }
 .batch-bar-send { color: var(--success); }
-/* 底部条上的 popover 向上展开（默认向下会被裁切）。 */
-.batch-bar .batch-targets-popover { right: auto; bottom: calc(100% + 6px); left: 0; top: auto; display: flex; width: min(380px, calc(100vw - 32px)); max-height: min(320px, 60vh); flex-direction: column; gap: 6px; overflow: auto; padding: 8px; }
+/* 底部条上的 popover 向上展开：定位由 reka side="top" 负责，这里只管尺寸布局。 */
+.batch-targets-popover { display: flex; width: min(380px, calc(100vw - 32px)); max-height: min(320px, 60vh); flex-direction: column; gap: 6px; overflow: auto; padding: 8px; }
 .batch-bar-status { position: absolute; z-index: 5; right: 8px; bottom: 48px; left: 8px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 94%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); font-size: 11px; }
 .batch-bar-status p { margin: 0; }
 .batch-bar-status .icon-button { flex: 0 0 auto; margin-left: auto; }
@@ -553,35 +566,58 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 /* 进程表复用全局 .file-header：在悬浮卡（popover 底色）内改用同底色，
    避免 var(--background) 在卡片上显出一块色差；sticky + 阴影保留。 */
 .metrics-float .file-header { background: var(--popover); box-shadow: 0 1px 2px color-mix(in srgb, var(--foreground) 6%, transparent); }
-.file-footer span:nth-child(2) { color: var(--muted-foreground); }
 
 /* SSH settings dialog */
 .settings-modal { width: min(680px, 100%); height: min(620px, calc(100vh - 48px)); }
-.settings-body { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 14px; overflow-y: auto; padding-right: 4px; }
+/* overflow-y:auto 会让 overflow-x 也算成 auto，本元素因此成为水平裁剪盒；
+   .settings-layout 的 margin:0 -16px 若冲不出裁剪盒，左栏左边 16px 会被切掉
+   （选中药丸左角变直角、视觉贴边的根因）。负 margin 移到本层、用等量 padding
+   保持子内容原位：裁剪盒扩到 modal 边缘，layout 的负 margin 在盒内成立。 */
+.settings-body { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 14px; overflow-y: auto; margin: 0 -16px; padding: 0 20px 0 16px; }
 /* 分类导航布局（对齐宿主设置页）：左栏分类 + 右栏内容；右栏滚动，左栏不滚。
    弹窗高度固定，切分类时不再随内容多少跳动。 */
 .settings-nav-modal { height: min(600px, calc(100vh - 40px)); }
 .settings-layout { display: flex; min-height: 0; flex: 1 1 auto; margin: 0 -16px; border-top: 1px solid var(--border); }
-.settings-nav { display: flex; flex: 0 0 148px; flex-direction: column; gap: 1px; overflow-y: auto; border-right: 1px solid var(--border); padding: 8px; }
-.settings-nav button { height: 28px; overflow: hidden; border: 0; border-radius: var(--radius); padding: 0 8px; background: transparent; color: var(--muted-foreground); font-size: 12px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-.settings-nav button:hover { background: var(--accent); }
-.settings-nav button.is-active { background: var(--accent); color: var(--foreground); font-weight: 500; }
+/* 左栏水平留白对齐宿主设置侧栏：药丸距内容边缘 12px（.settings-layout 负 margin
+   把左栏拉到弹窗 padding 边缘，这里 8px 会让选中药丸视觉贴边）。 */
+.settings-nav { display: flex; flex: 0 0 168px; flex-direction: column; gap: 1px; overflow-y: auto; border-right: 1px solid var(--border); padding: 8px 12px; }
+/* reka Tabs 包装：unlayered 规则压过 wrapper 分层工具类；.modal 按钮复位选择器
+   已排除 data-slot="tabs-trigger"（:not 按参数计特异性，复位实际是 (0,3,1)，
+   不排除会压过本组 (0,3,0) 规则、把背景抹成透明）。 */
+.settings-nav-tabs { width: 100%; }
+.settings-nav-list { display: flex; flex-direction: column; gap: 1px; width: 100%; height: auto; padding: 0; background: transparent; }
+.settings-nav .settings-nav-item { height: 28px; overflow: hidden; border: 0; border-radius: var(--radius); padding: 0 8px; background: transparent; color: var(--muted-foreground); font-size: 12px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; flex: 0 0 auto; justify-content: flex-start; box-shadow: none; }
+/* hover 不用 --accent：亮色（pearl）主题下它是 #f5f5f5，落在白底上等于没颜色；
+   改用前景色 8% 混合，明暗两态都可见。 */
+.settings-nav .settings-nav-item:hover { background: color-mix(in srgb, var(--foreground) 8%, transparent); }
+/* 选中态对齐宿主设置侧栏（截图「隧道维护」）：前景色实心药丸 + 反色文字，
+   暗色主题下令牌自动反转。active 优先于 hover。
+   选择器同时覆盖 data-state 与 data-active：reka 的 RovingFocusItem 会把
+   data-active="" 合并到 trigger 上，shadcn 包装类的 data-active:bg-background/
+   text-foreground（白底）只认这个属性，漏盖会出现选中项白底白字。 */
+.settings-nav .settings-nav-item[data-state="active"],
+.settings-nav .settings-nav-item[data-active],
+.settings-nav .settings-nav-item[data-state="active"]:hover,
+.settings-nav .settings-nav-item[data-active]:hover { background: var(--foreground); color: var(--background); font-weight: 500; }
 .settings-content { display: flex; min-width: 0; flex: 1 1 auto; flex-direction: column; gap: 14px; overflow-y: auto; padding: 12px 16px; }
 .settings-pane { display: flex; flex-direction: column; gap: 10px; }
 .settings-pane .settings-section-title:first-child { margin-top: 0; border-top: 0; padding-top: 0; }
 /* 窄弹窗：左栏变顶部横向分类条。 */
 @media (max-width: 560px) {
   .settings-layout { flex-direction: column; }
-  .settings-nav { flex: 0 0 auto; flex-direction: row; border-right: 0; border-bottom: 1px solid var(--border); }
-  .settings-nav button { flex: 0 0 auto; }
+  .settings-nav { flex: 0 0 auto; border-right: 0; border-bottom: 1px solid var(--border); }
+  .settings-nav-list { flex-direction: row; }
+  .settings-nav .settings-nav-item { flex: 0 0 auto; }
 }
 .settings-field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--muted-foreground); }
-/* 开关行恢复横向布局：.settings-field 的 column 会让 .switch-control 在列向
-   flex 里被 stretch/flex-basis 拉成方块、文字掉到下一行（WebGL 开关）。 */
+/* 开关行恢复横向布局：.settings-field 的 column 会让开关与文字掉到两行，
+   行内 flex 保持"开关 + 标签"同行（WebGL / 下载目录开关）。 */
 .settings-switch-row { flex-direction: row; align-items: center; gap: 8px; }
 .settings-radio-row { flex-direction: row; align-items: center; gap: 8px; }
 .settings-radio-row input { margin: 0; }
-.settings-field input, .settings-field select, .settings-field textarea { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.settings-field input, .settings-field textarea { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+/* 设置表单里的 reka Select：触发钮吃满整行（原生 select 的 stretch 语义）。 */
+.settings-field [data-slot="select-trigger"] { width: 100%; min-width: 0; }
 /* 目录输入 + 浏览按钮同行：输入框吃满剩余宽度，图标按钮与输入框等高。 */
 .settings-dir-row { display: flex; align-items: center; gap: 6px; }
 .settings-dir-row input { min-width: 0; flex: 1 1 auto; }
@@ -612,12 +648,27 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .settings-key-icon { width: 14px; height: 14px; flex: 0 0 14px; color: var(--muted-foreground); }
 /* 全局 quick sudo 配置：来源选择行、列表操作列、内联表单操作列。 */
 .credential-source-row { display: flex; flex: 1; align-items: center; gap: 8px; min-width: 0; }
-.credential-source-row select { flex: 1; min-width: 0; }
+.credential-source-row .credential-source-select { flex: 1; min-width: 0; }
 /* 「管理全局配置」入口：裸文字链接放表单行里太像半成品，升级为紧凑描边按钮。 */
 .credential-source-row .link-button { flex: 0 0 auto; align-self: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 3px 10px; background: var(--background); color: var(--foreground); font-size: 11px; white-space: nowrap; }
 .credential-source-row .link-button:hover { background: var(--accent); }
 .settings-list-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; }
 .profiles-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin: 4px 0 0; }
+/* 独立 profiles 弹窗：高度随内容（空态不再撑满 620px），宽度收窄，上限同设置弹窗。 */
+.profiles-modal { width: min(560px, 100%); height: auto; max-height: min(620px, calc(100vh - 48px)); }
+/* 工具行：左侧计数（muted 小字），右侧主按钮「新建配置」。 */
+.profiles-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.profiles-count { font-size: 11px; }
+.profiles-add { min-height: 26px; padding: 2px 10px; font-size: 11px; }
+/* 列表区保底高度：空态垂直居中不塌陷；有列表时随内容撑开。 */
+.profiles-content { display: flex; min-height: 240px; flex: 1 1 auto; flex-direction: column; }
+.profiles-empty { display: flex; flex: 1 1 auto; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
+.profiles-empty svg { width: 28px; height: 28px; opacity: .55; }
+.profiles-empty p { margin: 0; }
+/* 行 hover 与录制记录列表同一视觉语言。 */
+.profiles-list li:hover { background: var(--accent); }
+.profiles-list li:first-child { border-radius: 5px 5px 0 0; }
+.profiles-list li:last-child { border-radius: 0 0 5px 5px; }
 .mcp-limits { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .mcp-limits input { width: 100%; }
 .settings-body .link-button { display: inline-flex; align-items: center; gap: 5px; }
@@ -709,6 +760,12 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .highlight-editor .highlight-editor-inputs input[type="text"], .highlight-editor .highlight-editor-inputs input:not([type]) { flex: 1 1 auto; min-width: 0; }
 .highlight-editor label.highlight-editor-flag { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--muted-foreground); cursor: pointer; white-space: nowrap; }
 .highlight-editor label.highlight-editor-flag input { accent-color: var(--primary); }
+/* 编辑器标志位 ToggleGroup（.* / Aa）：样式对齐终端搜索面板的开关组。 */
+.highlight-editor-flags { display: inline-flex; overflow: hidden; border: 1px solid var(--border); border-radius: 4px; }
+.highlight-editor-flag-item { min-width: 26px; height: 20px; padding: 0 6px; border: 0; background: transparent; color: var(--muted-foreground); font-family: var(--terminal-font-family); font-size: 10px; }
+.highlight-editor-flag-item + .highlight-editor-flag-item { border-left: 1px solid var(--border); }
+.highlight-editor-flag-item:hover { background: var(--accent); }
+.highlight-editor-flag-item[data-state="on"] { background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary); }
 .highlight-palette { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .highlight-palette-swatch { width: 18px; height: 18px; border-radius: 4px; border: 2px solid transparent; cursor: pointer; padding: 0; }
 .highlight-palette-swatch.selected { border-color: var(--foreground); }
@@ -729,7 +786,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 
 /* ---- 审计日志（IMPL_PLAN_NETCATTY_PARITY §3-B4，独立弹窗）---- */
 .audit-toolbar { display: flex; align-items: center; gap: 8px; }
-.audit-toolbar select { min-width: 150px; }
+.audit-toolbar .audit-kind-select { min-width: 150px; }
 .audit-truncated { font-size: 10px; }
 .audit-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
 .audit-row { display: flex; align-items: baseline; gap: 8px; font-size: 10px; }

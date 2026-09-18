@@ -15,7 +15,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: "toggle", node: DirTreeNode): void;
   (event: "open", node: DirTreeNode): void;
-  (event: "context", payload: { node: DirTreeNode; x: number; y: number }): void;
+  (event: "context", payload: { node: DirTreeNode }): void;
 }>();
 
 // R3-P2-6：树行键盘可达——roving tabindex（当前目录行 tabindex=0，其余 -1；
@@ -71,7 +71,7 @@ function onRowKeydown(event: KeyboardEvent, node: DirTreeNode) {
       :tabindex="tabIndexFor(node, index)"
       @click="emit('open', node)"
       @keydown="onRowKeydown($event, node)"
-      @contextmenu.prevent.stop="emit('context', { node, x: $event.clientX, y: $event.clientY })"
+      @contextmenu="emit('context', { node })"
     >
       <button type="button" class="sftp-tree-caret" :aria-label="caretName(node)" @click.stop="emit('toggle', node)">
         <span v-if="node.loading" class="sftp-tree-spinner" />

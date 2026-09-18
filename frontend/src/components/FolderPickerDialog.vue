@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { ArrowUp, Folder, HardDrive, Loader2, X } from "@lucide/vue";
 import { workbenchMessage } from "../lib/i18n";
+import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 interface BrowseEntry {
   name: string;
@@ -81,11 +82,12 @@ const atDriveRoot = computed(() => !!current.value && !current.value.parent);
 </script>
 
 <template>
-  <!-- 应用内目录选择器：沙箱 iframe 没有目录选择 API，由 sidecar 列本机目录 -->
-  <section class="modal-backdrop" @mousedown.self="emit('close')">
-    <article class="modal folder-picker-modal">
+  <!-- 应用内目录选择器：沙箱 iframe 没有目录选择 API，由 sidecar 列本机目录。
+       父级 v-if 挂载即打开；Esc 由 App.vue 弹窗关闭链处理（此处 prevent 拦截 reka）。 -->
+  <Dialog :open="true" @update:open="(open) => { if (!open) emit('close'); }">
+    <DialogContent class="modal folder-picker-modal" @escape-key-down.prevent>
       <header>
-        <h2>{{ t("folderPicker.title") }}</h2>
+        <DialogTitle>{{ t("folderPicker.title") }}</DialogTitle>
         <button :title="t('close')" class="icon-button" @click="emit('close')"><X /></button>
       </header>
       <div class="folder-picker-path">
@@ -122,6 +124,6 @@ const atDriveRoot = computed(() => !!current.value && !current.value.parent);
         <span class="folder-picker-current mono" :title="current?.path">{{ drives ? t("folderPicker.thisPC") : current?.path }}</span>
         <button class="primary-button" :disabled="!current" @click="current && emit('select', current.path)">{{ t("folderPicker.confirm") }}</button>
       </footer>
-    </article>
-  </section>
+    </DialogContent>
+  </Dialog>
 </template>
