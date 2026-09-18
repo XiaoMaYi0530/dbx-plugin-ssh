@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   decideConnectRetry,
+  INACTIVE_RETRY_DELAY_MS,
+  INACTIVE_RETRY_MAX,
   isPermanentConnectError,
   OPEN_RETRY_BASE_DELAY_MS,
   OPEN_RETRY_FAST_FAIL_WINDOW_MS,
@@ -50,9 +52,17 @@ describe("decideConnectRetry", () => {
     expect(decideConnectRetry({ ...BASE, cause: new Error("SSH connection failed: UnknownKey") })).toEqual({ kind: "fail" });
   });
 
-  it("fails inactive-connection errors on manual entries but retries during boot restore", () => {
-    expect(decideConnectRetry({ ...BASE, inactive: true, cause: new Error("Connection is not active") })).toEqual({ kind: "fail" });
+  it("polls inactive-connection errors on manual entries for a bounded window, then fails", () => {
+    const first = decideConnectRetry({ ...BASE, inactive: true, cause: new Error("Connection is not active") });
+    expect(first).toEqual({ kind: "retry", attempt: 1, delayMs: INACTIVE_RETRY_DELAY_MS });
+    const last = decideConnectRetry({ ...BASE, attempt: INACTIVE_RETRY_MAX - 1, inactive: true, cause: new Error("Connection is not active") });
+    expect(last).toEqual({ kind: "retry", attempt: INACTIVE_RETRY_MAX, delayMs: INACTIVE_RETRY_DELAY_MS });
+    const exhausted = decideConnectRetry({ ...BASE, attempt: INACTIVE_RETRY_MAX, inactive: true, cause: new Error("Connection is not active") });
+    expect(exhausted).toEqual({ kind: "fail" });
+  });
+
+  it("keeps the regular backoff ladder for inactive errors during boot restore", () => {
     const restored = decideConnectRetry({ ...BASE, inactive: true, bootRestore: true, cause: new Error("Connection is not active") });
-    expect(restored.kind).toBe("retry");
+    expect(restored).toEqual({ kind: "retry", attempt: 1, delayMs: OPEN_RETRY_BASE_DELAY_MS });
   });
 });

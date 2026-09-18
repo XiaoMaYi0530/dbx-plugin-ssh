@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { ChevronDown, ChevronUp, Search, X } from "@lucide/vue";
 import { workbenchMessage } from "../lib/i18n";
 import { persistSearchOptions, type TerminalSearchOptions } from "../lib/terminalInteraction";
+import { ToggleGroup, ToggleGroupItem } from "./ui/toggle-group";
 
 type TerminalSearchMatchState = "idle" | "match" | "no-match";
 
@@ -31,6 +32,16 @@ const caseSensitive = ref(props.initialOptions?.caseSensitive ?? false);
 const useRegex = ref(props.initialOptions?.regex ?? false);
 const wholeWord = ref(props.initialOptions?.wholeWord ?? false);
 const input = ref<HTMLInputElement>();
+
+// ToggleGroup（multiple）以字符串数组建模；桥接到三个独立布尔开关。
+const toggleValues = computed<string[]>({
+  get: () => [caseSensitive.value ? "case" : "", useRegex.value ? "regex" : "", wholeWord.value ? "word" : ""].filter(Boolean),
+  set: (values) => {
+    caseSensitive.value = values.includes("case");
+    useRegex.value = values.includes("regex");
+    wholeWord.value = values.includes("word");
+  },
+});
 
 const t = (key: string, values: Record<string, string | number> = {}) => workbenchMessage(props.locale, key, values);
 
@@ -96,11 +107,11 @@ onMounted(() => {
       <button type="button" class="terminal-search-btn" :title="t('terminalSearch.close')" @click="emit('close')"><X /></button>
     </div>
     <div class="terminal-search-options">
-      <div class="terminal-search-toggles" role="group" :aria-label="t('terminalSearch.open')">
-        <button type="button" :class="{ 'is-active': caseSensitive }" :aria-pressed="caseSensitive" :title="t('terminalSearch.caseSensitive')" @click="caseSensitive = !caseSensitive">Aa</button>
-        <button type="button" :class="{ 'is-active': useRegex }" :aria-pressed="useRegex" :title="t('terminalSearch.regex')" @click="useRegex = !useRegex">.*</button>
-        <button type="button" :class="{ 'is-active': wholeWord }" :aria-pressed="wholeWord" :title="t('terminalSearch.wholeWord')" @click="wholeWord = !wholeWord">|w|</button>
-      </div>
+      <ToggleGroup v-model="toggleValues" type="multiple" class="terminal-search-toggles" :aria-label="t('terminalSearch.open')">
+        <ToggleGroupItem value="case" :title="t('terminalSearch.caseSensitive')">Aa</ToggleGroupItem>
+        <ToggleGroupItem value="regex" :title="t('terminalSearch.regex')">.*</ToggleGroupItem>
+        <ToggleGroupItem value="word" :title="t('terminalSearch.wholeWord')">|w|</ToggleGroupItem>
+      </ToggleGroup>
       <span class="terminal-search-status" :data-state="matchState" role="status">{{ statusText }}</span>
     </div>
   </div>
@@ -121,7 +132,7 @@ onMounted(() => {
   border-radius: var(--radius);
   padding: 6px;
   background: var(--popover);
-  box-shadow: 0 10px 32px rgb(0 0 0 / 30%);
+  box-shadow: var(--shadow-popover);
   font-size: 11px;
 }
 
@@ -218,7 +229,7 @@ onMounted(() => {
   background: var(--accent);
 }
 
-.terminal-search-toggles button.is-active {
+.terminal-search-toggles button[data-state="on"] {
   background: color-mix(in srgb, var(--primary) 16%, transparent);
   color: var(--primary);
 }

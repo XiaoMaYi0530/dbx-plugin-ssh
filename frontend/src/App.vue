@@ -7,9 +7,7 @@ import { CanvasAddon } from "@xterm/addon-canvas";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
-  Activity,
   Archive,
-  Circle,
   Disc,
   Film,
   Pause,
@@ -100,7 +98,7 @@ import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnecti
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
 import { decideConnectRetry } from "./lib/connectRetry";
 import { createConnectLog } from "./lib/connectLog";
-import { focusableElements, nextFocusIndex, pickModalFocusTarget } from "./lib/modalFocus";
+import { pickModalFocusTarget } from "./lib/modalFocus";
 import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
@@ -174,6 +172,14 @@ import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
 import ConnectingCard from "./components/ConnectingCard.vue";
 import FolderPickerDialog from "./components/FolderPickerDialog.vue";
 import SideNavPanel, { type SftpSideQuickPath } from "./components/SideNavPanel.vue";
+import { Switch } from "./components/ui/switch";
+import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs";
+import { ToggleGroup, ToggleGroupItem } from "./components/ui/toggle-group";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "./components/ui/context-menu";
+import { Popover, PopoverAnchor, PopoverContent } from "./components/ui/popover";
+import { Dialog, DialogContent, DialogTitle } from "./components/ui/dialog";
+import { ToastAction, ToastClose, ToastProvider, ToastRoot, ToastViewport } from "./components/ui/toast";
 
 interface SessionInfo {
   sessionId: string;
@@ -461,13 +467,20 @@ const terminalError = ref("");
 const connectCancelled = ref(false);
 // 成功过渡动画：open 成功后先切 success 卡片（进度到顶 + 对号），hold 播完再进终端。
 const connectSucceeded = ref(false);
+// 手动重连撞上 "Connection is not active"（sidecar 注册表丢凭据）：卡片保持
+// connecting 态并提示用户在 DBX 侧边栏重开连接，插件在有界窗口内自动轮等待宿主重放凭据。
+const inactiveWaiting = ref(false);
 const CONNECT_SUCCESS_HOLD_MS = 750;
 const connectLogsOpen = ref(false);
 const connectLog = createConnectLog();
 const sftpError = ref("");
 const sftpErrorRetry = ref<(() => void) | null>(null);
+const sftpErrorOpen = ref(false);
+const sftpErrorKey = ref(0);
 const notice = ref("");
 const noticeActions = ref<Array<{ label: string; run: () => void }>>([]);
+const noticeOpen = ref(false);
+const noticeKey = ref(0);
 const session = ref<SessionInfo>();
 const currentPath = ref("/");
 const entries = ref<SftpEntry[]>([]);
@@ -551,15 +564,17 @@ const dragActive = ref(false);
 // Terminal-local drag overlay: true only while files are dragged over the
 // terminal pane and the drop can actually be accepted (writable session).
 const terminalDragActive = ref(false);
-const terminalMenu = ref<{ x: number; y: number }>();
+// 右键菜单由 reka ContextMenu 承载（定位/碰撞/Esc/外点关闭均交给 reka）；
+// 这里只保留受控 open 状态与负载数据，坐标由 trigger 从原生事件捕获。
+const terminalMenuOpen = ref(false);
 // 行右键菜单：selection 为打开菜单瞬间的多选快照（>1 时切换为批量区）。
-const fileMenu = ref<{ x: number; y: number; entry: SftpEntry; selection: string[] }>();
+const fileMenu = ref<{ entry: SftpEntry; selection: string[] }>();
 // 文件列表空白处右键：新建文件夹 / 新建文件 / 刷新（拦截浏览器默认菜单）。
-const blankMenu = ref<{ x: number; y: number }>();
+const blankMenu = ref(false);
 // 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩。
-const sideMenu = ref<{ x: number; y: number; path: string }>();
-// 下载历史项右键：只为已有本机落盘路径提供定位/打开操作。
-const transferHistoryMenu = ref<{ x: number; y: number; path: string }>();
+const sideMenu = ref<{ path: string }>();
+// 下载历史项右键：只为已有本机落盘路径提供定位/打开操作；taskId 用于按卡受控打开。
+const transferHistoryMenu = ref<{ taskId: string }>();
 const zmodemState = ref<"idle" | "waiting" | "uploading">("idle");
 const zmodemFileName = ref("");
 const zmodemTransferred = ref(0);
@@ -699,7 +714,7 @@ const metricsError = ref("");
 const settingsOpen = ref(false);
 // 设置弹窗分类导航（左栏）：标签复用各区块既有 i18n 键，不新增文案。
 const SETTINGS_CATEGORIES = [
-  { id: "sudo", labelKey: "settingsQuickSudo" },
+  { id: "sudo", labelKey: "settingsNav.sudo" },
   { id: "agent", labelKey: "agentTerminalSection" },
   { id: "transfer", labelKey: "downloadSettings.title" },
   { id: "terminal", labelKey: "settingsNav.terminal" },
@@ -708,6 +723,13 @@ const SETTINGS_CATEGORIES = [
 ] as const;
 type SettingsCategory = (typeof SETTINGS_CATEGORIES)[number]["id"];
 const settingsCategory = ref<SettingsCategory>("sudo");
+
+function onSettingsCategoryChange(value: string | number) {
+  settingsCategory.value = value as SettingsCategory;
+}
+
+// reka Select 不接受空串 option value（空串 = 未选中占位）；空值选项用哨兵值双向映射。
+const SELECT_EMPTY_SENTINEL = "__empty__";
 const auditOpen = ref(false);
 const settingsLoading = ref(false);
 const settingsLoadFailed = ref(false);
@@ -883,8 +905,6 @@ let replayInFlight = false;
 // closes cannot self-heal by retrying — after a few attempts the drain must
 // resync past the hole instead of spinning the replay loop forever.
 let replayNoProgress = 0;
-let noticeTimer = 0;
-let errorTimer = 0;
 let commandMarkerTimer = 0;
 let agentPromptTimer = 0;
 let zmodemSentry: ZmodemSentry | null = null;
@@ -922,7 +942,13 @@ const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle
 });
 const terminalInputQueue = createTerminalInputQueue({
   send: (sessionId, payload) => window.dbxPlugin.sendBinary(`ssh/terminal/in/${sessionId}`, payload),
-  onError: (cause) => showError(cause, "terminal"),
+  onError: (cause) => {
+    showError(cause, "terminal");
+    // 会话被外部杀掉（宿主重推连接的 disconnect、sidecar 重启）时本 tab 无
+    // 事件感知，终端看似活着实则打不进字。输入撞上死会话时按传输断开的
+    // 同款有界梯子自动重连。错误串契约见 backend ssh.rs session()。
+    if (terminalState.value === "connected" && String(cause).includes("not found or expired")) scheduleSessionReconnect();
+  },
 });
 
 const locale = ref("zh-CN");
@@ -1120,9 +1146,9 @@ function persistState() {
 }
 
 // —— 自定义 tooltip（对齐 DBX 宿主的气泡提示）——
-// 全局接管 title 属性：悬停时把值挪到 data-tooltip（抑制原生慢速灰框），
-// 350ms 后显示主题化气泡；下方空间不足翻到上方。模板无需改动，所有现有
-// 和未来的 title 自动生效。
+// 全局接管 title 属性：悬停或键盘聚焦时把值挪到 data-tooltip（抑制原生慢速
+// 灰框），350ms 后显示主题化气泡；下方空间不足翻到上方。模板无需改动，所有
+// 现有和未来的 title 自动生效。
 const tooltip = ref<{ text: string; x: number; y: number; above: boolean; arrowOffset: number } | null>(null);
 const tooltipBubble = ref<HTMLElement>();
 let tooltipEl: HTMLElement | null = null;
@@ -1135,12 +1161,8 @@ function hideTooltip() {
   tooltipEl = null;
 }
 
-function onTooltipOver(event: MouseEvent) {
-  const target = (event.target as HTMLElement | null)?.closest?.("[title], [data-tooltip]") as HTMLElement | null;
-  if (target === tooltipEl) return;
-  hideTooltip();
-  if (!target) return;
-  // title → data-tooltip：Vue 绑定只在值变化时重写 title，下次悬停再挪一次。
+function scheduleTooltip(target: HTMLElement) {
+  // title → data-tooltip：Vue 绑定只在值变化时重写 title，下次触发再挪一次。
   const title = target.getAttribute("title");
   if (title !== null) {
     target.setAttribute("data-tooltip", title);
@@ -1171,7 +1193,32 @@ function onTooltipOver(event: MouseEvent) {
   }, 350);
 }
 
+function onTooltipOver(event: MouseEvent) {
+  const target = (event.target as HTMLElement | null)?.closest?.("[title], [data-tooltip]") as HTMLElement | null;
+  if (target === tooltipEl) return;
+  hideTooltip();
+  if (!target) return;
+  scheduleTooltip(target);
+}
+
 function onTooltipOut(event: MouseEvent) {
+  if (!tooltipEl) return;
+  const related = event.relatedTarget as HTMLElement | null;
+  if (related && tooltipEl.contains(related)) return;
+  hideTooltip();
+}
+
+// 键盘可达性：focusin/focusout 走同一套气泡（focus 锚定元素本身，
+// 不依赖指针位置），blur 时收起。
+function onTooltipFocusIn(event: FocusEvent) {
+  const target = (event.target as HTMLElement | null)?.closest?.("[title], [data-tooltip]") as HTMLElement | null;
+  if (target === tooltipEl) return;
+  hideTooltip();
+  if (!target) return;
+  scheduleTooltip(target);
+}
+
+function onTooltipFocusOut(event: FocusEvent) {
   if (!tooltipEl) return;
   const related = event.relatedTarget as HTMLElement | null;
   if (related && tooltipEl.contains(related)) return;
@@ -1183,15 +1230,27 @@ interface BannerAction {
   label: string;
   run: () => void;
 }
+// reka Toast 承载展示与计时（悬停暂停/滑动关闭为内建行为）；通知为单实例替换
+// 语义——每次 show 递增 key 重挂 ToastRoot，时长重置（3500ms，带动作放宽到 8000ms）。
 function showNotice(message: string, actions: BannerAction[] = []) {
   notice.value = message;
   noticeActions.value = actions;
-  window.clearTimeout(noticeTimer);
-  // 带动作的通知留得更久，给用户点按钮的时间。
-  noticeTimer = window.setTimeout(() => {
-    notice.value = "";
-    noticeActions.value = [];
-  }, actions.length ? 8000 : 3500);
+  noticeKey.value += 1;
+  noticeOpen.value = true;
+}
+
+function onNoticeOpenChange(open: boolean) {
+  if (open) return;
+  noticeOpen.value = false;
+  notice.value = "";
+  noticeActions.value = [];
+}
+
+function onSftpErrorOpenChange(open: boolean) {
+  if (open) return;
+  sftpErrorOpen.value = false;
+  sftpError.value = "";
+  sftpErrorRetry.value = null;
 }
 
 function showError(cause: unknown, target: "terminal" | "sftp" = "sftp", retry?: () => void) {
@@ -1204,11 +1263,8 @@ function showError(cause: unknown, target: "terminal" | "sftp" = "sftp", retry?:
     sftpErrorRetry.value = retry ?? null;
     // 错误横幅与通知同款自动消失（保留手动关闭），时限放宽到 8s：
     // 错误信息通常更长，需要读完的时间。
-    window.clearTimeout(errorTimer);
-    errorTimer = window.setTimeout(() => {
-      sftpError.value = "";
-      sftpErrorRetry.value = null;
-    }, 8000);
+    sftpErrorKey.value += 1;
+    sftpErrorOpen.value = true;
   }
 }
 
@@ -1241,11 +1297,9 @@ function applyAppearance(next: DbxPluginAppearanceInput) {
   root.style.setProperty("--destructive", resolved.colors.destructive);
   root.style.setProperty("--popover", DBX_POPOVER[resolved.colorScheme]);
   root.style.setProperty("--ssh-terminal-background", resolved.colors.background);
-  root.style.setProperty("--ui-font-family", resolved.ui.fontFamily);
-  root.style.setProperty("--terminal-font-family", resolved.terminal.fontFamily);
+  followHostFonts(resolved);
   if (terminal) {
     terminal.options.theme = terminalTheme();
-    terminal.options.fontFamily = resolved.terminal.fontFamily;
     // 宿主下发的字体大小即缩放基准；外观切换后回到基准值，
     // 但用户 A+/A- 调过的字号（localStorage）优先于宿主基准。
     const persistedFontSize = loadPersistedTerminalFontSize();
@@ -1255,6 +1309,38 @@ function applyAppearance(next: DbxPluginAppearanceInput) {
   }
 }
 
+// 字体始终跟随宿主：不写内联字体变量——内联样式会压过 themeSync 桥样式表里的
+// var(--font-sans)/var(--font-mono) 引用（这正是宿主全局字体此前不生效的根因），
+// 撤出内联后桥引用直接命中宿主令牌，宿主改字体经 SDK 令牌推送自动跟随。
+function followHostFonts(resolved: ReturnType<typeof resolveAppearance>) {
+  const root = document.documentElement;
+  root.style.removeProperty("--ui-font-family");
+  root.style.removeProperty("--terminal-font-family");
+  if (terminal) {
+    terminal.options.fontFamily = hostTerminalFontFamily(resolved);
+    scheduleFit();
+  }
+}
+
+// xterm 需要具体字体串（不认 CSS 变量）：取 --terminal-font-family 的计算值
+// （桥已把宿主令牌/回退解析好），计算值为空时回退 appearance 解析值。
+function hostTerminalFontFamily(resolved: ReturnType<typeof resolveAppearance>): string {
+  const computed = getComputedStyle(document.documentElement).getPropertyValue("--terminal-font-family").trim();
+  return computed || resolved.terminal.fontFamily;
+}
+
+// 宿主字体令牌经 SDK applyTheme 写 :root 内联样式推送（无事件通道）：观察
+// style 属性变化，终端字体随之更新；插件自身写颜色令牌也会触发，
+// 计算值未变时为空操作。
+const hostFontObserver = new MutationObserver(() => {
+  if (!terminal) return;
+  const family = hostTerminalFontFamily(appearance.value);
+  if (family !== terminal.options.fontFamily) {
+    terminal.options.fontFamily = family;
+    scheduleFit();
+  }
+});
+
 function createTerminal() {
   if (!terminalHost.value || terminal) return;
   terminalFontSize.value = loadPersistedTerminalFontSize() ?? appearance.value.terminal.fontSize;
@@ -1263,7 +1349,7 @@ function createTerminal() {
     cursorBlink: true,
     // 细竖线光标（bar）：块状光标在宽字距下显得笨重，竖线更接近常规输入框观感。
     cursorStyle: "bar",
-    fontFamily: appearance.value.terminal.fontFamily,
+    fontFamily: hostTerminalFontFamily(appearance.value),
     fontSize: terminalFontSize.value,
     lineHeight: 1.15,
     scrollback: 25_000,
@@ -1442,7 +1528,7 @@ function applyTerminalFontSize(size: number) {
 
 function openTerminalSearch() {
   if (!terminal) return;
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   // iTerm2 风格：打开搜索时用当前选区首行预填查询，并带入持久化的选项开关。
   searchSeedQuery.value = terminalSearchSeedFromSelection(terminal.getSelection() || "");
   searchSeedOptions.value = sanitizeSearchOptions(window.localStorage.getItem(TERMINAL_SEARCH_OPTIONS_KEY));
@@ -1820,7 +1906,7 @@ const trzszStatusLabel = computed(() => {
 
 /** 右键菜单「Upload (trz)」：向 PTY 发送 trz 触发远端，announce 回来后接管。 */
 function chooseTrzszUpload() {
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   if (!session.value || !canWrite.value || !canStartTrzszTransfer({ zmodemBusy: zmodemBusy.value, trzszBusy: trzszBusy.value })) return;
   applyTrzszEvent({ type: "waiting", direction: "upload" });
   trzszDetectionTimer = window.setTimeout(() => {
@@ -2030,6 +2116,28 @@ function drainTerminalFrames() {
   }
 }
 
+// 传输断开/会话被杀的统一入口：有界退避自动重连，梯子耗尽才落到
+// disconnected 终态等待手动重连。
+function scheduleSessionReconnect() {
+  if (!disposed && reconnectAttempt < TERMINAL_RECONNECT_DELAYS.length) {
+    const delay = terminalReconnectDelay(reconnectAttempt++);
+    terminalState.value = "connecting";
+    reconnectPending.value = true;
+    reconnectTimer = window.setTimeout(() => {
+      if (disposed) return;
+      // 梯子第一级重试前先请宿主按最新配置重开连接（与手动 reconnect 同路径）：
+      // 侧边栏编辑连接（改密码等）会让 sidecar 凭据过期，缺这步自动重连必撞
+      // 旧凭据、落到红色错误态等手动自救——凭据已是新的时这是一次假错误。
+      if (reconnectAttempt === 1) void requestHostReopenConnection().finally(() => { if (!disposed) void openSession(); });
+      else void openSession();
+    }, delay);
+    return;
+  }
+  terminalState.value = "disconnected";
+  reconnectPending.value = false;
+  terminalError.value = t("transportDisconnected");
+}
+
 function handleEvent(event: DbxPluginEvent) {
   if (event.method === "ssh/batchBar/state") {
     const params = event.params as { source?: string; draft?: string; quickPickId?: string; open?: boolean };
@@ -2049,18 +2157,7 @@ function handleEvent(event: DbxPluginEvent) {
     if (event.params.state === "disconnected") {
       // Transport dropped (network flap, server restart): auto-reconnect with
       // a bounded backoff ladder instead of parking on a dead terminal.
-      if (!disposed && reconnectAttempt < TERMINAL_RECONNECT_DELAYS.length) {
-        const delay = terminalReconnectDelay(reconnectAttempt++);
-        terminalState.value = "connecting";
-        reconnectPending.value = true;
-        reconnectTimer = window.setTimeout(() => {
-          if (!disposed) void openSession();
-        }, delay);
-        return;
-      }
-      terminalState.value = "disconnected";
-      reconnectPending.value = false;
-      terminalError.value = t("transportDisconnected");
+      scheduleSessionReconnect();
     }
     return;
   }
@@ -2136,6 +2233,8 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
   // 重试定时器重入时必须保留计数，否则 OPEN_RETRY_MAX 永远打不满，
   // 认证失败等秒级永久错误会无限重试、错误文案永不呈现。
   if (!isRetry) openRetryAttempt = 0;
+  // 重试重入保留等待提示；新入口（用户动作 / 断线重连 / 初次打开）重置。
+  if (!isRetry) inactiveWaiting.value = false;
   // A session opened over a stale one must not inherit a stuck ZMODEM
   // overlay (zmodemBusy would keep swallowing terminal input).
   cancelZmodemUpload();
@@ -2185,6 +2284,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     // 注意 session/directoryTrackingSupported 等响应式状态在 hold 结束后才写入：
     // 提前写入会让 SFTP/工具栏等 watcher 在动画播放期间就开始渲染（画面抖动）。
     connectSucceeded.value = true;
+    inactiveWaiting.value = false;
     const successShownAt = Date.now();
     connectLog.push("info", t("connectCard.log.connected", { seconds: ((Date.now() - attemptStarted) / 1000).toFixed(1) }));
     const replay = await window.dbxPlugin.invoke<ReplayResult>("ssh/terminal/replay", {
@@ -2208,9 +2308,10 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     const attemptMs = Date.now() - attemptStarted;
     // "Connection is not active"：sidecar 连接注册表还没有该连接。boot 恢复
     // 场景（宿主启动时为恢复的插件 tab 重放 connect 生命周期）这是暂时态，
-    // 与其它快失败一起在窗口内重试即可自愈；非 boot 路径（手动重连等）重试
-    // 仍不可能成功，保持立即失败并指引从左侧连接重新打开。认证 / host-key
-    // 拒绝是秒级永久错误，重试不可能自愈——跳过重试直接进 error 态，
+    // 与其它快失败一起在窗口内重试即可自愈；非 boot 路径（手动重连等）宿主只在
+    // 用户从侧边栏重开连接时才重放凭据，因此在有界窗口内轮询等待自愈（卡片
+    // 显示等待文案），窗口耗尽再落错误态并指引从左侧连接重新打开。认证 /
+    // host-key 拒绝是秒级永久错误，重试不可能自愈——跳过重试直接进 error 态，
     // 呈现 friendly 文案 + Reconnect 出口（P1-1）。决策细节见 connectRetry.ts。
     const inactive = isConnectionInactiveError(cause);
     const decision = decideConnectRetry({
@@ -2223,6 +2324,8 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     });
     if (decision.kind === "retry") {
       openRetryAttempt = decision.attempt;
+      // 只有手动入口的 inactive 轮询需要"请在侧边栏重开"提示；boot 恢复由宿主自动重放。
+      inactiveWaiting.value = inactive && !bootRestore;
       terminalState.value = "connecting";
       connectLog.push("warn", t("connectCard.log.retry", { seconds: decision.delayMs / 1000 }));
       reconnectTimer = window.setTimeout(() => {
@@ -2230,6 +2333,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       }, decision.delayMs);
       return;
     }
+    inactiveWaiting.value = false;
     terminalState.value = "error";
     activeTerminalSessionId = "";
     // 日志记录分类后的友好原因（与卡片错误行同源），未分类时保留原始错误串。
@@ -2333,9 +2437,26 @@ async function closeSession(updateStatus = true) {
   persistState();
 }
 
+// 手动重连前请宿主按当前最新配置重开连接：连接在侧边栏被编辑（如改密码）后，
+// 宿主会摘掉 connected 标记且不回推插件，sidecar 里存的凭据就此过期——不先
+// 重开的话 openSession 只会拿旧凭据反复失败。宿主以打开连接的同款流程重新
+// 下发配置（含 vault 里的最新凭据）。旧宿主无 host.reopenConnection：请求
+// 报错静默忽略，行为退化为原样。
+async function requestHostReopenConnection() {
+  if (!connectionId.value) return;
+  try {
+    const api = window.dbxPlugin;
+    if (api.reopenConnection) await api.reopenConnection(connectionId.value);
+    else await api.request("host.reopenConnection", { connectionId: connectionId.value });
+  } catch {
+    // 旧宿主无此方法。
+  }
+}
+
 async function reconnect() {
   terminal?.clear();
   await closeSession(false);
+  await requestHostReopenConnection();
   await openSession();
 }
 
@@ -2350,9 +2471,13 @@ function cancelConnect() {
   connectLog.push("warn", t("connectCard.log.cancelled"));
 }
 
-/** 已取消态的 Connect 出口：重新走完整 openSession 流程（入口会重置取消标记）。 */
-function startConnect() {
+/** 已取消态的 Connect 出口：与错误态 reconnect 同路径——先请宿主按最新配置
+ * 重开连接（侧边栏改密码/连接信息后 sidecar 凭据已过期，缺这步会拿旧凭据
+ * 反复失败、把 inactive 重试梯子耗尽才落错误态），再走完整 openSession
+ * 流程（入口会重置取消标记）。 */
+async function startConnect() {
   connectCancelled.value = false;
+  await requestHostReopenConnection();
   void openSession();
 }
 
@@ -2372,20 +2497,24 @@ async function reconnectNow() {
   await openSession();
 }
 
-// 新建会话（同连接第二个 tab）：桥 openWorkbench 不查重、每次新开 tab，
-// context 复制当前一份并换发新 workbenchId——后端按 workbenchId 开独立 PTY
-// （#41 会话隔离），两个 tab 互不干扰、boot 恢复各回各的会话。克隆的
-// workbenchState 摘掉 sessionId/terminalSequence，避免新 tab 尝试回附旧会话。
+// 新建会话（同连接再开一个 tab）：context 复制当前一份并换发新 workbenchId——
+// 后端按 workbenchId 开独立 PTY（#41 会话隔离），多个 tab 互不干扰、boot 恢复
+// 各回各的会话。克隆的 workbenchState 摘掉 sessionId/terminalSequence，避免新
+// tab 尝试回附旧会话。forceNew 让宿主跳过"同 connectionId 复用已有 tab"的查重
+// （桥路径不传 connectionId，按钮开的 tab 会互相查重，导致只能多开一个）；
+// 旧宿主忽略第三参，退化为原查重行为。connectionId 显式写入 context：宿主的
+// 重推凭据（reinit re-push）与 hostContext 合并都键在 context.connectionId 上，
+// 不能依赖宿主已把它合进 context（旧宿主没有那层合并）。
 function openNewSessionTab() {
   const api = window.dbxPlugin;
   if (!api.openWorkbench || !connectionId.value) return;
-  const context: Record<string, unknown> = { ...hostContext.value, workbenchId: crypto.randomUUID() };
+  const context: Record<string, unknown> = { ...hostContext.value, connectionId: connectionId.value, workbenchId: crypto.randomUUID() };
   const persisted = context.workbenchState;
   if (persisted && typeof persisted === "object") {
     const { sessionId: _sessionId, terminalSequence: _terminalSequence, ...rest } = persisted as Record<string, unknown>;
     context.workbenchState = rest;
   }
-  void api.openWorkbench("io.dbx.ssh.workbench", context);
+  void api.openWorkbench("io.dbx.ssh.workbench", context, { forceNew: true });
 }
 
 async function restoreTransfers() {
@@ -2698,6 +2827,14 @@ const highlightMenuOpen = ref(false);
 const highlightSaving = ref(false);
 const highlightDraftError = ref("");
 const highlightDraft = reactive({ id: undefined as string | undefined, pattern: "", color: HIGHLIGHT_COLOR_DEFAULT, isRegex: false, caseSensitive: false });
+// ToggleGroup（multiple）以字符串数组建模；这里桥接到 draft 的两个布尔标志位。
+const highlightFlagValues = computed<string[]>({
+  get: () => [highlightDraft.isRegex ? "regex" : "", highlightDraft.caseSensitive ? "case" : ""].filter(Boolean),
+  set: (values) => {
+    highlightDraft.isRegex = values.includes("regex");
+    highlightDraft.caseSensitive = values.includes("case");
+  },
+});
 const compiledHighlightRules = computed(() => compileRules(highlightRules.value));
 
 function loadHighlightEnabled(): boolean {
@@ -3114,12 +3251,14 @@ function refreshSideTree() {
   void expandSideTreeNode(root);
 }
 
-/** 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩。 */
-function openSideMenu(payload: { path: string; x: number; y: number }) {
-  terminalMenu.value = undefined;
+/** 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩。
+ *  行处理器只记录负载并互斥收口；定位/打开由包裹侧栏的 reka ContextMenuTrigger
+ *  从冒泡上来的原生 contextmenu 事件完成（DirTree/SideNavPanel 不能再 prevent/stop）。 */
+function openSideMenu(payload: { path: string }) {
+  terminalMenuOpen.value = false;
   fileMenu.value = undefined;
-  blankMenu.value = undefined;
-  sideMenu.value = { x: Math.min(payload.x, window.innerWidth - 190), y: Math.min(payload.y, window.innerHeight - 220), path: payload.path };
+  blankMenu.value = false;
+  sideMenu.value = { path: payload.path };
 }
 
 function sideMenuAction(action: "open" | "copyPath" | "copyName" | "archive") {
@@ -3162,17 +3301,19 @@ async function archiveSidePath(path: string) {
   }
 }
 
-/** 空白处右键：新建文件夹 / 新建文件 / 刷新（三菜单互斥，弹前先关其它）。 */
-function openBlankMenu(payload: { x: number; y: number }) {
-  terminalMenu.value = undefined;
+/** 空白处右键：新建文件夹 / 新建文件 / 刷新（与行菜单共用同一 ContextMenu 根；
+ *  行右键已由 showFileMenu 先行接管，这里按事件目标兜底空白区）。 */
+function onFileAreaContextMenu(event: MouseEvent) {
+  if ((event.target as HTMLElement).closest(".file-row")) return;
+  terminalMenuOpen.value = false;
   fileMenu.value = undefined;
   sideMenu.value = undefined;
-  blankMenu.value = { x: Math.min(payload.x, window.innerWidth - 190), y: Math.min(payload.y, window.innerHeight - 160) };
+  blankMenu.value = true;
 }
 
 function blankMenuAction(action: "mkdir" | "newFile" | "refresh") {
   const menu = blankMenu.value;
-  blankMenu.value = undefined;
+  blankMenu.value = false;
   if (!menu) return;
   if (action === "refresh") {
     void loadDirectory();
@@ -3202,7 +3343,7 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false) {
   const normalized = normalizeRemotePath(path);
   const epochId = listEpoch.next();
   loadingFiles.value = true;
-  if (!fromTerminal) sftpError.value = "";
+  if (!fromTerminal) { sftpError.value = ""; sftpErrorOpen.value = false; }
   try {
     const result = await window.dbxPlugin.invoke<{ entries: SftpEntry[] }>(sudoMode.value ? "sudo/listDir" : "sftp/list", {
       sessionId: session.value.sessionId,
@@ -3222,7 +3363,7 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false) {
     if (!listEpoch.isCurrent(epochId)) return;
     const message = cause instanceof Error ? cause.message : String(cause);
     if (fromTerminal) showNotice(t("followDirectoryFailed", { path: normalized, error: message }));
-    else sftpError.value = message;
+    else { sftpError.value = message; sftpErrorKey.value += 1; sftpErrorOpen.value = true; }
   } finally {
     if (listEpoch.isCurrent(epochId)) loadingFiles.value = false;
   }
@@ -3290,10 +3431,11 @@ function loadSftpPaneDefaultOpen(): boolean {
   }
 }
 
-// 下载偏好（保存目录 + 每次询问）：权威存储在 sidecar preferences.json——
-// 工作台 iframe 是 sandbox="allow-scripts"（opaque origin），localStorage
-// 直接抛 SecurityError；localStorage 仅作 web 浏览器直连场景的同步缓存。
-let downloadPrefsHydrated = false;
+// 下载偏好（保存目录 + 每次询问 + 终端字体来源）：权威存储在 sidecar
+// preferences.json——工作台 iframe 是 sandbox="allow-scripts"（opaque
+// origin），localStorage 直接抛 SecurityError；localStorage 仅作 web
+// 浏览器直连场景的同步缓存。
+let prefsHydrated = false;
 
 function loadDownloadDir(): string {
   return downloadDirState.value;
@@ -3301,7 +3443,7 @@ function loadDownloadDir(): string {
 
 function persistDownloadDir(value: string) {
   downloadDirState.value = value.trim();
-  void syncDownloadPrefs();
+  void syncPrefs();
 }
 
 function loadDownloadUseDefaultDir(): boolean {
@@ -3310,7 +3452,7 @@ function loadDownloadUseDefaultDir(): boolean {
 
 function persistDownloadUseDefaultDir(value: boolean) {
   downloadUseDefaultState.value = value;
-  void syncDownloadPrefs();
+  void syncPrefs();
 }
 
 function loadDownloadConflictPolicy(): DownloadConflictPolicy {
@@ -3319,10 +3461,10 @@ function loadDownloadConflictPolicy(): DownloadConflictPolicy {
 
 function persistDownloadConflictPolicy(value: DownloadConflictPolicy) {
   downloadConflictState.value = sanitizeConflictPolicy(value);
-  void syncDownloadPrefs();
+  void syncPrefs();
 }
 
-function cacheDownloadPrefs() {
+function cachePrefs() {
   try {
     if (downloadDirState.value) window.localStorage.setItem(DOWNLOAD_DIR_KEY, downloadDirState.value);
     else window.localStorage.removeItem(DOWNLOAD_DIR_KEY);
@@ -3336,8 +3478,8 @@ function cacheDownloadPrefs() {
   }
 }
 
-async function syncDownloadPrefs() {
-  cacheDownloadPrefs();
+async function syncPrefs() {
+  cachePrefs();
   try {
     await window.dbxPlugin.invoke("local/preferences/set", {
       downloadDir: downloadDirState.value,
@@ -3349,9 +3491,9 @@ async function syncDownloadPrefs() {
   }
 }
 
-async function hydrateDownloadPrefs() {
-  if (downloadPrefsHydrated) return;
-  downloadPrefsHydrated = true;
+async function hydratePrefs() {
+  if (prefsHydrated) return;
+  prefsHydrated = true;
   try {
     downloadDirState.value = window.localStorage.getItem(DOWNLOAD_DIR_KEY)?.trim() || "";
     downloadUseDefaultState.value = window.localStorage.getItem(DOWNLOAD_USE_DEFAULT_KEY) !== "0";
@@ -3364,7 +3506,7 @@ async function hydrateDownloadPrefs() {
     if (typeof prefs.downloadDir === "string") downloadDirState.value = prefs.downloadDir.trim();
     if (typeof prefs.downloadUseDefaultDir === "boolean") downloadUseDefaultState.value = prefs.downloadUseDefaultDir;
     if (prefs.downloadConflictPolicy !== undefined) downloadConflictState.value = sanitizeConflictPolicy(prefs.downloadConflictPolicy);
-    cacheDownloadPrefs();
+    cachePrefs();
   } catch {
     // 旧 sidecar：保留 localStorage 种子或默认。
   }
@@ -4706,12 +4848,12 @@ async function copyTerminalSelection() {
   } catch {
     showError(new Error(t("terminalCopyUnavailable")), "terminal");
   }
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   terminal?.focus();
 }
 
 async function pasteTerminal() {
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   try {
     const text = await readClipboardText(clipboardDeps());
     await sendConfirmedPaste(text || "");
@@ -4761,18 +4903,18 @@ function resolvePasteConfirm(accepted: boolean) {
 
 function selectAllTerminal() {
   terminal?.selectAll();
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   terminal?.focus();
 }
 
 function clearTerminal() {
   terminal?.clear();
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   terminal?.focus();
 }
 
 function chooseZmodem() {
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   zmodemInput.value?.click();
 }
 
@@ -5090,6 +5232,11 @@ function pickBatchTargets(mode: "all" | "connected") {
 }
 
 // 下拉切换命令：回填输入框（Electerm 语义），发送仍由回车/发送按钮触发。
+function onBatchQuickPick(value: unknown) {
+  batchQuickPickId.value = value == null ? "" : String(value);
+  applyBatchQuickPick();
+}
+
 function applyBatchQuickPick() {
   const command = quickPickCommandById(quickCommands.value, batchQuickPickId.value);
   if (command) {
@@ -5624,7 +5771,7 @@ async function openReplay(item: RecordingSummary) {
         rows: 26,
         convertEol: false,
         theme: terminalTheme(),
-        fontFamily: appearance.value.terminal.fontFamily,
+        fontFamily: hostTerminalFontFamily(appearance.value),
         fontSize: appearance.value.terminal.fontSize,
       });
       replayTerminal.open(replayHost.value);
@@ -5930,7 +6077,7 @@ function beginChmod(entry: SftpEntry) {
 
 async function openSettings() {
   settingsOpen.value = true;
-  await hydrateDownloadPrefs();
+  await hydratePrefs();
   downloadDirDraft.value = loadDownloadDir();
   downloadUseDefaultDraft.value = loadDownloadUseDefaultDir();
   downloadConflictDraft.value = loadDownloadConflictPolicy();
@@ -6301,52 +6448,47 @@ function onZmodemInput(event: Event) {
 }
 
 function showTerminalMenu(event: MouseEvent) {
-  event.preventDefault();
   // 选中复制模式下右键直接粘贴；Shift+右键（或关闭该模式）保留完整菜单。
+  // 粘贴分支必须 preventDefault：reka 触发器据此跳过开菜单（同时也压住系统菜单）；
+  // 菜单分支不能 preventDefault，否则 reka ContextMenuTrigger 不会打开。
   if (resolveTerminalRightClickAction({ selectCopy: termSelectCopy.value, shiftKey: event.shiftKey }) === "paste") {
-    terminalMenu.value = undefined;
+    event.preventDefault();
+    terminalMenuOpen.value = false;
     fileMenu.value = undefined;
     void pasteTerminal();
     return;
   }
-  terminalMenu.value = { x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 250) };
+  terminalMenuOpen.value = true;
   fileMenu.value = undefined;
 }
 
 function showFileMenu(event: MouseEvent, entry: SftpEntry) {
-  event.preventDefault();
-  // .stop 防止冒泡到文件列表容器的空白右键菜单（空白菜单会覆盖行菜单的回归）。
-  event.stopPropagation();
+  // 不再 preventDefault/stopPropagation：事件要冒泡到包裹 .file-rows 的
+  // ContextMenuTrigger 完成定位与打开；空白区与行共用同一菜单根，由容器处理器
+  // onFileAreaContextMenu 按事件目标区分（行内目标直接返回）。
   selectedPath.value = entry.uri;
   fileMenu.value = {
-    x: Math.min(event.clientX, window.innerWidth - 190),
-    y: Math.min(event.clientY, window.innerHeight - 290),
     entry,
     selection: [...selectedUris.value],
   };
-  terminalMenu.value = undefined;
-  blankMenu.value = undefined;
+  terminalMenuOpen.value = false;
+  blankMenu.value = false;
   sideMenu.value = undefined;
   transferHistoryMenu.value = undefined;
 }
 
 function showTransferHistoryMenu(event: MouseEvent, entry: TransferHistoryEntry) {
-  event.preventDefault();
-  event.stopPropagation();
-  // 浏览器下载、上传及旧记录都可能没有可验证的本机路径：拦截系统菜单，
-  // 但不展示无效操作。
+  // 浏览器下载、上传及旧记录都可能没有可验证的本机路径：拦截系统菜单与
+  // reka 触发器（preventDefault 后 reka 跳过打开），但不展示无效操作。
   if (!entry.localPath) {
+    event.preventDefault();
     transferHistoryMenu.value = undefined;
     return;
   }
-  transferHistoryMenu.value = {
-    x: Math.min(event.clientX, window.innerWidth - 190),
-    y: Math.min(event.clientY, window.innerHeight - 100),
-    path: entry.localPath,
-  };
-  terminalMenu.value = undefined;
+  transferHistoryMenu.value = { taskId: entry.taskId };
+  terminalMenuOpen.value = false;
   fileMenu.value = undefined;
-  blankMenu.value = undefined;
+  blankMenu.value = false;
   sideMenu.value = undefined;
 }
 
@@ -6362,7 +6504,7 @@ function showTransferHistoryMenu(event: MouseEvent, entry: TransferHistoryEntry)
  */
 function closeToolbarPopovers() {
   fileMenu.value = undefined;
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   transferHistoryMenu.value = undefined;
   transferPanelOpen.value = false;
   columnsOpen.value = false;
@@ -6376,12 +6518,19 @@ function closeToolbarPopovers() {
 }
 
 function closeMenus() {
-  terminalMenu.value = undefined;
+  terminalMenuOpen.value = false;
   fileMenu.value = undefined;
-  blankMenu.value = undefined;
+  blankMenu.value = false;
   sideMenu.value = undefined;
   transferHistoryMenu.value = undefined;
   closeToolbarPopovers();
+}
+
+/** document click 收口：reka 菜单/弹层内容 portal 到 body，内部点击会冒泡到
+ *  document——旧实现面板上有 @click.stop，内部点击从不触发这里的清扫，保持语义一致。 */
+function onDocumentClickCloseMenus(event: MouseEvent) {
+  if ((event.target as HTMLElement | null)?.closest?.('[data-slot="context-menu-content"], [data-slot="popover-content"]')) return;
+  closeMenus();
 }
 
 /** 多选批量：复制所选路径（换行拼接写入剪贴板）。 */
@@ -6394,10 +6543,10 @@ function copySelectedPaths() {
 }
 
 /**
- * 弹层焦点管理（P1-2）：打开时焦点进入弹层首控件、Tab 圈定在弹层内、
- * 关闭后归还触发元素。原生 autofocus 在 Vue 动态插入时不生效，改为
- * 显式驱动；决策逻辑走 modalFocus 纯函数（有单测），Esc 关闭链沿用
- * 下方 onDocumentKeydown 的分层退出。
+ * 弹层焦点管理（P1-2）：打开时焦点进入弹层首控件、关闭后归还触发元素。
+ * 原生 autofocus 在 Vue 动态插入时不生效，改为显式驱动；Tab 圈定已移交
+ * reka Dialog 的 FocusScope（Phase 6），Esc 关闭链沿用下方
+ * onDocumentKeydown 的分层退出。
  */
 // 触发元素栈：与弹层嵌套深度同步 push/pop。右键菜单项这类"打开弹层后自身
 // 随菜单卸载"的触发元素无法承接归还焦点，逐层弹出时跳过已断连元素。
@@ -6411,23 +6560,8 @@ let lastStableFocus: HTMLElement | null = null;
 const ghostClickGuard = createGhostClickGuard();
 function onDocumentMouseDownCapture(event: MouseEvent) {
   ghostClickGuard.noteMouseDown();
-  // 批量目标弹层点空白收起：capture 阶段先于 batch-bar 的 @mousedown.stop 生效，
-  // 条内空白/终端区/工具栏任意 mousedown 都能关；popover 内部与触发按钮
-  // （触发按钮自身是 toggle 语义）不处理，避免关了又开的抖动。
-  if (batchTargetsOpen.value) {
-    const target = event.target;
-    if (target instanceof HTMLElement && !target.closest(".batch-targets-popover") && !target.closest(".batch-bar-targets")) {
-      batchTargetsOpen.value = false;
-    }
-  }
-  // 关键词高亮管理弹层点空白收起：capture 阶段先于 popover 内部处理；
-  // popover 内部与触发按钮（toggle 语义）不处理，避免关了又开的抖动。
-  if (highlightMenuOpen.value) {
-    const target = event.target;
-    if (target instanceof HTMLElement && !target.closest(".highlight-rules-popover") && !target.closest(".highlight-rules-trigger")) {
-      highlightMenuOpen.value = false;
-    }
-  }
+  // 批量目标/高亮规则两个 popover 的点空白收起已移交 reka DismissableLayer
+  // （pointerdown-outside → update:open(false)），capture 手动清扫移除。
 }
 function onDocumentClickCapture(event: MouseEvent) {
   if (!ghostClickGuard.shouldSuppress()) return;
@@ -6437,7 +6571,7 @@ function onDocumentClickCapture(event: MouseEvent) {
 function trackStableFocus(event: FocusEvent) {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
-  if (target.closest(".modal-backdrop") || target.closest(".context-menu")) return;
+  if (target.closest('[data-slot="dialog-content"]') || target.closest('[data-slot="context-menu-content"]')) return;
   lastStableFocus = target;
 }
 // 与 Esc 关闭链同源的弹层在开状态（hostKey/agent 审批属安全弹窗：
@@ -6468,10 +6602,10 @@ const modalOpenStates = computed(() => [
 ]);
 const modalOpenCount = computed(() => modalOpenStates.value.filter(Boolean).length);
 
-/** 当前最顶层弹层容器；无弹层时返回 null（同时只开一层，取首个命中即可）。 */
+/** 当前最顶层弹层容器；无弹层时返回 null（嵌套时取首个命中即最外层——焦点回落语义）。 */
 function topModalContainer(): HTMLElement | null {
   if (!modalOpenCount.value) return null;
-  return document.querySelector<HTMLElement>(".modal-backdrop .modal");
+  return document.querySelector<HTMLElement>('[data-slot="dialog-content"]');
 }
 
 function focusTopModal() {
@@ -6514,20 +6648,14 @@ watch(modalOpenCount, (count, previous) => {
  * 逐层 if-return：无内容打开时按键穿透，不影响终端内 vim 等自身 Esc 语义。
  */
 function onDocumentKeydown(event: KeyboardEvent) {
-  if (event.key === "Tab") {
-    // 弹层 Tab 焦点陷阱（P1-2）：仅当弹层在场时圈定，无弹层不拦截
-    // （终端/shell 内 Tab 补全等语义不受影响）。
-    const container = topModalContainer();
-    if (!container) return;
-    const focusables = focusableElements(container);
-    const currentIndex = focusables.indexOf(document.activeElement as HTMLElement);
-    const index = nextFocusIndex(focusables.length, currentIndex, event.shiftKey);
-    if (index < 0) return;
-    event.preventDefault();
-    focusables[index]?.focus({ preventScroll: true });
-    return;
-  }
+  // Tab 焦点陷阱已移交 reka Dialog 的 FocusScope（每个弹层独立圈定，嵌套时顶层
+  // 生效）；此处不再拦截 Tab。注意 FocusScope 的 keydown 挂在内容元素上，冒泡先于
+  // 本 document 处理器，若恢复自制陷阱会与 reka 双步进，勿回退。
+  if (event.key === "Tab") return;
   if (event.key !== "Escape") return;
+  // reka Select/ContextMenu/Popover 弹层打开时 Esc 由 reka 消费（关弹层），不落入下方
+  // 弹窗关闭链。本处理器注册早于 DismissableLayer，先跑时弹层 DOM 仍在。
+  if (document.querySelector('[data-slot="select-content"], [data-slot="context-menu-content"], [data-slot="popover-content"]')) return;
   // 录制倒计时优先取消（遮罩在终端区，不属于弹层体系）。
   if (isCountdownActive(recordCountdown.value)) {
     cancelRecordCountdown();
@@ -6620,27 +6748,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
     settingsOpen.value = false;
     return;
   }
-  // ---- 右键菜单（文件/终端/侧栏/空白/传输历史互斥，一次全清）----
-  if (fileMenu.value || terminalMenu.value || sideMenu.value || blankMenu.value || transferHistoryMenu.value) {
-    fileMenu.value = undefined;
-    terminalMenu.value = undefined;
-    sideMenu.value = undefined;
-    blankMenu.value = undefined;
-    transferHistoryMenu.value = undefined;
-    return;
-  }
-  // ---- 工具栏弹出层（含指标浮层，R5-P2-1：同列 popover 一并进 Esc 链；
-  //      高亮规则/终端 MCP 模式为收敛后新增弹层，同列收口）----
-  if (quickMenuOpen.value || pathHistoryOpen.value || columnsOpen.value || transferPanelOpen.value || connectionInfoOpen.value || metricsOpen.value || batchTargetsOpen.value || batchSaveMode.value || bookmarkSaveOpen.value || highlightMenuOpen.value || agentModeOpen.value) {
-    quickMenuOpen.value = false;
-    highlightMenuOpen.value = false;
-    agentModeOpen.value = false;
-    pathHistoryOpen.value = false;
-    columnsOpen.value = false;
-    transferPanelOpen.value = false;
-    connectionInfoOpen.value = false;
-    bookmarkSaveOpen.value = false;
-    batchTargetsOpen.value = false;
+  // 右键菜单与九个工具栏 popover 均已迁移 reka（ContextMenu/Popover）：Esc 与外点
+  // 由 reka 自行消费（见上方 content 守卫），不再占 Esc 链一层。本层只剩
+  // 指标浮层（.metrics-float 非 reka）与批量保存态（带草稿清理）。
+  if (metricsOpen.value || batchSaveMode.value) {
     if (batchSaveMode.value) cancelBatchBarSave();
     if (metricsOpen.value) closeMetrics();
   }
@@ -6720,8 +6831,19 @@ async function initialize() {
   ]);
   locale.value = api.locale || "zh-CN";
   restoreUiState();
+  const appearanceAppliedAtBoot = Boolean(api.appearance || api.theme);
   if (api.appearance) applyAppearance(api.appearance);
   else if (isDbxPluginTheme(api.theme)) applyAppearance(themeToAppearance(api.theme));
+  // 宿主可能在 init 前先应答 host.getContext（如重推连接期间 init 被延迟）：
+  // 此时 api.locale/appearance 仍是 bootstrap 默认值。init 落地后重读一次，
+  // 否则会话会停在默认英文/默认主题。ready 已解决时 then 立即执行，是幂等重读。
+  void api.ready.then(() => {
+    if (api.locale) locale.value = api.locale;
+    if (!appearanceAppliedAtBoot) {
+      if (api.appearance) applyAppearance(api.appearance);
+      else if (isDbxPluginTheme(api.theme)) applyAppearance(themeToAppearance(api.theme));
+    }
+  });
   unsubscribeAppearance = api.onAppearanceChange?.(applyAppearance);
   // appearance 契约缺失（当前 1.1 桥只推 theme）时订阅 env 主题推送，两套不同时挂。
   if (!unsubscribeAppearance) unsubscribeTheme = onHostThemeChange((theme) => applyAppearance(themeToAppearance(theme)));
@@ -6776,18 +6898,21 @@ async function findReattachSession(): Promise<string> {
 watch([splitRatio, paneOrder, sftpPaneOpen, followDirectory, sudoMode, visibleColumns], persistState, { deep: true });
 
 onMounted(() => {
-  document.addEventListener("click", closeMenus);
+  document.addEventListener("click", onDocumentClickCloseMenus);
   document.addEventListener("click", onDocumentClickCapture, true);
   document.addEventListener("mousedown", onDocumentMouseDownCapture, true);
   document.addEventListener("keydown", onDocumentKeydown);
   document.addEventListener("focusin", trackStableFocus);
   document.addEventListener("mouseover", onTooltipOver);
   document.addEventListener("mouseout", onTooltipOut);
+  document.addEventListener("focusin", onTooltipFocusIn);
+  document.addEventListener("focusout", onTooltipFocusOut);
   document.addEventListener("pointerdown", hideTooltip, true);
   document.addEventListener("wheel", hideTooltip, true);
+  hostFontObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["style"] });
   void hydrateQuickCommands();
   void hydrateHighlightRules();
-  void hydrateDownloadPrefs();
+  void hydratePrefs();
   void initialize().catch((cause) => {
     terminalState.value = "error";
     showError(cause, "terminal");
@@ -6798,8 +6923,11 @@ onBeforeUnmount(() => {
   disposed = true;
   document.removeEventListener("mouseover", onTooltipOver);
   document.removeEventListener("mouseout", onTooltipOut);
+  document.removeEventListener("focusin", onTooltipFocusIn);
+  document.removeEventListener("focusout", onTooltipFocusOut);
   document.removeEventListener("pointerdown", hideTooltip, true);
   document.removeEventListener("wheel", hideTooltip, true);
+  hostFontObserver.disconnect();
   hideTooltip();
   window.clearTimeout(persistTimer);
   window.clearInterval(recordCountdownTimer);
@@ -6807,8 +6935,6 @@ onBeforeUnmount(() => {
   window.clearTimeout(resizeTimer);
   window.clearTimeout(reconnectTimer);
   window.clearInterval(reconnectCountdownTimer);
-  window.clearTimeout(noticeTimer);
-  window.clearTimeout(errorTimer);
   window.clearTimeout(zmodemDetectionTimer);
   window.clearTimeout(trzszDetectionTimer);
   window.clearTimeout(trzszWatchdogTimer);
@@ -6827,7 +6953,7 @@ onBeforeUnmount(() => {
     if (terminalMouseDownHandler) terminalHost.value.removeEventListener("mousedown", terminalMouseDownHandler);
     if (terminalMouseUpHandler) terminalHost.value.removeEventListener("mouseup", terminalMouseUpHandler);
   }
-  document.removeEventListener("click", closeMenus);
+  document.removeEventListener("click", onDocumentClickCloseMenus);
   document.removeEventListener("click", onDocumentClickCapture, true);
   document.removeEventListener("mousedown", onDocumentMouseDownCapture, true);
   document.removeEventListener("keydown", onDocumentKeydown);
@@ -6860,16 +6986,19 @@ onBeforeUnmount(() => {
 <template>
   <main class="workbench">
     <header class="toolbar" :style="toolbarStyle">
-      <!-- 连接信息入口：Info 图标按钮紧跟标识区（状态徽章右侧），弹层锚在左侧 -->
-      <div class="identity-side menu-anchor">
+      <!-- 连接信息入口：Info 图标按钮紧跟标识区（状态徽章右侧），弹层左对齐锚定 -->
+      <div class="identity-side">
         <div class="identity">
           <span v-if="connection.color" class="connection-color" :style="{ backgroundColor: connection.color }" />
           <strong>{{ connectionIdentity }}</strong>
           <span v-if="connection.readOnly || connectionReadOnly" class="read-only-badge">{{ t("readOnly") }}</span>
           <span class="session-pill" :class="`session-${sessionStatus}`"><span class="session-dot" aria-hidden="true" />{{ t(`sessionStatus.${sessionStatus}`) }}<span v-if="sessionStatus === 'reconnecting' && reconnectCountdown" class="session-pill-countdown mono">{{ t("sessionStatus.reconnectCountdown", { seconds: reconnectCountdown.seconds, attempt: reconnectCountdown.attempt }) }}</span></span>
         </div>
-        <button type="button" class="icon-button icon-neutral" :title="t('connectionInfo')" :aria-expanded="connectionInfoOpen" @click.stop="toggleConnectionInfo"><Info /></button>
-        <section v-if="connectionInfoOpen" class="popover popover-left connection-info-popover" @click.stop>
+        <Popover :open="connectionInfoOpen" @update:open="(open) => { if (!open) connectionInfoOpen = false; }">
+          <PopoverAnchor as-child>
+            <button type="button" class="icon-button icon-neutral" :title="t('connectionInfo')" :aria-expanded="connectionInfoOpen" @click.stop="toggleConnectionInfo"><Info /></button>
+          </PopoverAnchor>
+          <PopoverContent class="popover connection-info-popover" align="start" :side-offset="5">
           <h3>{{ t("connectionInfo") }}</h3>
           <dl class="connection-info-grid">
             <dt>{{ t("connectionInfoHost") }}</dt><dd class="mono"><span v-if="metricsDistroBadge" class="distro-badge" :style="{ backgroundColor: metricsDistroBadge.color }" :title="metricsDistroBadge.name">{{ metricsDistroBadge.label }}</span> {{ connection.host || connection.name || "–" }}</dd>
@@ -6884,7 +7013,8 @@ onBeforeUnmount(() => {
               <button class="link-button" :disabled="connectionLatencyBusy || !connected" @click="measureLatency">{{ t("connectionInfoMeasure") }}</button>
             </dd>
           </dl>
-        </section>
+          </PopoverContent>
+        </Popover>
       </div>
       <div class="toolbar-actions">
         <button class="icon-button icon-neutral" :title="paneOrder === 'terminal-left' ? t('moveSftpLeft') : t('moveTerminalLeft')" @click="togglePaneOrder"><ArrowLeftRight /></button>
@@ -6899,15 +7029,18 @@ onBeforeUnmount(() => {
         <button class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
         <button class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
         <label class="follow-directory-control" :title="t('followTerminal')">
-          <button class="switch-control" type="button" role="switch" :aria-checked="followDirectory" :disabled="!connected" @click="setDirectoryTracking(!followDirectory)"><span /></button>
+          <Switch size="sm" :model-value="followDirectory" :disabled="!connected" @update:model-value="setDirectoryTracking" />
           <span>{{ t("followTerminal") }}</span>
         </label>
         <span class="toolbar-separator" aria-hidden="true" />
         <button class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
         <button class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
-        <div class="menu-anchor">
-          <button class="icon-button icon-amber" :title="t('quickCommands')" :disabled="!connected" @click.stop="toggleQuickMenu"><Zap /></button>
-          <section v-if="quickMenuOpen" class="popover quick-commands-popover" @click.stop>
+        <div>
+          <Popover :open="quickMenuOpen" @update:open="(open) => { if (!open) quickMenuOpen = false; }">
+            <PopoverAnchor as-child>
+              <button class="icon-button icon-amber" :title="t('quickCommands')" :disabled="!connected" @click.stop="toggleQuickMenu"><Zap /></button>
+            </PopoverAnchor>
+            <PopoverContent class="popover quick-commands-popover" align="end" :side-offset="5">
             <!-- Termius Snippets 式结构：列表态（搜索 + 卡片 + 整宽新建按钮）与
                  编辑器子视图（返回 + 名称 + 多行命令 + 保存）两个视图切换。 -->
             <template v-if="!quickEditorOpen">
@@ -6955,22 +7088,30 @@ onBeforeUnmount(() => {
                 </div>
               </footer>
             </template>
-          </section>
+            </PopoverContent>
+          </Popover>
         </div>
-        <div class="menu-anchor">
-          <button class="icon-button" :class="agentMode === 'off' ? 'icon-neutral' : 'icon-emerald is-active'" :title="t('agentTerminalQuickHint')" :disabled="!connected" @click.stop="toggleAgentModeMenu"><Bot /></button>
-          <section v-if="agentModeOpen" class="popover agent-mode-popover" @click.stop>
+        <div>
+          <Popover :open="agentModeOpen" @update:open="(open) => { if (!open) agentModeOpen = false; }">
+            <PopoverAnchor as-child>
+              <button class="icon-button" :class="agentMode === 'off' ? 'icon-neutral' : 'icon-emerald is-active'" :title="t('agentTerminalQuickHint')" :aria-pressed="agentMode !== 'off'" :disabled="!connected" @click.stop="toggleAgentModeMenu"><Bot /></button>
+            </PopoverAnchor>
+            <PopoverContent class="popover agent-mode-popover" align="end" :side-offset="5">
             <h3>{{ t("agentTerminalSection") }}</h3>
             <label v-for="mode in AGENT_MODES" :key="mode" class="agent-mode-option">
               <input type="radio" name="agent-mode" :checked="agentMode === mode" :disabled="agentModeBusy" @change="applyAgentMode(mode)" />
               <span>{{ t(`agentTerminal${mode === "off" ? "Off" : mode === "auto" ? "Auto" : "Strict"}`) }}</span>
             </label>
             <p class="muted agent-mode-note">{{ agentModeHint }}</p>
-          </section>
+            </PopoverContent>
+          </Popover>
         </div>
-        <div class="menu-anchor">
-          <button class="icon-button icon-violet highlight-rules-trigger" :class="{ 'is-active': highlightMenuOpen }" :title="t('highlightRules.title')" @click.stop="toggleHighlightMenu"><Palette /></button>
-          <section v-if="highlightMenuOpen" class="popover highlight-rules-popover" @click.stop>
+        <div>
+          <Popover :open="highlightMenuOpen" @update:open="(open) => { if (!open) highlightMenuOpen = false; }">
+            <PopoverAnchor as-child>
+              <button class="icon-button icon-violet" :class="{ 'is-active': highlightMenuOpen }" :title="t('highlightRules.title')" :aria-pressed="highlightMenuOpen" @click.stop="toggleHighlightMenu"><Palette /></button>
+            </PopoverAnchor>
+            <PopoverContent class="popover highlight-rules-popover" align="end" :side-offset="5">
             <h3>{{ t("highlightRules.title") }}</h3>
             <div v-if="!highlightRules.length" class="empty compact">{{ t("highlightRules.empty") }}</div>
             <div v-else class="highlight-rule-list">
@@ -6995,8 +7136,10 @@ onBeforeUnmount(() => {
             <footer class="highlight-editor">
               <div class="highlight-editor-inputs">
                 <input v-model="highlightDraft.pattern" :placeholder="t('highlightRules.patternPlaceholder')" :maxlength="200" spellcheck="false" @keydown.enter="saveHighlightRule" />
-                <label class="highlight-editor-flag" :title="t('highlightRules.regex')"><input v-model="highlightDraft.isRegex" type="checkbox" />.*</label>
-                <label class="highlight-editor-flag" :title="t('highlightRules.caseSensitive')"><input v-model="highlightDraft.caseSensitive" type="checkbox" />Aa</label>
+                <ToggleGroup v-model="highlightFlagValues" type="multiple" class="highlight-editor-flags">
+                  <ToggleGroupItem value="regex" class="highlight-editor-flag-item" :title="t('highlightRules.regex')">.*</ToggleGroupItem>
+                  <ToggleGroupItem value="case" class="highlight-editor-flag-item" :title="t('highlightRules.caseSensitive')">Aa</ToggleGroupItem>
+                </ToggleGroup>
               </div>
               <div class="highlight-palette">
                 <button v-for="swatch in HIGHLIGHT_PALETTE" :key="swatch" type="button" class="highlight-palette-swatch" :class="{ selected: highlightDraft.color.toLowerCase() === swatch }" :style="{ backgroundColor: swatch }" :aria-label="swatch" @click="highlightDraft.color = swatch" />
@@ -7009,24 +7152,35 @@ onBeforeUnmount(() => {
               </div>
               <p v-if="highlightDraftError" class="task-error">{{ highlightDraftError }}</p>
             </footer>
-          </section>
+            </PopoverContent>
+          </Popover>
         </div>
-        <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
+        <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :aria-pressed="metricsOpen" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
         <button class="icon-button" :class="{ 'is-recording': recordingActive }" :title="recordingActive ? t('recordingStop') : t('recordingTitle')" :disabled="!connected" @click="toggleRecording"><Disc /></button>
-        <button class="icon-button" :class="{ 'is-active': recordingsOpen }" :title="t('recordingsTitle')" @click="toggleRecordings"><Film /></button>
+        <button class="icon-button" :class="{ 'is-active': recordingsOpen }" :title="t('recordingsTitle')" :aria-pressed="recordingsOpen" @click="toggleRecordings"><Film /></button>
         <button class="icon-button icon-violet" :title="t('settings')" :disabled="!connected" @click="openSettings"><Settings /></button>
         <button class="icon-button icon-amber" :title="t('auditLog.title')" @click="openAuditLog"><FileText /></button>
-        <div class="menu-anchor">
-          <button class="icon-button icon-violet" :title="t('customizeColumns')" @click.stop="toggleColumnsMenu"><Columns3 /></button>
-          <div v-if="columnsOpen" class="popover columns-popover" @click.stop>
+        <div>
+          <Popover :open="columnsOpen" @update:open="(open) => { if (!open) columnsOpen = false; }">
+            <PopoverAnchor as-child>
+              <button class="icon-button icon-violet" :title="t('customizeColumns')" @click.stop="toggleColumnsMenu"><Columns3 /></button>
+            </PopoverAnchor>
+            <PopoverContent class="popover columns-popover" align="end" :side-offset="5">
             <label v-for="column in (['size', 'modified', 'permissions'] as SftpColumn[])" :key="column"><input type="checkbox" :checked="visibleColumns.includes(column)" @change="toggleColumn(column)" />{{ t(column) }}</label>
             <hr class="columns-popover-separator" />
             <label :title="t('sftpPane.defaultOpenHint')"><input type="checkbox" :checked="sftpPaneDefaultOpen" @change="toggleSftpPaneDefaultOpen" />{{ t("sftpPane.defaultOpen") }}</label>
-          </div>
+            </PopoverContent>
+          </Popover>
         </div>
-        <div class="menu-anchor">
-          <button class="icon-button icon-blue" :title="t('transfers')" @click.stop="toggleTransferPanel"><ArrowUpDown /><span v-if="activeTransfers" class="activity-dot" /></button>
-          <section v-if="transferPanelOpen" class="popover transfer-popover" @click.stop @contextmenu.prevent.stop>
+        <div>
+          <!-- 历史卡右键菜单（ContextMenu）打开时忽略弹层的外点关闭请求：
+               菜单项 pointerdown 相对弹层是"外部"，不加守卫会在 select 前把宿主弹层
+               连同菜单一起卸载，动作丢失。 -->
+          <Popover :open="transferPanelOpen" @update:open="(open) => { if (!open && !transferHistoryMenu) transferPanelOpen = false; }">
+            <PopoverAnchor as-child>
+              <button class="icon-button icon-blue" :title="t('transfers')" @click.stop="toggleTransferPanel"><ArrowUpDown /><span v-if="activeTransfers" class="activity-dot" /></button>
+            </PopoverAnchor>
+            <PopoverContent class="popover transfer-popover" align="end" :side-offset="5">
             <h3>{{ t("transfers") }}</h3>
             <div v-if="!transferList.length" class="empty compact">{{ t("noTransfers") }}</div>
             <article v-for="task in transferList" :key="task.taskId" class="transfer-card">
@@ -7066,25 +7220,46 @@ onBeforeUnmount(() => {
             </div>
             <div v-else-if="transferHistoryLoading && !transferHistory.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
             <div v-else-if="!transferHistory.length" class="empty compact">{{ t("transfersHistory.empty") }}</div>
-            <article v-for="entry in transferHistory" :key="entry.taskId" class="transfer-card transfer-history-card" @contextmenu="showTransferHistoryMenu($event, entry)">
-              <div class="transfer-title"><FileUp v-if="entry.direction === 'upload'" /><Download v-else /><span :title="entry.fileName">{{ entry.fileName || entry.taskId }}</span></div>
-              <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span>{{ formatBytes(entry.size) }}</span></div>
-              <p v-if="entry.localPath" class="transfer-path mono" :title="entry.localPath">{{ entry.localPath }}</p>
-              <p v-if="entry.error" class="task-error">{{ entry.error }}</p>
-            </article>
-          </section>
+            <ContextMenu v-for="entry in transferHistory" :key="entry.taskId" :open="transferHistoryMenu?.taskId === entry.taskId" @update:open="(open) => { if (!open && transferHistoryMenu?.taskId === entry.taskId) transferHistoryMenu = undefined; }">
+              <ContextMenuTrigger as-child>
+                <article class="transfer-card transfer-history-card" @contextmenu="showTransferHistoryMenu($event, entry)">
+                  <div class="transfer-title"><FileUp v-if="entry.direction === 'upload'" /><Download v-else /><span :title="entry.fileName">{{ entry.fileName || entry.taskId }}</span></div>
+                  <div class="transfer-meta"><span>{{ t(`transferStatus.${entry.status}`) }}</span><span>{{ formatBytes(entry.size) }}</span></div>
+                  <p v-if="entry.localPath" class="transfer-path mono" :title="entry.localPath">{{ entry.localPath }}</p>
+                  <p v-if="entry.error" class="task-error">{{ entry.error }}</p>
+                </article>
+              </ContextMenuTrigger>
+              <ContextMenuContent>
+                <ContextMenuItem @select="entry.localPath && revealTransferTarget(entry.localPath)"><FolderOpen />{{ t("revealInFolder") }}</ContextMenuItem>
+                <ContextMenuItem @select="entry.localPath && openTransferTarget(entry.localPath)"><FileText />{{ t("openDownloadedFile") }}</ContextMenuItem>
+              </ContextMenuContent>
+            </ContextMenu>
+            </PopoverContent>
+          </Popover>
         </div>
       </div>
     </header>
 
     <div v-if="tooltip" ref="tooltipBubble" class="app-tooltip" :class="{ 'app-tooltip-above': tooltip.above }" :style="{ left: `${tooltip.x}px`, top: `${tooltip.y}px`, '--arrow-offset': `${tooltip.arrowOffset}px` }" role="tooltip">{{ tooltip.text }}</div>
-    <div v-if="notice" class="notice">
-      <span>{{ notice }}</span>
-      <button v-for="action in noticeActions" :key="action.label" class="notice-action" @click="action.run()">{{ action.label }}</button>
-    </div>
-    <div v-if="sftpError" class="error-banner"><span>{{ sftpError }}</span><button v-if="sftpErrorRetry" class="notice-action" @click="sftpErrorRetry()">{{ t("retry") }}</button><button :title="t('close')" @click="sftpError = ''; sftpErrorRetry = null"><X /></button></div>
+    <ToastProvider :label="t('notification')">
+      <ToastRoot v-if="notice" :key="noticeKey" :open="noticeOpen" :duration="noticeActions.length ? 8000 : 3500" class="notice" @update:open="onNoticeOpenChange">
+        <span>{{ notice }}</span>
+        <ToastAction v-for="action in noticeActions" :key="action.label" :alt-text="action.label" class="notice-action" @click="action.run()">{{ action.label }}</ToastAction>
+      </ToastRoot>
+      <ToastViewport class="notice-viewport" />
+    </ToastProvider>
+    <ToastProvider :label="t('notification')">
+      <ToastRoot v-if="sftpError" :key="sftpErrorKey" :open="sftpErrorOpen" :duration="8000" class="error-banner" @update:open="onSftpErrorOpenChange">
+        <span>{{ sftpError }}</span>
+        <ToastAction v-if="sftpErrorRetry" :alt-text="t('retry')" class="notice-action" @click="sftpErrorRetry()">{{ t("retry") }}</ToastAction>
+        <ToastClose :title="t('close')"><X /></ToastClose>
+      </ToastRoot>
+      <ToastViewport class="error-viewport" />
+    </ToastProvider>
 
     <section ref="paneContainer" :class="orderedPaneClass">
+      <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
+        <ContextMenuTrigger as-child>
       <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
         <div ref="terminalHost" class="terminal-host" />
         <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint") }}</strong></div>
@@ -7126,6 +7301,7 @@ onBeforeUnmount(() => {
             :name="connection.name || connectionIdentity"
             :identity="connectionIdentity"
             :state="connectCardState"
+            :status-text="inactiveWaiting ? t('connectCard.waitingReopen') : ''"
             :error-text="terminalErrorFriendly || terminalError || t('disconnected')"
             :error-detail="terminalErrorDetail"
             :logs-open="connectLogsOpen"
@@ -7146,18 +7322,18 @@ onBeforeUnmount(() => {
           <span v-else class="marker-text">{{ t("terminalCommand.hint") }}</span>
           <span v-if="commandMarker.cwd" class="marker-cwd mono">{{ commandMarker.cwd }}</span>
         </div>
-        <div v-if="agentRunning" class="agent-run-banner">
+        <div v-if="agentRunning" class="agent-run-banner" role="status">
           <Loader2 class="spinning" />
           <span class="agent-run-text">{{ t("agentRunningBanner") }}</span>
           <code class="agent-run-command mono" :title="agentRunning.command">{{ agentRunning.command }}</code>
           <button class="agent-interrupt" @click="interruptAgentRun">{{ t("agentInterrupt") }}</button>
         </div>
-        <div v-if="zmodemBusy" class="zmodem-status">
+        <div v-if="zmodemBusy" class="zmodem-status" role="status">
           <Loader2 class="spinning" />
           <span>{{ zmodemState === "waiting" ? t("zmodemWaiting") : t("zmodemUploading", { name: zmodemFileName, percent: zmodemPercent }) }}</span>
           <span v-if="zmodemSpeed">{{ formatBytes(zmodemSpeed) }}/s</span>
         </div>
-        <div v-if="trzszOverlayVisible" class="zmodem-status trzsz-status" :class="{ 'trzsz-done': trzszPhase === 'success', 'trzsz-failed': trzszPhase === 'failed' }">
+        <div v-if="trzszOverlayVisible" class="zmodem-status trzsz-status" role="status" :class="{ 'trzsz-done': trzszPhase === 'success', 'trzsz-failed': trzszPhase === 'failed' }">
           <Loader2 v-if="trzszPhase === 'waiting' || trzszPhase === 'transferring'" class="spinning" />
           <TriangleAlert v-else-if="trzszPhase === 'failed'" />
           <span class="trzsz-label">{{ trzszStatusLabel }}</span>
@@ -7323,12 +7499,17 @@ onBeforeUnmount(() => {
             </div>
             <div class="replay-controls">
               <button class="icon-button" :title="t(replayPlaying ? 'replayPause' : 'replayPlay')" @click="toggleReplayPlay"><Pause v-if="replayPlaying" /><Play v-else /></button>
-              <select v-model.number="replaySpeed" class="replay-speed" :title="t('replaySpeed')">
-                <option :value="0.5">0.5×</option>
-                <option :value="1">1×</option>
-                <option :value="2">2×</option>
-                <option :value="4">4×</option>
-              </select>
+              <Select :model-value="String(replaySpeed)" @update:model-value="(v) => (replaySpeed = Number(v))">
+                <SelectTrigger size="xs" class="replay-speed" :title="t('replaySpeed')">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="0.5">0.5×</SelectItem>
+                  <SelectItem value="1">1×</SelectItem>
+                  <SelectItem value="2">2×</SelectItem>
+                  <SelectItem value="4">4×</SelectItem>
+                </SelectContent>
+              </Select>
               <input class="replay-seek" type="range" min="0" :max="Math.max(1, replayDurationMs)" :value="replayPlayheadMs" step="100" @input="onReplaySeek" />
               <span class="mono replay-time">{{ formatDuration(replayPlayheadMs / 1000) }} / {{ formatDuration(replayDurationMs / 1000) }}</span>
               <button class="link-button" :disabled="replayExporting" @click="exportReplayGif">{{ replayExporting ? t("replayExporting") : t("replayExportGif") }}</button>
@@ -7353,9 +7534,13 @@ onBeforeUnmount(() => {
         <!-- 批量发送命令条（Electerm quick-command bar）：贴终端底部，回车即发送；
              目标选择/快速命令切换/保存为快速命令均在条上完成。 -->
         <section v-if="connected && batchBarOpen" class="batch-bar" @contextmenu.stop @mousedown.stop @click.stop>
-          <div class="menu-anchor">
-            <button class="batch-bar-targets" :title="t('batchSendTitle')" @click.stop="toggleBatchTargetsPopover"><ListChecks /><span>{{ t("batchSendTargets", { count: batchSelected.length, total: batchTargets.length }) }}</span></button>
-            <section v-if="batchTargetsOpen" class="popover batch-targets-popover" @click.stop>
+          <div>
+            <!-- 底部条上的 popover 向上展开（reka side="top"，旧绝对定位会被裁切）。 -->
+            <Popover :open="batchTargetsOpen" @update:open="(open) => { if (!open) batchTargetsOpen = false; }">
+              <PopoverAnchor as-child>
+                <button class="batch-bar-targets" :title="t('batchSendTitle')" @click.stop="toggleBatchTargetsPopover"><ListChecks /><span>{{ t("batchSendTargets", { count: batchSelected.length, total: batchTargets.length }) }}</span></button>
+              </PopoverAnchor>
+              <PopoverContent class="popover batch-targets-popover" side="top" align="start" :side-offset="6">
               <p class="muted batch-send-hint">{{ t("batchSendHint") }}</p>
               <div class="command-history-header">
                 <span>{{ t("batchSendTargets", { count: batchSelected.length, total: batchTargets.length }) }}</span>
@@ -7376,12 +7561,17 @@ onBeforeUnmount(() => {
                   <span v-if="target.readOnly" class="read-only-badge">{{ t("readOnly") }}</span>
                 </label>
               </div>
-            </section>
+              </PopoverContent>
+            </Popover>
           </div>
-          <select v-if="!batchSaveMode && quickCommands.length" v-model="batchQuickPickId" class="batch-bar-quick" :title="t('batchSendQuickPick')" @change="applyBatchQuickPick">
-            <option value="">{{ t("batchSendQuickPick") }}</option>
-            <option v-for="item in quickCommands" :key="item.id" :value="item.id">{{ item.name }}</option>
-          </select>
+          <Select v-if="!batchSaveMode && quickCommands.length" :model-value="batchQuickPickId" @update:model-value="onBatchQuickPick">
+            <SelectTrigger size="xs" class="batch-bar-quick" :title="t('batchSendQuickPick')">
+              <SelectValue :placeholder="t('batchSendQuickPick')" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="item in quickCommands" :key="item.id" :value="item.id">{{ item.name }}</SelectItem>
+            </SelectContent>
+          </Select>
           <input
             v-if="batchSaveMode"
             v-model="batchSaveName"
@@ -7421,6 +7611,19 @@ onBeforeUnmount(() => {
           </button>
         </section>
       </section>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem :disabled="!terminal?.hasSelection()" @select="copyTerminalSelection"><Copy />{{ t("terminalCopy") }}</ContextMenuItem>
+          <ContextMenuItem :disabled="!connected || terminalTransferBusy" @select="pasteTerminal"><ClipboardPaste />{{ t("terminalPaste") }}</ContextMenuItem>
+          <ContextMenuItem @select="selectAllTerminal"><TextSelect />{{ t("terminalSelectAll") }}</ContextMenuItem>
+          <ContextMenuItem @select="openTerminalSearch"><Search />{{ t("terminalSearch.open") }}</ContextMenuItem>
+          <ContextMenuItem @select="clearTerminal"><Eraser />{{ t("terminalClear") }}</ContextMenuItem>
+          <ContextMenuItem :disabled="!connected" @select="sendSudoRefresh"><ShieldCheck />{{ t("sudoRefresh.title") }}</ContextMenuItem>
+          <ContextMenuSeparator />
+          <ContextMenuItem :disabled="!connected || terminalTransferBusy || !canWrite" @select="chooseZmodem"><FileUp />{{ t("zmodemUpload") }}</ContextMenuItem>
+          <ContextMenuItem :disabled="!connected || terminalTransferBusy || !canWrite" @select="chooseTrzszUpload"><FileUp />{{ t("trzszUpload") }}</ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
 
       <div v-if="sftpPaneOpen" class="divider" @pointerdown="startDividerDrag" />
 
@@ -7430,10 +7633,13 @@ onBeforeUnmount(() => {
           <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
           <button class="icon-button icon-cyan" :title="t('refresh')" :disabled="!connected || loadingFiles" @click="loadDirectory()"><RefreshCw :class="{ spinning: loadingFiles }" /></button>
           <input v-model="currentPath" spellcheck="false" @keydown.enter="submitPathInput" />
-          <div class="menu-anchor">
-            <button class="icon-button icon-amber" :title="t('sftpBookmark.add')" :disabled="!connected" @click.stop="toggleBookmarkSave"><Star /></button>
-            <!-- 星标收藏弹层：label 默认取路径末段，可编辑后保存（前端先行校验 + 后端错误回显） -->
-            <div v-if="bookmarkSaveOpen" class="popover bookmark-save-popover" @click.stop>
+          <div>
+            <Popover :open="bookmarkSaveOpen" @update:open="(open) => { if (!open) bookmarkSaveOpen = false; }">
+              <PopoverAnchor as-child>
+                <button class="icon-button icon-amber" :title="t('sftpBookmark.add')" :disabled="!connected" @click.stop="toggleBookmarkSave"><Star /></button>
+              </PopoverAnchor>
+              <!-- 星标收藏弹层：label 默认取路径末段，可编辑后保存（前端先行校验 + 后端错误回显） -->
+              <PopoverContent class="popover bookmark-save-popover" align="end" :side-offset="5">
               <strong class="path-history-title">{{ t("sftpBookmark.add") }}</strong>
               <span class="bookmark-save-path mono" :title="currentPath">{{ currentPath }}</span>
               <input v-model="bookmarkLabelDraft" class="bookmark-label-input mono" :maxlength="SFTP_BOOKMARK_LABEL_MAX_LENGTH" spellcheck="false" :placeholder="t('sftpBookmark.namePlaceholder')" :disabled="bookmarkSaving" autofocus @keydown.enter="confirmBookmarkSave" />
@@ -7441,11 +7647,15 @@ onBeforeUnmount(() => {
                 <button class="icon-button icon-emerald" :title="t('save')" :disabled="bookmarkSaving" @click="confirmBookmarkSave"><Save /></button>
                 <button class="icon-button" :title="t('cancel')" :disabled="bookmarkSaving" @click="bookmarkSaveOpen = false"><X /></button>
               </div>
-            </div>
+              </PopoverContent>
+            </Popover>
           </div>
-          <div class="menu-anchor">
-            <button class="icon-button" :title="t('sftpPathHistory.title')" :disabled="!connected" @click.stop="togglePathHistoryMenu"><History /></button>
-            <div v-if="pathHistoryOpen" class="popover path-history-popover" @click.stop>
+          <div>
+            <Popover :open="pathHistoryOpen" @update:open="(open) => { if (!open) pathHistoryOpen = false; }">
+              <PopoverAnchor as-child>
+                <button class="icon-button" :title="t('sftpPathHistory.title')" :disabled="!connected" @click.stop="togglePathHistoryMenu"><History /></button>
+              </PopoverAnchor>
+              <PopoverContent class="popover path-history-popover" align="end" :side-offset="5">
               <strong class="path-history-title">{{ t("sftpPathHistory.title") }}</strong>
               <button v-for="item in currentPathHistory" :key="item" class="path-item mono" :title="item" @click="goToPath(item)">{{ item }}</button>
               <div v-if="!currentPathHistory.length" class="empty compact">{{ t("sftpPathHistory.empty") }}</div>
@@ -7460,19 +7670,23 @@ onBeforeUnmount(() => {
               <div v-else class="empty compact">{{ t("sftpBookmark.empty") }}</div>
               <strong class="path-history-title">{{ t("sftpQuickPath.title") }}</strong>
               <button v-for="item in SFTP_QUICK_PATHS" :key="item" class="path-item mono" :title="item" @click="goToPath(item)">{{ item }}</button>
-            </div>
+              </PopoverContent>
+            </Popover>
           </div>
           <button class="icon-button" :title="t('sftpPaste.action')" :disabled="!connected || !canWrite || !sftpClipboard || pasteBusy" @click="pasteClipboard"><ClipboardPaste /></button>
           <button class="icon-button icon-teal" :title="`${t('upload')} · Ctrl/Cmd+V`" :disabled="!connected || !canWrite" @click.stop="chooseUpload"><FileUp /></button>
           <button class="icon-button icon-amber" :title="t('newFolder')" :disabled="!connected || !canWrite" @click="operationDraft = ''; operationDialog = 'mkdir'"><FolderPlus /></button>
           <button class="icon-button icon-amber" :title="t('sftpNewFile.action')" :disabled="!connected || !canWrite" @click="openNewFileDialog"><FilePlus /></button>
           <label class="follow-directory-control sudo-label" :title="!canWrite ? t('readOnly') : t('sudo.modeHint')">
-            <button class="switch-control" type="button" role="switch" :aria-checked="sudoMode" :disabled="!connected || !canWrite" @click="toggleSudoMode"><span /></button>
+            <Switch size="sm" :model-value="sudoMode" :disabled="!connected || !canWrite" @update:model-value="toggleSudoMode" />
             <span>{{ t("sudo.mode") }}</span>
           </label>
         </div>
         <!-- SFTP 面板主体：左侧 tree/quick 双 tab 侧栏（可收起）+ 右侧文件区 -->
         <div class="sftp-body">
+          <ContextMenu :open="!!sideMenu" @update:open="(open) => { if (!open) sideMenu = undefined; }">
+            <!-- display:contents 避免包装 span 参与 flex 布局；行右键经冒泡到达触发器。 -->
+            <ContextMenuTrigger class="contents">
           <SideNavPanel
             :tab="sftpSideTab"
             :collapsed="sftpSideCollapsed"
@@ -7487,6 +7701,15 @@ onBeforeUnmount(() => {
             @refresh-tree="refreshSideTree"
             @node-context="openSideMenu"
           />
+            </ContextMenuTrigger>
+            <!-- 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩 -->
+            <ContextMenuContent>
+              <ContextMenuItem @select="sideMenuAction('open')"><Folder />{{ t("openFolder") }}</ContextMenuItem>
+              <ContextMenuItem @select="sideMenuAction('copyPath')"><Copy />{{ t("sftpCopy.copyPath") }}</ContextMenuItem>
+              <ContextMenuItem @select="sideMenuAction('copyName')"><FileText />{{ t("sftpCopy.copyName") }}</ContextMenuItem>
+              <ContextMenuItem :disabled="!canWrite || archiveBusy" @select="sideMenuAction('archive')"><Archive />{{ t("archive.action") }}</ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
           <div class="sftp-main">
           <div class="sftp-filter-bar">
             <label class="sftp-search-input">
@@ -7494,11 +7717,16 @@ onBeforeUnmount(() => {
               <input v-model="sftpSearch" type="search" :placeholder="t('sftpSearch.placeholder')" spellcheck="false" />
               <button v-if="sftpSearch" class="sftp-search-clear" :title="t('cancel')" @click.prevent="sftpSearch = ''"><X /></button>
             </label>
-            <select v-model="sftpTypeFilter" class="sftp-type-filter" :title="t('sftpFilter.all')">
-              <option value="all">{{ t("sftpFilter.all") }}</option>
-              <option value="directory">{{ t("sftpFilter.folders") }}</option>
-              <option value="file">{{ t("sftpFilter.files") }}</option>
-            </select>
+            <Select :model-value="sftpTypeFilter" @update:model-value="(v) => (sftpTypeFilter = v as SftpTypeFilter)">
+              <SelectTrigger size="xs" class="sftp-type-filter" :title="t('sftpFilter.all')">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">{{ t("sftpFilter.all") }}</SelectItem>
+                <SelectItem value="directory">{{ t("sftpFilter.folders") }}</SelectItem>
+                <SelectItem value="file">{{ t("sftpFilter.files") }}</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
           <div v-if="selectedUris.length > 1" class="sftp-batch-bar">
             <span>{{ t("sftpBatch.selected", { count: selectedUris.length }) }}</span>
@@ -7511,8 +7739,12 @@ onBeforeUnmount(() => {
             <button @click="clearRowSelection"><X />{{ t("sftpBatch.clear") }}</button>
           </div>
           <div class="file-table">
-            <!-- 空白处右键：新建文件夹/新建文件/刷新（行右键已在 showFileMenu 内 .stop）-->
-            <div class="file-rows" @contextmenu.prevent.stop="openBlankMenu({ x: $event.clientX, y: $event.clientY })">
+            <!-- 行右键（文件操作）与空白处右键（新建/刷新）共用同一 ContextMenu 根：
+                 行处理器 showFileMenu 先行设置负载，容器处理器按事件目标兜空白区；
+                 定位/碰撞/Esc/外点关闭均由 reka 承担。 -->
+            <ContextMenu :open="!!(fileMenu || blankMenu)" @update:open="(open) => { if (!open) { fileMenu = undefined; blankMenu = false; } }">
+              <ContextMenuTrigger as-child>
+            <div class="file-rows" @contextmenu="onFileAreaContextMenu">
               <div class="file-header" :style="sftpGridStyle">
                 <button @click="toggleSort('name')">{{ t("name") }}<component :is="sortIcon('name')" /></button>
                 <button v-if="visibleColumns.includes('size')" @click="toggleSort('size')">{{ t("size") }}<component :is="sortIcon('size')" /></button>
@@ -7555,6 +7787,40 @@ onBeforeUnmount(() => {
               </button>
               <div v-if="!loadingFiles && !visibleEntries.length" class="empty">{{ entries.length ? t("sftpSearch.noMatch") : t("emptyFolder") }}</div>
             </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent>
+                <!-- 多选感知：右键时已多选（selection > 1）→ 菜单整体切换为批量区，单项动作隐藏 -->
+                <template v-if="fileMenu && fileMenu.selection.length > 1">
+                  <ContextMenuItem :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @select="batchArchive()"><Archive />{{ t("sftpBatch.archive") }}</ContextMenuItem>
+                  <ContextMenuItem variant="destructive" :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @select="batchDeleteOpen = true"><Trash2 />{{ t("sftpBatch.delete") }}</ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem @select="copySelectedPaths"><Copy />{{ t("sftpCopy.copySelected") }}</ContextMenuItem>
+                </template>
+                <template v-else-if="fileMenu">
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @select="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</ContextMenuItem>
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file'" @select="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</ContextMenuItem>
+                  <ContextMenuItem :disabled="!canWrite" @select="beginRename(fileMenu.entry)"><Pencil />{{ t("rename") }}</ContextMenuItem>
+                  <ContextMenuItem @select="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</ContextMenuItem>
+                  <ContextMenuItem :disabled="!canWrite" @select="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem @select="copyTextToClipboard(pathFromUri(fileMenu.entry.uri), 'sftpCopy.copiedPath')"><Copy />{{ t("sftpCopy.copyPath") }}</ContextMenuItem>
+                  <ContextMenuItem @select="copyTextToClipboard(fileMenu.entry.name, 'sftpCopy.copiedName')"><FileText />{{ t("sftpCopy.copyName") }}</ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem :disabled="!canWrite" @select="beginChmod(fileMenu.entry)"><Lock />{{ t("permissionsEdit") }}</ContextMenuItem>
+                  <ContextMenuItem @select="openAttributes(fileMenu.entry)"><Info />{{ t("sftpAttrs.action") }}</ContextMenuItem>
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'directory' || (fileMenu.entry.kind === 'file' && !isArchiveName(fileMenu.entry.name))" :disabled="!canWrite || archiveBusy" @select="archiveEntry(fileMenu.entry)"><Archive />{{ t("archive.action") }}</ContextMenuItem>
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file' && isArchiveName(fileMenu.entry.name)" :disabled="!canWrite || archiveBusy" @select="extractEntry(fileMenu.entry)"><PackageOpen />{{ t("extract.action") }}</ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem variant="destructive" :disabled="!canWrite" @select="deleteTarget = fileMenu.entry"><Trash2 />{{ t("delete") }}</ContextMenuItem>
+                </template>
+                <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 刷新 -->
+                <template v-else>
+                  <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('mkdir')"><FolderPlus />{{ t("newFolder") }}</ContextMenuItem>
+                  <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('newFile')"><FilePlus />{{ t("sftpNewFile.action") }}</ContextMenuItem>
+                  <ContextMenuItem :disabled="!connected || loadingFiles" @select="blankMenuAction('refresh')"><RefreshCw />{{ t("refresh") }}</ContextMenuItem>
+                </template>
+              </ContextMenuContent>
+            </ContextMenu>
             <footer class="file-footer"><span>{{ sftpFiltersActive ? t("sftpSearch.footerMatch", { matched: visibleEntries.length, total: entries.length }) : t("items", { count: entries.length }) }}</span><span v-if="diskUsage" :title="`${diskUsage.filesystem} → ${diskUsage.mount}`">{{ formatBytes(diskUsage.availableBytes) }} {{ t("diskFreeOf", { total: formatBytes(diskUsage.totalBytes) }) }}</span><span>{{ currentPath }}</span></footer>
           </div>
           </div>
@@ -7563,73 +7829,17 @@ onBeforeUnmount(() => {
       </section>
     </section>
 
-    <nav v-if="terminalMenu" class="context-menu" :style="{ left: terminalMenu.x + 'px', top: terminalMenu.y + 'px' }" @click.stop>
-      <button :disabled="!terminal?.hasSelection()" @click="copyTerminalSelection"><Copy />{{ t("terminalCopy") }}</button>
-      <button :disabled="!connected || terminalTransferBusy" @click="pasteTerminal"><ClipboardPaste />{{ t("terminalPaste") }}</button>
-      <button @click="selectAllTerminal"><TextSelect />{{ t("terminalSelectAll") }}</button>
-      <button @click="openTerminalSearch"><Search />{{ t("terminalSearch.open") }}</button>
-      <button @click="clearTerminal"><Eraser />{{ t("terminalClear") }}</button>
-      <button :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck />{{ t("sudoRefresh.title") }}</button>
-      <hr />
-      <button :disabled="!connected || terminalTransferBusy || !canWrite" @click="chooseZmodem"><FileUp />{{ t("zmodemUpload") }}</button>
-      <button :disabled="!connected || terminalTransferBusy || !canWrite" @click="chooseTrzszUpload"><FileUp />{{ t("trzszUpload") }}</button>
-    </nav>
-
-    <nav v-if="fileMenu" class="context-menu" :style="{ left: fileMenu.x + 'px', top: fileMenu.y + 'px' }" @click.stop>
-      <!-- 多选感知：右键时已多选（selection > 1）→ 菜单整体切换为批量区，单项动作隐藏 -->
-      <template v-if="fileMenu.selection.length > 1">
-        <button :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="fileMenu = undefined; batchArchive()"><Archive />{{ t("sftpBatch.archive") }}</button>
-        <button class="danger" :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @click="fileMenu = undefined; batchDeleteOpen = true"><Trash2 />{{ t("sftpBatch.delete") }}</button>
-        <hr />
-        <button @click="copySelectedPaths"><Copy />{{ t("sftpCopy.copySelected") }}</button>
-      </template>
-      <template v-else>
-        <button v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @click="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</button>
-        <button v-if="fileMenu.entry.kind === 'file'" @click="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</button>
-        <button :disabled="!canWrite" @click="beginRename(fileMenu.entry); fileMenu = undefined"><Pencil />{{ t("rename") }}</button>
-        <button @click="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</button>
-        <button :disabled="!canWrite" @click="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</button>
-        <hr />
-        <button @click="copyTextToClipboard(pathFromUri(fileMenu.entry.uri), 'sftpCopy.copiedPath'); fileMenu = undefined"><Copy />{{ t("sftpCopy.copyPath") }}</button>
-        <button @click="copyTextToClipboard(fileMenu.entry.name, 'sftpCopy.copiedName'); fileMenu = undefined"><FileText />{{ t("sftpCopy.copyName") }}</button>
-        <hr />
-        <button :disabled="!canWrite" @click="beginChmod(fileMenu.entry)"><Lock />{{ t("permissionsEdit") }}</button>
-        <button @click="openAttributes(fileMenu.entry)"><Info />{{ t("sftpAttrs.action") }}</button>
-        <button v-if="fileMenu.entry.kind === 'directory' || (fileMenu.entry.kind === 'file' && !isArchiveName(fileMenu.entry.name))" :disabled="!canWrite || archiveBusy" @click="archiveEntry(fileMenu.entry)"><Archive />{{ t("archive.action") }}</button>
-        <button v-if="fileMenu.entry.kind === 'file' && isArchiveName(fileMenu.entry.name)" :disabled="!canWrite || archiveBusy" @click="extractEntry(fileMenu.entry)"><PackageOpen />{{ t("extract.action") }}</button>
-        <hr />
-        <button class="danger" :disabled="!canWrite" @click="deleteTarget = fileMenu.entry; fileMenu = undefined"><Trash2 />{{ t("delete") }}</button>
-      </template>
-    </nav>
-
-    <nav v-if="transferHistoryMenu" class="context-menu" :style="{ left: transferHistoryMenu.x + 'px', top: transferHistoryMenu.y + 'px' }" @click.stop>
-      <button @click="revealTransferTarget(transferHistoryMenu.path); transferHistoryMenu = undefined"><FolderOpen />{{ t("revealInFolder") }}</button>
-      <button @click="openTransferTarget(transferHistoryMenu.path); transferHistoryMenu = undefined"><FileText />{{ t("openDownloadedFile") }}</button>
-    </nav>
-
-    <!-- 侧栏（目录树/快捷路径）行右键：打开 / 复制路径 / 复制文件名 / 压缩 -->
-    <nav v-if="sideMenu" class="context-menu" :style="{ left: sideMenu.x + 'px', top: sideMenu.y + 'px' }" @click.stop>
-      <button @click="sideMenuAction('open')"><Folder />{{ t("openFolder") }}</button>
-      <button @click="sideMenuAction('copyPath')"><Copy />{{ t("sftpCopy.copyPath") }}</button>
-      <button @click="sideMenuAction('copyName')"><FileText />{{ t("sftpCopy.copyName") }}</button>
-      <button :disabled="!canWrite || archiveBusy" @click="sideMenuAction('archive')"><Archive />{{ t("archive.action") }}</button>
-    </nav>
-
-    <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 刷新 -->
-    <nav v-if="blankMenu" class="context-menu" :style="{ left: blankMenu.x + 'px', top: blankMenu.y + 'px' }" @click.stop>
-      <button :disabled="!canWrite" @click="blankMenuAction('mkdir')"><FolderPlus />{{ t("newFolder") }}</button>
-      <button :disabled="!canWrite" @click="blankMenuAction('newFile')"><FilePlus />{{ t("sftpNewFile.action") }}</button>
-      <button :disabled="!connected || loadingFiles" @click="blankMenuAction('refresh')"><RefreshCw />{{ t("refresh") }}</button>
-    </nav>
-
-    <section v-if="previewOpen" class="modal-backdrop" @mousedown.self="closePreview">
-      <article class="modal preview-modal">
+    <!-- 弹层统一迁移 reka Dialog（Strategy B）：portal/遮罩/焦点陷阱/外点关闭由 reka
+         承担；Esc 仍由 onDocumentKeydown 分层链独占（内容上一律 @escape-key-down.prevent），
+         外点关闭经 update:open(false) 路由到各弹窗的语义取消函数。 -->
+    <Dialog :open="previewOpen" @update:open="(open) => { if (!open) closePreview(); }">
+      <DialogContent class="modal preview-modal" @escape-key-down.prevent>
         <header>
-          <h2>
+          <DialogTitle>
             {{ previewTitle }}
             <span v-if="previewDirty" class="preview-dirty"><span class="preview-dirty-dot" />{{ t("editSave.unsaved") }}</span>
             <span v-else-if="previewTruncated" class="preview-truncated-badge">{{ t("previewDialog.truncated", { limit: formatBytes(MAX_INLINE_PREVIEW_BYTES), size: formatBytes(previewSize) }) }}</span>
-          </h2>
+          </DialogTitle>
           <div v-if="previewEditableAllowed" class="preview-actions">
             <template v-if="!previewEditable">
               <button :title="t('editSave.edit')" @click="beginPreviewEdit"><Pencil />{{ t("editSave.edit") }}</button>
@@ -7646,20 +7856,20 @@ onBeforeUnmount(() => {
           <img class="preview-image" :class="{ 'preview-image--full': previewImageZoomed }" :src="previewImageUrl" :alt="previewTitle" :title="previewImageZoomed ? t('imagePreview.zoomOut') : t('imagePreview.zoomIn')" @click="previewImageZoomed = !previewImageZoomed" />
         </div>
         <TextPreview v-else :text="previewText" :file-name="previewTitle" :appearance="appearance" :editable="previewEditable" @change="previewDraft = $event" />
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="operationDialog === 'mkdir'" class="modal-backdrop" @mousedown.self="operationDialog = null">
-      <article class="modal small-modal">
-        <header><h2>{{ t("newFolder") }}</h2><button :title="t('close')" class="icon-button" @click="operationDialog = null"><X /></button></header>
+    <Dialog :open="operationDialog === 'mkdir'" @update:open="(open) => { if (!open) operationDialog = null; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("newFolder") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="operationDialog = null"><X /></button></header>
         <input v-model="operationDraft" autofocus @keydown.enter="createDirectory" />
         <footer><button @click="operationDialog = null">{{ t("cancel") }}</button><button class="primary-button" :disabled="!operationDraft.trim()" @click="createDirectory">{{ t("confirm") }}</button></footer>
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="commandOpen" class="modal-backdrop" @mousedown.self="commandOpen = false">
-      <article class="modal command-modal">
-        <header><h2>{{ t("commandTitle") }}</h2><button :title="t('close')" class="icon-button" @click="commandOpen = false"><X /></button></header>
+    <Dialog :open="commandOpen" @update:open="(open) => { if (!open) commandOpen = false; }">
+      <DialogContent class="modal command-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("commandTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="commandOpen = false"><X /></button></header>
         <textarea
           v-model="commandDraft"
           class="mono"
@@ -7686,7 +7896,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <label class="quick-sudo-control" :title="t('quickSudoHint')">
-          <button class="switch-control" type="button" role="switch" :aria-checked="commandUseSudo" :disabled="commandRunning" @click="commandUseSudo = !commandUseSudo"><span /></button>
+          <Switch v-model="commandUseSudo" size="sm" :disabled="commandRunning" />
           <span>{{ t("quickSudo") }}</span>
         </label>
         <div v-if="commandRunning" class="command-output"><Loader2 class="spinning" /><span>{{ t("commandRunning") }}</span></div>
@@ -7701,12 +7911,13 @@ onBeforeUnmount(() => {
             {{ t("commandRun") }}
           </button>
         </footer>
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="chmodTarget" class="modal-backdrop" @mousedown.self="chmodTarget = undefined">
-      <article class="modal small-modal">
-        <header><h2>{{ t("permissionsEdit") }} · {{ chmodTarget.name }}</h2><button :title="t('close')" class="icon-button" @click="chmodTarget = undefined"><X /></button></header>
+    <Dialog :open="!!chmodTarget" @update:open="(open) => { if (!open) chmodTarget = undefined; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="chmodTarget">
+        <header><DialogTitle>{{ t("permissionsEdit") }} · {{ chmodTarget.name }}</DialogTitle><button :title="t('close')" class="icon-button" @click="chmodTarget = undefined"><X /></button></header>
         <div class="perm-matrix" role="group" :aria-label="t('permissionsEdit')">
           <span></span>
           <span v-for="column in PERM_COLUMNS" :key="column.bit" class="perm-matrix-head">{{ t(column.key) }}</span>
@@ -7720,31 +7931,35 @@ onBeforeUnmount(() => {
         <input v-model="chmodDraft" class="mono" spellcheck="false" :placeholder="t('permissionsPlaceholder')" @keydown.enter="confirmChmod" />
         <p class="muted">{{ t("permissionsHint") }}</p>
         <footer><button @click="chmodTarget = undefined">{{ t("cancel") }}</button><button class="primary-button" :disabled="!chmodDraft.trim() || chmodSubmitting" @click="confirmChmod">{{ t("confirm") }}</button></footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="deleteTarget" class="modal-backdrop" @mousedown.self="deleteTarget = undefined">
-      <article class="modal small-modal destructive-modal">
-        <header><h2>{{ t("deleteTitle") }}</h2><button :title="t('close')" class="icon-button" @click="deleteTarget = undefined"><X /></button></header>
+    <Dialog :open="!!deleteTarget" @update:open="(open) => { if (!open) deleteTarget = undefined; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="deleteTarget">
+        <header><DialogTitle>{{ t("deleteTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="deleteTarget = undefined"><X /></button></header>
         <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ deleteTarget.name }}</strong><p class="muted">{{ t("deleteMessage") }}</p></div></div>
         <footer><button @click="deleteTarget = undefined">{{ t("cancel") }}</button><button class="danger-button" :disabled="deleteSubmitting" @click="confirmDelete"><Trash2 />{{ t("delete") }}</button></footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="batchDeleteOpen" class="modal-backdrop" @mousedown.self="batchDeleteOpen = false">
-      <article class="modal small-modal destructive-modal">
-        <header><h2>{{ t("sftpBatch.deleteTitle") }}</h2><button :title="t('close')" class="icon-button" @click="batchDeleteOpen = false"><X /></button></header>
+    <Dialog :open="batchDeleteOpen" @update:open="(open) => { if (!open) batchDeleteOpen = false; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("sftpBatch.deleteTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="batchDeleteOpen = false"><X /></button></header>
         <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("sftpBatch.selected", { count: selectedEntries.length }) }}</strong><p class="muted">{{ t("sftpBatch.deleteMessage") }}</p></div></div>
         <div v-if="batchProgress" class="batch-progress-row"><progress class="batch-progress-bar" :value="batchProgressPercent(batchProgress)" max="100" /><span class="batch-progress mono">{{ t("sftpBatch.progress", { done: batchProgress.done, total: batchProgress.total }) }}</span></div>
         <footer><button @click="batchDeleteOpen = false" :disabled="batchDeleteSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="batchDeleteSubmitting" @click="confirmBatchDelete"><Loader2 v-if="batchDeleteSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
     <!-- 录制删除确认：应用内弹窗替代 window.confirm（宿主沙箱 iframe 无 allow-modals，confirm 恒 false） -->
     <!-- 下载/导出前的保存目录选择（设置里开启「每次询问」时出现） -->
-    <section v-if="downloadPrompt" class="modal-backdrop" @mousedown.self="resolveDownloadPrompt(undefined)">
-      <article class="modal small-modal">
-        <header><h2>{{ t("downloadSettings.askTitle") }}</h2><button class="icon-button" :title="t('close')" @click="resolveDownloadPrompt(undefined)"><X /></button></header>
+    <Dialog :open="!!downloadPrompt" @update:open="(open) => { if (!open) resolveDownloadPrompt(undefined); }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="downloadPrompt">
+        <header><DialogTitle>{{ t("downloadSettings.askTitle") }}</DialogTitle><button class="icon-button" :title="t('close')" @click="resolveDownloadPrompt(undefined)"><X /></button></header>
         <p class="muted mono">{{ downloadPrompt.fileName }}</p>
         <label class="settings-field">
           <span>{{ t("downloadSettings.directory") }}</span>
@@ -7762,13 +7977,15 @@ onBeforeUnmount(() => {
           <button @click="resolveDownloadPrompt(undefined)">{{ t("cancel") }}</button>
           <button class="primary-button" @click="resolveDownloadPrompt({ dir: downloadPrompt.dir, setDefault: downloadPrompt.setDefault })">{{ t("save") }}</button>
         </footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
     <!-- 「询问我」冲突策略：目标目录已有同名文件时的选择 -->
-    <section v-if="downloadConflictPrompt" class="modal-backdrop" @mousedown.self="resolveDownloadConflict(undefined)">
-      <article class="modal small-modal">
-        <header><h2>{{ t("downloadConflict.title") }}</h2><button class="icon-button" :title="t('close')" @click="resolveDownloadConflict(undefined)"><X /></button></header>
+    <Dialog :open="!!downloadConflictPrompt" @update:open="(open) => { if (!open) resolveDownloadConflict(undefined); }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="downloadConflictPrompt">
+        <header><DialogTitle>{{ t("downloadConflict.title") }}</DialogTitle><button class="icon-button" :title="t('close')" @click="resolveDownloadConflict(undefined)"><X /></button></header>
         <p>{{ t("downloadConflict.message", { name: downloadConflictPrompt.fileName }) }}</p>
         <p class="muted mono">{{ downloadConflictPrompt.path }}</p>
         <footer>
@@ -7776,37 +7993,41 @@ onBeforeUnmount(() => {
           <button class="danger-button" @click="resolveDownloadConflict('overwrite')">{{ t("downloadSettings.conflict.overwrite") }}</button>
           <button class="primary-button" @click="resolveDownloadConflict('rename')">{{ t("downloadSettings.conflict.rename") }}</button>
         </footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="recordingDeleteTarget" class="modal-backdrop" @mousedown.self="recordingDeleteTarget = null">
-      <article class="modal small-modal destructive-modal">
-        <header><h2>{{ t("recordingDelete") }}</h2><button :title="t('close')" class="icon-button" @click="recordingDeleteTarget = null"><X /></button></header>
+    <Dialog :open="!!recordingDeleteTarget" @update:open="(open) => { if (!open) recordingDeleteTarget = null; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="recordingDeleteTarget">
+        <header><DialogTitle>{{ t("recordingDelete") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="recordingDeleteTarget = null"><X /></button></header>
         <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("recordingDeleteConfirm", { host: recordingDeleteTarget.host || recordingDeleteTarget.recordingId }) }}</strong><p class="muted">{{ formatRecordedAt(recordingDeleteTarget.startedAt) }} · {{ formatDuration(recordingDeleteTarget.durationSecs ?? 0) }}</p></div></div>
         <footer><button @click="recordingDeleteTarget = null" :disabled="recordingDeleteSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="recordingDeleteSubmitting" @click="confirmRecordingDelete"><Loader2 v-if="recordingDeleteSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
     <!-- 录制一键清空确认：应用内弹窗（沙箱 iframe confirm 恒 false） -->
-    <section v-if="recordingClearAllOpen" class="modal-backdrop" @mousedown.self="recordingClearAllOpen = false">
-      <article class="modal small-modal destructive-modal">
-        <header><h2>{{ t("recordingsClear") }}</h2><button :title="t('close')" class="icon-button" @click="recordingClearAllOpen = false"><X /></button></header>
+    <Dialog :open="recordingClearAllOpen" @update:open="(open) => { if (!open) recordingClearAllOpen = false; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("recordingsClear") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="recordingClearAllOpen = false"><X /></button></header>
         <div class="destructive-copy"><span class="destructive-icon"><Trash2 /></span><div><strong>{{ t("recordingsClearConfirm", { count: recordings.length }) }}</strong></div></div>
         <footer><button @click="recordingClearAllOpen = false" :disabled="recordingClearAllSubmitting">{{ t("cancel") }}</button><button class="danger-button" :disabled="recordingClearAllSubmitting" @click="confirmRecordingClearAll"><Loader2 v-if="recordingClearAllSubmitting" class="spinning" /><Trash2 v-else />{{ t("delete") }}</button></footer>
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="newFileDialog" class="modal-backdrop" @mousedown.self="newFileDialog = false">
-      <article class="modal small-modal">
-        <header><h2>{{ t("sftpNewFile.title") }}</h2><button :title="t('close')" class="icon-button" @click="newFileDialog = false"><X /></button></header>
+    <Dialog :open="newFileDialog" @update:open="(open) => { if (!open) newFileDialog = false; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("sftpNewFile.title") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="newFileDialog = false"><X /></button></header>
         <input v-model="newFileDraft" autofocus spellcheck="false" :placeholder="t('sftpNewFile.placeholder')" @keydown.enter="createNewFile" />
         <footer><button @click="newFileDialog = false">{{ t("cancel") }}</button><button class="primary-button" :disabled="!newFileDraft.trim() || newFileSubmitting" @click="createNewFile"><Loader2 v-if="newFileSubmitting" class="spinning" />{{ t("confirm") }}</button></footer>
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="attrsTarget" class="modal-backdrop" @mousedown.self="closeAttributes">
-      <article class="modal small-modal attrs-modal">
-        <header><h2>{{ t("sftpAttrs.title") }} · {{ attrsTarget.name }}</h2><button :title="t('close')" class="icon-button" @click="closeAttributes"><X /></button></header>
+    <Dialog :open="!!attrsTarget" @update:open="(open) => { if (!open) closeAttributes(); }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="attrsTarget">
+        <header><DialogTitle>{{ t("sftpAttrs.title") }} · {{ attrsTarget.name }}</DialogTitle><button :title="t('close')" class="icon-button" @click="closeAttributes"><X /></button></header>
         <div v-if="attrsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
         <template v-else-if="attrsInfo">
           <dl class="attrs-grid">
@@ -7837,12 +8058,13 @@ onBeforeUnmount(() => {
           <button @click="closeAttributes">{{ t("close") }}</button>
           <button class="primary-button" :disabled="!canWrite || !attrsMode.trim() || attrsSubmitting" @click="saveAttributesPermissions"><Loader2 v-if="attrsSubmitting" class="spinning" />{{ t("sftpAttrs.save") }}</button>
         </footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="settingsOpen" class="modal-backdrop" @mousedown.self="settingsOpen = false">
-      <article class="modal settings-modal settings-nav-modal">
-        <header><h2>{{ t("settings") }}</h2><button :title="t('close')" class="icon-button" @click="settingsOpen = false"><X /></button></header>
+    <Dialog :open="settingsOpen" @update:open="(open) => { if (!open) settingsOpen = false; }">
+      <DialogContent class="modal settings-modal settings-nav-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("settings") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="settingsOpen = false"><X /></button></header>
         <div class="settings-body">
           <div v-if="settingsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
           <div v-else-if="settingsLoadFailed" class="task-error" role="alert">
@@ -7852,17 +8074,26 @@ onBeforeUnmount(() => {
           <template v-else>
           <div class="settings-layout">
             <nav class="settings-nav" aria-label="settings categories">
-              <button v-for="cat in SETTINGS_CATEGORIES" :key="cat.id" type="button" :class="{ 'is-active': settingsCategory === cat.id }" @click="settingsCategory = cat.id">{{ t(cat.labelKey) }}</button>
+              <Tabs :model-value="settingsCategory" orientation="vertical" class="settings-nav-tabs" @update:model-value="onSettingsCategoryChange">
+                <TabsList class="settings-nav-list">
+                  <TabsTrigger v-for="cat in SETTINGS_CATEGORIES" :key="cat.id" :value="cat.id" class="settings-nav-item">{{ t(cat.labelKey) }}</TabsTrigger>
+                </TabsList>
+              </Tabs>
             </nav>
             <div class="settings-content">
             <div v-show="settingsCategory === 'sudo'" class="settings-pane">
             <label class="settings-field">
               <span>{{ t("settingsCredentialSource") }}</span>
               <span class="credential-source-row">
-                <select v-model="settingsDraft.quickSudoProfileId">
-                  <option value="">{{ t("profileSourceConnection") }}</option>
-                  <option v-for="profile in sudoProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}</option>
-                </select>
+                <Select :model-value="settingsDraft.quickSudoProfileId || SELECT_EMPTY_SENTINEL" @update:model-value="(v) => (settingsDraft.quickSudoProfileId = v === SELECT_EMPTY_SENTINEL ? '' : String(v))">
+                  <SelectTrigger size="xs" class="credential-source-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem :value="SELECT_EMPTY_SENTINEL">{{ t("profileSourceConnection") }}</SelectItem>
+                    <SelectItem v-for="profile in sudoProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}</SelectItem>
+                  </SelectContent>
+                </Select>
                 <!-- 内联管理入口：展开/收起下方配置档 section，不再跳独立弹窗（工具栏 KeyRound 仍保留独立弹窗）。 -->
                 <button class="link-button" :aria-expanded="profilesInlineOpen" @click="profilesInlineOpen = !profilesInlineOpen">{{ t("profilesManage") }}</button>
               </span>
@@ -7905,12 +8136,15 @@ onBeforeUnmount(() => {
                 </label>
                 <label class="settings-field">
                   <span>{{ t("settingsFlowMode") }}</span>
-                  <select v-model="profileDraft.authFlowMode">
-                    <option value="off">{{ t("flowOff") }}</option>
-                    <option value="password_then_otp">{{ t("flowThenOtp") }}</option>
-                    <option value="password_plus_otp">{{ t("flowPlusOtp") }}</option>
-                    <option value="password_only">{{ t("flowOnly") }}</option>
-                  </select>
+                  <Select :model-value="profileDraft.authFlowMode" @update:model-value="(v) => (profileDraft.authFlowMode = String(v))">
+                    <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="off">{{ t("flowOff") }}</SelectItem>
+                      <SelectItem value="password_then_otp">{{ t("flowThenOtp") }}</SelectItem>
+                      <SelectItem value="password_plus_otp">{{ t("flowPlusOtp") }}</SelectItem>
+                      <SelectItem value="password_only">{{ t("flowOnly") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </label>
                 <label class="settings-field">
                   <span>{{ t("settingsPasswordHint") }}</span>
@@ -7921,7 +8155,7 @@ onBeforeUnmount(() => {
                   <input v-model="profileDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
                 </label>
                 <label class="quick-sudo-control">
-                  <button class="switch-control" type="button" role="switch" :aria-checked="profileDraft.sudoUsePty" @click="profileDraft.sudoUsePty = !profileDraft.sudoUsePty"><span /></button>
+                  <Switch v-model="profileDraft.sudoUsePty" size="sm" />
                   <span>{{ t("settingsUsePty") }}</span>
                 </label>
                 <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
@@ -7932,7 +8166,7 @@ onBeforeUnmount(() => {
               </template>
             </section>
             <label class="quick-sudo-control">
-              <button class="switch-control" type="button" role="switch" :aria-checked="settingsDraft.quickSudo" @click="settingsDraft.quickSudo = !settingsDraft.quickSudo"><span /></button>
+              <Switch v-model="settingsDraft.quickSudo" size="sm" />
               <span>{{ t("settingsQuickSudo") }}</span>
             </label>
             <template v-if="!boundProfile">
@@ -7946,12 +8180,15 @@ onBeforeUnmount(() => {
             </label>
             <label class="settings-field">
               <span>{{ t("settingsFlowMode") }}</span>
-              <select v-model="settingsDraft.authFlowMode">
-                <option value="off">{{ t("flowOff") }}</option>
-                <option value="password_then_otp">{{ t("flowThenOtp") }}</option>
-                <option value="password_plus_otp">{{ t("flowPlusOtp") }}</option>
-                <option value="password_only">{{ t("flowOnly") }}</option>
-              </select>
+              <Select :model-value="settingsDraft.authFlowMode" @update:model-value="(v) => (settingsDraft.authFlowMode = String(v))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="off">{{ t("flowOff") }}</SelectItem>
+                  <SelectItem value="password_then_otp">{{ t("flowThenOtp") }}</SelectItem>
+                  <SelectItem value="password_plus_otp">{{ t("flowPlusOtp") }}</SelectItem>
+                  <SelectItem value="password_only">{{ t("flowOnly") }}</SelectItem>
+                </SelectContent>
+              </Select>
             </label>
             <label class="settings-field">
               <span>{{ t("settingsPasswordHint") }}</span>
@@ -7962,7 +8199,7 @@ onBeforeUnmount(() => {
               <input v-model="settingsDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
             </label>
             <label class="quick-sudo-control">
-              <button class="switch-control" type="button" role="switch" :aria-checked="settingsDraft.sudoUsePty" @click="settingsDraft.sudoUsePty = !settingsDraft.sudoUsePty"><span /></button>
+              <Switch v-model="settingsDraft.sudoUsePty" size="sm" />
               <span>{{ t("settingsUsePty") }}</span>
             </label>
             </template>
@@ -7974,9 +8211,12 @@ onBeforeUnmount(() => {
             <h3 class="settings-section-title">{{ t("agentTerminalSection") }}</h3>
             <label class="settings-field">
               <span>{{ t("agentTerminalMode") }}</span>
-              <select v-model="settingsDraft.agentTerminalMode">
-                <option v-for="mode in AGENT_MODES" :key="mode" :value="mode">{{ t(`agentTerminal${mode === "off" ? "Off" : mode === "auto" ? "Auto" : "Strict"}`) }}</option>
-              </select>
+              <Select :model-value="settingsDraft.agentTerminalMode" @update:model-value="(v) => (settingsDraft.agentTerminalMode = String(v))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="mode in AGENT_MODES" :key="mode" :value="mode">{{ t(`agentTerminal${mode === "off" ? "Off" : mode === "auto" ? "Auto" : "Strict"}`) }}</SelectItem>
+                </SelectContent>
+              </Select>
             </label>
             <p class="muted settings-note">{{ agentTerminalModeHint }}</p>
             <div class="settings-remembered">
@@ -8003,7 +8243,7 @@ onBeforeUnmount(() => {
               </span>
             </label>
             <label class="settings-field settings-switch-row">
-              <button class="switch-control" type="button" role="switch" :aria-checked="downloadUseDefaultDraft" @click="downloadUseDefaultDraft = !downloadUseDefaultDraft"><span /></button>
+              <Switch v-model="downloadUseDefaultDraft" size="sm" />
               <span>{{ t("downloadSettings.useDefaultDir") }}</span>
             </label>
             <p class="muted settings-note">{{ t("downloadSettings.useDefaultDirHint") }}</p>
@@ -8019,14 +8259,14 @@ onBeforeUnmount(() => {
             <div v-show="settingsCategory === 'terminal'" class="settings-pane">
             <h3 class="settings-section-title">{{ t("webglSection") }}</h3>
             <label class="settings-field settings-switch-row">
-              <button class="switch-control" type="button" role="switch" :aria-checked="webglEnabled" @click="setWebglEnabled(!webglEnabled)"><span /></button>
+              <Switch size="sm" :model-value="webglEnabled" @update:model-value="setWebglEnabled" />
               <span>{{ t("webglLabel") }}</span>
             </label>
             <p class="muted settings-note">{{ t("webglHint") }}</p>
 
             <h3 class="settings-section-title">{{ t("terminalSelectCopy.section") }}</h3>
             <label class="quick-sudo-control">
-              <button class="switch-control" type="button" role="switch" :aria-checked="termSelectCopy" @click="toggleSelectCopy"><span /></button>
+              <Switch size="sm" :model-value="termSelectCopy" @update:model-value="toggleSelectCopy" />
               <span>{{ t("terminalSelectCopy.label") }}</span>
             </label>
             <p class="muted settings-note">{{ t("terminalSelectCopy.hint") }}</p>
@@ -8083,10 +8323,13 @@ onBeforeUnmount(() => {
             </div>
             <label class="settings-field">
               <span>{{ t("mcpSettings.permissionMode") }}</span>
-              <select v-model="mcpDraft.permissionMode">
-                <option value="autonomous">{{ t("mcpSettings.permissionModeAutonomous") }}</option>
-                <option value="confirm">{{ t("mcpSettings.permissionModeConfirm") }}</option>
-              </select>
+              <Select :model-value="mcpDraft.permissionMode" @update:model-value="(v) => (mcpDraft.permissionMode = String(v))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="autonomous">{{ t("mcpSettings.permissionModeAutonomous") }}</SelectItem>
+                  <SelectItem value="confirm">{{ t("mcpSettings.permissionModeConfirm") }}</SelectItem>
+                </SelectContent>
+              </Select>
             </label>
             <p v-if="mcpDraft.permissionMode === 'confirm'" class="muted settings-note">{{ t("mcpSettings.permissionModeConfirmHint") }}</p>
             <label class="settings-field">
@@ -8108,20 +8351,25 @@ onBeforeUnmount(() => {
           <button @click="settingsOpen = false">{{ t("close") }}</button>
           <button class="primary-button" :disabled="settingsLoading || settingsLoadFailed || settingsSaving || !settingsMeta" @click="saveSettings"><Loader2 v-if="settingsSaving" class="spinning" />{{ t("settingsSave") }}</button>
         </footer>
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="auditOpen" class="modal-backdrop" @mousedown.self="auditOpen = false">
-      <article class="modal settings-modal audit-modal">
-        <header><h2>{{ t("auditLog.title") }}</h2><button :title="t('close')" class="icon-button" @click="auditOpen = false"><X /></button></header>
+    <Dialog :open="auditOpen" @update:open="(open) => { if (!open) auditOpen = false; }">
+      <DialogContent class="modal settings-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("auditLog.title") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="auditOpen = false"><X /></button></header>
         <div class="settings-body">
           <div class="audit-toolbar">
             <label class="highlight-editor-flag">
               <span>{{ t("auditLog.kindFilter") }}</span>
-              <select v-model="auditKindFilter">
-                <option value="">{{ t("auditLog.kindAll") }}</option>
-                <option v-for="kind in auditKindOptions(auditEntries)" :key="kind" :value="kind">{{ auditKindLabel(kind, t) }}</option>
-              </select>
+              <Select :model-value="auditKindFilter || SELECT_EMPTY_SENTINEL" @update:model-value="(v) => (auditKindFilter = v === SELECT_EMPTY_SENTINEL ? '' : String(v))">
+                <SelectTrigger size="xs" class="audit-kind-select">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem :value="SELECT_EMPTY_SENTINEL">{{ t("auditLog.kindAll") }}</SelectItem>
+                  <SelectItem v-for="kind in auditKindOptions(auditEntries)" :key="kind" :value="kind">{{ auditKindLabel(kind, t) }}</SelectItem>
+                </SelectContent>
+              </Select>
             </label>
             <button class="icon-button" :title="t('refresh')" :disabled="auditLoading" @click="loadAuditEntries"><RefreshCw :class="{ spinning: auditLoading }" /></button>
             <button class="icon-button" :title="t('auditLog.clear')" @click="clearAuditLog"><Trash2 /></button>
@@ -8149,30 +8397,34 @@ onBeforeUnmount(() => {
           </template>
         </div>
         <footer><button @click="auditOpen = false">{{ t("close") }}</button></footer>
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="profilesOpen" class="modal-backdrop" @mousedown.self="profilesOpen = false">
-      <article class="modal settings-modal">
-        <header><h2>{{ t("profilesTitle") }}</h2><button :title="t('close')" class="icon-button" @click="profilesOpen = false"><X /></button></header>
+    <Dialog :open="profilesOpen" @update:open="(open) => { if (!open) profilesOpen = false; }">
+      <DialogContent class="modal settings-modal profiles-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("profilesTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="profilesOpen = false"><X /></button></header>
         <div class="settings-body">
           <p class="muted">{{ t("profilesHint") }}</p>
-          <div v-if="sudoProfilesLoading && !sudoProfiles.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
-          <div v-else-if="!sudoProfiles.length" class="empty compact">{{ t("profilesEmpty") }}</div>
-          <ul v-else class="settings-list">
-            <li v-for="profile in sudoProfiles" :key="profile.id">
-              <div class="settings-list-main">
-                <strong>{{ profile.name }}</strong>
-                <span class="muted">{{ profileSummary(profile) }}</span>
-              </div>
-              <span class="settings-list-actions">
-                <button class="icon-button" :title="t('profilesEdit')" @click="startProfileEdit(profile)"><Pencil /></button>
-                <button class="icon-button" :title="t('profilesDelete')" @click="removeProfile(profile)"><Trash2 /></button>
-              </span>
-            </li>
-          </ul>
-          <p class="muted">{{ t("profilesLimit", { count: sudoProfiles.length, limit: 20 }) }}</p>
-          <button v-if="!profileEditing" class="link-button" @click="startProfileCreate">{{ t("profilesAdd") }}</button>
+          <div class="profiles-toolbar">
+            <span class="profiles-count muted">{{ t("profilesLimit", { count: sudoProfiles.length, limit: 20 }) }}</span>
+            <button v-if="!profileEditing" class="primary-button profiles-add" @click="startProfileCreate"><Plus />{{ t("profilesAdd") }}</button>
+          </div>
+          <div class="profiles-content">
+            <div v-if="sudoProfilesLoading && !sudoProfiles.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+            <div v-else-if="!sudoProfiles.length" class="profiles-empty"><ShieldCheck /><p>{{ t("profilesEmpty") }}</p></div>
+            <ul v-else class="settings-list profiles-list">
+              <li v-for="profile in sudoProfiles" :key="profile.id">
+                <div class="settings-list-main">
+                  <strong>{{ profile.name }}</strong>
+                  <span class="muted">{{ profileSummary(profile) }}</span>
+                </div>
+                <span class="settings-list-actions">
+                  <button class="icon-button" :title="t('profilesEdit')" @click="startProfileEdit(profile)"><Pencil /></button>
+                  <button class="icon-button" :title="t('profilesDelete')" @click="removeProfile(profile)"><Trash2 /></button>
+                </span>
+              </li>
+            </ul>
+          </div>
 
           <template v-if="profileEditing">
             <h3 class="settings-section-title">{{ profileDraft.id ? t("profilesEdit") : t("profilesAdd") }}</h3>
@@ -8190,11 +8442,14 @@ onBeforeUnmount(() => {
             </label>
             <label class="settings-field">
               <span>{{ t("settingsFlowMode") }}</span>
-              <select v-model="profileDraft.authFlowMode">
-                <option value="password_then_otp">{{ t("flowThenOtp") }}</option>
-                <option value="password_plus_otp">{{ t("flowPlusOtp") }}</option>
-                <option value="password_only">{{ t("flowOnly") }}</option>
-              </select>
+              <Select :model-value="profileDraft.authFlowMode" @update:model-value="(v) => (profileDraft.authFlowMode = String(v))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="password_then_otp">{{ t("flowThenOtp") }}</SelectItem>
+                  <SelectItem value="password_plus_otp">{{ t("flowPlusOtp") }}</SelectItem>
+                  <SelectItem value="password_only">{{ t("flowOnly") }}</SelectItem>
+                </SelectContent>
+              </Select>
             </label>
             <label class="settings-field">
               <span>{{ t("settingsPasswordHint") }}</span>
@@ -8205,7 +8460,7 @@ onBeforeUnmount(() => {
               <input v-model="profileDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
             </label>
             <label class="quick-sudo-control">
-              <button class="switch-control" type="button" role="switch" :aria-checked="profileDraft.sudoUsePty" @click="profileDraft.sudoUsePty = !profileDraft.sudoUsePty"><span /></button>
+              <Switch v-model="profileDraft.sudoUsePty" size="sm" />
               <span>{{ t("settingsUsePty") }}</span>
             </label>
             <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
@@ -8216,21 +8471,26 @@ onBeforeUnmount(() => {
           </template>
         </div>
         <footer><button @click="profilesOpen = false">{{ t("close") }}</button></footer>
-      </article>
-    </section>
-    <section v-if="hostKeyPrompt" class="modal-backdrop">
-      <article class="modal host-key-modal">
-        <header><h2>{{ t("hostKeyDialog.title") }}</h2></header>
+      </DialogContent>
+    </Dialog>
+    <!-- 安全弹窗：不允许 Esc / 点击遮罩关闭，必须显式信任或拒绝（不在 Esc 链中） -->
+    <Dialog :open="!!hostKeyPrompt">
+      <DialogContent class="modal host-key-modal" @escape-key-down.prevent @pointer-down-outside.prevent>
+        <template v-if="hostKeyPrompt">
+        <header><DialogTitle>{{ t("hostKeyDialog.title") }}</DialogTitle></header>
         <p>{{ t("hostKeyDialog.desc") }}</p>
         <dl><dt>{{ t("hostKeyDialog.server") }}</dt><dd>{{ hostKeyPrompt.host }}:{{ hostKeyPrompt.port }}</dd><dt>{{ t("hostKeyDialog.keyType") }}</dt><dd>{{ hostKeyPrompt.keyType }}</dd><dt>{{ t("hostKeyDialog.fingerprint") }}</dt><dd class="fingerprint">{{ hostKeyPrompt.fingerprint }}</dd></dl>
         <label class="remember"><input v-model="rememberHostKey" type="checkbox" /> {{ t("hostKeyDialog.remember") }}</label>
         <footer><button @click="resolveHostKey(false)">{{ t("hostKeyDialog.reject") }}</button><button class="primary-button" @click="resolveHostKey(true)">{{ t("hostKeyDialog.trust") }}</button></footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="agentPromptHead" class="modal-backdrop">
-      <article class="modal agent-prompt-modal">
-        <header><h2>{{ agentPromptHead.source === "mcp" ? t("agentPrompt.mcpSource", { tool: agentPromptHead.tool }) : t("agentPromptTitle") }}</h2></header>
+    <!-- 安全弹窗：不允许 Esc / 点击遮罩关闭，必须显式批准或拒绝（不在 Esc 链中） -->
+    <Dialog :open="!!agentPromptHead">
+      <DialogContent class="modal" @escape-key-down.prevent @pointer-down-outside.prevent>
+        <template v-if="agentPromptHead">
+        <header><DialogTitle>{{ agentPromptHead.source === "mcp" ? t("agentPrompt.mcpSource", { tool: agentPromptHead.tool }) : t("agentPromptTitle") }}</DialogTitle></header>
         <div class="agent-prompt-meta">
           <span>{{ t("agentPromptSource") }} <code class="mono">{{ agentPromptHead.tool }}</code></span>
           <span class="agent-risk-badge" :class="agentPromptHead.risk === 'elevated' ? 'elevated' : 'low'">{{ agentPromptHead.risk === "elevated" ? t("agentPromptRiskElevated") : t("agentPromptRiskLow") }}</span>
@@ -8248,14 +8508,15 @@ onBeforeUnmount(() => {
         </label>
         <p class="muted agent-prompt-countdown">{{ t("agentPromptTimeoutHint", { seconds: Math.ceil(agentPromptRemaining) }) }}</p>
         <footer><button @click="resolveAgentPrompt('deny')">{{ t("agentPromptDeny") }}</button><button class="primary-button" @click="resolveAgentPrompt('approve')">{{ t("agentPromptApprove") }}</button></footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
     <!-- 告警排查：异构告警 → 结构化 + 分类 + 只读诊断命令清单 -->
-    <section v-if="alertTriageOpen" class="modal-backdrop" @mousedown.self="alertTriageOpen = false">
-      <article class="modal alert-triage-modal">
+    <Dialog :open="alertTriageOpen" @update:open="(open) => { if (!open) alertTriageOpen = false; }">
+      <DialogContent class="modal alert-triage-modal" @escape-key-down.prevent>
         <header>
-          <h2>{{ t("alertTriage.title") }}</h2>
+          <DialogTitle>{{ t("alertTriage.title") }}</DialogTitle>
           <button :title="t('close')" class="icon-button" @click="alertTriageOpen = false"><X /></button>
         </header>
         <p class="muted alert-triage-hint">{{ t("alertTriage.hint") }}</p>
@@ -8285,13 +8546,14 @@ onBeforeUnmount(() => {
             <button @click="copySuggestions">{{ t("alertTriage.copyAll") }}</button>
           </footer>
         </div>
-      </article>
-    </section>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="pasteConfirm" class="modal-backdrop" @mousedown.self="resolvePasteConfirm(false)">
-      <article class="modal small-modal" :class="{ 'destructive-modal': pasteConfirm.danger }">
+    <Dialog :open="!!pasteConfirm" @update:open="(open) => { if (!open) resolvePasteConfirm(false); }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="pasteConfirm">
         <header>
-          <h2>{{ pasteConfirm.danger ? t("terminalDanger.title") : t("terminalPasteConfirm.title") }}</h2>
+          <DialogTitle>{{ pasteConfirm.danger ? t("terminalDanger.title") : t("terminalPasteConfirm.title") }}</DialogTitle>
           <button :title="t('close')" class="icon-button" @click="resolvePasteConfirm(false)"><X /></button>
         </header>
         <div v-if="pasteConfirm.danger" class="destructive-copy">
@@ -8309,13 +8571,15 @@ onBeforeUnmount(() => {
           <button @click="resolvePasteConfirm(false)">{{ t("cancel") }}</button>
           <button :class="pasteConfirm.danger ? 'danger-button' : 'primary-button'" @click="resolvePasteConfirm(true)">{{ t("terminalPasteConfirm.confirm") }}</button>
         </footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
-    <section v-if="dropUploadPrompt" class="modal-backdrop" @mousedown.self="resolveDropUpload('cancel')">
-      <article class="modal small-modal">
+    <Dialog :open="!!dropUploadPrompt" @update:open="(open) => { if (!open) resolveDropUpload('cancel'); }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="dropUploadPrompt">
         <header>
-          <h2>{{ t("terminalDropPrompt.title") }}</h2>
+          <DialogTitle>{{ t("terminalDropPrompt.title") }}</DialogTitle>
           <button :title="t('close')" class="icon-button" @click="resolveDropUpload('cancel')"><X /></button>
         </header>
         <p class="muted">{{ t("terminalDropPrompt.summary", { count: dropUploadPrompt.files.length }) }}</p>
@@ -8343,8 +8607,9 @@ onBeforeUnmount(() => {
           <button @click="resolveDropUpload('cancel')">{{ t("cancel") }}</button>
           <button class="primary-button" :disabled="dropUploadTarget === 'custom' && !normalizeDropTargetDir(dropUploadPathInput)" @click="confirmDropUpload">{{ t("upload") }}</button>
         </footer>
-      </article>
-    </section>
+        </template>
+      </DialogContent>
+    </Dialog>
 
     <!-- 目录选择器：DOM 末尾渲染，保证叠在设置弹窗/下载询问弹窗之上。
          不传 initialPath：默认从「此电脑」盘符页开始（macOS/Linux 无盘符概念，
@@ -8372,7 +8637,7 @@ onBeforeUnmount(() => {
 .sftp-search-clear { display: grid; width: 16px; height: 16px; flex: 0 0 16px; border: 0; border-radius: 50%; padding: 0; place-items: center; background: transparent; color: var(--muted-foreground); cursor: pointer; }
 .sftp-search-clear:hover { background: var(--accent); color: var(--foreground); }
 .sftp-search-clear svg { width: 11px; height: 11px; }
-.sftp-type-filter { height: 26px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 3px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.sftp-type-filter { flex: 0 0 auto; }
 .sftp-batch-bar { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid var(--border); padding: 5px 8px; background: color-mix(in srgb, var(--primary) 8%, var(--background)); color: var(--muted-foreground); font-size: 11px; }
 .sftp-batch-bar span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sftp-batch-bar button { display: inline-flex; height: 24px; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; }
@@ -8383,7 +8648,7 @@ onBeforeUnmount(() => {
 .batch-progress-bar { flex: 0 1 140px; height: 6px; min-width: 80px; accent-color: var(--primary); }
 .batch-progress-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 .batch-progress-row .batch-progress-bar { flex: 1; }
-.path-history-popover { display: flex; width: 250px; max-height: min(320px, 50vh); flex-direction: column; padding: 8px; overflow: auto; }
+/* 弹层根规则移到 style.css 全局：portal 后内容根不带本组件 scopeId。 */
 .path-history-title { margin: 4px; color: var(--muted-foreground); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; }
 .path-history-popover .path-item { display: block; width: 100%; height: 26px; overflow: hidden; border: 0; border-radius: 4px; padding: 0 7px; background: transparent; color: var(--foreground); font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .path-history-popover .path-item:hover { background: var(--accent); }
@@ -8394,8 +8659,7 @@ onBeforeUnmount(() => {
 .bookmark-row:hover .bookmark-delete, .bookmark-row .bookmark-delete:focus-visible { opacity: 1; }
 .bookmark-row .bookmark-delete:hover { color: var(--destructive); background: var(--accent); }
 .bookmark-row .bookmark-delete svg { width: 12px; height: 12px; }
-/* 星标收藏弹层：路径预览 + 可编辑 label + 保存/取消 */
-.bookmark-save-popover { display: flex; width: 250px; flex-direction: column; gap: 6px; padding: 8px; }
+/* 星标收藏弹层：路径预览 + 可编辑 label + 保存/取消（根规则见 style.css 全局） */
 .bookmark-save-path { overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .bookmark-label-input { width: 100%; border: 1px solid var(--border); border-radius: 4px; padding: 4px 7px; background: var(--background); color: var(--foreground); font-size: 11px; }
 .bookmark-save-actions { display: flex; justify-content: flex-end; gap: 4px; }
@@ -8426,8 +8690,7 @@ onBeforeUnmount(() => {
 .command-history-item { display: block; width: 100%; overflow: hidden; border: 1px solid transparent; border-radius: 4px; padding: 4px 8px; background: transparent; color: var(--foreground); font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .command-history-item:hover { background: var(--accent); border-color: var(--border); }
 
-/* 快速命令栏（工具栏下拉）：发送 / 编辑 / 删除 + 底部新增编辑器 */
-.quick-commands-popover { display: flex; width: min(360px, calc(100vw - 24px)); max-height: min(480px, calc(100vh - 60px)); flex-direction: column; gap: 4px; padding: 8px; overflow: auto; }
+/* 快速命令栏（工具栏下拉）：发送 / 编辑 / 删除 + 底部新增编辑器（根规则见 style.css 全局） */
 .quick-commands-popover h3 { margin: 2px 4px 6px; font-size: 12px; }
 /* 搜索行：图标 + 无边框输入（容器边框即输入框）。 */
 .quick-search { display: flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 4px; padding: 0 8px; background: var(--background); }
@@ -8467,8 +8730,7 @@ onBeforeUnmount(() => {
 .quick-command-editor-actions button { height: 24px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; }
 .quick-command-editor-actions .primary-button { background: var(--primary); color: var(--primary-foreground); }
 
-/* 连接信息面板（工具栏下拉，只读） */
-.connection-info-popover { width: min(300px, calc(100vw - 24px)); padding: 8px 12px 12px; }
+/* 连接信息面板（工具栏下拉，只读；根规则见 style.css 全局） */
 .connection-info-popover h3 { margin: 4px 0 8px; font-size: 12px; }
 .connection-info-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 12px; }
 .connection-info-grid dt { max-width: 16ch; overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
@@ -8476,8 +8738,7 @@ onBeforeUnmount(() => {
 .connection-info-grid .task-error { font-size: 10px; }
 .connection-info-grid .link-button { flex: 0 0 auto; align-self: center; font-size: 10px; }
 
-/* 终端 MCP 模式快速开关（工具栏弹出层，与设置弹窗共用三档文案） */
-.agent-mode-popover { width: min(280px, calc(100vw - 24px)); padding: 8px 12px 12px; }
+/* 终端 MCP 模式快速开关（工具栏弹出层，与设置弹窗共用三档文案；根规则见 style.css 全局） */
 .agent-mode-popover h3 { margin: 4px 0 8px; font-size: 12px; }
 .agent-mode-option { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 12px; cursor: pointer; }
 .agent-mode-note { margin: 8px 0 0; font-size: 11px; }
@@ -8542,9 +8803,13 @@ onBeforeUnmount(() => {
   100% { opacity: 0.25; transform: scale(0.92); }
 }
 .recordings-float { width: 440px; }
-/* 录制记录卡片：左 图标+主机/时间两行，右 时长+操作图标按钮（不再复用
-   传输卡片 grid——那是为进度条设计的，录制卡塞进去行列全错位）。 */
-.recording-card { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--border); padding: 8px 4px; }
+/* 录制记录列表：shadcn 式行布局——行间距归零，行间仅一条 45% 淡化的发丝线，
+   行 hover 出 accent 圆角背景。旧卡片每条 border-top + body gap 会叠出
+   "每行上下各一条线"的双线观感，此处整体替换。 */
+.recordings-float .metrics-float-body { gap: 0; padding: 4px 6px; }
+.recording-card { display: flex; align-items: center; gap: 8px; border-radius: var(--radius); padding: 7px 8px; }
+.recording-card + .recording-card { border-top: 1px solid color-mix(in srgb, var(--border) 45%, transparent); }
+.recording-card:hover { background: var(--accent); }
 .recording-icon { width: 16px; height: 16px; flex: 0 0 16px; color: var(--muted-foreground); }
 .recording-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
 .recording-host { overflow: hidden; font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
@@ -8574,10 +8839,10 @@ onBeforeUnmount(() => {
 /* 空录制（00:00/00:00）在终端区中央给提示，不再黑屏干等。 */
 .replay-terminal-wrap { position: relative; }
 .replay-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted-foreground); font-size: 12px; pointer-events: none; }
-/* 控制行控件对齐：播放钮 24px / 倍速 26px / 导出按钮走次级按钮规范。 */
+/* 控制行控件对齐：播放钮 24px / 倍速 26px（SelectTrigger xs）/ 导出按钮走次级按钮规范。 */
 .replay-controls .link-button { display: inline-flex; height: 24px; align-items: center; align-self: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 11px; }
 .replay-controls .link-button:hover:not(:disabled) { background: var(--accent); }
-.replay-speed { width: 76px; height: 26px; }
+.replay-speed { flex: 0 0 auto; width: 76px; }
 .replay-time { min-width: 110px; text-align: right; font-size: 12px; color: var(--muted-foreground); }
 /* 终端拖入上传落点询问：文件清单限高滚动，路径行对齐 radio 观感。 */
 .drop-file-list { max-height: 132px; margin: 0; overflow: auto; white-space: pre; }

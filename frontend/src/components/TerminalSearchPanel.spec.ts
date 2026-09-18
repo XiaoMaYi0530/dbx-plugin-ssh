@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 // TerminalSearchPanel 组件测试：输入即查、prev/next/close 按钮、Aa|.*\|w\| 三个
-// 开关（is-active / aria-pressed / 持久化 localStorage / 触发重查）、Enter 与
+// 开关（data-state=on / aria-pressed / 持久化 localStorage / 触发重查）、Enter 与
 // Shift+Enter、Esc 关闭、空查询 clear、挂载聚焦 + 选区种子即查、match/no-match 状态文案。
 import { beforeEach, describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
@@ -99,7 +99,7 @@ describe("TerminalSearchPanel", () => {
     const caseToggle = toggleButtons(wrapper)[0];
     expect(caseToggle.text()).toBe("Aa");
     await caseToggle.trigger("click");
-    expect(caseToggle.classes()).toContain("is-active");
+    expect(caseToggle.attributes("data-state")).toBe("on");
     expect(caseToggle.attributes("aria-pressed")).toBe("true");
     expect(wrapper.emitted("findNext")?.at(-1)).toEqual(["Aa", { caseSensitive: true, regex: false, wholeWord: false }]);
     expect(JSON.parse(window.localStorage.getItem(TERMINAL_SEARCH_OPTIONS_KEY) ?? "{}")).toEqual({
@@ -128,9 +128,9 @@ describe("TerminalSearchPanel", () => {
     window.localStorage.setItem(TERMINAL_SEARCH_OPTIONS_KEY, JSON.stringify({ caseSensitive: true, regex: true, wholeWord: false }));
     const wrapper = mountPanel({ initialOptions: { caseSensitive: true, regex: true, wholeWord: false } });
     const [caseToggle, regexToggle, wordToggle] = toggleButtons(wrapper);
-    expect(caseToggle.classes()).toContain("is-active");
-    expect(regexToggle.classes()).toContain("is-active");
-    expect(wordToggle.classes()).not.toContain("is-active");
+    expect(caseToggle.attributes("data-state")).toBe("on");
+    expect(regexToggle.attributes("data-state")).toBe("on");
+    expect(wordToggle.attributes("data-state")).toBe("off");
     // Toggles already in their stored state → no watch fires → storage untouched.
     expect(wrapper.emitted("findNext")).toBeUndefined();
   });

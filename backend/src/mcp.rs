@@ -3777,6 +3777,7 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         .unwrap_or_default()
         .trim()
         .to_string();
+    let connect_timeout = arg_u64(arguments, "connectTimeoutSecs")?;
     Ok(StoredConnection {
         sudo_whitelist: Vec::new(),
         id: connection_pool_id(arguments),
@@ -3801,9 +3802,8 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        connect_timeout_secs: arg_u64(arguments, "connectTimeoutSecs")?
-            .unwrap_or(30)
-            .max(1),
+        connect_timeout_secs: connect_timeout.unwrap_or(30).max(1),
+        connect_timeout_explicit: connect_timeout.is_some(),
         keepalive_interval_secs: 30,
         // MCP drives exec channels, never the user's interactive PTY —
         // activity injection doesn't apply here.

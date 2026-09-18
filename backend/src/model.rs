@@ -119,6 +119,12 @@ pub struct StoredConnection {
     #[cfg_attr(windows, allow(dead_code))]
     pub agent_socket: String,
     pub connect_timeout_secs: u64,
+    /// Whether `connect_timeout_secs` was explicitly present in the lifecycle
+    /// params (vs defaulted to 30). `connection/test` needs this to align its
+    /// dial budget with the host-side RPC deadline: a stored/absent value of
+    /// 0 materializes as the host's own fallback (10s), not the manifest
+    /// default, so an absent field means the host will kill the call at 10s.
+    pub connect_timeout_explicit: bool,
     pub keepalive_interval_secs: u64,
     /// Interactive-terminal activity keepalive: interval in seconds for
     /// injecting space+backspace into the PTY so server-side idle policies
@@ -284,6 +290,8 @@ impl JumpHost {
             private_key_passphrase: self.private_key_passphrase.clone(),
             agent_socket: self.agent_socket.clone(),
             connect_timeout_secs: timeout_secs.max(1),
+            // 跳数合成的连接其超时由调用方显式传入，按显式处理。
+            connect_timeout_explicit: true,
             keepalive_interval_secs: keepalive_secs,
             // Jump hops carry no interactive terminal, so no activity
             // keepalive either.
@@ -455,6 +463,9 @@ impl StoredConnection {
             .map(str::to_string)
             .collect();
         let jump_hosts = parse_jump_hosts(external_config)?;
+        // connect_timeout_secs 显式性单独留存：缺省（未展开高级选项）时宿主
+        // connection/test 的 RPC 截止走的是宿主自己的 10s 回退而不是这里的 30s。
+        let connect_timeout = config_u64(external_config, connection, "connect_timeout_secs");
         let runtime_host = if runtime_host.is_empty() {
             host.clone()
         } else {
@@ -496,9 +507,8 @@ impl StoredConnection {
             private_key,
             private_key_passphrase,
             agent_socket,
-            connect_timeout_secs: config_u64(external_config, connection, "connect_timeout_secs")
-                .unwrap_or(30)
-                .max(1),
+            connect_timeout_secs: connect_timeout.unwrap_or(30).max(1),
+            connect_timeout_explicit: connect_timeout.is_some(),
             keepalive_interval_secs: config_u64(
                 external_config,
                 connection,
@@ -1873,9 +1883,11 @@ mod manifest_contract_tests {
         )
         .unwrap();
         assert_eq!(zero_timeout.connect_timeout_secs, 1);
+        assert!(zero_timeout.connect_timeout_explicit);
 
         // ⑧b 表单未填时跟随 manifest 默认（30s）：慢速 Windows/macOS 主机的
-        //    握手+认证预算不再按旧默认 15s 一连接就打满。
+        //    握手+认证预算不再按旧默认 15s 一连接就打满。缺省同时标记为
+        //    非显式——connection/test 的拨号预算据此对齐宿主 10s 回退截止。
         let default_timeout = connection_with(
             "password",
             Some("pw"),
@@ -1884,6 +1896,7 @@ mod manifest_contract_tests {
         )
         .unwrap();
         assert_eq!(default_timeout.connect_timeout_secs, 30);
+        assert!(!default_timeout.connect_timeout_explicit);
 
         // ⑨ 跳板机不接受 none：链上每一跳都必须认证，"No authentication"
         //    只对最终会话合法。

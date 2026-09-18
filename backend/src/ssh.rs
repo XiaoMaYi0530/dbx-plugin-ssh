@@ -528,6 +528,37 @@ fn host_key_unreachable_response(error: String) -> Value {
     json!({ "state": "unreachable", "error": error })
 }
 
+/// Host-side RPC deadline fallback for `connection/test` when the stored
+/// connection omits `connect_timeout_secs`: the host materializes 0/absent
+/// via dbx-core `default_connect_timeout_secs()` = 10s
+/// (crates/dbx-core/src/models/connection.rs:501) — NOT this plugin's
+/// manifest default of 30s. Keep in sync with the host.
+const HOST_FALLBACK_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// `connection/test` dial budget: the host kills the RPC at the effective
+/// connect timeout, so the sidecar must answer one second earlier (the
+/// margin covers stdio write→parse→dispatch latency), floored at 1s. An
+/// explicit `connect_timeout_secs` is the deadline itself; an absent one
+/// means the host falls back to its own 10s default.
+fn test_dial_budget_secs(connect_timeout_secs: u64, explicit: bool) -> u64 {
+    let deadline = if explicit {
+        connect_timeout_secs.max(1)
+    } else {
+        HOST_FALLBACK_CONNECT_TIMEOUT_SECS
+    };
+    deadline.saturating_sub(1).max(1)
+}
+
+/// Actionable `connection/test` timeout: the cryptic host RPC-timeout
+/// message gave no remedy; this names the effective budget (flagged as the
+/// host default when the field was absent) plus the user-side fix.
+fn test_timeout_message(host: &str, port: u16, budget_secs: u64, host_default: bool) -> String {
+    let source = if host_default { " (host default)" } else { "" };
+    format!(
+        "SSH connection to {host}:{port} timed out after {budget_secs} seconds{source}. Increase 'SSH timeout' under Advanced options and retry."
+    )
+}
+
 /// Key-exchange-only probe handler (tiny-rdm's CheckHostKey equivalent):
 /// the server key is fingerprinted and compared against the known_hosts
 /// stores, then the handshake is aborted with `Ok(false)` so no
@@ -1396,9 +1427,25 @@ impl SshRuntime {
         operation_id: &str,
         emitter: PluginEmitter,
     ) -> Result<(), String> {
-        let (handle, jumps) = self
-            .connect_authenticated(connection, operation_id, Some(emitter))
-            .await?;
+        // 宿主对 connection/test 有 RPC 截止（有效连接超时），截止一到直接
+        // 杀掉请求、用户只看到费解的宿主超时文案——sidecar 必须在截止前
+        // 作答，因此拨号预算按宿主截止对齐并留 1s 余量。
+        let budget_secs = test_dial_budget_secs(
+            connection.connect_timeout_secs,
+            connection.connect_timeout_explicit,
+        );
+        let probe = self.connect_authenticated(connection, operation_id, Some(emitter));
+        let (handle, jumps) = match tokio::time::timeout(Duration::from_secs(budget_secs), probe).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(test_timeout_message(
+                    &connection.runtime_host,
+                    connection.runtime_port,
+                    budget_secs,
+                    !connection.connect_timeout_explicit,
+                ));
+            }
+        };
         handle
             .disconnect(
                 Disconnect::ByApplication,
@@ -5361,6 +5408,25 @@ fn plugin_error(error: PluginError) -> String {
 mod tests {
     use super::*;
     use russh::{cipher, kex, mac};
+
+    #[test]
+    fn test_connection_budget_aligns_with_host_deadline() {
+        assert_eq!(test_dial_budget_secs(30, true), 29);
+        assert_eq!(test_dial_budget_secs(30, false), 9);
+        assert_eq!(test_dial_budget_secs(1, true), 1);
+    }
+
+    #[test]
+    fn test_timeout_message_names_budget_source_and_remedy() {
+        let explicit = test_timeout_message("dbx-ssh-test", 22, 29, false);
+        assert_eq!(
+            explicit,
+            "SSH connection to dbx-ssh-test:22 timed out after 29 seconds. Increase 'SSH timeout' under Advanced options and retry."
+        );
+        let fallback = test_timeout_message("dbx-ssh-test", 22, 9, true);
+        assert!(fallback.contains("timed out after 9 seconds (host default)"), "{fallback}");
+        assert!(fallback.contains("Increase 'SSH timeout' under Advanced options"), "{fallback}");
+    }
 
     #[test]
     fn replay_buffer_is_sequence_addressable() {

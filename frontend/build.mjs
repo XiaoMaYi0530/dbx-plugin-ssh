@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "vite";
 import vue from "@vitejs/plugin-vue";
+import tailwindcss from "@tailwindcss/vite";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const temporary = path.join(root, "dist");
@@ -11,8 +12,13 @@ const output = path.resolve(root, "../ui");
 await build({
   root,
   configFile: false,
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],
   base: "./",
+  resolve: {
+    alias: {
+      "@": path.resolve(root, "src"),
+    },
+  },
   build: {
     outDir: temporary,
     emptyOutDir: true,

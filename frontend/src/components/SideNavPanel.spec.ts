@@ -44,21 +44,24 @@ function mountPanel(props: Partial<{ tab: "tree" | "quick"; collapsed: boolean; 
 describe("SideNavPanel", () => {
   it("activates the tree tab by default and shows the refresh button only there", () => {
     const wrapper = mountPanel();
-    expect(wrapper.find('button[title="sftpSide.tree"]').classes()).toContain("is-active");
-    expect(wrapper.find('button[title="sftpQuickPath.title"]').classes()).not.toContain("is-active");
+    expect(wrapper.find('button[title="sftpSide.tree"]').attributes("data-state")).toBe("active");
+    expect(wrapper.find('button[title="sftpQuickPath.title"]').attributes("data-state")).toBe("inactive");
     expect(wrapper.find('button[title="refresh"]').exists()).toBe(true);
+    // 刷新按钮显隐由 tab prop 驱动（父组件持有状态）。
+    expect(mountPanel({ tab: "quick" }).find('button[title="refresh"]').exists()).toBe(false);
   });
 
   it("clicking the quick tab emits update:tab and hides the refresh button", async () => {
-    const wrapper = mountPanel({ tab: "quick" });
-    await wrapper.find('button[title="sftpQuickPath.title"]').trigger("click");
+    const wrapper = mountPanel();
+    // reka TabsTrigger 在 mousedown（左键）激活，与 Radix 一致；click 不触发切换。
+    await wrapper.find('button[title="sftpQuickPath.title"]').trigger("mousedown", { button: 0 });
     expect(wrapper.emitted("update:tab")?.[0]).toEqual(["quick"]);
-    expect(wrapper.find('button[title="refresh"]').exists()).toBe(false);
+    expect(wrapper.find('button[title="refresh"]').exists()).toBe(true);
   });
 
   it("clicking the tree tab emits update:tab with 'tree'", async () => {
     const wrapper = mountPanel({ tab: "quick" });
-    await wrapper.find('button[title="sftpSide.tree"]').trigger("click");
+    await wrapper.find('button[title="sftpSide.tree"]').trigger("mousedown", { button: 0 });
     expect(wrapper.emitted("update:tab")?.[0]).toEqual(["tree"]);
   });
 
@@ -95,7 +98,7 @@ describe("SideNavPanel", () => {
     expect(toggled.path).toBe("/var");
 
     await rows[1].trigger("contextmenu", { clientX: 40, clientY: 30 });
-    expect(wrapper.emitted("node-context")?.[0]).toEqual([{ path: "/var", x: 40, y: 30 }]);
+    expect(wrapper.emitted("node-context")?.[0]).toEqual([{ path: "/var" }]);
   });
 
   it("renders quick paths, navigates on click, marks the current one and right-click emits node-context", async () => {
@@ -110,7 +113,7 @@ describe("SideNavPanel", () => {
     expect(wrapper.emitted("navigate")?.[0]).toEqual(["/home/dev"]);
 
     await buttons[1].trigger("contextmenu", { clientX: 7, clientY: 9 });
-    expect(wrapper.emitted("node-context")?.[0]).toEqual([{ path: "/srv/data", x: 7, y: 9 }]);
+    expect(wrapper.emitted("node-context")?.[0]).toEqual([{ path: "/srv/data" }]);
   });
 
   it("shows a home icon for home quick paths and a folder icon for the rest", () => {

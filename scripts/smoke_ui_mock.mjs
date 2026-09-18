@@ -140,7 +140,10 @@ try {
 
   // --- global quick commands: add via the toolbar popover -----------------
   console.log("==> quick commands: global store add");
-  await page.click('button[title="Quick commands"]');
+  // 自定义 tooltip 系统（App.vue 全局接管）：首次 hover 后 title 会挪到
+  // data-tooltip，此后 button[title=...] 选择器不再命中，两处点击都要兼容。
+  const QUICK_BTN = 'button[title="Quick commands"], button[data-tooltip="Quick commands"]';
+  await page.click(QUICK_BTN);
   await expect(page, ".quick-commands-popover", "quick commands popover");
   await expectText(page, ".quick-command-global-hint", "Stored globally", "global-store hint");
   // 编辑器已改为子视图：先点"新建"按钮，名称 input + 命令 textarea。
@@ -163,7 +166,9 @@ try {
   await expect(page, ".batch-targets-popover", "batch targets popover");
   await expectText(page, ".batch-target-row", "demo@server.demo.internal", "target row user@host");
   await expectText(page, ".batch-target-row", "Current", "current-session badge");
-  await page.selectOption(".batch-bar-quick", { label: "ui-mock cmd" });
+  // 快速命令下拉已迁到 reka Select（Phase 3）：点开触发钮，再点选项。
+  await page.click(".batch-bar-quick");
+  await page.click('[data-slot="select-item"]:has-text("ui-mock cmd")');
   const draft = await page.inputValue(".batch-bar-input");
   await check("quick pick fills the command draft", draft === "echo ui-mock-batch", `draft="${draft}"`);
   await page.screenshot({ path: `${SHOT_DIR}/03-batch-send.png`, fullPage: false });
@@ -209,7 +214,7 @@ try {
 
   // --- global quick commands: delete --------------------------------------
   console.log("==> quick commands: delete");
-  await page.click('button[title="Quick commands"]');
+  await page.click(QUICK_BTN);
   // 动作按钮 hover 浮现（opacity 0 → 1），先悬停卡片再点删除；
   // 删除有 window.confirm 确认（不可逆操作），自动接受。
   await page.hover(".quick-command-row");

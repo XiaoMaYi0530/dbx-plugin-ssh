@@ -24,6 +24,16 @@ export const OPEN_RETRY_BASE_DELAY_MS = 2000;
 export const OPEN_RETRY_FAST_FAIL_WINDOW_MS = 8000;
 
 /**
+ * Bounded poll window for manual entry points that hit "Connection is not
+ * active": the host only replays connection/connect into a live sidecar when
+ * the user reopens the connection from the DBX sidebar, so the plugin retries
+ * for this many rounds at a fixed cadence, giving the user a chance to reopen
+ * it and letting the attempt self-heal.
+ */
+export const INACTIVE_RETRY_MAX = 10;
+export const INACTIVE_RETRY_DELAY_MS = 3000;
+
+/**
  * Permanent connect-error kinds. Auth and host-key rejections fail within
  * milliseconds and can never self-heal by retrying — the user must fix the
  * credential or the known-hosts entry first — so they skip the retry ladder
@@ -49,10 +59,16 @@ export function decideConnectRetry(options: {
   inactive: boolean;
   bootRestore: boolean;
 }): ConnectRetryDecision {
-  // "Connection is not active" is transient only while the host replays the
-  // connect lifecycle for a restored tab; a manual entry (reconnect button
-  // etc.) can never self-heal this way and must fail fast with guidance.
-  if (options.inactive && !options.bootRestore) return { kind: "fail" };
+  // "Connection is not active" means the sidecar lost the connection registry
+  // (e.g. sidecar restart); the host only refills it when the user reopens the
+  // connection from the DBX sidebar. Manual entry points (reconnect button
+  // etc.) poll for a bounded window so a reopen self-heals, then fail with
+  // guidance. Boot restores keep the regular ladder because the host replays
+  // the connect lifecycle on its own.
+  if (options.inactive && !options.bootRestore) {
+    if (options.attempt >= INACTIVE_RETRY_MAX) return { kind: "fail" };
+    return { kind: "retry", attempt: options.attempt + 1, delayMs: INACTIVE_RETRY_DELAY_MS };
+  }
   if (isPermanentConnectError(options.cause)) return { kind: "fail" };
   if (options.attempt >= options.maxAttempts) return { kind: "fail" };
   if (options.attemptMs >= OPEN_RETRY_FAST_FAIL_WINDOW_MS) return { kind: "fail" };

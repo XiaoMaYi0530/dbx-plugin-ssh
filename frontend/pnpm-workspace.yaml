@@ -1,0 +1,4 @@
+allowBuilds:
+  # vue-demi's postinstall only switches its build to Vue 2; this plugin is
+  # Vue 3-only, so the script is intentionally skipped (same as the DBX host).
+  vue-demi: false

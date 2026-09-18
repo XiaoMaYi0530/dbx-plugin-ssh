@@ -54,8 +54,12 @@ npm install -g @dbx-app/plugin-cli @dbx-app/cli @dbx-app/mcp-server
 4. **安全红线**：远端命令一律 shell 单引号转义；写操作过 `ensure_writable`（只读连接）；
    sudo 写入分块 ≤256KiB；`removeAll` 拒绝 `/`；私钥只出指纹不出内容。
 5. **前端**：新文案七语全补（漏一语 typecheck 不报，靠 review）；错误走
-   `showError(cause, "terminal"|"sftp")`；无新依赖；`fileTransfer` 缺失（web/docker
-   模式）必须有浏览器兜底（File API 上传 / Blob 下载）。
+   `showError(cause, "terminal"|"sftp")`；UI 组件一律用 `frontend/src/components/ui/`
+   下的 reka-ui wrapper（Dialog/Popover/Select/ContextMenu/Switch…），Tailwind
+   工具类可用；wrapper 按需从宿主组件集增补——只保留实际被引用的子组件文件，
+   未用到的宿主 wrapper 不入库（删过一批零引用文件，见 components.json 声明的
+   别名已实配 `@`→`src`）；除此之外**不再新增其他运行时依赖**（确有需要先讨论）；
+   `fileTransfer` 缺失（web/docker 模式）必须有浏览器兜底（File API 上传 / Blob 下载）。
 6. **测试**：新能力 = 单测（纯解析，不连 SSH）+ smoke 用例（scripts/smoke_*.py，
    未注册方法 SKIP 而非 FAIL）+ 对标清单状态更新，三者齐才算完成。
 

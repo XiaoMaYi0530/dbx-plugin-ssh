@@ -119,7 +119,7 @@ describe("SSH workbench protocol helpers", () => {
 
 describe("workbench localization", () => {
   const locales: WorkbenchLocale[] = ["en", "es", "it", "ja", "pt-BR", "zh-CN", "zh-TW"];
-  const requiredKeys = ["connecting", "reconnect", "upload", "uploaded", "downloaded", "fileTransferUnavailable", "newFolder", "delete", "deleteTitle", "deleted", "name", "size", "modified", "permissions", "transfers", "terminalCopy", "terminalPaste", "zmodemUpload", "terminalSearch.open", "terminalPasteConfirm.title", "terminalDanger.title", "terminalZoom.fontSize", "terminalCommand.running", "terminalCommand.finished", "terminalCommand.hint", "sessionStatus.connecting", "sessionStatus.connected", "sessionStatus.reconnecting", "sessionStatus.disconnected", "sessionStatus.error"];
+  const requiredKeys = ["connecting", "reconnect", "upload", "uploaded", "downloaded", "newFolder", "delete", "deleteTitle", "deleted", "name", "size", "modified", "permissions", "transfers", "terminalCopy", "terminalPaste", "zmodemUpload", "terminalSearch.open", "terminalPasteConfirm.title", "terminalDanger.title", "terminalZoom.fontSize", "terminalCommand.running", "terminalCommand.finished", "terminalCommand.hint", "sessionStatus.connecting", "sessionStatus.connected", "sessionStatus.reconnecting", "sessionStatus.disconnected", "sessionStatus.error"];
 
   it("resolves every supported locale and falls back to Simplified Chinese", () => {
     expect(resolveWorkbenchLocale("zh-HK")).toBe("zh-TW");
@@ -667,13 +667,35 @@ const appStyleIndex = appVueSource.indexOf("<style");
 const appTemplate = appVueSource.slice(appVueSource.indexOf("<template>"), appVueSource.lastIndexOf("</template>", appStyleIndex));
 const appScript = appVueSource.slice(appVueSource.indexOf("<script"), appVueSource.indexOf("</script>"));
 
-/** 模板中 class 含 marker 且由 v-if 守卫的元素 → 守卫表达式的状态 ref 基名。 */
+/** 模板中 class 含 marker 且由 v-if 守卫的元素 → 守卫表达式的状态 ref 基名。
+ *  reka Popover 面板（Phase 5）无 v-if：内容 portal、由包裹的 <Popover :open="ref">
+ *  受控，向回找最近的 Popover 根提取守卫 ref。Phase 6 的 Dialog 同理：弹窗壳是
+ *  <Dialog :open="ref"><DialogContent class="modal …">，marker 命中 DialogContent
+ *  的 class，向回找最近的 Dialog 根（open 表达式可带 !! 前缀或 === 比较）。 */
 function templateGuardRefs(classMarker: string): string[] {
   const refs = new Set<string>();
   const marker = new RegExp(`class="[^"]*${classMarker}`, "g");
   for (let hit = marker.exec(appTemplate); hit; hit = marker.exec(appTemplate)) {
-    const guard = appTemplate.slice(appTemplate.lastIndexOf("<", hit.index), hit.index).match(/v-if="([A-Za-z_$][\w$]*)/);
-    if (guard) refs.add(guard[1]);
+    const tagStart = appTemplate.lastIndexOf("<", hit.index);
+    const guard = appTemplate.slice(tagStart, hit.index).match(/v-if="([A-Za-z_$][\w$]*)/);
+    if (guard) {
+      refs.add(guard[1]);
+      continue;
+    }
+    // 无 v-if 守卫（portal 受控面板）：取最近的 Popover/Dialog 根（两者索引较大者
+    // 才是当前面板的包裹根，取错会把弹窗误归给更早的 popover）。
+    let bestStart = -1;
+    let bestMatch: RegExpMatchArray | null = null;
+    for (const rootTag of ["Popover", "Dialog"]) {
+      const rootStart = appTemplate.lastIndexOf(`<${rootTag} :open="`, tagStart);
+      if (rootStart <= bestStart) continue;
+      const root = appTemplate.slice(rootStart).match(new RegExp(`<${rootTag} :open="!*([A-Za-z_$][\\w$]*)`));
+      if (root) {
+        bestStart = rootStart;
+        bestMatch = root;
+      }
+    }
+    if (bestMatch) refs.add(bestMatch[1]);
   }
   return [...refs];
 }
@@ -687,7 +709,12 @@ function scriptBlockRefs(startMarker: string, endMarker: string): Set<string> {
 
 describe("App.vue popover/modal wiring structural guard", () => {
   const popoverRefs = templateGuardRefs("popover");
-  const modalRefs = templateGuardRefs("modal-backdrop");
+  // Phase 6：弹窗壳为 <Dialog :open="ref"><DialogContent class="modal …>，
+  // marker 取 "modal "（尾空格）以排除 replay-modal/-modal 变体类的误命中。
+  const modalRefs = templateGuardRefs("modal ");
+  // FolderPickerDialog 内部已迁 reka Dialog，App 侧仍是组件标签上的 v-if 守卫。
+  const folderPickerGuard = appTemplate.match(/<FolderPickerDialog\s+v-if="([A-Za-z_$][\w$]*)/);
+  if (folderPickerGuard) modalRefs.push(folderPickerGuard[1]);
   const focusTableRefs = scriptBlockRefs("const modalOpenStates = computed(() => [", "]);");
   const escChainRefs = scriptBlockRefs("function onDocumentKeydown(event: KeyboardEvent)", "\nfunction ");
   const familyRefs = scriptBlockRefs("function closeToolbarPopovers()", "\nfunction ");
@@ -698,7 +725,7 @@ describe("App.vue popover/modal wiring structural guard", () => {
     for (const ref of ["quickMenuOpen", "connectionInfoOpen", "agentModeOpen", "highlightMenuOpen", "bookmarkSaveOpen", "columnsOpen", "transferPanelOpen", "batchTargetsOpen", "pathHistoryOpen"]) {
       expect(popoverRefs, `popover 提取丢失 ${ref}`).toContain(ref);
     }
-    for (const ref of ["settingsOpen", "alertTriageOpen", "hostKeyPrompt"]) {
+    for (const ref of ["settingsOpen", "alertTriageOpen", "hostKeyPrompt", "folderPickerTarget"]) {
       expect(modalRefs, `modal 提取丢失 ${ref}`).toContain(ref);
     }
   });
@@ -709,7 +736,7 @@ describe("App.vue popover/modal wiring structural guard", () => {
     expect(missing, `状态 ref 未接入任何收口机制（modalOpenStates / Esc 链 / closeToolbarPopovers）: ${missing.join(", ")}`).toEqual([]);
   });
 
-  it("keeps every .modal-backdrop ref inside modalOpenStates (focus trap table)", () => {
+  it("keeps every Dialog modal ref inside modalOpenStates (focus trap table)", () => {
     // modalOpenStates 驱动弹层焦点进入 / Tab 陷阱 / 触发元素归还（R3-P1-2）；
     // alertTriage 曾因不在表内导致打开不聚焦、Esc 关不掉（round1 P1-1）。
     const missing = modalRefs.filter((ref) => !focusTableRefs.has(ref));

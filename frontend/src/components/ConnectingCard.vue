@@ -12,6 +12,8 @@ interface Props {
   /** `user@host:port` identity line. */
   identity: string;
   state: ConnectCardState;
+  /** Overrides the "Connecting…" status line (e.g. waiting for the host to reopen the connection). */
+  statusText?: string;
   /** Friendly error line for the error state (raw detail stays on `errorDetail`). */
   errorText?: string;
   /** Raw error text, surfaced as the tooltip of the friendly line. */
@@ -63,7 +65,7 @@ function formatLogTime(ts: number) {
     </div>
     <footer class="connect-card-footer">
       <template v-if="state === 'connecting'">
-        <span class="connect-card-status">{{ t("connecting") }}</span>
+        <span class="connect-card-status">{{ statusText || t("connecting") }}</span>
         <button type="button" class="connect-card-ghost-button" @click="emit('cancel')">{{ t("connectCard.cancel") }}</button>
       </template>
       <template v-else-if="state === 'cancelled'">

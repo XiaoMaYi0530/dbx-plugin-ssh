@@ -1,0 +1,64 @@
+/*
+ * Tailwind 4 entry — theme + utilities ONLY, no preflight.
+ *
+ * The plugin keeps its hand-rolled resets in src/style.css during the
+ * incremental migration, so Tailwind's preflight layer is deliberately not
+ * imported (it would fight `button,input,select{font:inherit}` etc.).
+ *
+ * `tw-animate-css` and `shadcn-vue/tailwind.css` are safe to include: both
+ * ship only @property/@theme keyframes, @utility and @custom-variant
+ * definitions (verified — no global resets). shadcn-vue/tailwind.css provides
+ * the data-open/data-closed/data-checked/data-active/data-horizontal variants
+ * the reka-ui wrappers rely on.
+ *
+ * Theming: the DBX host pushes resolved tokens onto the iframe <html> and
+ * shared/frontend/themeSync.ts bridges them into the plugin's own variables
+ * (--background, --foreground, ... declared at the top of src/style.css).
+ * The @theme inline block below maps ONLY those existing plugin variables —
+ * no new color variables are introduced. Missing shadcn tokens map to the
+ * closest plugin variable:
+ *   input  → --border        ring → --primary
+ *   card   → --popover       secondary → --muted
+ *
+ * Dark variant keys off the host-maintained attribute, not a .dark class.
+ */
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+@import "tw-animate-css";
+@import "shadcn-vue/tailwind.css";
+
+@source "../**/*.{vue,ts,tsx,js,jsx,html}";
+
+@custom-variant dark (&:is(:where([data-dbx-theme="dark"]) *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--popover);
+  --color-card-foreground: var(--foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--muted);
+  --color-secondary-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-ring: var(--primary);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-overlay: var(--overlay);
+  --font-sans: var(--ui-font-family);
+  --font-mono: var(--terminal-font-family);
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 4px);
+}
