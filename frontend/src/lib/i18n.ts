@@ -19,6 +19,7 @@ const messages = {
       timeout: "The connection timed out. Check network reachability, firewalls and VPN routes.",
       hostKey: "The server's host key was rejected. If the server was rebuilt, open the Known hosts panel to update the stored entry, then reconnect.",
       network: "The server is unreachable over the network. Check routing and firewalls, then press Reconnect.",
+      keyFormat: "The SSH private key could not be decoded. Re-paste the complete private key (including the BEGIN/END lines) — public keys, PuTTY PPK files or text mangled while copying all cause this. If the key is protected, fill in the private key passphrase field. The raw error shows the specific cause.",
     },
     connectCard: {
       waitingReopen: "Credentials unavailable — reopen this connection from the DBX sidebar; retrying automatically…",
@@ -354,6 +355,7 @@ const messages = {
       timeout: "La conexión agotó el tiempo de espera. Comprueba la accesibilidad de la red, los cortafuegos y las rutas VPN.",
       hostKey: "La clave de host del servidor fue rechazada. Si el servidor se reconstruyó, abre el panel de Hosts conocidos para actualizar la entrada guardada y vuelve a conectar.",
       network: "No se puede alcanzar el servidor por la red. Revisa el enrutamiento y los cortafuegos y pulsa Reconectar.",
+      keyFormat: "No se pudo decodificar la clave privada SSH. Vuelve a pegar la clave privada completa (incluidas las líneas BEGIN/END): las claves públicas, los archivos PuTTY PPK o el texto dañado al copiar lo provocan. Si la clave está protegida, rellena el campo «Frase de contraseña de la clave». El error original indica la causa concreta.",
     },
     connectCard: {
       waitingReopen: "Credenciales no disponibles: vuelve a abrir esta conexión desde la lista de DBX; reintentando automáticamente…",
@@ -683,6 +685,7 @@ const messages = {
       timeout: "Connessione scaduta. Verifica raggiungibilità di rete, firewall e route VPN.",
       hostKey: "La host key del server è stata rifiutata. Se il server è stato ricostruito, apri il pannello Host noti per aggiornare la voce salvata, poi riconnettiti.",
       network: "Il server non è raggiungibile in rete. Controlla routing e firewall, poi premi Riconnetti.",
+      keyFormat: "Impossibile decodificare la chiave privata SSH. Incolla di nuovo la chiave privata completa (incluse le righe BEGIN/END): chiavi pubbliche, file PuTTY PPK o testo danneggiato durante la copia lo causano. Se la chiave è protetta, compila il campo «Passphrase chiave privata». L'errore originale indica la causa specifica.",
     },
     connectCard: {
       waitingReopen: "Credenziali non disponibili: riapri questa connessione dall'elenco di DBX; nuovo tentativo automatico in corso…",
@@ -1012,6 +1015,7 @@ const messages = {
       timeout: "接続がタイムアウトしました。ネットワークの到達性・ファイアウォール・VPN 経路を確認してください。",
       hostKey: "サーバーのホスト鍵が拒否されました。サーバーを再構築した場合は、「既知のホスト」パネルで保存済みのエントリを更新してから再接続してください。",
       network: "ネットワーク経由でサーバーに到達できません。ルーティングとファイアウォールを確認してから、再接続を押してください。",
+      keyFormat: "SSH 秘密鍵をデコードできませんでした。秘密鍵を全文（BEGIN/END 行を含む）貼り直してください。公開鍵・PuTTY PPK・コピー時に壊れたテキストもこの原因になります。鍵が保護されている場合は「秘密鍵のパスフレーズ」欄に入力してください。具体的な原因は元のエラーを参照してください。",
     },
     connectCard: {
       waitingReopen: "資格情報が利用できません — DBX の接続一覧からこの接続を開き直してください。自動で再試行しています…",
@@ -1341,6 +1345,7 @@ const messages = {
       timeout: "A conexão expirou. Verifique a acessibilidade da rede, firewalls e rotas de VPN.",
       hostKey: "A host key do servidor foi rejeitada. Se o servidor foi reconstruído, abra o painel de Hosts conhecidos para atualizar a entrada salva e reconecte.",
       network: "O servidor está inacessível pela rede. Verifique roteamento e firewalls e pressione Reconectar.",
+      keyFormat: "Não foi possível decodificar a chave privada SSH. Cole novamente a chave privada completa (incluindo as linhas BEGIN/END): chaves públicas, arquivos PuTTY PPK ou texto danificado ao copiar causam isso. Se a chave for protegida, preencha o campo «Frase secreta da chave». O erro original mostra a causa específica.",
     },
     connectCard: {
       waitingReopen: "Credenciais indisponíveis — reabra esta conexão na lista do DBX; tentando novamente automaticamente…",
@@ -1670,6 +1675,7 @@ const messages = {
       timeout: "连接超时。请检查网络可达性、防火墙与 VPN 路由。",
       hostKey: "服务器主机密钥被拒绝。若服务器曾重装，请在「已知主机」面板更新记录，然后重新连接。",
       network: "网络无法到达服务器。请检查路由与防火墙，然后点击“重新连接”。",
+      keyFormat: "SSH 私钥无法解析。请重新粘贴完整私钥（含 BEGIN/END 行）：公钥、PuTTY PPK 或复制时损坏的文本都会导致此错误。若私钥设有口令，请填写「私钥口令」字段。具体原因见原始错误信息。",
     },
     connectCard: {
       waitingReopen: "凭据已不可用：请在 DBX 左侧连接列表重新打开该连接，正在自动重试…",
@@ -2005,6 +2011,7 @@ const messages = {
       timeout: "連線逾時。請檢查網路可達性、防火牆與 VPN 路由。",
       hostKey: "伺服器主機金鑰被拒絕。若伺服器曾重裝，請在「已知主機」面板更新記錄，然後重新連線。",
       network: "網路無法抵達伺服器。請檢查路由與防火牆，然後點擊「重新連線」。",
+      keyFormat: "SSH 私密金鑰無法解析。請重新貼上完整私密金鑰（含 BEGIN/END 行）：公鑰、PuTTY PPK 或複製時損毀的文字都會導致此錯誤。若金鑰設有通關密語，請填寫「私鑰密語」欄位。具體原因請見原始錯誤訊息。",
     },
     connectCard: {
       waitingReopen: "憑據已不可用：請在 DBX 左側連線清單重新開啟此連線，正在自動重試…",
