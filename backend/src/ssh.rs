@@ -40,6 +40,7 @@ use crate::model::{
 };
 use crate::quick_commands;
 use crate::session_recording;
+use crate::sftp_tree;
 use crate::ssh_algorithms;
 use crate::sudo_profiles;
 use crate::transfer_history;
@@ -843,11 +844,40 @@ struct DownloadSink {
 #[derive(Clone)]
 struct DownloadState {
     session_id: String,
+    /// Single-file download: the file itself. Folder download: the root
+    /// directory (`tree` is `Some` in that case).
     remote_path: String,
     file_name: String,
+    /// Single-file download: file size. Folder download: aggregate byte total
+    /// across the tree (the progress denominator).
     size: u64,
+    /// Single-file download: next chunk offset. Folder download: aggregate
+    /// transferred bytes across finished files.
     next_offset: u64,
     sink: Option<Arc<DownloadSink>>,
+    /// Present only for recursive folder downloads (`sftp/download/tree/start`);
+    /// the chunk/finish/cancel paths branch on it while sharing the registry,
+    /// progress events and cancel plumbing with plain file downloads.
+    tree: Option<TreeDownloadState>,
+}
+
+/// Live state of one recursive folder download. Files stream through the same
+/// chunked pipeline one at a time: `current` is in flight into `sink`'s
+/// staging `.part` file, which is renamed into place as soon as the file is
+/// complete, so a mid-tree failure leaves no partial file behind.
+#[derive(Clone)]
+struct TreeDownloadState {
+    /// Fresh, collision-free local root directory created by `start`; the
+    /// whole tree is removed from disk when the task is cancelled.
+    root_local: PathBuf,
+    files: VecDeque<sftp_tree::TreeFile>,
+    current: Option<sftp_tree::TreeFile>,
+    current_offset: u64,
+    sink: Option<Arc<DownloadSink>>,
+    file_count: u64,
+    files_done: u64,
+    skipped: u64,
+    failures: Vec<Value>,
 }
 
 struct FinishingUpload {
@@ -4282,6 +4312,7 @@ impl SshRuntime {
                     size,
                     next_offset: offset,
                     sink,
+                    tree: None,
                 },
             );
         emitter
@@ -4304,6 +4335,309 @@ impl SshRuntime {
         )
     }
 
+    /// `sftp/download/tree/start`: recursive folder download. Pure SFTP — the
+    /// remote tree is walked with `read_dir` (no shell, no remote temp
+    /// archive), regular files stream one at a time through the same chunked
+    /// `sftp/download/next` pipeline as plain downloads, and the local layout
+    /// mirrors the remote one under a fresh, collision-free folder (empty
+    /// directories included). Symlinks are never followed (cycle protection);
+    /// per-file problems are recorded and skipped so one bad file cannot sink
+    /// the whole tree.
+    pub async fn start_tree_download(
+        &self,
+        session_id: &str,
+        remote_path: &str,
+        download_dir: Option<&str>,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        if self.active_transfer_count(session_id)? >= 3 {
+            return Err("This SSH session already has three active transfers".to_string());
+        }
+        let root_remote = normalize_remote_path(remote_path)?;
+        let sftp = self.sftp(session_id).await?;
+        let metadata = sftp
+            .lock()
+            .await
+            .symlink_metadata(root_remote.clone())
+            .await
+            .map_err(sftp_error)?;
+        if metadata.is_symlink() {
+            return Err(
+                "Refusing to download a symlink as a folder; download its target instead"
+                    .to_string(),
+            );
+        }
+        if !metadata.is_dir() {
+            return Err("Folder download needs a remote directory".to_string());
+        }
+        // 本地根目录：与单文件下载共用目录语义（偏好下载目录 / 自定义绝对
+        // 目录），根名撞车让位 " (n)"。落点在 start 时定死，任务取消或未完成
+        // 时整树删除，所以提前占名不会留下悬空目录。
+        let base_dir = download_dir
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                local_downloads::downloads_base_dir(|key| std::env::var_os(key), &self.data_dir)
+            });
+        if !base_dir.is_absolute() {
+            return Err("Download directory must be an absolute path".to_string());
+        }
+        std::fs::create_dir_all(&base_dir).map_err(|error| {
+            format!(
+                "Failed to create download directory '{}': {error}",
+                base_dir.display()
+            )
+        })?;
+        let root_name = root_remote
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("download");
+        let root_local = local_downloads::final_download_path(&base_dir, root_name, false);
+        std::fs::create_dir_all(&root_local).map_err(|error| {
+            format!(
+                "Failed to create download folder '{}': {error}",
+                root_local.display()
+            )
+        })?;
+        let scan = match scan_remote_tree(&sftp, &root_remote).await {
+            Ok(scan) => scan,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&root_local);
+                return Err(error);
+            }
+        };
+        // 本地目录骨架先行：空目录也保留。
+        for relative in &scan.dirs {
+            let Some(path) = sftp_tree::safe_tree_path(&root_local, relative) else {
+                continue;
+            };
+            if let Err(error) = std::fs::create_dir_all(&path) {
+                let _ = std::fs::remove_dir_all(&root_local);
+                return Err(format!(
+                    "Failed to create local folder '{}': {error}",
+                    path.display()
+                ));
+            }
+        }
+        let total = scan.total_bytes();
+        let file_count = scan.file_count();
+        let dir_count = scan.dir_count();
+        let skipped = scan.skipped;
+        let file_name = root_local
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root_name.to_string());
+        let task_id = Uuid::new_v4().to_string();
+        self.downloads
+            .lock()
+            .map_err(|_| "Download registry is poisoned".to_string())?
+            .insert(
+                task_id.clone(),
+                DownloadState {
+                    session_id: session_id.to_string(),
+                    remote_path: root_remote.clone(),
+                    file_name: file_name.clone(),
+                    size: total,
+                    next_offset: 0,
+                    sink: None,
+                    tree: Some(TreeDownloadState {
+                        root_local: root_local.clone(),
+                        files: VecDeque::from(scan.files),
+                        current: None,
+                        current_offset: 0,
+                        sink: None,
+                        file_count,
+                        files_done: 0,
+                        skipped,
+                        failures: scan.failures,
+                    }),
+                },
+            );
+        emitter
+            .event(
+                "sftp/transfer/progress",
+                json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "fileName": file_name, "transferred": 0, "size": total, "status": "queued", "fileCount": file_count }),
+            )
+            .map_err(plugin_error)?;
+        let connection_id = self.session_connection_id(session_id).await;
+        self.record_transfer_start(
+            &task_id,
+            session_id,
+            &connection_id,
+            "download",
+            &file_name,
+            total,
+        );
+        Ok(
+            json!({ "taskId": task_id, "fileName": file_name, "size": total, "chunkSize": TRANSFER_CHUNK_SIZE, "fileCount": file_count, "dirCount": dir_count, "skippedCount": skipped }),
+        )
+    }
+
+    /// Chunk pump for folder downloads. `next_offset` stays the aggregate byte
+    /// position across the tree; when the in-flight file completes it is
+    /// renamed into place and the next queued file opens within the same call,
+    /// so the caller's chunk loop is identical to a plain download. A tree
+    /// whose queue is drained answers with an empty eof chunk (this is also
+    /// how a zero-byte tree completes — the frontend loop runs until eof, not
+    /// until the byte total).
+    async fn download_tree_chunk(
+        &self,
+        task_id: &str,
+        offset: u64,
+        download: DownloadState,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        if offset != download.next_offset {
+            return Err(format!(
+                "Download offset mismatch: expected {}, received {offset}",
+                download.next_offset
+            ));
+        }
+        let sftp = self.sftp(&download.session_id).await?;
+        let Some(mut tree) = download.tree.clone() else {
+            return Err("Download task is not a folder download".to_string());
+        };
+        loop {
+            if tree.current.is_none() {
+                let Some(file) = tree.files.pop_front() else {
+                    // 队列耗尽：空树或全部走完。最后一批文件的改名/失败登记
+                    // 就发生在本次调用里，先把状态写回，finish 才能看到完整
+                    // 汇总；随后补发一个空 eof 块，让前端的分块等待器（只认
+                    // 二进制帧）与单文件语义保持一致。
+                    {
+                        let mut downloads = self
+                            .downloads
+                            .lock()
+                            .map_err(|_| "Download registry is poisoned".to_string())?;
+                        if let Some(current) = downloads.get_mut(task_id) {
+                            if let Some(tree_state) = current.tree.as_mut() {
+                                *tree_state = tree.clone();
+                            }
+                        }
+                    }
+                    let mut payload = Vec::with_capacity(8);
+                    payload.extend_from_slice(&offset.to_be_bytes());
+                    emitter
+                        .binary(&format!("sftp/download/{task_id}"), &payload)
+                        .map_err(plugin_error)?;
+                    return Ok(
+                        json!({ "taskId": task_id, "offset": offset, "length": 0, "eof": true, "fileName": download.file_name }),
+                    );
+                };
+                match open_tree_sink(&tree.root_local, &file.relative).await {
+                    Ok(sink) => {
+                        tree.sink = Some(Arc::new(sink));
+                        tree.current = Some(file);
+                        tree.current_offset = 0;
+                    }
+                    Err(error) => {
+                        tree.failures
+                            .push(json!({ "path": file.relative, "error": error }));
+                        continue;
+                    }
+                }
+            }
+            let file = tree.current.clone().expect("current file is present");
+            let remaining = file.size - tree.current_offset;
+            if remaining == 0 {
+                // 当前文件收尾：暂存 .part 改名落位（空文件也会在这一步真实
+                // 落地），失败记入汇总且不中断整树。
+                finalize_tree_current(self, &mut tree).await;
+                continue;
+            }
+            let mut source = match sftp.lock().await.open(file.remote_path.clone()).await {
+                Ok(source) => source,
+                Err(error) => {
+                    tree.failures
+                        .push(json!({ "path": file.relative, "error": sftp_error(error) }));
+                    discard_tree_current(&mut tree);
+                    continue;
+                }
+            };
+            if let Err(error) = source
+                .seek(std::io::SeekFrom::Start(tree.current_offset))
+                .await
+            {
+                tree.failures.push(json!({ "path": file.relative, "error": format!("SFTP download seek failed: {error}") }));
+                discard_tree_current(&mut tree);
+                continue;
+            }
+            let requested = remaining.min(TRANSFER_CHUNK_SIZE as u64) as usize;
+            let mut chunk = vec![0_u8; requested];
+            let length = match source.read(&mut chunk).await {
+                Ok(length) => length,
+                Err(error) => {
+                    tree.failures.push(json!({ "path": file.relative, "error": format!("SFTP download failed: {error}") }));
+                    discard_tree_current(&mut tree);
+                    continue;
+                }
+            };
+            if length == 0 {
+                // 远端文件比扫描时短：只记失败，不把半成品留在本地。
+                tree.failures.push(
+                    json!({ "path": file.relative, "error": "file shrank below its scanned size" }),
+                );
+                discard_tree_current(&mut tree);
+                continue;
+            }
+            chunk.truncate(length);
+            // 克隆 Arc 而非借用，写失败的清理路径需要 &mut tree。
+            if let Some(sink) = tree.sink.clone() {
+                if let Err(error) = sink.file.lock().await.write_all(&chunk).await {
+                    tree.failures.push(json!({ "path": file.relative, "error": format!("Failed to write local download file: {error}") }));
+                    discard_tree_current(&mut tree);
+                    continue;
+                }
+            }
+            tree.current_offset += length as u64;
+            // 文件耗尽即在本调用内收尾（改名落位）：eof 与落位必须同帧，否则
+            // eof 后调用方直接 finish，最后一个文件会被记成未传输。
+            if tree.current_offset >= file.size {
+                finalize_tree_current(self, &mut tree).await;
+            }
+            let next_offset = offset + length as u64;
+            let mut payload = Vec::with_capacity(8 + length);
+            payload.extend_from_slice(&offset.to_be_bytes());
+            payload.extend_from_slice(&chunk);
+            emitter
+                .binary(&format!("sftp/download/{task_id}"), &payload)
+                .map_err(plugin_error)?;
+            {
+                let mut downloads = self
+                    .downloads
+                    .lock()
+                    .map_err(|_| "Download registry is poisoned".to_string())?;
+                let current = downloads
+                    .get_mut(task_id)
+                    .ok_or("Download task was not found")?;
+                if current.next_offset != offset {
+                    return Err("Download task changed while a chunk was in flight".to_string());
+                }
+                current.next_offset = next_offset;
+                if let Some(tree_state) = current.tree.as_mut() {
+                    *tree_state = tree.clone();
+                }
+            }
+            let current_remaining = tree
+                .current
+                .as_ref()
+                .map(|file| file.size - tree.current_offset)
+                .unwrap_or(0);
+            let eof = sftp_tree::tree_eof(tree.files.len(), current_remaining);
+            emitter
+                .event(
+                    "sftp/transfer/progress",
+                    json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "transferred": next_offset, "size": download.size, "status": "running", "fileCount": tree.file_count, "fileIndex": tree.files_done + u64::from(tree.current.is_some()), "currentFile": tree.current.as_ref().map(|file| file.relative.clone()) }),
+                )
+                .map_err(plugin_error)?;
+            return Ok(
+                json!({ "taskId": task_id, "offset": offset, "length": length, "eof": eof, "fileName": download.file_name }),
+            );
+        }
+    }
+
     pub async fn download_chunk(
         &self,
         task_id: &str,
@@ -4320,6 +4654,11 @@ impl SshRuntime {
                 .cloned()
                 .ok_or("Download task was not found")?
         };
+        if download.tree.is_some() {
+            return self
+                .download_tree_chunk(task_id, offset, download, emitter)
+                .await;
+        }
         if offset != download.next_offset {
             return Err(format!(
                 "Download offset mismatch: expected {}, received {offset}",
@@ -4410,6 +4749,11 @@ impl SshRuntime {
             if let Some(sink) = download.sink.as_ref() {
                 let _ = std::fs::remove_file(&sink.part_path);
             }
+            // 文件夹下载的取消语义：整棵半成品目录删除，不在下载目录里留
+            // 部分内容（根目录是本任务创建的让位新目录，删除不伤及他物）。
+            if let Some(tree) = download.tree.as_ref() {
+                let _ = std::fs::remove_dir_all(&tree.root_local);
+            }
         }
         if upload.is_none() && download.is_none() && finishing.is_none() {
             return Err("Transfer task was not found".to_string());
@@ -4437,6 +4781,11 @@ impl SshRuntime {
             .map_err(|_| "Download registry is poisoned".to_string())?
             .remove(task_id)
             .ok_or("Download task was not found".to_string())?;
+        if download.tree.is_some() {
+            return self
+                .complete_tree_download(download, task_id, emitter)
+                .await;
+        }
         let record_failed = |error: &str| {
             self.record_transfer(json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "failed", "error": error }));
         };
@@ -4474,6 +4823,57 @@ impl SshRuntime {
             "success": true,
             "taskId": task_id,
             "localPath": local_path.as_ref().map(|path| path.to_string_lossy()),
+        }))
+    }
+
+    /// Tree flavor of `sftp/download/finish`: every queued file must be
+    /// drained (eof), otherwise the whole folder is torn down — there is no
+    /// tree resume, so a half-downloaded folder never lingers on disk. A
+    /// drained tree completes even when individual files failed: the summary
+    /// (`failedCount` + inline samples) is the contract for the workbench
+    /// notice.
+    async fn complete_tree_download(
+        &self,
+        download: DownloadState,
+        task_id: &str,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        let Some(tree) = download.tree.clone() else {
+            return Err("Download task is not a folder download".to_string());
+        };
+        let remaining = tree.files.len() + usize::from(tree.current.is_some());
+        if remaining > 0 {
+            // 未传完：整树拆除（无目录续传语义），失败入账。
+            let _ = std::fs::remove_dir_all(&tree.root_local);
+            let error =
+                format!("Folder download is incomplete: {remaining} file(s) not transferred");
+            self.record_transfer(json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "failed", "error": error }));
+            return Err(error);
+        }
+        if let Some(sink) = tree.sink.as_ref() {
+            // 正常路径不会到达（current 已全部收尾）；防御性清理残留 .part。
+            let _ = std::fs::remove_file(&sink.part_path);
+        }
+        let (failed_count, failed_files) = sftp_tree::failure_report(&tree.failures);
+        let mut task = json!({
+            "taskId": task_id, "sessionId": download.session_id, "direction": "download",
+            "fileName": download.file_name, "size": download.size, "transferred": download.next_offset,
+            "status": "completed",
+            "fileCount": tree.file_count, "failedCount": failed_count, "skippedCount": tree.skipped,
+        });
+        task["localPath"] = json!(tree.root_local.to_string_lossy());
+        self.record_transfer(task.clone());
+        emitter
+            .event("sftp/transfer/progress", task)
+            .map_err(plugin_error)?;
+        Ok(json!({
+            "success": true,
+            "taskId": task_id,
+            "localPath": tree.root_local.to_string_lossy(),
+            "fileCount": tree.file_count,
+            "failedCount": failed_count,
+            "skippedCount": tree.skipped,
+            "failedFiles": failed_files,
         }))
     }
 
@@ -4551,7 +4951,11 @@ impl SshRuntime {
                 .iter()
                 .filter(|(_, download)| download.session_id == session_id)
                 .map(|(task_id, download)| {
-                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "running" })
+                    let mut row = json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "running" });
+                    if let Some(tree) = download.tree.as_ref() {
+                        row["fileCount"] = json!(tree.file_count);
+                    }
+                    row
                 }),
         );
         Ok(json!({ "tasks": tasks }))
@@ -4584,9 +4988,15 @@ impl SshRuntime {
             .map_err(|_| "Download registry is poisoned".to_string())?
             .get(task_id)
         {
-            return Ok(
-                json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "size": download.size, "transferred": download.next_offset, "status": "running" }),
-            );
+            let mut status = json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "size": download.size, "transferred": download.next_offset, "status": "running" });
+            if let Some(tree) = download.tree.as_ref() {
+                status["fileCount"] = json!(tree.file_count);
+                status["filesRemaining"] =
+                    json!(tree.files.len() + usize::from(tree.current.is_some()));
+                status["currentFile"] =
+                    json!(tree.current.as_ref().map(|file| file.relative.clone()));
+            }
+            return Ok(status);
         }
         if let Some(task) = self
             .transfer_history
@@ -5338,6 +5748,163 @@ async fn delete_directory_tree(
             .map_err(sftp_error)?;
     }
     Ok(())
+}
+
+/// Recursively walks a remote directory over SFTP and collects the folder
+/// download plan (breadth-first, so parents are read before children):
+/// regular files in download order, the directory layout, symlink/special
+/// skips and per-path failures. Only root-level problems (not a readable
+/// directory) abort; a failing subdirectory is recorded and the walk goes on.
+/// Symlinks are never followed, so server-side cycles cannot loop the walk.
+async fn scan_remote_tree(
+    sftp: &Arc<AsyncMutex<SftpSession>>,
+    root: &str,
+) -> Result<sftp_tree::TreeScan, String> {
+    let mut scan = sftp_tree::TreeScan::new();
+    let mut pending: VecDeque<(String, String)> = VecDeque::new();
+    pending.push_back((root.to_string(), String::new()));
+    while let Some((dir_remote, dir_relative)) = pending.pop_front() {
+        let entries = sftp.lock().await.read_dir(dir_remote.clone()).await;
+        let entries = match entries {
+            Ok(entries) => entries,
+            Err(error) => {
+                if dir_relative.is_empty() {
+                    return Err(sftp_error(error));
+                }
+                scan.record_failure(
+                    &dir_relative,
+                    format!("directory is not readable: {}", sftp_error(error)),
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let name = entry.file_name();
+            let child_relative = if dir_relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{dir_relative}/{name}")
+            };
+            match entry.file_type() {
+                FileType::Dir => {
+                    let Some(relative) = sftp_tree::sanitize_relative(&child_relative) else {
+                        scan.record_failure(
+                            &child_relative,
+                            "directory name is not usable on the local filesystem",
+                        );
+                        continue;
+                    };
+                    match scan.push_dir(&relative) {
+                        Ok(true) => pending.push_back((format!("{dir_remote}/{name}"), relative)),
+                        Ok(false) => {}
+                        Err(capacity) => return Err(capacity.to_string()),
+                    }
+                }
+                FileType::File => {
+                    let Some(relative) = sftp_tree::sanitize_relative(&child_relative) else {
+                        scan.record_failure(
+                            &child_relative,
+                            "file name is not usable on the local filesystem",
+                        );
+                        continue;
+                    };
+                    let remote_child = format!("{dir_remote}/{name}");
+                    let size = match entry.metadata().size {
+                        Some(size) => size,
+                        None => {
+                            scan.record_failure(
+                                &child_relative,
+                                "directory listing did not report the file size",
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(capacity) = scan.push_file(relative, remote_child, size) {
+                        return Err(capacity.to_string());
+                    }
+                }
+                _ => scan.skip(),
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// Creates the parent directories for one queued tree file and opens its
+/// staging `.part` file. The relative path is re-validated (sanitize +
+/// containment) so nothing server-reported can place bytes outside the
+/// download root. A stale `.part` from a crashed earlier attempt is replaced,
+/// never appended to.
+async fn open_tree_sink(root_local: &Path, relative: &str) -> Result<DownloadSink, String> {
+    let Some(final_path) = sftp_tree::safe_tree_path(root_local, relative) else {
+        return Err("path escapes the download folder".to_string());
+    };
+    let name = final_path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    let final_dir = final_path.parent().unwrap_or(root_local).to_path_buf();
+    std::fs::create_dir_all(&final_dir).map_err(|error| {
+        format!(
+            "Failed to create local folder '{}': {error}",
+            final_dir.display()
+        )
+    })?;
+    let part_path = final_dir.join(format!("{name}.part"));
+    let _ = std::fs::remove_file(&part_path);
+    let file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&part_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to create local download file '{}': {error}",
+                part_path.display()
+            )
+        })?;
+    Ok(DownloadSink {
+        part_path,
+        final_dir,
+        overwrite: false,
+        file: AsyncMutex::new(file),
+    })
+}
+
+/// Drops the in-flight tree file after a failure: the staging `.part` is
+/// deleted so a failed file never leaves partial bytes behind.
+fn discard_tree_current(tree: &mut TreeDownloadState) {
+    if let Some(sink) = tree.sink.take() {
+        let _ = std::fs::remove_file(&sink.part_path);
+    }
+    tree.current = None;
+    tree.current_offset = 0;
+}
+
+/// Completes the in-flight tree file: the staging `.part` is flushed and
+/// renamed into place. Failures are recorded and the file simply vanishes
+/// from the local tree (no partial bytes) while the walk continues.
+async fn finalize_tree_current(runtime: &SshRuntime, tree: &mut TreeDownloadState) {
+    if let Some(sink) = tree.sink.take() {
+        if let Some(file) = tree.current.clone() {
+            let name = file
+                .relative
+                .rsplit('/')
+                .next()
+                .unwrap_or(&file.relative)
+                .to_string();
+            match runtime.finalize_download_sink(&sink, &name).await {
+                Ok(_) => tree.files_done += 1,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&sink.part_path);
+                    tree.failures
+                        .push(json!({ "path": file.relative, "error": error }));
+                }
+            }
+        }
+    }
+    tree.current = None;
+    tree.current_offset = 0;
 }
 
 /// Reads an upload spool meta file (`upload-<taskId>.json`). Corrupt or
@@ -6640,6 +7207,7 @@ mod tests {
                 size: 9,
                 next_offset: 5,
                 sink: None,
+                tree: None,
             },
         );
         let no_connection = |_: &str| String::new();

@@ -36,6 +36,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/createDirectory`、`sftp/rename`、`sftp/delete` | SFTP 写操作 |
 | `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传，见下文） |
 | `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文；桌面端可选 `downloadDir` 指定本机绝对保存目录） |
+| `sftp/download/tree/start` | 递归目录下载启动：远端 `read_dir` 走树扫描（有界），本地镜像目录布局后复用 `sftp/download/next`/`finish`/`sftp/transfer/cancel` 分块管线（见「递归目录下载」节） |
 | `sftp/stat`、`sftp/exists`、`sftp/touch`、`sftp/write` | 扩展文件操作：元信息单查、存在性检查、空文件创建、小文件直写 |
 | `sftp/archive`、`sftp/extract` | 远端 tar.gz 打包与解压 |
 | `sftp/copy`、`sftp/move` | 服务器内复制 / 剪切（逐项执行，目标存在需 `overwrite`） |
@@ -464,7 +465,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - `ssh/terminal/in/{sessionId}`：原始终端输入。
 - `ssh/terminal/out/{sessionId}`：首字节为流类型，随后为大端 `u64` 单调序号，再后为终端数据。
 - `sftp/upload/{taskId}`：大端 `u64` 文件偏移加最多 256 KiB 数据；偏移必须等于服务端期待值。
-- `sftp/download/{taskId}`：大端 `u64` 文件偏移加最多 256 KiB 数据。
+- `sftp/download/{taskId}`：大端 `u64` 文件偏移加最多 256 KiB 数据（树任务该偏移为整树聚合字节位置；队列耗尽后的 eof 应答携带 0 字节数据）。
 
 终端输出保留 2 MiB 环形缓存。前端检测到序号缺口后停止乱序输出并调用 `ssh/terminal/replay`。文件传输采用逐块 RPC 确认，不依赖广播队列可靠送达。
 
@@ -620,6 +621,37 @@ offset 语义不变）。中断来源不限：前端中止、sidecar 重启、�
 后端把 `nextOffset` 置为该值继续分片；`offset > size` 报错。身份校验仅为 best-effort 的 size 一致
 （同尺寸改写会拼接错内容，文档明示）；返回体新增 `resumeOffset` 回显。会话内暂停/恢复为纯前端语义
 （分片循环在两分片之间挂起），不涉及新方法。
+
+### 递归目录下载（sftp/download/tree/start）
+
+纯 SFTP 递归下载一个远端目录，**不依赖远端 shell、不在远端产生临时打包文件**。参数
+`{ sessionId, remotePath, downloadDir? }`（`downloadDir` 为本机绝对目录，缺省用偏好下载目录）。
+`start` 先做远端 BFS 扫描（`read_dir`，有界：≤50 000 文件、≤10 000 目录、深度 ≤64，超限整体报错
+而不静默截断），随后创建本地根目录并镜像全部子目录（**空目录也保留**）。返回
+`{ taskId, fileName, size, chunkSize, fileCount, dirCount, skippedCount }`，其中 `size` 是整树
+字节总量（聚合进度的分母）。
+
+之后**复用现有单文件分块管线**：`sftp/download/next` 按序逐文件传输（文件完成即把暂存 `.part`
+改名落位并接续下一文件，调用方循环写法与普通下载完全一致），`next_offset` 语义为整树聚合字节
+位置；队列耗尽后 `next` 返回空 `eof` 块（零字节树由此完成，调用方须循环到 `eof` 而非字节数）。
+`sftp/download/finish` 返回
+`{ success, taskId, localPath, fileCount, failedCount, skippedCount, failedFiles: [{ path, error }] }`
+（`failedFiles` 内联上限 50 条，完整计数始终随行）。`sftp/transfer/progress` 事件为聚合进度，
+树任务额外携带 `fileCount`/`fileIndex`/`currentFile`。
+
+语义约定：
+
+- **符号链接与特殊条目默认跳过**（永不跟随，防环），计入 `skippedCount`。
+- **容错**：单个文件/子目录读取失败只记入失败汇总并继续；整树完成时任务状态仍为 `completed`
+  并携带 `failedCount`，由工作台提示「N 个文件失败」。
+- **同名冲突**：根目录名按单文件下载同一让位策略（` " (n)"`）在 start 时定名；目录下载无
+  「覆盖」语义。
+- **路径防护**：服务端返回的每个路径分量都经文件名消毒（`.`/`..`/分隔符/控制字符中和），落盘
+  前再校验最终路径必须仍在本任务下载根之下。
+- **取消/未完成**：`sftp/transfer/cancel` 或未传完即 `finish` 时**整棵半成品目录删除**（根目录是
+  本任务新建的让位目录，删除不伤及既有文件）；部分成功（`failedCount > 0`）的完成结果保留。
+- 仅桌面本机落盘模式可用（`local/capabilities.canSaveLocal`）；web/docker 无本地文件系统时工作台
+  直接提示不可用。单个文件大小仍受 16 GiB 传输上限约束，超限文件记为失败而非中断。
 
 ### ssh/metrics/history
 

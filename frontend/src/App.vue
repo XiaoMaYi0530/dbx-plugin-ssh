@@ -163,6 +163,7 @@ import { createRequestEpoch } from "./lib/requestEpoch";
 import { sanitizeSftpEntries } from "./lib/sftpEntries";
 import { resolveRemotePath } from "./lib/remotePathInput";
 import { shouldCommitRename } from "./lib/sftpRename";
+import { folderDownloadOutcome, type FolderDownloadFinish } from "./lib/sftpFolderDownload";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
 import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRendererLike } from "./lib/terminalWebgl";
 import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from "./lib/terminalClickCursor";
@@ -248,6 +249,12 @@ interface TransferTask {
   error?: string;
   // saveToLocal 下载完成后的本机落盘路径（用于展示与在文件管理器中定位）。
   localPath?: string;
+  // 目录下载（sftp/download/tree/start）扩展：整树文件数、在传相对路径与
+  // 失败汇总（完成但部分文件失败时面板提示）。
+  fileCount?: number;
+  currentFile?: string;
+  failedCount?: number;
+  failureSample?: string;
 }
 
 // sftp/transfer/history 行（落盘历史 + 内存 live 合并视图）：status 沿用现有枚举、无 queued。
@@ -294,6 +301,10 @@ interface DownloadInfo {
   chunkSize: number;
   // 断点续传：start 带 offset 时回显的恢复起点。
   resumeOffset?: number;
+  // 目录下载（tree/start）扩展：扫描得到的整树规模。
+  fileCount?: number;
+  dirCount?: number;
+  skippedCount?: number;
 }
 
 interface ExecResult {
@@ -2207,6 +2218,10 @@ function updateTransfer(params: Record<string, unknown>) {
   const sample = sampleTransferSpeed(transferSamples.get(taskId), transferred, performance.now());
   transferSamples.set(taskId, sample);
   transferSpeeds[taskId] = sample.speed;
+  // 目录下载事件附带的树内字段（fileCount/fileIndex/currentFile）有则透传；
+  // 文件下载事件不带这些键，保持原有行为。
+  const fileCount = params.fileCount !== undefined ? Number(params.fileCount) : existing?.fileCount;
+  const currentFile = typeof params.currentFile === "string" ? params.currentFile : existing?.currentFile;
   transferTasks[taskId] = {
     taskId,
     sessionId: String(params.sessionId || existing?.sessionId || ""),
@@ -2216,6 +2231,8 @@ function updateTransfer(params: Record<string, unknown>) {
     transferred,
     status: normalizeTransferStatus(params.status, existing?.status),
     error: typeof params.error === "string" ? params.error : existing?.error,
+    fileCount: Number.isFinite(fileCount) && fileCount! > 0 ? fileCount : undefined,
+    currentFile: currentFile || undefined,
   };
   if (!existing && (transferTasks[taskId].status === "queued" || transferTasks[taskId].status === "running")) openTransferPanel();
 }
@@ -4538,6 +4555,11 @@ function probeLocalCapabilities() {
 
 async function downloadEntry(entry: SftpEntry) {
   fileMenu.value = undefined;
+  // 目录条目走递归文件夹下载（tree/start + 同一分块管线）；文件沿用单文件管线。
+  if (entry.kind === "directory") {
+    await downloadDirectoryEntry(entry);
+    return;
+  }
   openTransferPanel();
   if (!session.value || entry.kind !== "file") return;
   // Prefer the sidecar local sink on desktop so completed downloads retain a
@@ -4655,6 +4677,132 @@ async function downloadEntry(entry: SftpEntry) {
       // 失败闭环：横幅带「重试」，按原入口完整重跑（含询问/冲突流程）。
       showError(cause, "sftp", () => void downloadEntry(entry));
     }
+  }
+}
+
+// —— 递归文件夹下载（issue #46）：目录条目 → sftp/download/tree/start ——
+// 复用单文件下载的分块循环（saveToLocal 语义：字节留在 sidecar 落盘，前端
+// 只跟进度）；与文件下载的差异：必须本机落盘（web/docker 无本地文件系统时
+// 不可用），循环跑到 eof 为止（空树也会先收到一次空 eof 块），根名撞车由
+// sidecar 自动让位（无「覆盖」语义），取消/未完成时 sidecar 整树删除。
+async function downloadDirectoryEntry(entry: SftpEntry) {
+  fileMenu.value = undefined;
+  openTransferPanel();
+  if (!session.value || entry.kind !== "directory") return;
+  const local = await probeLocalCapabilities();
+  if (!local?.canSaveLocal) {
+    showError(new Error(t("folderDownload.unsupported")));
+    return;
+  }
+  // 「使用默认地址」关闭时先选保存目录；取消则整次下载不发生。
+  let dirOverride = "";
+  let setDefaultAfter = false;
+  if (!loadDownloadUseDefaultDir()) {
+    const chosen = await askDownloadTarget(entry.name);
+    if (chosen === undefined) return;
+    dirOverride = chosen.dir.trim();
+    setDefaultAfter = chosen.setDefault;
+  }
+  let info: DownloadInfo | undefined;
+  try {
+    // start 里做远端递归扫描（有界）：树很大时这一步本身耗时，给足超时。
+    info = await window.dbxPlugin.invoke<DownloadInfo>("sftp/download/tree/start", {
+      sessionId: session.value.sessionId,
+      remotePath: pathFromUri(entry.uri),
+      downloadDir: dirOverride || loadDownloadDir() || undefined,
+    }, { timeoutMs: 10 * 60 * 1000 });
+    transferTasks[info.taskId] = {
+      taskId: info.taskId,
+      sessionId: session.value.sessionId,
+      direction: "download",
+      fileName: info.fileName,
+      size: info.size,
+      transferred: 0,
+      status: "running",
+      fileCount: info.fileCount,
+    };
+    let offset = 0;
+    while (true) {
+      await waitWhilePaused(info.taskId);
+      const chunkPromise = waitForDownloadChunk(info.taskId, offset);
+      const nextPromise = window.dbxPlugin.invoke<{ length: number; eof: boolean }>("sftp/download/next", { taskId: info.taskId, offset });
+      // 取消会通过分块等待器中断；吞掉在途请求的拒绝避免 unhandled rejection。
+      nextPromise.catch(() => undefined);
+      const result = await nextPromise;
+      const chunk = await chunkPromise;
+      if (!result.eof && result.length === 0) throw new Error(t("errors.downloadEmptyChunk"));
+      offset += result.length;
+      if (chunk.byteLength && chunk.byteLength !== result.length) throw new Error(t("errors.downloadChunkLength"));
+      const task = transferTasks[info.taskId];
+      if (task) {
+        task.status = "running";
+        task.transferred = offset;
+      }
+      if (result.eof) break;
+    }
+    const finish = await window.dbxPlugin.invoke<FolderDownloadFinish>("sftp/download/finish", { taskId: info.taskId }, { timeoutMs: 30 * 60 * 1000 });
+    cancelledTransferTasks.delete(info.taskId);
+    const outcome = folderDownloadOutcome(finish);
+    const task = transferTasks[info.taskId];
+    if (task) {
+      task.status = "completed";
+      task.transferred = info.size;
+      if (outcome.localPath) task.localPath = outcome.localPath;
+      task.failedCount = outcome.failedCount || undefined;
+      task.failureSample = outcome.failureSample || undefined;
+      task.currentFile = undefined;
+    }
+    const revealActions = outcome.localPath
+      ? [
+          {
+            label: t("revealInFolder"),
+            run: () => {
+              const savedPath = outcome.localPath;
+              if (savedPath) void revealTransferTarget(savedPath);
+            },
+          },
+        ]
+      : [];
+    let message: string;
+    if (outcome.partial) {
+      message = t("folderDownload.completedWithFailures", { path: outcome.localPath, count: outcome.failedCount, total: outcome.fileCount });
+    } else {
+      message = t("downloadedToDir", { count: outcome.fileCount, path: outcome.localPath });
+    }
+    if (outcome.skippedCount) message += t("folderDownload.skippedNote", { count: outcome.skippedCount });
+    showNotice(message, revealActions);
+    if (setDefaultAfter) applyChosenDirAsDefault(dirOverride);
+  } catch (cause) {
+    if (info) {
+      const waiter = downloadChunkWaiters.get(info.taskId);
+      if (waiter) {
+        window.clearTimeout(waiter.timer);
+        downloadChunkWaiters.delete(info.taskId);
+      }
+      await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: info.taskId }).catch(() => undefined);
+      if (cancelledTransferTasks.delete(info.taskId)) {
+        const task = transferTasks[info.taskId];
+        if (task) task.status = "cancelled";
+        showNotice(t("transferStatus.cancelled"));
+      } else {
+        showError(cause, "sftp", () => void downloadDirectoryEntry(entry));
+      }
+    } else {
+      showError(cause, "sftp", () => void downloadDirectoryEntry(entry));
+    }
+  }
+}
+
+// 多选批量下载：文件与目录混选，逐项走各自管线（单项失败不阻断剩余项）。
+async function batchDownload() {
+  const menu = fileMenu.value;
+  fileMenu.value = undefined;
+  if (!menu) return;
+  const uris = menu.selection.length ? menu.selection : [menu.entry.uri];
+  const targets = entries.value.filter((entry) => uris.includes(entry.uri));
+  for (const entry of targets) {
+    if (entry.kind !== "file" && entry.kind !== "directory") continue;
+    await downloadEntry(entry);
   }
 }
 
@@ -7222,7 +7370,11 @@ onBeforeUnmount(() => {
               <div class="transfer-title"><FileUp v-if="task.direction === 'upload'" /><Download v-else /><span>{{ task.fileName || task.taskId }}</span><strong>{{ transferPercent(task) }}%</strong></div>
               <progress :value="transferPercent(task)" max="100" />
               <div class="transfer-meta"><span>{{ t(`transferStatus.${task.status}`) }}</span><span>{{ formatBytes(task.transferred) }} / {{ formatBytes(task.size) }}</span><span v-if="transferSpeeds[task.taskId]">{{ formatBytes(transferSpeeds[task.taskId]) }}/s</span></div>
+              <!-- 目录下载：在传文件相对路径，让长传输有可感知的推进。 -->
+              <p v-if="task.currentFile" class="transfer-path mono" :title="task.currentFile">{{ task.currentFile }}</p>
               <p v-if="task.localPath" class="transfer-path mono" :title="task.localPath">{{ task.localPath }}</p>
+              <!-- 目录下载部分失败：完成后仍标注哪些文件没拿到。 -->
+              <p v-if="task.failedCount" class="task-error" :title="task.failureSample">{{ t("folderDownload.failedCard", { count: task.failedCount }) }}</p>
               <div v-if="transferPausable(task.status) || task.status === 'queued' || task.status === 'running' || task.localPath" class="transfer-actions">
                 <button v-if="transferPausable(task.status)" class="icon-button" :title="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" :aria-label="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" @click="toggleTransferPause(task)"><Play v-if="pausedTaskIds.has(task.taskId)" /><Pause v-else /></button>
                 <button v-if="task.status === 'queued' || task.status === 'running'" class="icon-button" :title="t('cancel')" :aria-label="t('cancel')" @click="cancelTransfer(task)"><X /></button>
@@ -7826,6 +7978,7 @@ onBeforeUnmount(() => {
               <ContextMenuContent>
                 <!-- 多选感知：右键时已多选（selection > 1）→ 菜单整体切换为批量区，单项动作隐藏 -->
                 <template v-if="fileMenu && fileMenu.selection.length > 1">
+                  <ContextMenuItem @select="batchDownload"><Download />{{ t("download") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @select="batchArchive()"><Archive />{{ t("sftpBatch.archive") }}</ContextMenuItem>
                   <ContextMenuItem variant="destructive" :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @select="batchDeleteOpen = true"><Trash2 />{{ t("sftpBatch.delete") }}</ContextMenuItem>
                   <ContextMenuSeparator />
@@ -7833,7 +7986,7 @@ onBeforeUnmount(() => {
                 </template>
                 <template v-else-if="fileMenu">
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @select="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</ContextMenuItem>
-                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file'" @select="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</ContextMenuItem>
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file' || fileMenu.entry.kind === 'directory'" @select="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="beginRename(fileMenu.entry)"><Pencil />{{ t("rename") }}</ContextMenuItem>
                   <ContextMenuItem @select="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</ContextMenuItem>
