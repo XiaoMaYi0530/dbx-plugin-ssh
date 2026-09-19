@@ -206,6 +206,45 @@ def main() -> None:
                 raise AssertionError(f"same-connection workbenches missing: {rows}")
             print(f"    independent sessions {session_id} and {second_id}")
 
+        def case_dead_session_input_signal():
+            """Input into a session the sidecar no longer has must not vanish.
+
+            The binary-handler failure is mirrored as a ssh/terminal/error
+            event (same contract as sftp/upload/error) so the workbench can
+            run its reconnect ladder instead of showing a terminal that looks
+            alive while swallowing every keystroke. The session-gone replay
+            error is the second self-heal signal.
+            """
+            opened = req("ssh/session/open", {
+                "connectionId": connection_id,
+                "workbenchId": "smoke-fs-dead-input",
+                "cols": 80,
+                "rows": 24,
+            })
+            dead_id = opened.get("sessionId") or "smoke-fs-dead-input"
+            time.sleep(0.5)  # let the PTY settle so close cannot race the open
+            req("ssh/session/close", {"sessionId": dead_id})
+            client.events.clear()
+            client.send_binary(f"ssh/terminal/in/{dead_id}",
+                               struct.pack(">Q", 1) + b"echo dead\r")
+            event = client.wait_event("ssh/terminal/error", timeout=10.0)
+            if not event:
+                raise AssertionError("dead-session input produced no ssh/terminal/error event")
+            params = event.get("params", {})
+            if params.get("sessionId") != dead_id:
+                raise AssertionError(f"error event sessionId mismatch: {params!r}")
+            if "not found or expired" not in str(params.get("error", "")):
+                raise AssertionError(f"error not the session-gone contract: {params!r}")
+            try:
+                client.request("ssh/terminal/replay",
+                               {"sessionId": dead_id, "afterSequence": 0}, timeout=10)
+            except SidecarError as error:
+                if "not found or expired" not in str(error):
+                    raise AssertionError(f"dead-session replay errored oddly: {error}")
+            else:
+                raise AssertionError("replay on a dead session unexpectedly succeeded")
+            print(f"    dead session {dead_id[:8]}… mirrored input failure and refused replay")
+
         step("sftp/home")
         result = client.request("sftp/home", {"sessionId": session_id})
         home = result.get("path") or "/config"
@@ -1134,6 +1173,8 @@ def main() -> None:
         print("\n--- session isolation group ---")
         report.run("same connection opens independent sessions", "ssh/session/open",
                    case_same_connection_sessions_are_independent)
+        report.run("dead session mirrors input failure as event", "ssh/session/close",
+                   case_dead_session_input_signal)
 
         print("\n--- sftp_ext group ---")
         report.run("sftp/stat /config", "sftp/stat", case_sftp_stat)

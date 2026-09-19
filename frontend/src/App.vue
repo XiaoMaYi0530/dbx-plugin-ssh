@@ -93,7 +93,7 @@ import {
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
 import { createTerminalInputQueue } from "./lib/terminalInputQueue";
-import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
+import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
 import { decideConnectRetry } from "./lib/connectRetry";
 import { createConnectLog } from "./lib/connectLog";
@@ -981,7 +981,7 @@ const terminalInputQueue = createTerminalInputQueue({
     // 会话被外部杀掉（宿主重推连接的 disconnect、sidecar 重启）时本 tab 无
     // 事件感知，终端看似活着实则打不进字。输入撞上死会话时按传输断开的
     // 同款有界梯子自动重连。错误串契约见 backend ssh.rs session()。
-    if (terminalState.value === "connected" && String(cause).includes("not found or expired")) scheduleSessionReconnect();
+    if (terminalState.value === "connected" && !reconnectPending.value && isSessionGoneError(cause)) scheduleSessionReconnect();
   },
 });
 
@@ -2133,6 +2133,11 @@ function drainTerminalFrames() {
   if (Number.isFinite(firstPending) && firstPending > lastSequence + 1 && !replayInFlight && session.value) {
     const holeAt = lastSequence;
     replayInFlight = true;
+    // A session-gone replay failure must resync and reconnect: the hole can
+    // never be filled (the session object is gone server-side), so the
+    // ssh-transport-disconnected state frame stuck behind it would otherwise
+    // freeze the drain forever and the tab keeps claiming "connected".
+    let sessionGone = false;
     void window.dbxPlugin.invoke<ReplayResult>("ssh/terminal/replay", { sessionId: session.value.sessionId, afterSequence: lastSequence })
       .then((result) => {
         if (!result.complete) {
@@ -2155,10 +2160,22 @@ function drainTerminalFrames() {
           replayNoProgress = 0;
         }
       })
-      .catch((cause) => showError(cause, "terminal"))
+      .catch((cause) => {
+        if (isSessionGoneError(cause) && firstPending > lastSequence) {
+          sessionGone = true;
+          lastSequence = firstPending - 1;
+          replayNoProgress = 0;
+          return;
+        }
+        showError(cause, "terminal");
+      })
       .finally(() => {
         replayInFlight = false;
         drainTerminalFrames();
+        // Run after the resync drain above delivered the buffered disconnect
+        // state frame (it flips the state off "connected"); the ladder then
+        // picks the reconnect up unless one is already pending.
+        if (sessionGone && !reconnectPending.value && !disposed) scheduleSessionReconnect();
       });
   }
 }
@@ -2204,6 +2221,17 @@ function handleEvent(event: DbxPluginEvent) {
     if (event.params.state === "disconnected") {
       // Transport dropped (network flap, server restart): auto-reconnect with
       // a bounded backoff ladder instead of parking on a dead terminal.
+      scheduleSessionReconnect();
+    }
+    return;
+  }
+  // Input hit a session the sidecar no longer has (host-pushed disconnect the
+  // tab missed, sidecar restart): the terminal still looks alive but every
+  // keystroke is swallowed. The sidecar mirrors binary-handler failures as
+  // this event; treat it as the same transport-drop ladder. Guarded so a
+  // reconnect already in flight is not double-scheduled.
+  if (event.method === "ssh/terminal/error" && event.params.sessionId === session.value?.sessionId) {
+    if (terminalState.value === "connected" && !reconnectPending.value) {
       scheduleSessionReconnect();
     }
     return;

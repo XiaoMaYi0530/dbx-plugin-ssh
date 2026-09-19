@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import appVueSource from "../App.vue?raw";
 import { Osc7DirectoryParser, parseOsc7Path } from "./terminalDirectoryTracking";
-import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, shouldReattachTerminal, terminalReconnectDelay } from "./terminalReconnect";
+import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay } from "./terminalReconnect";
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress } from "./sftpBatchProgress";
 import { sampleTransferSpeed } from "./transferSpeed";
 import { DANGEROUS_COMMAND_PATTERNS, buildPasteConfirmation, inspect } from "./dangerousCommands";
@@ -94,6 +94,18 @@ describe("SSH workbench protocol helpers", () => {
     expect(isConnectionInactiveError(new Error("Connection refused by host"))).toBe(false);
     expect(isConnectionInactiveError(undefined)).toBe(false);
     expect(isConnectionInactiveError("")).toBe(false);
+  });
+
+  it("classifies the dead-session contract that must resync and reconnect", () => {
+    // Both sidecar spellings (session() / write_terminal()) mean the session
+    // object is gone: replays can never succeed and input is swallowed.
+    expect(isSessionGoneError(new Error("SSH session was not found or expired"))).toBe(true);
+    expect(isSessionGoneError("SSH session was not found")).toBe(true);
+    // Transient failures keep the plain error banner path.
+    expect(isSessionGoneError(new Error("SSH input queue is closed"))).toBe(false);
+    expect(isSessionGoneError(new Error("Connection refused by host"))).toBe(false);
+    expect(isSessionGoneError(undefined)).toBe(false);
+    expect(isSessionGoneError("")).toBe(false);
   });
 
   it("resolves the SFTP pane visibility from the workbench state or the global default", () => {

@@ -1066,9 +1066,18 @@ impl PluginHandler for Plugin {
                 u64::from_be_bytes(data[..8].try_into().map_err(|_| {
                     to_plugin_error("Invalid SSH terminal input sequence".to_string())
                 })?);
-            self.ssh
-                .write_terminal(session_id, data[8..].to_vec())
-                .map_err(to_plugin_error)?;
+            if let Err(error) = self.ssh.write_terminal(session_id, data[8..].to_vec()) {
+                // Binary handler failures are only logged by the SDK loop, so a
+                // workbench typing into a dead session (host-pushed disconnect,
+                // sidecar restart) would otherwise learn nothing: the tab keeps
+                // looking alive while every keystroke is swallowed. Mirror the
+                // failure as an event the workbench can auto-reconnect on.
+                let _ = emitter.event(
+                    "ssh/terminal/error",
+                    json!({ "sessionId": session_id, "error": error }),
+                );
+                return Err(to_plugin_error(error));
+            }
             emitter.event(
                 "ssh/terminal/inputAck",
                 json!({ "sessionId": session_id, "sequence": sequence }),

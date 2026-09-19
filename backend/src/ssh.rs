@@ -2096,13 +2096,15 @@ impl SshRuntime {
         // Do not hold the session-map read guard while applying backpressure:
         // closing a dead session needs the write lock to drop the receiver so
         // a blocked sender can observe closure and return.
-        let terminal_tx = {
-            let sessions = self.sessions.blocking_read();
-            sessions
-                .get(session_id)
-                .map(|session| session.terminal_tx.clone())
-                .ok_or("SSH session was not found")?
-        };
+            let terminal_tx = {
+                let sessions = self.sessions.blocking_read();
+                sessions
+                    .get(session_id)
+                    .map(|session| session.terminal_tx.clone())
+                    // Same string as session() below — the workbench's dead-session
+                    // detection matches on this contract (App.vue input queue).
+                    .ok_or("SSH session was not found or expired")?
+            };
         enqueue_terminal_input(&terminal_tx, data)
     }
 

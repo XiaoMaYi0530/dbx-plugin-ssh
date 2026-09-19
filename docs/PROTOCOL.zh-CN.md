@@ -480,6 +480,10 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 终端输出保留 2 MiB 环形缓存。前端检测到序号缺口后停止乱序输出并调用 `ssh/terminal/replay`。文件传输采用逐块 RPC 确认，不依赖广播队列可靠送达。
 
+### 死会话输入事件（`ssh/terminal/error`）
+
+二进制 handler 失败只落 sidecar stderr（SDK 循环仅日志），工作台原本对"输入撞上已消失会话"毫无感知——终端看似在线实则打不进字。与 `sftp/upload/error` 同理，`ssh/terminal/in/{sessionId}` 处理失败时镜像发事件 `ssh/terminal/error { sessionId, error }`（错误串即 `write_terminal` 原文，会话不存在时为 `SSH session was not found or expired`，与 `session()` 同契约）。前端收到后按传输断开的同款有界退避梯子自动重连；`ssh/terminal/replay` 因会话消失报错时，前端同样将序号游标 resync 过缺口（让卡在缓冲里的 `ssh-transport-disconnected` 状态帧得以放出）再进入重连。
+
 ### 上传两阶段计数与收尾语义（issue #60）
 
 上传事件 `sftp/transfer/progress` 携带 `phase` 字段区分两个独立计数（各自从 0 起步）：`staging` = 字节缓存进本地 spool 文件（`transferred` = 已缓冲字节数，速率≈本机磁盘），`uploading` = 字节真正推送到 SFTP 服务器（`transferred` = 已推送字节数，速率≈网络）。工作台只在 `uploading` 阶段采样速度、并按阶段钳制进度单调，避免"3G→100M 回跳"与"20MB/s 假速度"。`sftp/transfer/list` / `sftp/transfer/status` 的上传行同样带 `phase`（staging 行的 `transferred` 为 spool 字节数）。下载事件无 `phase`。
