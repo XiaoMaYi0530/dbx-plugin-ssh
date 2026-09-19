@@ -2,7 +2,7 @@
 // null/非数组整体收敛为空数组、null 行与无名/无 uri 行丢弃、缺 kind 降级
 // 为 file（渲染占位而非整表丢弃/比较器抛错）。
 import { describe, expect, it } from "vitest";
-import { sanitizeSftpEntries } from "./sftpEntries";
+import { sanitizeSftpEntries, sanitizeVisibleColumns } from "./sftpEntries";
 
 describe("sanitizeSftpEntries", () => {
   it("returns an empty array for null / non-array payloads", () => {
@@ -57,5 +57,48 @@ describe("sanitizeSftpEntries", () => {
   it("passes a healthy payload through unchanged in shape", () => {
     const row = { name: "hosts", uri: "sftp:/etc/hosts", kind: "file", size: 221, modifiedAt: 1700000000, permissions: "0644" };
     expect(sanitizeSftpEntries([row])).toEqual([row]);
+  });
+
+  it("keeps owner/group strings and normalizes non-string values to undefined", () => {
+    const entries = sanitizeSftpEntries([
+      { name: "a", uri: "sftp:/a", kind: "file", owner: "root", group: "docker" },
+      { name: "b", uri: "sftp:/b", kind: "file", owner: 1000, group: null },
+      { name: "c", uri: "sftp:/c", kind: "file" },
+    ]);
+    // issue #34：字符串直接透传；数字/空值归一为缺省（UI 渲染 "-"）。
+    expect(entries[0].owner).toBe("root");
+    expect(entries[0].group).toBe("docker");
+    expect(entries[1].owner).toBeUndefined();
+    expect(entries[1].group).toBeUndefined();
+    expect(entries[2].owner).toBeUndefined();
+    expect(entries[2].group).toBeUndefined();
+  });
+});
+
+describe("sanitizeVisibleColumns", () => {
+  it("falls back to the default columns for non-array payloads", () => {
+    expect(sanitizeVisibleColumns(undefined)).toEqual(["size", "modified"]);
+    expect(sanitizeVisibleColumns(null)).toEqual(["size", "modified"]);
+    expect(sanitizeVisibleColumns("size")).toEqual(["size", "modified"]);
+  });
+
+  it("keeps only known columns and drops junk entries", () => {
+    expect(sanitizeVisibleColumns(["size", "owner", "group", "permissions", "evil"])).toEqual([
+      "size",
+      "owner",
+      "group",
+      "permissions",
+    ]);
+    // 旧版本持久化状态（没有 owner/group）原样保留。
+    expect(sanitizeVisibleColumns(["modified", "permissions"])).toEqual(["modified", "permissions"]);
+  });
+
+  it("falls back to defaults when nothing usable remains", () => {
+    expect(sanitizeVisibleColumns([])).toEqual(["size", "modified"]);
+    expect(sanitizeVisibleColumns([42, null])).toEqual(["size", "modified"]);
+  });
+
+  it("accepts the new owner/group columns from persisted state", () => {
+    expect(sanitizeVisibleColumns(["size", "owner", "group"])).toEqual(["size", "owner", "group"]);
   });
 });

@@ -4,6 +4,8 @@
  * （null entries 让 for-of 抛 TypeError、null 行让排序比较器抛错）。
  * sanitize 规则：非数组 → 空数组；非对象行丢弃；缺 kind 的行降级为 file
  * （渲染占位而不是整表丢弃）；size/modifiedAt 非数值时取中性默认。
+ * owner/group（属主/属组，issue #34）是可选字符串，非字符串一律归一为
+ * 缺省（UI 渲染 "-"）。
  */
 export type SftpEntryKind = "file" | "directory" | "symlink" | "other";
 
@@ -15,9 +17,34 @@ export interface SftpSanitizedEntry {
   modifiedAt?: number;
   permissions?: string;
   contentType?: string;
+  /** 属主用户；缺省即"未知"（渲染 "-"）。 */
+  owner?: string;
+  /** 属组；缺省即"未知"（渲染 "-"）。 */
+  group?: string;
 }
 
 const KNOWN_KINDS: readonly SftpEntryKind[] = ["file", "directory", "symlink", "other"];
+
+/** 可选显示列；`owner`/`group` 默认关闭（issue #34：默认不显示，避免打扰现有用户）。 */
+export type SftpColumn = "size" | "modified" | "permissions" | "owner" | "group";
+
+const KNOWN_COLUMNS: readonly SftpColumn[] = ["size", "modified", "permissions", "owner", "group"];
+
+/** 持久化状态没有可用列偏好时的默认列。 */
+export const DEFAULT_VISIBLE_COLUMNS: SftpColumn[] = ["size", "modified"];
+
+export function sanitizeVisibleColumns(value: unknown): SftpColumn[] {
+  if (!Array.isArray(value)) return [...DEFAULT_VISIBLE_COLUMNS];
+  const columns = value.filter(
+    (column): column is SftpColumn =>
+      typeof column === "string" && (KNOWN_COLUMNS as readonly string[]).includes(column),
+  );
+  return columns.length > 0 ? columns : [...DEFAULT_VISIBLE_COLUMNS];
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
 
 export function sanitizeSftpEntries(value: unknown): SftpSanitizedEntry[] {
   if (!Array.isArray(value)) return [];
@@ -36,6 +63,8 @@ export function sanitizeSftpEntries(value: unknown): SftpSanitizedEntry[] {
       size: typeof record.size === "number" ? record.size : undefined,
       modifiedAt: typeof record.modifiedAt === "number" ? record.modifiedAt : undefined,
       permissions: typeof record.permissions === "string" ? record.permissions : undefined,
+      owner: optionalString(record.owner),
+      group: optionalString(record.group),
     });
   }
   return entries;

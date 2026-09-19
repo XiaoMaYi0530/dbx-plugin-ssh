@@ -2978,10 +2978,16 @@ impl SshRuntime {
         &self,
         session_id: &str,
         path: &str,
+        include_owner: bool,
     ) -> Result<Vec<SftpEntry>, String> {
         let sftp = self.sftp(session_id).await?;
         let path = normalize_remote_path(path)?;
-        let entries = sftp.lock().await.read_dir(path).await.map_err(sftp_error)?;
+        let entries = sftp
+            .lock()
+            .await
+            .read_dir(path.clone())
+            .await
+            .map_err(sftp_error)?;
         let mut result = entries
             .map(|entry| {
                 let metadata = entry.metadata();
@@ -2991,6 +2997,21 @@ impl SshRuntime {
                     FileType::Symlink => "symlink",
                     FileType::Other => "other",
                 };
+                let (owner, group) = if include_owner {
+                    // Names first (SFTPv4+), numeric ids as the v3 fallback —
+                    // the same semantics `sftp/stat` already documents.
+                    let owner = metadata
+                        .user
+                        .clone()
+                        .or_else(|| metadata.uid.map(|uid| uid.to_string()));
+                    let group = metadata
+                        .group
+                        .clone()
+                        .or_else(|| metadata.gid.map(|gid| gid.to_string()));
+                    (owner, group)
+                } else {
+                    (None, None)
+                };
                 SftpEntry {
                     name: entry.file_name(),
                     uri: sftp_uri(&entry.path()),
@@ -2999,9 +3020,18 @@ impl SshRuntime {
                     modified_at: metadata.mtime.map(u64::from),
                     permissions: metadata.permissions.map(format_permissions),
                     content_type: content_type_for_path(&entry.path()),
+                    owner,
+                    group,
                 }
             })
             .collect::<Vec<_>>();
+        if include_owner {
+            // One extra read-only round trip upgrades numeric ids to names on
+            // SFTPv3 servers (OpenSSH): `ls -l` puts owner/group in fields 3/4.
+            // Any failure (no shell, no `ls`, timeout) keeps the numeric or
+            // absent values, never the listing itself.
+            enrich_owner_names(self, session_id, &path, &mut result).await;
+        }
         result.sort_by(|left, right| {
             let left_dir = left.kind == "directory";
             let right_dir = right.kind == "directory";
@@ -5499,6 +5529,131 @@ fn format_permissions(value: u32) -> String {
     format!("{:04o}", value & 0o7777)
 }
 
+/// Budget for the one `ls -l` round trip that upgrades numeric owner ids to
+/// names. Generous enough for slow links, still bounded so a wedged shell
+/// cannot stall directory listings.
+const OWNER_LOOKUP_TIMEOUT_SECS: u64 = 10;
+
+/// Whether an owner/group value still benefits from the `ls -l` name lookup:
+/// absent, or a numeric id string (SFTPv3 servers report `0`, `1000`, ...).
+fn owner_needs_name(value: &Option<String>) -> bool {
+    match value {
+        None => true,
+        Some(value) => !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+    }
+}
+
+/// Overwrites numeric/absent owner/group values on `entries` with names read
+/// from one read-only `ls -l` round trip. Best effort by design: no shell,
+/// no `ls`, a timeout or unparsable output all leave the listing untouched
+/// (numeric ids or absent fields, which the UI renders as "-").
+async fn enrich_owner_names(
+    runtime: &SshRuntime,
+    session_id: &str,
+    path: &str,
+    entries: &mut [SftpEntry],
+) {
+    if entries.is_empty() || !entries.iter().any(|entry| owner_needs_name(&entry.owner)) {
+        return;
+    }
+    let session = match runtime.session(session_id).await {
+        Ok(session) => session,
+        Err(_) => return,
+    };
+    // GNU renders epoch mtimes with `--time-style=+%s` (same trick sudo_fs
+    // uses); BusyBox/BSD reject that option, so a plain `ls -l` retry covers
+    // the classic layout. Owner/group sit in fields 3/4 on both.
+    let gnu = format!("ls -l --time-style=+%s -- {}", exec::shell_quote(path));
+    let output = match exec::exec_plain(
+        &session.handle,
+        &gnu,
+        Duration::from_secs(OWNER_LOOKUP_TIMEOUT_SECS),
+        &[],
+    )
+    .await
+    {
+        Ok(outcome) => outcome.output,
+        Err(_) => {
+            let plain = format!("ls -l -- {}", exec::shell_quote(path));
+            match exec::exec_plain(
+                &session.handle,
+                &plain,
+                Duration::from_secs(OWNER_LOOKUP_TIMEOUT_SECS),
+                &[],
+            )
+            .await
+            {
+                Ok(outcome) => outcome.output,
+                Err(_) => return,
+            }
+        }
+    };
+    let names = parse_ls_owner_map(&output);
+    if names.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        if let Some((owner, group)) = names.get(&entry.name) {
+            if owner_needs_name(&entry.owner) {
+                entry.owner = Some(owner.clone());
+            }
+            if owner_needs_name(&entry.group) {
+                entry.group = Some(group.clone());
+            }
+        }
+    }
+}
+
+/// Parses `ls -l` output into `name -> (owner, group)`. Owner/group sit in
+/// fields 3/4 of every layout; the name start depends on whether the date
+/// collapsed into one epoch field (GNU `--time-style=+%s`, name from field 6)
+/// or spread over three classic fields (name from field 8). Returns an empty
+/// map for headers (`total`, `ls:` diagnostics) and unparsable rows.
+fn parse_ls_owner_map(output: &str) -> HashMap<String, (String, String)> {
+    let mut map = HashMap::new();
+    for line in output.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with("total") || line.starts_with("ls:") {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 7 || fields[0].len() < 10 {
+            continue;
+        }
+        let name_start = if fields[5].parse::<u64>().is_ok() {
+            6
+        } else {
+            8
+        };
+        if fields.len() <= name_start {
+            continue;
+        }
+        let mut name = fields[name_start..].join(" ");
+        // `ls -l` renders symlinks as "name -> target"; keep only the name.
+        if let Some((head, _)) = name.split_once(" -> ") {
+            name = head.to_string();
+        }
+        let name = unquote_ls_output_name(&name);
+        if name.is_empty() {
+            continue;
+        }
+        map.entry(name)
+            .or_insert_with(|| (fields[2].to_string(), fields[3].to_string()));
+    }
+    map
+}
+
+/// Undoes the quoting `ls` applies to unusual names when its stdout is a
+/// terminal (possible when `sudo_use_pty` is enabled): shell-escape style
+/// renders `weird name's` as `'weird name'\''s'`.
+fn unquote_ls_output_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        return trimmed[1..trimmed.len() - 1].replace("'\\''", "'");
+    }
+    trimmed.to_string()
+}
+
 fn directory_tracking_marker(session_id: &str) -> Vec<u8> {
     format!("\x1b]777;dbx-directory-ready-{session_id}\x07").into_bytes()
 }
@@ -5613,6 +5768,89 @@ fn plugin_error(error: PluginError) -> String {
 mod tests {
     use super::*;
     use russh::{cipher, kex, mac};
+
+    #[test]
+    fn numeric_or_absent_owner_values_ask_for_names() {
+        assert!(owner_needs_name(&None));
+        assert!(owner_needs_name(&Some("0".to_string())));
+        assert!(owner_needs_name(&Some("1000".to_string())));
+        // Already a name (SFTPv4+ attribute or a previous lookup): no work.
+        assert!(!owner_needs_name(&Some("root".to_string())));
+        // Defensive: an empty string would render as "-" either way.
+        assert!(!owner_needs_name(&Some(String::new())));
+    }
+
+    #[test]
+    fn parse_ls_owner_map_reads_gnu_epoch_layout() {
+        let output = "\
+total 20
+drwxr-xr-x  3 root root 4096 1720000000 .
+drwxr-xr-x  1 root wheel 4096 1720000001 ..
+-rw-r--r--  1 alice docker  123 1720000002 notes.txt
+drwxr-xr-x  2 root root 4096 1720000003 sub dir with spaces
+lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
+";
+        let map = parse_ls_owner_map(output);
+        assert_eq!(
+            map.get("notes.txt"),
+            Some(&("alice".to_string(), "docker".to_string()))
+        );
+        assert_eq!(
+            map.get("sub dir with spaces"),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+        // Symlink arrow is stripped from the name key.
+        assert_eq!(
+            map.get("link"),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+        // "." / ".." come along but harmless: they never match SftpEntry names.
+        assert_eq!(
+            map.get("."),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_ls_owner_map_reads_classic_layout() {
+        // BusyBox/BSD dates spread over three fields; owner/group stay in
+        // fields 3/4 regardless.
+        let output = "\
+-rw-r--r--    1 root     root          4096 Jan 15 10:23 readme.md
+-rw-r--r--    1 svc     deploy          123 Jan 15  2024 old.log
+";
+        let map = parse_ls_owner_map(output);
+        assert_eq!(
+            map.get("readme.md"),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+        assert_eq!(
+            map.get("old.log"),
+            Some(&("svc".to_string(), "deploy".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_ls_owner_map_ignores_headers_and_noise() {
+        assert!(parse_ls_owner_map("").is_empty());
+        assert!(parse_ls_owner_map("total 20\n").is_empty());
+        assert!(parse_ls_owner_map("ls: cannot open '/x': Permission denied\n").is_empty());
+        // A row too short to carry owner/group is dropped, not misparsed.
+        assert!(parse_ls_owner_map("-rw-r--r-- 1 x\n").is_empty());
+    }
+
+    #[test]
+    fn parse_ls_owner_map_keeps_first_row_for_duplicate_names() {
+        let output = "\
+-rw-r--r--  1 root root 1 1720000000 a.txt
+-rw-r--r--  1 amy ops  2 1720000001 a.txt
+";
+        let map = parse_ls_owner_map(output);
+        assert_eq!(
+            map.get("a.txt"),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+    }
 
     #[test]
     fn test_connection_budget_aligns_with_host_deadline() {
