@@ -447,4 +447,143 @@ state({ sudo_source: "off", auth_flow_mode: "password_plus_otp" }).visible("pass
 state({ advanced_options: false, authentication: "password", password_source: "command" }).visible("password_command", true);
 state({ advanced_options: false, authentication: "password", password_source: "direct" }).visible("password_command", false);
 state({ advanced_options: false, authentication: "private-key", password_source: "command" }).visible("password_command", false);
+
+// ---------------------------------------------------------------------------
+// Host dialog timeout-scope contract (issue #20: "全局" timeouts revert to
+// "当前连接" after save+reopen).
+//
+// The connect/query timeout scope radios in the host's "Advanced" tab are NOT
+// plugin fields: they bind the host `ConnectionConfig` top-level
+// `connect_timeout_secs` / `query_timeout_secs` plus the scope sentinels
+// `connect_timeout_inherit` / `query_timeout_inherit` (true = follow the host
+// global timeout settings). Plugin (db_type="plugin") connections render the
+// same host block, so the plugin cannot express or repair this in the
+// manifest - it is recorded here as the mirrored host contract, like the
+// dialog semantics mirrored in backend/src/model.rs.
+//
+// Host semantics mirrored from the DBX desktop checkout (main@7a6bb0fe2):
+//   * hydrate  - apps/desktop/src/components/connection/ConnectionDialog.vue
+//                (ConnectionDialog syncAction="hydrate" block):
+//                `config.connect_timeout_inherit === true` is the ONLY global
+//                state; absent/false/0 all mean "current connection".
+//   * submit   - same file, `connectionConfigForSubmit` plugin branch: it
+//                rebuilds the config via `buildPluginConnectionConfig`
+//                (apps/desktop/src/lib/plugins/frontendPlugin.ts), which does
+//                not carry the two inherit flags, then re-assigns only the
+//                scalar timeouts. The non-plugin branch ({...form}) keeps the
+//                flags, so plugin connections are the ones that lose them.
+//   * persist  - apps/desktop/src/stores/connectionStore.ts
+//                `normalizeConnection` falls back to the inherit-ID list and
+//                `updateConnection`/`persistTimeoutInheritance` then solidify
+//                the lost scope as "current connection".
+//
+// KNOWN HOST BUG: the plugin branch drops the scope, so every save resets the
+// visible scope to "current connection" (both for an explicit "全局" choice
+// and for a brand-new connection, whose dialog form defaults to inherit=true).
+// Minimal host-side fix: in the `connectionConfigForSubmit` plugin branch,
+// alongside the `config.connect_timeout_secs = ...` re-assignments, add
+//   config.connect_timeout_inherit = form.value.connect_timeout_inherit;
+//   config.query_timeout_inherit = form.value.query_timeout_inherit;
+// (and optionally carry the flags in `buildPluginConnectionConfig`'s base
+// object). Human decision lives on the host side; the assertions below pin
+// the semantics this plugin's users depend on so a host regression cannot
+// silently change them again.
+// ---------------------------------------------------------------------------
+let timeoutScenarios = 0;
+
+const GLOBAL_CONNECT_TIMEOUT_SECS = 10;
+const GLOBAL_QUERY_TIMEOUT_SECS = 0;
+
+// Host hydrate: stored config -> dialog form state.
+function hydrateTimeoutScope(config) {
+  const connectInherit = config.connect_timeout_inherit === true;
+  const queryInherit = config.query_timeout_inherit === true;
+  return {
+    connect_timeout_inherit: connectInherit,
+    connect_timeout_secs: connectInherit ? GLOBAL_CONNECT_TIMEOUT_SECS : (config.connect_timeout_secs || 10),
+    query_timeout_inherit: queryInherit,
+    query_timeout_secs: queryInherit ? GLOBAL_QUERY_TIMEOUT_SECS : (config.query_timeout_secs ?? 60),
+  };
+}
+
+// Host submit, plugin branch, as the contract requires it: the scalar
+// timeouts are re-assigned from the form AND the scope flags survive.
+function submitTimeoutScope(form) {
+  return {
+    connect_timeout_secs: form.connect_timeout_secs,
+    query_timeout_secs: form.query_timeout_secs,
+    connect_timeout_inherit: form.connect_timeout_inherit,
+    query_timeout_inherit: form.query_timeout_inherit,
+  };
+}
+
+function assertTimeoutScope(label, form, expected) {
+  timeoutScenarios++;
+  const reopened = hydrateTimeoutScope(submitTimeoutScope(form));
+  assert.deepEqual(reopened, expected, `${label}: timeout scope lost across save/reopen`);
+}
+
+// 1) Existing "current connection" (1s / 60s) -> user picks 全局 for both
+//    timeouts -> save -> reopen must still show 全局 (issue #20 report).
+{
+  const form = {
+    ...hydrateTimeoutScope({ connect_timeout_secs: 1, query_timeout_secs: 60 }),
+    connect_timeout_inherit: true,
+    query_timeout_inherit: true,
+  };
+  assertTimeoutScope("global save keeps global", form, {
+    connect_timeout_inherit: true,
+    connect_timeout_secs: GLOBAL_CONNECT_TIMEOUT_SECS,
+    query_timeout_inherit: true,
+    query_timeout_secs: GLOBAL_QUERY_TIMEOUT_SECS,
+  });
+}
+
+// 2) 全局 -> back to 当前连接 with an edited number -> save -> reopen must
+//    stay "current connection" with the typed value still editable.
+{
+  const form = {
+    ...hydrateTimeoutScope({ connect_timeout_secs: 1, query_timeout_secs: 60 }),
+    connect_timeout_inherit: true,
+    query_timeout_inherit: true,
+  };
+  form.connect_timeout_inherit = false;
+  form.connect_timeout_secs = 42;
+  form.query_timeout_inherit = false;
+  form.query_timeout_secs = 120;
+  assertTimeoutScope("switch back to per-connection stays editable", form, {
+    connect_timeout_inherit: false,
+    connect_timeout_secs: 42,
+    query_timeout_inherit: false,
+    query_timeout_secs: 120,
+  });
+}
+
+// 3) A brand-new connection: the dialog form defaults to inherit=true, so the
+//    first save must persist 全局 too (same root cause, same revert).
+assertTimeoutScope("new connection default keeps global", {
+  connect_timeout_inherit: true,
+  connect_timeout_secs: GLOBAL_CONNECT_TIMEOUT_SECS,
+  query_timeout_inherit: true,
+  query_timeout_secs: GLOBAL_QUERY_TIMEOUT_SECS,
+}, {
+  connect_timeout_inherit: true,
+  connect_timeout_secs: GLOBAL_CONNECT_TIMEOUT_SECS,
+  query_timeout_inherit: true,
+  query_timeout_secs: GLOBAL_QUERY_TIMEOUT_SECS,
+});
+
+// Sentinel semantics: only an explicit `true` means 全局. The host hydrate
+// must keep treating absent/false/0 (and any other falsy junk) as "current
+// connection" so legacy rows saved before the flags existed stay editable.
+for (const junk of [undefined, false, 0, "true"]) {
+  timeoutScenarios++;
+  const reopened = hydrateTimeoutScope({ connect_timeout_inherit: junk, query_timeout_inherit: junk, connect_timeout_secs: 7, query_timeout_secs: 8 });
+  assert.equal(reopened.connect_timeout_inherit, false, `sentinel ${String(junk)} must not mean global`);
+  assert.equal(reopened.query_timeout_inherit, false, `sentinel ${String(junk)} must not mean global`);
+  assert.equal(reopened.connect_timeout_secs, 7, "per-connection value must survive hydrate");
+  assert.equal(reopened.query_timeout_secs, 8, "per-connection value must survive hydrate");
+}
+
 console.log(`PASS SSH connection form: ${scenarios} combinations; field ordering and seven-language labels/options`);
+console.log(`PASS SSH timeout scope contract: ${timeoutScenarios} cases; global/per-connection sentinels survive save+reopen (issue #20, host-side fix tracked separately)`);
