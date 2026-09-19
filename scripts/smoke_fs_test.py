@@ -215,6 +215,7 @@ def main() -> None:
         ssh_dir = f"{home}/.ssh"
         touch_path = f"{home}/.dbx-fs-smoke-touch"
         write_path = f"{home}/.dbx-fs-smoke-write"
+        perms_path = f"{home}/.dbx-fs-smoke-perms.sh"
         archive_path = f"{home}/.dbx-parity-test.tar.gz"
         extract_dir = f"{home}/.dbx-parity-extract"
         sudo_dir = f"{home}/.sudo-test"
@@ -260,6 +261,25 @@ def main() -> None:
                 raise AssertionError(f"read-back mismatch: {content!r}")
             print(f"    wrote and read back {write_path}")
             req("sftp/delete", {"sessionId": session_id, "path": write_path})
+
+        def case_sftp_write_preserves_permissions():
+            # Issue #37: saving over an existing file must not drop its
+            # permission bits (e.g. the executable bit of a script).
+            req("sftp/write", {"sessionId": session_id, "remotePath": perms_path,
+                               "dataBase64": base64.b64encode(b"#!/bin/sh\necho one\n").decode()})
+            req("sftp/chmod", {"sessionId": session_id, "path": perms_path, "mode": "0755"})
+            updated = b"#!/bin/sh\necho two\n"
+            req("sftp/write", {"sessionId": session_id, "remotePath": perms_path,
+                               "dataBase64": base64.b64encode(updated).decode()})
+            mode = req("sftp/stat", {"sessionId": session_id, "path": perms_path}).get("mode")
+            if mode != "0755":
+                raise AssertionError(f"mode after overwrite save={mode!r}, want '0755'")
+            read_back = req("sftp/read", {"sessionId": session_id, "path": perms_path, "maxBytes": 4096})
+            content = base64.b64decode(read_back.get("dataBase64", "")).decode(errors="replace")
+            if content != updated.decode():
+                raise AssertionError(f"read-back mismatch after overwrite: {content!r}")
+            print(f"    {perms_path}: mode stayed 0755 after overwrite save")
+            req("sftp/delete", {"sessionId": session_id, "path": perms_path})
 
         def case_sftp_archive():
             try:  # archive source must exist; create ~/.ssh if the container lacks it
@@ -1030,6 +1050,8 @@ def main() -> None:
         report.run("sftp/exists true/false", "sftp/exists", case_sftp_exists)
         report.run("sftp/touch + sftp/stat empty file", "sftp/touch", case_sftp_touch_stat)
         report.run("sftp/write + sftp/read round-trip", "sftp/write", case_sftp_write_read)
+        report.run("sftp/write overwrite keeps chmod 0755", "sftp/write",
+                   case_sftp_write_preserves_permissions)
         archive_case = "sftp/archive .ssh -> tar.gz"
         report.run(archive_case, "sftp/archive", case_sftp_archive)
         report.run("sftp/extract tar.gz -> directory", "sftp/extract", case_sftp_extract, needs=archive_case)

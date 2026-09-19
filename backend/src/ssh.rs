@@ -5444,13 +5444,57 @@ fn remote_transfer_paths(target: &str, task_id: &str) -> Result<(String, String)
     ))
 }
 
+/// Permission attributes carried over from an existing target to the staged
+/// replacement file: the mode's permission bits (`0o7777`, so an executable
+/// script keeps its `+x` across saves) and nothing else. Ownership (uid/gid)
+/// is deliberately not preserved — SETSTAT on uid/gid needs elevated
+/// privileges, so the replacement keeps the writing user's own ownership.
+fn preserved_target_permissions(
+    target: &russh_sftp::protocol::FileAttributes,
+) -> Option<russh_sftp::protocol::FileAttributes> {
+    let permissions = target.permissions?;
+    Some(russh_sftp::protocol::FileAttributes {
+        permissions: Some(permissions & 0o7777),
+        ..Default::default()
+    })
+}
+
+/// Applies [`preserved_target_permissions`] to the staged file before the
+/// rename. A SETSTAT failure aborts the commit with the original target
+/// untouched instead of silently saving a permission-downgraded copy (issue
+/// #37: an executable script must not lose its `+x` on every save).
+pub(crate) async fn apply_preserved_permissions(
+    sftp: &Arc<AsyncMutex<SftpSession>>,
+    temporary: &str,
+    target: Option<&russh_sftp::protocol::FileAttributes>,
+) -> Result<(), String> {
+    if let Some(attributes) = target.and_then(preserved_target_permissions) {
+        let mode = attributes.permissions.unwrap_or_default();
+        if let Err(error) = sftp
+            .lock()
+            .await
+            .set_metadata(temporary.to_string(), attributes)
+            .await
+        {
+            let _ = sftp.lock().await.remove_file(temporary.to_string()).await;
+            return Err(format!(
+                "SFTP save failed while preserving permissions {}: {error}; original file left unchanged",
+                format_permissions(mode),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn commit_remote_file(
     sftp: &Arc<AsyncMutex<SftpSession>>,
     temporary: &str,
     target: &str,
     backup: &str,
 ) -> Result<(), String> {
-    let target_exists = sftp.lock().await.metadata(target.to_string()).await.is_ok();
+    let target_attributes = sftp.lock().await.metadata(target.to_string()).await.ok();
+    apply_preserved_permissions(sftp, temporary, target_attributes.as_ref()).await?;
+    let target_exists = target_attributes.is_some();
     if target_exists {
         sftp.lock()
             .await
@@ -7149,6 +7193,50 @@ mod tests {
                 "russh 服务端清零 partial success，客户端据此拒绝继续"
             );
             assert!(answers.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn preserved_permissions_keep_mode_bits_and_drop_everything_else() {
+            // Issue #37: the mode's permission bits (including setuid/setgid/
+            // sticky) must ride onto the staged file; the file-type bits of
+            // st_mode and the uid/gid/size/timestamps must not.
+            let target = russh_sftp::protocol::FileAttributes {
+                size: Some(12),
+                uid: Some(1000),
+                gid: Some(1000),
+                permissions: Some(0o100755),
+                atime: Some(1),
+                mtime: Some(2),
+                ..Default::default()
+            };
+            let preserved = preserved_target_permissions(&target).expect("permissions present");
+            assert_eq!(preserved.permissions, Some(0o755));
+            // Only permission bits travel: the staged file already has its own
+            // identity, and SETSTAT on uid/gid needs elevated privileges.
+            assert_eq!(preserved.size, None);
+            assert_eq!(preserved.uid, None);
+            assert_eq!(preserved.user, None);
+            assert_eq!(preserved.gid, None);
+            assert_eq!(preserved.group, None);
+            assert_eq!(preserved.atime, None);
+            assert_eq!(preserved.mtime, None);
+            let sticky = russh_sftp::protocol::FileAttributes {
+                permissions: Some(0o101755),
+                ..Default::default()
+            };
+            let preserved = preserved_target_permissions(&sticky).expect("permissions present");
+            assert_eq!(preserved.permissions, Some(0o1755));
+        }
+
+        #[test]
+        fn preserved_permissions_skip_targets_without_mode_information() {
+            // Servers may omit permission attributes entirely; without a mode
+            // to preserve there is nothing to SETSTAT.
+            let target = russh_sftp::protocol::FileAttributes {
+                size: Some(3),
+                ..Default::default()
+            };
+            assert!(preserved_target_permissions(&target).is_none());
         }
     }
 }
