@@ -161,7 +161,7 @@ import { toolbarTintStyle } from "./lib/toolbarTint";
 import { createGhostClickGuard } from "./lib/ghostClickGuard";
 import { createRequestEpoch } from "./lib/requestEpoch";
 import { sanitizeSftpEntries } from "./lib/sftpEntries";
-import { resolveRemotePath } from "./lib/remotePathInput";
+import { resolveRemotePath, splitRemotePathSegments } from "./lib/remotePathInput";
 import { shouldCommitRename } from "./lib/sftpRename";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
 import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRendererLike } from "./lib/terminalWebgl";
@@ -4411,12 +4411,26 @@ function goToPath(path: string) {
   void loadDirectory(path);
 }
 
+// #54 路径栏分段回跳：非编辑态把路径渲染成一串分段 chip（根目录 / 也可点击
+// 回根），点击任一分段经 goToPath 直接回到对应前缀；点击分段以外区域或导航
+// 框聚焦后 Enter 进入编辑态，输入行为与原先完全一致（复用 submitPathInput）。
+const pathBarEditing = ref(false);
+const pathBarInputEl = ref<HTMLInputElement | null>(null);
+const pathCrumbs = computed(() => splitRemotePathSegments(currentPath.value));
+
+function beginPathBarEdit() {
+  if (pathBarEditing.value) return;
+  pathBarEditing.value = true;
+  void nextTick(() => pathBarInputEl.value?.focus());
+}
+
 // R3-P2-4：路径栏提交统一入口——`~`（home 已探测时）展开、`.`/`..` 段消解
 // 及基础归一，下游 joinRemote/exists 拼接与路径历史不再携带未规范路径。
 function submitPathInput() {
   if (!connected.value) return;
   const target = resolveRemotePath(currentPath.value, sftpHomePath.value || undefined);
   currentPath.value = target;
+  pathBarEditing.value = false;
   void loadDirectory(target);
 }
 
@@ -7667,7 +7681,27 @@ onBeforeUnmount(() => {
           <button class="icon-button" :title="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
           <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
           <button class="icon-button icon-cyan" :title="t('refresh')" :disabled="!connected || loadingFiles" @click="loadDirectory()"><RefreshCw :class="{ spinning: loadingFiles }" /></button>
-          <input v-model="currentPath" spellcheck="false" @keydown.enter="submitPathInput" />
+          <!-- #54 路径栏双态：非编辑态把当前路径渲染成可点击分段（末段为当前位置），
+               点击分段直接回跳、点击分段外区域进入编辑；编辑态是原先的完整输入框，
+               提交后回到分段展示。分段切分走 remotePathInput（有单测）。 -->
+          <div class="path-bar">
+            <input
+              v-show="pathBarEditing"
+              ref="pathBarInputEl"
+              v-model="currentPath"
+              spellcheck="false"
+              @keydown.enter="submitPathInput"
+              @keydown.esc="pathBarEditing = false"
+              @blur="pathBarEditing = false"
+            />
+            <nav v-show="!pathBarEditing" class="path-crumbs" tabindex="0" @click="beginPathBarEdit" @keydown.enter.self.prevent="beginPathBarEdit">
+              <template v-for="(crumb, index) in pathCrumbs" :key="crumb.path">
+                <span v-if="index" class="path-crumb-sep" aria-hidden="true">/</span>
+                <button v-if="index < pathCrumbs.length - 1" class="path-crumb mono" :title="crumb.path" @click.stop="goToPath(crumb.path)">{{ crumb.name }}</button>
+                <span v-else class="path-crumb current mono" :title="crumb.path" aria-current="location">{{ crumb.name }}</span>
+              </template>
+            </nav>
+          </div>
           <div>
             <Popover :open="bookmarkSaveOpen" @update:open="(open) => { if (!open) bookmarkSaveOpen = false; }">
               <PopoverAnchor as-child>
