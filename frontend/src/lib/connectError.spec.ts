@@ -27,6 +27,21 @@ describe("classifyConnectError", () => {
     expect(classifyConnectError("SSH handshake completed without presenting a host key")).toBe("hostKey");
   });
 
+  it("classifies private-key decoding failures as keyFormat (issue #21)", () => {
+    expect(
+      classifyConnectError(
+        "Failed to decode SSH private key: this private key is encrypted; fill in the private key passphrase field for this connection, then reconnect (decoder error: The key is encrypted)",
+      ),
+    ).toBe("keyFormat");
+    expect(classifyConnectError("Failed to decode SSH private key: Could not read key")).toBe("keyFormat");
+    expect(classifyConnectError("Failed to read SSH private key '/home/u/id_rsa': No such file")).toBe("keyFormat");
+  });
+
+  it("keeps server-side private-key rejections as auth, not keyFormat", () => {
+    expect(classifyConnectError("SSH private-key authentication was rejected")).toBe("auth");
+    expect(classifyConnectError("SSH private-key authentication timed out")).toBe("auth");
+  });
+
   it("leaves non-connect-domain errors untouched", () => {
     expect(classifyConnectError("Command not run: approval timed out waiting for the user")).toBeNull();
     expect(classifyConnectError("SFTP upload rejected: file exists")).toBeNull();
@@ -41,5 +56,6 @@ describe("classifyConnectError", () => {
     expect(connectErrorKey("auth")).toBe("connectError.auth");
     expect(connectErrorKey("timeout")).toBe("connectError.timeout");
     expect(connectErrorKey("network")).toBe("connectError.network");
+    expect(connectErrorKey("keyFormat")).toBe("connectError.keyFormat");
   });
 });

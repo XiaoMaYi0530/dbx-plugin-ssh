@@ -46,7 +46,8 @@ pub fn read_private_key_file(path: &Path) -> Result<String, String> {
             if encrypted {
                 Ok(text)
             } else {
-                Err(format!("Unrecognized private key format: {error}"))
+                // 与连接期同一套可操作错误分类（#21），底层错误原样保留。
+                Err(crate::ssh::private_key_decode_failure(&text, &error, false))
             }
         }
     }

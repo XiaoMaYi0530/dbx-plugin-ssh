@@ -5361,8 +5361,9 @@ async fn authenticate_private_key_result(
             }
         }
     };
-    let private_key =
-        decoded.map_err(|error| format!("Failed to decode SSH private key: {error}"))?;
+    let private_key = decoded.map_err(|error| {
+        private_key_decode_failure(&key_text, &error, stored_passphrase.is_some())
+    })?;
     let hash = session
         .best_supported_rsa_hash()
         .await
@@ -5405,10 +5406,264 @@ async fn resolve_private_key_text(connection: &StoredConnection) -> Result<Strin
 /// Normalizes text artifacts around a PEM/PPK key. `russh` matches PEM begin
 /// markers exactly at the start of a line, so a UTF-8 BOM or indentation on
 /// the first line otherwise becomes the opaque `Could not read key` error.
+/// Beyond the original CRLF/BOM/indent handling this also strips paste-time
+/// pollution that can never occur in a real key file: zero-width characters,
+/// `<br>` tags from web-page copies, trailing whitespace on marker lines,
+/// smart dashes, and whitespace inside base64 body lines (terminal copy that
+/// re-wrapped the text). Marker lines are rebuilt into their canonical
+/// `-----BEGIN … -----` form. No key semantics change: directive lines such
+/// as `DEK-Info:` are preserved as-is.
 fn normalize_private_key_text(text: &str) -> String {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let normalized = normalized.strip_prefix('\u{feff}').unwrap_or(&normalized);
-    normalized.trim_start().to_string()
+    let cleaned = strip_invisible_paste_artifacts(normalized);
+    let mut rebuilt: Vec<String> = Vec::new();
+    let mut in_pem_body = false;
+    for line in cleaned.split('\n') {
+        let trimmed = line.trim();
+        // Drop leading blank/indent-only lines, like the previous whole-text
+        // trim_start did.
+        if rebuilt.is_empty() && trimmed.is_empty() {
+            continue;
+        }
+        if looks_like_marker_line(trimmed) {
+            rebuilt.push(normalize_pem_marker_line(trimmed));
+            in_pem_body = trimmed.contains("BEGIN");
+            continue;
+        }
+        if in_pem_body {
+            let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            if !compact.is_empty() && compact.chars().all(is_pem_base64_char) {
+                rebuilt.push(compact);
+                continue;
+            }
+        }
+        rebuilt.push(trimmed.to_string());
+    }
+    // Trailing per-line whitespace is already gone; keep the original tail
+    // (including its final newline) so the resolved text stays byte-identical
+    // apart from the pollution fixes.
+    rebuilt.join("\n")
+}
+
+/// Removes characters and tags that only arrive via rich-text or web-page
+/// copying: zero-width space/joiners, stray mid-text BOMs, and `<br>` tags
+/// in any letter case. A valid key file never contains any of them, so the
+/// removal cannot alter real key content.
+fn strip_invisible_paste_artifacts(text: &str) -> String {
+    let filtered: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{feff}'))
+        .collect();
+    let lower = filtered.to_lowercase();
+    let mut remove = vec![false; filtered.len()];
+    for tag in ["<br />", "<br/>", "<br>"] {
+        let mut from = 0;
+        while let Some(offset) = lower[from..].find(tag) {
+            let start = from + offset;
+            for byte in remove.iter_mut().skip(start).take(tag.len()) {
+                *byte = true;
+            }
+            from = start + tag.len();
+        }
+    }
+    let mut out = String::with_capacity(filtered.len());
+    for (index, c) in filtered.char_indices() {
+        if !remove[index] {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// ASCII base64 alphabet plus the padding sign, as PEM bodies use it.
+fn is_pem_base64_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '/' || c == '+' || c == '='
+}
+
+/// Marker-line detection that also accepts smart dashes, which rich-text
+/// editors substitute for the ASCII hyphens of `-----BEGIN … -----`.
+fn looks_like_marker_line(line: &str) -> bool {
+    let starts_with_dash = line
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '-' | '\u{2013}' | '\u{2014}' | '\u{2212}'));
+    starts_with_dash && (line.contains("BEGIN") || line.contains("END"))
+}
+
+/// Rebuilds a PEM begin/end marker into the canonical five-dash form, fixing
+/// smart dashes (— – −), doubled inner spaces, and trailing whitespace, all
+/// of which make `russh`'s exact marker match fail with `Could not read key`.
+fn normalize_pem_marker_line(line: &str) -> String {
+    let ascii_dashes: String = line
+        .chars()
+        .map(|c| match c {
+            '\u{2013}' | '\u{2014}' | '\u{2212}' => '-',
+            other => other,
+        })
+        .collect();
+    let mut collapsed = String::with_capacity(ascii_dashes.len());
+    let mut previous_was_space = false;
+    for c in ascii_dashes.chars() {
+        if c.is_whitespace() {
+            if !previous_was_space {
+                collapsed.push(' ');
+                previous_was_space = true;
+            }
+        } else {
+            collapsed.push(c);
+            previous_was_space = false;
+        }
+    }
+    let core = collapsed.trim().trim_matches('-').trim();
+    if core.starts_with("BEGIN") || core.starts_with("END") {
+        format!("-----{core}-----")
+    } else {
+        collapsed
+    }
+}
+
+/// Detects the one-line authorized-keys form and PEM public/certificate
+/// envelopes so a pasted public key is reported as such instead of as an
+/// opaque decode failure.
+fn looks_like_public_key(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    for header in [
+        "-----BEGIN PUBLIC KEY-----",
+        "-----BEGIN OPENSSH PUBLIC KEY-----",
+        "-----BEGIN SSH2 PUBLIC KEY-----",
+        "-----BEGIN CERTIFICATE-----",
+    ] {
+        if trimmed.contains(header) {
+            return true;
+        }
+    }
+    let first = trimmed.lines().next().unwrap_or("");
+    let mut parts = first.split_whitespace();
+    let (Some(kind), Some(blob)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let looks_like_algorithm = kind.starts_with("ssh-")
+        || kind.starts_with("ecdsa-")
+        || kind.starts_with("sk-ssh-")
+        || kind.starts_with("sk-ecdsa-");
+    looks_like_algorithm && blob.len() >= 40 && blob.chars().all(is_pem_base64_char)
+}
+
+fn has_html_escaped_entities(text: &str) -> bool {
+    text.contains("&lt;")
+        || text.contains("&gt;")
+        || text.contains("&quot;")
+        || text.contains("&amp;")
+}
+
+/// Turns a raw `decode_secret_key` failure into an actionable message while
+/// always preserving the underlying decoder error verbatim (never swallow
+/// detail). Classification is a pure function of the key text and the error,
+/// so tests cover every branch without an SSH server. This only rewords the
+/// failure — authentication flow, passphrase handling, and decoding itself
+/// are untouched.
+pub(crate) fn private_key_decode_failure(
+    key_text: &str,
+    error: &russh::keys::Error,
+    passphrase_provided: bool,
+) -> String {
+    fn detailed(guidance: &str, error: &russh::keys::Error) -> String {
+        format!("Failed to decode SSH private key: {guidance} (decoder error: {error})")
+    }
+    let raw = error.to_string();
+    if key_text.contains("PuTTY-User-Key-File-") {
+        if matches!(error, russh::keys::Error::KeyIsEncrypted) || raw.contains("encrypted") {
+            return detailed(
+                "this PuTTY PPK key is encrypted; fill in the private key passphrase field \
+                 for this connection, then reconnect",
+                error,
+            );
+        }
+        if raw.contains("MAC") {
+            return detailed(
+                "the PuTTY PPK did not verify — the passphrase appears to be incorrect, or \
+                 the file is damaged; check the private key passphrase field or re-export \
+                 the key from PuTTYgen",
+                error,
+            );
+        }
+        return detailed(
+            "this PuTTY PPK file could not be parsed; export it from PuTTYgen again \
+             (Conversions → Export OpenSSH key) and paste the OpenSSH-format key",
+            error,
+        );
+    }
+    if looks_like_public_key(key_text) {
+        return detailed(
+            "the pasted text looks like a PUBLIC key or certificate, not a private key; \
+             paste the matching private key file contents, including the \
+             -----BEGIN … PRIVATE KEY----- and -----END … PRIVATE KEY----- lines",
+            error,
+        );
+    }
+    if matches!(error, russh::keys::Error::KeyIsEncrypted) {
+        return detailed(
+            "this private key is encrypted; fill in the private key passphrase field for \
+             this connection, then reconnect",
+            error,
+        );
+    }
+    if raw.contains("PKCS#5 algorithm") && raw.contains("unsupported") {
+        return detailed(
+            "the encrypted PKCS#8 key uses a PBKDF2 variant this decoder does not \
+             support; re-export the key in OpenSSH format (ssh-keygen -p -f <keyfile>) \
+             or without a passphrase",
+            error,
+        );
+    }
+    if key_text.contains("-----BEGIN EC PRIVATE KEY-----") && raw.starts_with("Der:") {
+        return detailed(
+            "legacy 'EC PRIVATE KEY' (SEC1) PEM is not supported by this decoder; convert \
+             the key once (ssh-keygen -p -f <keyfile>, or openssl pkcs8 -topk8 -nocrypt \
+             -in <keyfile>) and paste the converted key",
+            error,
+        );
+    }
+    if passphrase_provided
+        && (raw.contains("cryptographic error") || raw.contains("Unpad") || raw.contains("MAC"))
+    {
+        return detailed(
+            "the key did not decrypt with the stored passphrase — check or update the \
+             private key passphrase field, or the key file is damaged",
+            error,
+        );
+    }
+    if raw.contains("Base64 decoding error") {
+        return detailed(
+            "the key body is not valid base64 — the text was probably truncated or \
+             mangled while copying; re-copy the complete key from the original file",
+            error,
+        );
+    }
+    if matches!(error, russh::keys::Error::CouldNotReadKey) {
+        if has_html_escaped_entities(key_text) {
+            return detailed(
+                "the text looks HTML-escaped (&lt;, &quot;, …); copy the key from the \
+                 original file as plain text, not from a web page or chat window",
+                error,
+            );
+        }
+        if key_text.contains("-----BEGIN") {
+            return detailed(
+                "a PEM header was found but not in a recognizable form — the key was \
+                 probably mangled by rich-text copy (altered dashes or extra characters); \
+                 re-copy the key from the original file as plain text",
+                error,
+            );
+        }
+        return detailed(
+            "no PEM private-key header (-----BEGIN … PRIVATE KEY-----) was found; paste \
+             the complete key file contents, including the BEGIN and END lines",
+            error,
+        );
+    }
+    detailed("the key could not be decoded", error)
 }
 
 fn expand_private_key_path(path: &str) -> PathBuf {
@@ -6110,6 +6365,324 @@ mod tests {
         assert!(normalized.starts_with("-----BEGIN PRIVATE KEY-----\n"));
         assert!(!normalized.contains('\r'));
         assert!(decode_secret_key(&normalized, None).is_ok());
+    }
+
+    // —— #21: 私钥解码错误分类与粘贴污损修复 ————————————————————————————
+    // 以下密钥全部为本仓库测试现场生成的废弃密钥或 ssh-key 上游公开测试
+    // fixture,绝不包含真实凭据。口令仅为测试值。
+
+    /// 废弃测试密钥(本机为编写测试生成,无对应主机)。
+    const OPENSSH_ED25519_PLAIN: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDkhRLM2wxmY826/LvkQeMRNf9pptlryFMSddhmTmhSrwAAAJiaGi/pmhov
+6QAAAAtzc2gtZWQyNTUxOQAAACDkhRLM2wxmY826/LvkQeMRNf9pptlryFMSddhmTmhSrw
+AAAEA41GJvRrU3mTnSyjUyLinDInc6VUNdHcvGr1te4YW7S+SFEszbDGZjzbr8u+RB4xE1
+/2mm2WvIUxJ12GZOaFKvAAAADm1hdHJpeC1lZDI1NTE5AQIDBAUGBw==
+-----END OPENSSH PRIVATE KEY-----";
+
+    /// 同上,口令为 "test-phrase"。
+    const OPENSSH_ED25519_ENCRYPTED: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAd8e+k64
+ZPDgMURR64zer1AAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIMcQDHXhSWOHA0pR
+VYE3X8bEgjf0QVAcOzZ+6mZKzIa/AAAAoLKviiOSbTqOH2s7O+Y2AxZzne4kYYb0uZhpHH
+eGHpS7VjhQLlN/B1cgyfNWqdROswIXdPbDL1uC5nzv8MAvH4lEobnNgZWVaxKoIAyTP3v+
+c/3nQJQxJ1klouO/ojHcFFumbY4C+lRMGRhPIvtDj1alq5lvefD/3VmtK/jbeA8zuXcdv9
+1QXkLgYJ5A3wpFPs7x/jgDn/v3e6jAwfZoZLU=
+-----END OPENSSH PRIVATE KEY-----";
+
+    const ENCRYPTED_TEST_PASSPHRASE: &str = "test-phrase";
+
+    /// ssh-key 上游公开测试 fixture(user@example.com,无口令)。
+    const PPK3_ED25519_PLAIN: &str = "\
+PuTTY-User-Key-File-3: ssh-ed25519
+Encryption: none
+Comment: user@example.com
+Public-Lines: 2
+AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XF
+Sqti
+Private-Lines: 1
+AAAAILYGwiLRDBba4WxwpNRRc0cuxhfgXGVpINJuVsCPtZHt
+Private-MAC: 94140d0344fad6aa1bf7b71e9c93db11ccac8a232f8a51e11c024869d608c82d";
+
+    /// 同一上游 fixture,口令为 "123"。
+    const PPK3_ED25519_ENCRYPTED: &str = "\
+PuTTY-User-Key-File-3: ssh-ed25519
+Encryption: aes256-cbc
+Comment: user@example.com
+Public-Lines: 2
+AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XF
+Sqti
+Key-Derivation: Argon2id
+Argon2-Memory: 8192
+Argon2-Passes: 34
+Argon2-Parallelism: 1
+Argon2-Salt: 63d1d43f7bf7700720496646a2f5ec17
+Private-Lines: 1
+DyWtExZ3dxFutnb12tIwXBC6kWdozrvP+r6faHKBGDb4+qEar9XBiC0BmGySMHUi
+Private-MAC: 52fd00d4ef47ebc506e4e709486c0c6bc0606e24fe2c6cb1b3d168f4da238a66";
+
+    /// 废弃测试密钥(SEC1 传统 EC PEM,russh 不支持此封装)。
+    const EC_SEC1_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+MIIBaAIBAQQgOtPbXkrREPIS68niEPbISV5VZmM4655BvEie7U9k/4CggfowgfcC
+AQEwLAYHKoZIzj0BAQIhAP////8AAAABAAAAAAAAAAAAAAAA////////////////
+MFsEIP////8AAAABAAAAAAAAAAAAAAAA///////////////8BCBaxjXYqjqT57Pr
+vVV2mIa8ZR0GsMxTsPY7zjw+J9JgSwMVAMSdNgiG5wSTamZ44ROdJreBn36QBEEE
+axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpZP40Li/hp/m47n60p8D54W
+K84zV2sxXs7LtkBoN79R9QIhAP////8AAAAA//////////+85vqtpxeehPO5ysL8
+YyVRAgEBoUQDQgAERtRtbHHreGHq8c0a0GvFRsZ+3BfCcILOVeIpInh5O9ddBZQI
+Q/TyBph+JFB6VjJb6neA04jwsdD13REn2e7/og==
+-----END EC PRIVATE KEY-----";
+
+    /// 废弃测试密钥(PKCS#8 + PBES2/hmacWithSHA256,口令 "test-phrase";
+    /// russh 的 PKCS#5 解析不支持该 PRF)。
+    const PKCS8_PBES2_ENCRYPTED: &str = "\
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIICzzBJBgkqhkiG9w0BBQ0wPDAbBgkqhkiG9w0BBQwwDgQIOcKjFZoZ/fsCAggA
+MB0GCWCGSAFlAwQBAgQQTfxxn8bDf+3cTfXy9sHVtgSCAoBF4F4/74FYKIDBbFxE
+BXPvQRgnRTL6FWGD983/u9CueKi26cAty4N75cDEPwbq4xk/DMGhQTiSymv4SOK3
+MBgZ/hb8jHWIp8SrZ2IvP14uM/EsVAvLgmnlu8JH/Q4BfYLbo4tvY88Wwx93GXdW
+Ik6S30w+iDo/BTZ7by9mFITWD3DcIYpsrCgmn/MhQ/cRy7Eoe4wkMruMsY4aG4Tb
+K1gDN/dLL/jrafcwDx1sjA71BmVf0bNKR9CBk1sZ5i5d4D0YSFRI4t8TG15cjb/l
+NQwi9ykch3t6ojtQvHT645Z8kiTYjfPEyqgEWtSZd+69QAJ0Gl1XEqb+kH7eyMOL
+oyMOfoX+Z3cEHCNY5/FZvFUTLmVX+OjzYY34LvzoSICeCr7HE+cnkRBEdpbLgyw9
+LPlnpp7RWOXr8pidnr7vg7tN6sWnqM8JwPubDgl2gE1jUiqKHSWXHq6kEVEVA9Y4
+uRBKE24j+FrPYGRjoKVXyPX0gjhqp66GDGaBCWs7LzdFO10IPxDKM6GJ8AxKLk9X
+UVXqyvDfC9lh6YAHmTKmNYnKkEijdKkP7Uw57n8aWr1tw5xLyhABLZEGhPLcyazN
+z7fnjJ+3LAEqD5dlZaczncsdFmZh1naKswCmSrwZOEbAeGbaZvdsHqspYwXGBTna
+Q+KW8/vygV6WQZLnVu36rIkJq56Hzo3JFo3p2GOY/Pk1o82xFTm/fS3Pm3FWoapa
+SiK9nBQ20ok8efOFN535UDWrmOMKcZTF/ZgpjKPCPFwaDFlpgtbWbUW+1ABMYv4g
+GkWbTKmDiaAreK3qjVWf20UuzxzSFk/QS1dxTHoNv8NsvWAJp7AZv2WV6Bj+k9Is
+sfwQ
+-----END ENCRYPTED PRIVATE KEY-----";
+
+    /// 与 OPENSSH_ED25519_PLAIN 同钥的公钥单行形态(误粘场景)。
+    const ED25519_PUBLIC_ONELINER: &str = "\
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOSFEszbDGZjzbr8u+RB4xE1/2mm2WvIUxJ12GZOaFKv \
+matrix-ed25519";
+
+    fn decode_error_of(text: &str, passphrase: Option<&str>) -> russh::keys::Error {
+        decode_secret_key(text, passphrase).expect_err("sample must fail to decode")
+    }
+
+    fn assert_actionable(text: &str, error: &russh::keys::Error, provided: bool, guidance: &str) {
+        let message = private_key_decode_failure(text, error, provided);
+        assert!(
+            message.starts_with("Failed to decode SSH private key: "),
+            "{message}"
+        );
+        // 底层错误永远原样保留,不吞细节。
+        assert!(
+            message.contains(&format!("(decoder error: {error})")),
+            "{message}"
+        );
+        assert!(message.contains(guidance), "{message}");
+    }
+
+    #[test]
+    fn paste_artifacts_are_normalized_and_then_decode() {
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "marker trailing space",
+                OPENSSH_ED25519_PLAIN.replace(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----",
+                    "-----BEGIN OPENSSH PRIVATE KEY----- ",
+                ),
+            ),
+            (
+                "marker inner double space",
+                OPENSSH_ED25519_PLAIN.replace(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----",
+                    "-----BEGIN  OPENSSH  PRIVATE  KEY-----",
+                ),
+            ),
+            (
+                "smart dashes",
+                OPENSSH_ED25519_PLAIN
+                    .replace("-----BEGIN", "——–BEGIN")
+                    .replace("-----END", "——–END"),
+            ),
+            ("zero-width characters", {
+                let mut text = OPENSSH_ED25519_PLAIN
+                    .replace("-----BEGIN OPENSSH", "-----\u{200b}BEGIN\u{200b} OPENSSH");
+                text.insert(40, '\u{200b}');
+                text
+            }),
+            (
+                "web-page <br> tags",
+                OPENSSH_ED25519_PLAIN
+                    .replace('\n', "<br>\n")
+                    .replacen("<br>", "<BR>", 1),
+            ),
+            ("re-wrapped body lines", {
+                let mut lines: Vec<String> =
+                    OPENSSH_ED25519_PLAIN.lines().map(str::to_string).collect();
+                lines[1].insert_str(24, "  ");
+                lines[2].insert(24, '\t');
+                lines.join("\n")
+            }),
+            (
+                "crlf plus bom plus indent",
+                format!(
+                    "\u{feff}   \r\n{}\r\n",
+                    OPENSSH_ED25519_PLAIN.replace('\n', "\r\n")
+                ),
+            ),
+        ];
+        for (label, polluted) in &cases {
+            let normalized = normalize_private_key_text(polluted);
+            let decoded = decode_secret_key(&normalized, None);
+            assert!(decoded.is_ok(), "{label}: {normalized:?}");
+        }
+    }
+
+    #[test]
+    fn paste_artifact_normalization_preserves_directive_lines() {
+        // PKCS#5 传统加密 PEM 的 DEK-Info 指令行必须原样保留(含 IV 十六进制)。
+        let text = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\
+            DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF \n\nabc= \n\
+            -----END RSA PRIVATE KEY-----\n";
+        let normalized = normalize_private_key_text(text);
+        assert!(normalized.contains("DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n"));
+        assert!(normalized.contains("Proc-Type: 4,ENCRYPTED\n"));
+        assert!(normalized.contains("\nabc=\n"));
+    }
+
+    #[test]
+    fn decode_errors_are_classified_into_actionable_guidance() {
+        // 加密 OpenSSH 密钥、未填口令。
+        assert_actionable(
+            OPENSSH_ED25519_ENCRYPTED,
+            &decode_error_of(OPENSSH_ED25519_ENCRYPTED, None),
+            false,
+            "fill in the private key passphrase field",
+        );
+        // 加密 OpenSSH 密钥、口令错误。
+        assert_actionable(
+            OPENSSH_ED25519_ENCRYPTED,
+            &decode_error_of(OPENSSH_ED25519_ENCRYPTED, Some("wrong-phrase")),
+            true,
+            "did not decrypt with the stored passphrase",
+        );
+        // 公钥单行形态被误当私钥。
+        assert_actionable(
+            ED25519_PUBLIC_ONELINER,
+            &decode_error_of(ED25519_PUBLIC_ONELINER, None),
+            false,
+            "looks like a PUBLIC key or certificate",
+        );
+        assert_actionable(
+            "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----",
+            &decode_error_of(
+                "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----",
+                None,
+            ),
+            false,
+            "looks like a PUBLIC key or certificate",
+        );
+        // 完全不是密钥文本。
+        assert_actionable(
+            "hello world, this is not a key",
+            &decode_error_of("hello world, this is not a key", None),
+            false,
+            "no PEM private-key header",
+        );
+        // HTML 转义污染(无法自动修复,指引重新复制)。
+        let html_escaped = "&lt;p&gt;-----BEGIN OPENSSH PRIVATE KEY-----&lt;/p&gt;";
+        assert_actionable(
+            html_escaped,
+            &decode_error_of(html_escaped, None),
+            false,
+            "looks HTML-escaped",
+        );
+        // BEGIN 存在但标记无法修复(类型名内部断行)。
+        let broken_marker =
+            "-----BEGIN OPENSSH PRIVATE-KEY-----\nbody\n-----END OPENSSH PRIVATE-KEY-----";
+        assert_actionable(
+            broken_marker,
+            &decode_error_of(broken_marker, None),
+            false,
+            "mangled by rich-text copy",
+        );
+        // SEC1 传统 EC PEM。
+        assert_actionable(
+            EC_SEC1_PEM,
+            &decode_error_of(EC_SEC1_PEM, None),
+            false,
+            "legacy 'EC PRIVATE KEY' (SEC1)",
+        );
+        // PKCS#8 + 不支持的 PBKDF2 PRF。
+        assert_actionable(
+            PKCS8_PBES2_ENCRYPTED,
+            &decode_error_of(PKCS8_PBES2_ENCRYPTED, Some(ENCRYPTED_TEST_PASSPHRASE)),
+            true,
+            "PBKDF2 variant",
+        );
+        // PuTTY PPK 加密、未填口令。
+        assert_actionable(
+            PPK3_ED25519_ENCRYPTED,
+            &decode_error_of(PPK3_ED25519_ENCRYPTED, None),
+            false,
+            "this PuTTY PPK key is encrypted",
+        );
+        // PuTTY PPK 口令错误(MAC 校验失败)。
+        assert_actionable(
+            PPK3_ED25519_ENCRYPTED,
+            &decode_error_of(PPK3_ED25519_ENCRYPTED, Some("wrong")),
+            true,
+            "the passphrase appears to be incorrect",
+        );
+        // PuTTY PPK 结构损坏。
+        let corrupt_ppk = PPK3_ED25519_PLAIN.replace("Public-Lines: 2", "Public-Lines: 3");
+        assert_actionable(
+            &corrupt_ppk,
+            &decode_error_of(&corrupt_ppk, None),
+            false,
+            "export it from PuTTYgen",
+        );
+        // base64 主体损坏(终端复制插空格、未走归一化的原始文本)。
+        let mut lines: Vec<&str> = OPENSSH_ED25519_PLAIN.lines().collect();
+        let mut second = lines[1].to_string();
+        second.insert(20, ' ');
+        lines[1] = &second;
+        let spaced_body = lines.join("\n");
+        assert_actionable(
+            &spaced_body,
+            &decode_error_of(&spaced_body, None),
+            false,
+            "not valid base64",
+        );
+        // 兜底:未知错误仍保留原文,只加一句说明。
+        let junk_key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----";
+        assert_actionable(
+            junk_key,
+            &decode_error_of(junk_key, None),
+            false,
+            "the key could not be decoded",
+        );
+    }
+
+    #[test]
+    fn valid_keys_still_decode_after_normalization() {
+        assert!(
+            decode_secret_key(&normalize_private_key_text(OPENSSH_ED25519_PLAIN), None).is_ok()
+        );
+        assert!(decode_secret_key(
+            &normalize_private_key_text(OPENSSH_ED25519_ENCRYPTED),
+            Some(ENCRYPTED_TEST_PASSPHRASE)
+        )
+        .is_ok());
+        assert!(decode_secret_key(&normalize_private_key_text(PPK3_ED25519_PLAIN), None).is_ok());
+        assert!(decode_secret_key(
+            &normalize_private_key_text(PPK3_ED25519_ENCRYPTED),
+            Some("123")
+        )
+        .is_ok());
+        assert!(!looks_like_public_key(OPENSSH_ED25519_PLAIN));
+        assert!(looks_like_public_key(ED25519_PUBLIC_ONELINER));
     }
 
     #[tokio::test]
