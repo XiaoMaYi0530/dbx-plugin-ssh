@@ -34,13 +34,13 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `sftp/diskUsage` | 路径所在挂载的磁盘用量 |
 | `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/read` 支持可选 `offset` 分片续读，见下文） |
 | `sftp/createDirectory`、`sftp/rename`、`sftp/delete` | SFTP 写操作 |
-| `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传，见下文） |
+| `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传；`finish` 校验后交后台任务推送并立即返回，见「上传两阶段计数与收尾语义」） |
 | `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文；桌面端可选 `downloadDir` 指定本机绝对保存目录） |
 | `sftp/stat`、`sftp/exists`、`sftp/touch`、`sftp/write` | 扩展文件操作：元信息单查、存在性检查、空文件创建、小文件直写 |
 | `sftp/archive`、`sftp/extract` | 远端 tar.gz 打包与解压 |
 | `sftp/copy`、`sftp/move` | 服务器内复制 / 剪切（逐项执行，目标存在需 `overwrite`） |
 | `sftp/bookmarks/list`、`sftp/bookmarks/save`、`sftp/bookmarks/delete` | SFTP 路径书签管理（全局命名清单，插件数据目录持久化，见下文） |
-| `sftp/transfer/cancel` | 取消并清理临时状态 |
+| `sftp/transfer/cancel` | 取消并清理临时状态（可选 `reason` slug 落入账本，见「上传两阶段计数与收尾语义」） |
 | `sftp/transfer/list`、`sftp/transfer/status` | 查询会话传输任务列表 / 单任务状态（含历史，会话维度过滤） |
 | `sftp/transfer/history` | 跨重启传输历史查询（持久化 + 内存 live 合并，见下文） |
 | `sftp/transfer/history/clear` | 清空已持久化及当前进程中的传输历史 |
@@ -467,6 +467,12 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - `sftp/download/{taskId}`：大端 `u64` 文件偏移加最多 256 KiB 数据。
 
 终端输出保留 2 MiB 环形缓存。前端检测到序号缺口后停止乱序输出并调用 `ssh/terminal/replay`。文件传输采用逐块 RPC 确认，不依赖广播队列可靠送达。
+
+### 上传两阶段计数与收尾语义（issue #60）
+
+上传事件 `sftp/transfer/progress` 携带 `phase` 字段区分两个独立计数（各自从 0 起步）：`staging` = 字节缓存进本地 spool 文件（`transferred` = 已缓冲字节数，速率≈本机磁盘），`uploading` = 字节真正推送到 SFTP 服务器（`transferred` = 已推送字节数，速率≈网络）。工作台只在 `uploading` 阶段采样速度、并按阶段钳制进度单调，避免"3G→100M 回跳"与"20MB/s 假速度"。`sftp/transfer/list` / `sftp/transfer/status` 的上传行同样带 `phase`（staging 行的 `transferred` 为 spool 字节数）。下载事件无 `phase`。
+
+`sftp/upload/finish` **不再长持 RPC**：校验 spool 完整后把远端推送交给 sidecar 后台任务并立即返回 `{ success: true, taskId, phase: "uploading", accepted }`；完成/失败/取消只经终态 progress 事件回传（此前长持 RPC 会被桥上任一端的 deadline 判死，健康的多 GB 上传被误报为 "upload cancelled"）。`sftp/transfer/cancel` 新增可选 `reason`（字符串 slug，≤120 字符：`user`=用户按钮、`ack-timeout`=分片确认超时、`local-read-error`/`append-failed`/`start-failed`/`client-error`=前端各类异常清理），取消事件的 `error` 文案据此区分（如 "Upload cancelled by user" / "Upload cancelled (ack-timeout)"），sidecar 日志同步打印取消原因。二进制拒收（offset 失配/任务丢失/spool 写失败）新增事件 `sftp/upload/error { taskId, error }`，前端无需等满 30s ack 超时。
 
 传输状态查询（只读，不产生副作用）：
 

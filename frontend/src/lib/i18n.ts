@@ -297,6 +297,7 @@ const messages = {
     transferStatus: {
       queued: "Queued",
       running: "Transferring",
+      staging: "Buffering",
       completed: "Completed",
       cancelled: "Cancelled",
       failed: "Failed",
@@ -629,7 +630,7 @@ const messages = {
       invalid: "Introduzca un número entero positivo de MiB en cada límite.",
       saved: "Límites MCP guardados",
     },
-    transferStatus: { queued: "En cola", running: "Transfiriendo", completed: "Completado", cancelled: "Cancelado", failed: "Fallido" },
+    transferStatus: { queued: "En cola", running: "Transfiriendo", staging: "Almacenando", completed: "Completado", cancelled: "Cancelado", failed: "Fallido" },
     highlightRules: {
       title: "Resaltado de palabras clave",
       add: "Añadir regla",
@@ -958,7 +959,7 @@ const messages = {
       invalid: "Inserisci un numero intero positivo di MiB per ogni limite.",
       saved: "Limiti MCP salvati",
     },
-    transferStatus: { queued: "In coda", running: "Trasferimento", completed: "Completato", cancelled: "Annullato", failed: "Non riuscito" },
+    transferStatus: { queued: "In coda", running: "Trasferimento", staging: "Buffering", completed: "Completato", cancelled: "Annullato", failed: "Non riuscito" },
     highlightRules: {
       title: "Evidenziazione parole chiave",
       add: "Aggiungi regola",
@@ -1287,7 +1288,7 @@ const messages = {
       invalid: "各上限に正の整数（MiB）を入力してください。",
       saved: "MCP サイズ上限を保存しました",
     },
-    transferStatus: { queued: "待機中", running: "転送中", completed: "完了", cancelled: "キャンセル", failed: "失敗" },
+    transferStatus: { queued: "待機中", running: "転送中", staging: "バッファ中", completed: "完了", cancelled: "キャンセル", failed: "失敗" },
     highlightRules: {
       title: "キーワード ハイライト",
       add: "ルールを追加",
@@ -1616,7 +1617,7 @@ const messages = {
       invalid: "Informe um número inteiro positivo de MiB para cada limite.",
       saved: "Limites MCP salvos",
     },
-    transferStatus: { queued: "Na fila", running: "Transferindo", completed: "Concluído", cancelled: "Cancelado", failed: "Falhou" },
+    transferStatus: { queued: "Na fila", running: "Transferindo", staging: "Bufferizando", completed: "Concluído", cancelled: "Cancelado", failed: "Falhou" },
     highlightRules: {
       title: "Realce de palavras-chave",
       add: "Adicionar regra",
@@ -1948,6 +1949,7 @@ const messages = {
     transferStatus: {
       queued: "等待中",
       running: "传输中",
+      staging: "缓冲中",
       completed: "已完成",
       cancelled: "已取消",
       failed: "失败",
@@ -2283,6 +2285,7 @@ const messages = {
     transferStatus: {
       queued: "等候中",
       running: "傳輸中",
+      staging: "緩衝中",
       completed: "已完成",
       cancelled: "已取消",
       failed: "失敗",

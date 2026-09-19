@@ -176,7 +176,23 @@ def case_upload(client: SidecarClient, session_id: str, path: str, data: bytes, 
     spool = time.monotonic() - started
     print(f"    spool: {len(data)} bytes in {spool:.2f}s -> {mb_s(len(data), spool):.1f} MB/s (local temp file)")
     network_started = time.monotonic()
-    client.request("sftp/upload/finish", {"taskId": task_id}, timeout=600)
+    client.request("sftp/upload/finish", {"taskId": task_id}, timeout=60)
+    # finish hands the push to a sidecar background task (issue #60); measure
+    # until the terminal progress event for this task lands instead.
+    while True:
+        try:
+            client.timeout = 600.0
+            client._pump(None)
+        except SidecarError:
+            raise SidecarError("timeout waiting for upload completion event")
+        finally:
+            client.timeout = 30.0
+        completed = next((event for event in reversed(client.events)
+                          if event.get("method") == "sftp/transfer/progress"
+                          and event.get("params", {}).get("taskId") == task_id
+                          and event.get("params", {}).get("status") == "completed"), None)
+        if completed is not None:
+            break
     network = time.monotonic() - network_started
     print(f"    network transfer (upload/finish): {len(data)} bytes in {network:.2f}s -> "
           f"{mb_s(len(data), network):.1f} MB/s over SFTP")

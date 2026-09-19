@@ -132,6 +132,7 @@ import { sanitizeCommandOutput } from "./lib/terminalOutputText";
 import { normalizeTerminalInputBytes } from "./lib/terminalInput";
 import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
+import { mergeTransferProgress, transferCancelReason, type TransferPhase } from "./lib/transferProgress";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI, type DbxPluginAppearanceInput } from "./lib/appearance";
 import { isDbxPluginTheme, onHostThemeChange, themeToAppearance } from "./lib/hostTheme";
 import { AGENT_MODES, approvalRemainingSecs, buildAgentResolveBody, dropAgentPrompt, enqueueAgentPrompt, sanitizeRememberedCommands, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload, type AgentTerminalMode } from "./lib/agentTerminal";
@@ -248,6 +249,11 @@ interface TransferTask {
   error?: string;
   // saveToLocal 下载完成后的本机落盘路径（用于展示与在文件管理器中定位）。
   localPath?: string;
+  // 上传分两阶段计数（issue #60）：staging=字节缓存进本地 spool（快），
+  // uploading=字节真正推到 SFTP 服务器（慢）。transferred 只反映 uploading，
+  // staged 单独记录 staging 字节，面板不再出现"3G→100M"回跳与假速度。
+  phase?: TransferPhase;
+  staged?: number;
 }
 
 // sftp/transfer/history 行（落盘历史 + 内存 live 合并视图）：status 沿用现有枚举、无 queued。
@@ -927,6 +933,9 @@ let pendingTerminalInput = "";
 let activeTerminalSessionId = "";
 const pendingTerminalFrames = new Map<number, { stream: number; data: Uint8Array }>();
 const uploadAckWaiters = new Map<string, { nextOffset: number; resolve: () => void; reject: (error: Error) => void; timer: number }>();
+// 上传收尾等待器（issue #60）：finish RPC 只负责把远端推送交给 sidecar
+// 后台任务，真正的完成/失败经终态 progress 事件回传，这里据此结算。
+const transferCompletionWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
 const downloadChunkWaiters = new Map<string, { offset: number; resolve: (bytes: Uint8Array) => void; reject: (error: Error) => void; timer: number }>();
 const transferSamples = new Map<string, TransferSpeedSample>();
 // Download task ids the user cancelled from the transfer panel; lets the download
@@ -2196,6 +2205,18 @@ function handleEvent(event: DbxPluginEvent) {
     }
     return;
   }
+  // sidecar 拒收上传分片（offset 失配/任务丢失/spool 写失败）时立即失败在途
+  // ack 等待器，不再等满 30s 超时后才用一个含糊的 ack-timeout 收场（issue #60）。
+  if (event.method === "sftp/upload/error") {
+    const taskId = String(event.params.taskId || "");
+    const waiter = uploadAckWaiters.get(taskId);
+    if (waiter) {
+      window.clearTimeout(waiter.timer);
+      uploadAckWaiters.delete(taskId);
+      waiter.reject(Object.assign(new Error(String(event.params.error || "upload rejected")), { code: "upload-append-failed" }));
+    }
+    return;
+  }
   if (event.method === "sftp/transfer/progress") updateTransfer(event.params);
 }
 
@@ -2203,25 +2224,58 @@ function updateTransfer(params: Record<string, unknown>) {
   const taskId = String(params.taskId || "");
   if (!taskId) return;
   const existing = transferTasks[taskId];
-  const transferred = Number(params.transferred ?? existing?.transferred ?? 0);
-  const sample = sampleTransferSpeed(transferSamples.get(taskId), transferred, performance.now());
-  transferSamples.set(taskId, sample);
-  transferSpeeds[taskId] = sample.speed;
+  const status = normalizeTransferStatus(params.status, existing?.status);
+  const progress = mergeTransferProgress(existing, params);
+  // 速度只采样真实网络推送（uploading 阶段）：staging 字节走本机内存/磁盘，
+  // 计入会显示 20MB/s 级别的假速度（issue #60）。阶段切换时重置采样窗口。
+  const phaseChanged = progress.phase !== existing?.phase;
+  if (progress.phase === "staging") {
+    transferSamples.delete(taskId);
+    transferSpeeds[taskId] = 0;
+  } else {
+    const sample = sampleTransferSpeed(phaseChanged ? undefined : transferSamples.get(taskId), progress.transferred, performance.now());
+    transferSamples.set(taskId, sample);
+    transferSpeeds[taskId] = sample.speed;
+  }
   transferTasks[taskId] = {
     taskId,
     sessionId: String(params.sessionId || existing?.sessionId || ""),
     direction: params.direction === "download" ? "download" : existing?.direction || "upload",
     fileName: String(params.fileName || existing?.fileName || ""),
-    size: Number(params.size ?? existing?.size ?? 0),
-    transferred,
-    status: normalizeTransferStatus(params.status, existing?.status),
+    size: progress.size,
+    transferred: progress.transferred,
+    staged: progress.staged,
+    phase: progress.phase,
+    status,
     error: typeof params.error === "string" ? params.error : existing?.error,
   };
+  settleTransferCompletion(taskId, status);
   if (!existing && (transferTasks[taskId].status === "queued" || transferTasks[taskId].status === "running")) openTransferPanel();
 }
 
 function normalizeTransferStatus(value: unknown, fallback: TransferTask["status"] = "running"): TransferTask["status"] {
   return ["queued", "running", "completed", "cancelled", "failed"].includes(String(value)) ? String(value) as TransferTask["status"] : fallback;
+}
+
+/** 终态事件结算 finish 之后的收尾等待器：completed 兑现，cancelled/failed 拒绝。 */
+function settleTransferCompletion(taskId: string, status: TransferTask["status"]) {
+  const waiter = transferCompletionWaiters.get(taskId);
+  if (!waiter || (status !== "completed" && status !== "cancelled" && status !== "failed")) return;
+  transferCompletionWaiters.delete(taskId);
+  if (status === "completed") waiter.resolve();
+  else waiter.reject(Object.assign(new Error(transferTasks[taskId]?.error || t(`transferStatus.${status}`)), { code: "transfer-terminal" }));
+}
+
+/** 挂起直到该任务收到终态 progress 事件（完成/取消/失败）；注册前已终态则立即结算。 */
+function waitForTransferCompletion(taskId: string) {
+  const existing = transferTasks[taskId];
+  const status = existing?.status;
+  if (status === "completed" || status === "cancelled" || status === "failed") {
+    return status === "completed" ? Promise.resolve() : Promise.reject(Object.assign(new Error(existing?.error || t(`transferStatus.${status}`)), { code: "transfer-terminal" }));
+  }
+  return new Promise<void>((resolve, reject) => {
+    transferCompletionWaiters.set(taskId, { resolve, reject });
+  });
 }
 
 async function openSession(forceNew = false, bootRestore = false, isRetry = false) {
@@ -2531,7 +2585,15 @@ function openNewSessionTab() {
 async function restoreTransfers() {
   if (!session.value) return;
   const result = await window.dbxPlugin.invoke<{ tasks: TransferTask[] }>("sftp/transfer/list", { sessionId: session.value.sessionId }).catch(() => ({ tasks: [] }));
-  for (const task of result.tasks) transferTasks[task.taskId] = task;
+  for (const task of result.tasks) {
+    // 后端 list 的 staging 行把 spool 字节放在 transferred 里；恢复到本地
+    // 状态时归位到 staged，避免重挂后进度条展示阶段计数（issue #60）。
+    if (task.phase === "staging") {
+      task.staged = task.transferred;
+      task.transferred = 0;
+    }
+    transferTasks[task.taskId] = task;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2563,12 +2625,16 @@ async function reconcileActiveTransfers() {
   for (const task of Object.values(transferTasks)) {
     if (task.status !== "queued" && task.status !== "running") continue;
     try {
-      const status = await window.dbxPlugin.invoke<{ transferred?: number; status: string }>("sftp/transfer/status", { taskId: task.taskId });
+      const status = await window.dbxPlugin.invoke<{ transferred?: number; status: string; phase?: string }>("sftp/transfer/status", { taskId: task.taskId });
       const normalized = normalizeTransferStatus(status.status, "running");
       // task.status 此处必为 queued/running（上方守卫），终态即差异。
       if (normalized !== "queued" && normalized !== "running") {
         task.status = normalized;
-        if (status.transferred) task.transferred = status.transferred;
+        if (status.transferred != null) {
+          // staging 阶段的 transferred 字段是 spool 字节数，不能覆盖真实推送计数。
+          if (status.phase === "staging") task.staged = status.transferred;
+          else task.transferred = status.transferred;
+        }
       }
     } catch {
       task.status = "failed";
@@ -4484,7 +4550,12 @@ async function uploadSource(name: string, size: number, readChunk: (offset: numb
     let offset = startOffset;
     while (offset < size) {
       await waitWhilePaused(info.taskId);
-      const chunk = await readChunk(offset, info.chunkSize);
+      let chunk: Uint8Array;
+      try {
+        chunk = await readChunk(offset, info.chunkSize);
+      } catch (cause) {
+        throw Object.assign(cause instanceof Error ? cause : new Error(String(cause)), { code: "upload-read-failed" });
+      }
       if (!chunk.byteLength) throw new Error(t("errors.localFileShortRead"));
       const payload = new Uint8Array(8 + chunk.byteLength);
       writeU64(payload, 0, offset);
@@ -4495,9 +4566,17 @@ async function uploadSource(name: string, size: number, readChunk: (offset: numb
       await ack;
       offset = nextOffset;
     }
-    await window.dbxPlugin.invoke("sftp/upload/finish", { taskId: info.taskId }, { timeoutMs: 30 * 60 * 1000 });
+    // finish RPC 只把远端推送交给 sidecar 后台任务就返回（多 GB 文件的推送
+    // 可达数十分钟，长持 RPC 会被桥上任何一端的 deadline 判死并"自动取消"，
+    // issue #60）；真正的完成/失败由终态 progress 事件回传，这里等它落地。
+    try {
+      await window.dbxPlugin.invoke("sftp/upload/finish", { taskId: info.taskId }, { timeoutMs: 60_000 });
+    } catch (cause) {
+      throw Object.assign(cause instanceof Error ? cause : new Error(String(cause)), { code: "upload-start-failed" });
+    }
+    await waitForTransferCompletion(info.taskId);
   } catch (cause) {
-    await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: info.taskId }).catch(() => undefined);
+    await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: info.taskId, reason: transferCancelReason(cause) }).catch(() => undefined);
     throw cause;
   }
 }
@@ -4509,7 +4588,7 @@ function waitForUploadAck(taskId: string, nextOffset: number) {
       try {
         const status = await window.dbxPlugin.invoke<{ transferred: number; status: string }>("sftp/transfer/status", { taskId });
         if (status.transferred >= nextOffset && status.status === "running") resolve();
-        else reject(new Error(t("errors.uploadAckTimeout")));
+        else reject(Object.assign(new Error(t("errors.uploadAckTimeout")), { code: "upload-ack-timeout" }));
       } catch (cause) {
         reject(cause instanceof Error ? cause : new Error(String(cause)));
       }
@@ -4740,7 +4819,8 @@ async function cancelTransfer(task: TransferTask) {
     }
     cancelledTransferTasks.add(task.taskId);
   }
-  await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: task.taskId }).catch((cause) => showError(cause));
+  // reason=user 让后端账本把"用户主动取消"与异常清理区分开（issue #60）。
+  await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: task.taskId, reason: "user" }).catch((cause) => showError(cause));
 }
 
 async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T) => Promise<void>) {
@@ -6843,6 +6923,22 @@ function transferPercent(task: TransferTask) {
   return task.size > 0 ? Math.min(100, Math.round((task.transferred / task.size) * 100)) : task.status === "completed" ? 100 : 0;
 }
 
+/** staging 阶段进度条走不定态（推送计数尚未开始），uploading 用真实百分比。 */
+function transferBarValue(task: TransferTask): number | undefined {
+  return task.phase === "staging" ? undefined : transferPercent(task);
+}
+
+/** staging 行展示的字节数：spool 进度；其余阶段是已推送/已接收计数。 */
+function transferShownBytes(task: TransferTask): number {
+  return task.phase === "staging" ? task.staged ?? 0 : task.transferred;
+}
+
+/** 精确字节数 tooltip：化解 5.9GB(十进制) vs 5.49GiB(二进制) 的口径困惑（issue #60）。 */
+function transferBytesTitle(task: TransferTask): string | undefined {
+  if (!(task.size > 0)) return undefined;
+  return `${transferShownBytes(task).toLocaleString()} / ${task.size.toLocaleString()} bytes`;
+}
+
 function readU64(bytes: Uint8Array, offset: number) {
   return Number(new DataView(bytes.buffer, bytes.byteOffset + offset, 8).getBigUint64(0, false));
 }
@@ -7219,9 +7315,9 @@ onBeforeUnmount(() => {
             <h3>{{ t("transfers") }}</h3>
             <div v-if="!transferList.length" class="empty compact">{{ t("noTransfers") }}</div>
             <article v-for="task in transferList" :key="task.taskId" class="transfer-card">
-              <div class="transfer-title"><FileUp v-if="task.direction === 'upload'" /><Download v-else /><span>{{ task.fileName || task.taskId }}</span><strong>{{ transferPercent(task) }}%</strong></div>
-              <progress :value="transferPercent(task)" max="100" />
-              <div class="transfer-meta"><span>{{ t(`transferStatus.${task.status}`) }}</span><span>{{ formatBytes(task.transferred) }} / {{ formatBytes(task.size) }}</span><span v-if="transferSpeeds[task.taskId]">{{ formatBytes(transferSpeeds[task.taskId]) }}/s</span></div>
+              <div class="transfer-title"><FileUp v-if="task.direction === 'upload'" /><Download v-else /><span>{{ task.fileName || task.taskId }}</span><strong v-if="task.phase !== 'staging'">{{ transferPercent(task) }}%</strong></div>
+              <progress :value="transferBarValue(task)" max="100" />
+              <div class="transfer-meta"><span>{{ t(`transferStatus.${task.status}`) }}</span><span :title="transferBytesTitle(task)">{{ formatBytes(transferShownBytes(task)) }} / {{ formatBytes(task.size) }}</span><span v-if="transferSpeeds[task.taskId]">{{ formatBytes(transferSpeeds[task.taskId]) }}/s</span></div>
               <p v-if="task.localPath" class="transfer-path mono" :title="task.localPath">{{ task.localPath }}</p>
               <div v-if="transferPausable(task.status) || task.status === 'queued' || task.status === 'running' || task.localPath" class="transfer-actions">
                 <button v-if="transferPausable(task.status)" class="icon-button" :title="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" :aria-label="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" @click="toggleTransferPause(task)"><Play v-if="pausedTaskIds.has(task.taskId)" /><Pause v-else /></button>
