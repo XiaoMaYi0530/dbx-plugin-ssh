@@ -1075,7 +1075,9 @@ def main() -> None:
                 tail = b""
                 while not stop.is_set() and time.monotonic() < gate:
                     frames = client.binary_frames
-                    tail = (tail + b"".join(payload[8:]
+                    # Frame layout is [u8 stream][u8 BE sequence(8)][data]
+                    # (TerminalFrame::encode) — 9 prefix bytes, not 8.
+                    tail = (tail + b"".join(payload[9:]
                                             for _, payload in frames[consumed:]))[-2048:]
                     consumed = len(frames)
                     if go_marker in tail.decode(errors="replace"):
