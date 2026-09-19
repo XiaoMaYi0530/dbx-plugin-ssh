@@ -856,6 +856,66 @@ struct FinishingUpload {
     size: u64,
     transferred: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
+    /// Cancel reason slug supplied by the workbench ("user", "ack-timeout",
+    /// ...); read by the background push task so the surfaced error tells a
+    /// user abort apart from an error-triggered cleanup.
+    cancel_reason: Arc<Mutex<Option<String>>>,
+}
+
+/// Upload progress phase: `staging` = bytes buffered into the local spool
+/// file, `uploading` = bytes actually pushed to the SFTP server. The two
+/// counters restart independently, and the workbench needs the marker to keep
+/// its progress bar and speed estimate honest (issue #60).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UploadPhase {
+    Staging,
+    Uploading,
+}
+
+impl UploadPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            UploadPhase::Staging => "staging",
+            UploadPhase::Uploading => "uploading",
+        }
+    }
+}
+
+/// Shared shape of every upload progress event; `fileName` is only present on
+/// task-start events (the workbench keeps the name it already displayed).
+fn upload_progress_payload(
+    task_id: &str,
+    session_id: &str,
+    file_name: Option<&str>,
+    transferred: u64,
+    size: u64,
+    phase: UploadPhase,
+    status: &str,
+) -> Value {
+    let mut payload = json!({
+        "taskId": task_id,
+        "sessionId": session_id,
+        "direction": "upload",
+        "transferred": transferred,
+        "size": size,
+        "phase": phase.as_str(),
+        "status": status,
+    });
+    if let Some(file_name) = file_name {
+        payload["fileName"] = json!(file_name);
+    }
+    payload
+}
+
+/// Error text for a cancelled upload. The optional reason slug comes from the
+/// workbench so "Upload cancelled by user" reads differently from an
+/// error-triggered cleanup ("Upload cancelled (ack-timeout)").
+fn upload_cancel_error(reason: Option<&str>) -> String {
+    match reason.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("user") => "Upload cancelled by user".to_string(),
+        Some(reason) => format!("Upload cancelled ({reason})"),
+        None => "Upload cancelled".to_string(),
+    }
 }
 
 /// Background `sudo -nv` refresh loop keeping a connection's sudo timestamp
@@ -3890,7 +3950,15 @@ impl SshRuntime {
             emitter
                 .event(
                     "sftp/transfer/progress",
-                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": file_name, "transferred": resume_offset, "size": size, "status": "running" }),
+                    upload_progress_payload(
+                        &task_id,
+                        &session_id,
+                        Some(&file_name),
+                        resume_offset,
+                        size,
+                        UploadPhase::Staging,
+                        "running",
+                    ),
                 )
                 .map_err(plugin_error)?;
             let connection_id = self.session_connection_id(&session_id).await;
@@ -3938,7 +4006,15 @@ impl SshRuntime {
         emitter
             .event(
                 "sftp/transfer/progress",
-                json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": file_name, "transferred": 0, "size": size, "status": "queued" }),
+                upload_progress_payload(
+                    &task_id,
+                    &session_id,
+                    Some(file_name),
+                    0,
+                    size,
+                    UploadPhase::Staging,
+                    "queued",
+                ),
             )
             .map_err(plugin_error)?;
         let connection_id = self.session_connection_id(&session_id).await;
@@ -4042,7 +4118,15 @@ impl SshRuntime {
         emitter
             .event(
                 "sftp/transfer/progress",
-                json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "transferred": upload.received, "size": upload.expected_size, "status": "running" }),
+                upload_progress_payload(
+                    task_id,
+                    &upload.session_id,
+                    None,
+                    upload.received,
+                    upload.expected_size,
+                    UploadPhase::Staging,
+                    "running",
+                ),
             )
             .map_err(plugin_error)?;
         emitter
@@ -4053,8 +4137,16 @@ impl SshRuntime {
             .map_err(plugin_error)
     }
 
+    /// `sftp/upload/finish`: the spool holds the complete file, so hand the
+    /// remote push to a background task on the shared runtime and return at
+    /// once. Holding this RPC open for the whole push used to expose every
+    /// multi-GB upload to RPC deadlines anywhere on the bridge (host,
+    /// workbench, sidecar): once the deadline fired the upload was cancelled
+    /// mid-flight even though nothing was wrong (issue #60). The background
+    /// task reports exclusively through `sftp/transfer/progress` events, which
+    /// no deadline can kill; `phase: "uploading"` marks its events.
     pub async fn finish_upload(
-        &self,
+        self: &Arc<Self>,
         task_id: &str,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
@@ -4088,6 +4180,7 @@ impl SshRuntime {
         drop(file);
         let transferred_bytes = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_reason = Arc::new(Mutex::new(None::<String>));
         self.finishing_uploads
             .lock()
             .map_err(|_| "Finishing upload registry is poisoned".to_string())?
@@ -4099,84 +4192,129 @@ impl SshRuntime {
                     size: expected_size,
                     transferred: transferred_bytes.clone(),
                     cancelled: cancelled.clone(),
+                    cancel_reason: cancel_reason.clone(),
                 },
             );
-        let result: Result<(), String> = async {
-            let sftp = self.sftp(&session_id).await?;
-            let (temporary, backup) = remote_transfer_paths(&remote_path, task_id)?;
-            let mut source = tokio::fs::File::open(&local_path)
-                .await
-                .map_err(|error| format!("Failed to open upload spool file: {error}"))?;
-            let mut target = sftp
-                .lock()
-                .await
-                .create(temporary.clone())
-                .await
-                .map_err(sftp_error)?;
-            let mut transferred = 0_u64;
-            let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
-            loop {
-                if cancelled.load(Ordering::Acquire) {
-                    drop(target);
-                    let _ = sftp.lock().await.remove_file(temporary.clone()).await;
-                    return Err("Upload cancelled".to_string());
-                }
-                let read = source
-                    .read(&mut buffer)
+        let this = self.clone();
+        let emitter = emitter.clone();
+        let task_id = task_id.to_string();
+        let response_task_id = task_id.clone();
+        tokio::spawn(async move {
+            let result: Result<(), String> = async {
+                let sftp = this.sftp(&session_id).await?;
+                let (temporary, backup) = remote_transfer_paths(&remote_path, &task_id)?;
+                let mut source = tokio::fs::File::open(&local_path)
                     .await
-                    .map_err(|error| format!("Failed to read upload spool file: {error}"))?;
-                if read == 0 {
-                    break;
+                    .map_err(|error| format!("Failed to open upload spool file: {error}"))?;
+                let mut target = sftp
+                    .lock()
+                    .await
+                    .create(temporary.clone())
+                    .await
+                    .map_err(sftp_error)?;
+                let mut transferred = 0_u64;
+                let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        let reason = cancel_reason
+                            .lock()
+                            .map(|reason| reason.clone())
+                            .unwrap_or_default();
+                        let error = upload_cancel_error(reason.as_deref());
+                        eprintln!("[sftp] upload {task_id} aborted by cancel ({error})");
+                        drop(target);
+                        let _ = sftp.lock().await.remove_file(temporary.clone()).await;
+                        return Err(error);
+                    }
+                    let read = source
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|error| format!("Failed to read upload spool file: {error}"))?;
+                    if read == 0 {
+                        break;
+                    }
+                    if let Err(error) = target.write_all(&buffer[..read]).await {
+                        drop(target);
+                        let _ = sftp.lock().await.remove_file(temporary.clone()).await;
+                        return Err(format!("SFTP upload failed: {error}"));
+                    }
+                    transferred = transferred.saturating_add(read as u64);
+                    transferred_bytes.store(transferred, Ordering::Release);
+                    emitter
+                        .event(
+                            "sftp/transfer/progress",
+                            upload_progress_payload(
+                                &task_id,
+                                &session_id,
+                                None,
+                                transferred,
+                                expected_size,
+                                UploadPhase::Uploading,
+                                "running",
+                            ),
+                        )
+                        .map_err(plugin_error)?;
                 }
-                if let Err(error) = target.write_all(&buffer[..read]).await {
-                    drop(target);
-                    let _ = sftp.lock().await.remove_file(temporary.clone()).await;
-                    return Err(format!("SFTP upload failed: {error}"));
+                target
+                    .flush()
+                    .await
+                    .map_err(|error| format!("SFTP upload flush failed: {error}"))?;
+                drop(target);
+                commit_remote_file(&sftp, &temporary, &remote_path, &backup).await
+            }
+            .await;
+            match this.finishing_uploads.lock() {
+                Ok(mut finishing) => {
+                    finishing.remove(&task_id);
                 }
-                transferred = transferred.saturating_add(read as u64);
-                transferred_bytes.store(transferred, Ordering::Release);
-                emitter
-                    .event(
-                        "sftp/transfer/progress",
-                        json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "transferred": transferred, "size": expected_size, "status": "running" }),
-                    )
-                    .map_err(plugin_error)?;
+                Err(_) => eprintln!("[sftp] upload {task_id} finishing registry poisoned"),
             }
-            target
-                .flush()
-                .await
-                .map_err(|error| format!("SFTP upload flush failed: {error}"))?;
-            drop(target);
-            commit_remote_file(&sftp, &temporary, &remote_path, &backup).await
-        }
-        .await;
-        self.finishing_uploads
-            .lock()
-            .map_err(|_| "Finishing upload registry is poisoned".to_string())?
-            .remove(task_id);
-        let _ = tokio::fs::remove_file(&local_path).await;
-        remove_upload_meta(&self.transfer_dir, task_id);
-        match result {
-            Ok(()) => {
-                let task = json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": remote_path.rsplit('/').next().unwrap_or("upload"), "transferred": expected_size, "size": expected_size, "status": "completed" });
-                self.record_transfer(task.clone());
-                emitter
-                    .event("sftp/transfer/progress", task)
-                    .map_err(plugin_error)?;
-                Ok(json!({ "success": true, "taskId": task_id, "transferred": expected_size }))
+            let _ = tokio::fs::remove_file(&local_path).await;
+            remove_upload_meta(&this.transfer_dir, &task_id);
+            match result {
+                Ok(()) => {
+                    let task = upload_progress_payload(
+                        &task_id,
+                        &session_id,
+                        Some(remote_path.rsplit('/').next().unwrap_or("upload")),
+                        expected_size,
+                        expected_size,
+                        UploadPhase::Uploading,
+                        "completed",
+                    );
+                    this.record_transfer(task.clone());
+                    if let Err(error) = emitter.event("sftp/transfer/progress", task) {
+                        eprintln!(
+                            "[sftp] upload {task_id} completion event failed: {}",
+                            error.message
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[sftp] upload {task_id} push failed: {error}");
+                    let status = if cancelled.load(Ordering::Acquire) {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    let mut task = upload_progress_payload(
+                        &task_id,
+                        &session_id,
+                        Some(remote_path.rsplit('/').next().unwrap_or("upload")),
+                        transferred_bytes.load(Ordering::Acquire),
+                        expected_size,
+                        UploadPhase::Uploading,
+                        status,
+                    );
+                    task["error"] = json!(error);
+                    this.record_transfer(task.clone());
+                    let _ = emitter.event("sftp/transfer/progress", task);
+                }
             }
-            Err(error) => {
-                let status = if cancelled.load(Ordering::Acquire) {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
-                let task = json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": remote_path.rsplit('/').next().unwrap_or("upload"), "transferred": transferred_bytes.load(Ordering::Acquire), "size": expected_size, "status": status, "error": error });
-                self.record_transfer(task.clone());
-                let _ = emitter.event("sftp/transfer/progress", task);
-                Err(error)
-            }
-        }
+        });
+        Ok(
+            json!({ "success": true, "taskId": response_task_id, "phase": UploadPhase::Uploading.as_str(), "accepted": expected_size }),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4382,7 +4520,15 @@ impl SshRuntime {
         )
     }
 
-    pub fn cancel_transfer(&self, task_id: &str, emitter: &PluginEmitter) -> Result<(), String> {
+    /// `sftp/transfer/cancel`. `reason` is an optional workbench slug ("user",
+    /// "ack-timeout", ...) recorded in the ledger event so a cancellation can
+    /// be told apart from a server failure on the next bug report.
+    pub fn cancel_transfer(
+        &self,
+        task_id: &str,
+        reason: Option<&str>,
+        emitter: &PluginEmitter,
+    ) -> Result<(), String> {
         let upload = self
             .uploads
             .lock()
@@ -4400,7 +4546,22 @@ impl SshRuntime {
             .get(task_id)
             .map(|upload| {
                 upload.cancelled.store(true, Ordering::Release);
-                json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.size, "transferred": upload.transferred.load(Ordering::Acquire), "status": "cancelled" })
+                if let Ok(mut slot) = upload.cancel_reason.lock() {
+                    if slot.is_none() {
+                        *slot = reason.map(str::to_string);
+                    }
+                }
+                let mut task = upload_progress_payload(
+                    task_id,
+                    &upload.session_id,
+                    Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                    upload.transferred.load(Ordering::Acquire),
+                    upload.size,
+                    UploadPhase::Uploading,
+                    "cancelled",
+                );
+                task["error"] = json!(upload_cancel_error(reason));
+                task
             });
         if let Some(upload) = upload.as_ref() {
             let _ = std::fs::remove_file(&upload.local_path);
@@ -4416,10 +4577,26 @@ impl SshRuntime {
         }
         let task = upload
             .as_ref()
-            .map(|upload| json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.expected_size, "transferred": upload.received, "status": "cancelled" }))
+            .map(|upload| {
+                let mut task = upload_progress_payload(
+                    task_id,
+                    &upload.session_id,
+                    Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                    upload.received,
+                    upload.expected_size,
+                    UploadPhase::Staging,
+                    "cancelled",
+                );
+                task["error"] = json!(upload_cancel_error(reason));
+                task
+            })
             .or_else(|| download.as_ref().map(|download| json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "cancelled" })))
             .or(finishing)
             .expect("a transfer was present");
+        eprintln!(
+            "[sftp] transfer {task_id} cancelled (reason={})",
+            reason.unwrap_or("unspecified")
+        );
         self.record_transfer(task.clone());
         emitter
             .event("sftp/transfer/progress", task)
@@ -4531,19 +4708,41 @@ impl SshRuntime {
             .filter(|task| task.get("sessionId").and_then(Value::as_str) == Some(session_id))
             .cloned()
             .collect::<Vec<_>>();
-        tasks.extend(uploads
-            .iter()
-            .filter(|(_, upload)| upload.session_id == session_id)
-            .map(|(task_id, upload)| {
-                json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.expected_size, "transferred": upload.received, "status": "running" })
-            })
-            .collect::<Vec<_>>());
+        tasks.extend(
+            uploads
+                .iter()
+                .filter(|(_, upload)| upload.session_id == session_id)
+                .map(|(task_id, upload)| {
+                    upload_progress_payload(
+                        task_id,
+                        session_id,
+                        Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                        upload.received,
+                        upload.expected_size,
+                        UploadPhase::Staging,
+                        "running",
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
         tasks.extend(
             finishing_uploads
                 .iter()
                 .filter(|(_, upload)| upload.session_id == session_id)
                 .map(|(task_id, upload)| {
-                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.size, "transferred": upload.transferred.load(Ordering::Acquire), "status": if upload.cancelled.load(Ordering::Acquire) { "cancelled" } else { "running" } })
+                    upload_progress_payload(
+                        task_id,
+                        session_id,
+                        Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                        upload.transferred.load(Ordering::Acquire),
+                        upload.size,
+                        UploadPhase::Uploading,
+                        if upload.cancelled.load(Ordering::Acquire) {
+                            "cancelled"
+                        } else {
+                            "running"
+                        },
+                    )
                 }),
         );
         tasks.extend(
@@ -4564,9 +4763,15 @@ impl SshRuntime {
             .map_err(|_| "Upload registry is poisoned".to_string())?
             .get(task_id)
         {
-            return Ok(
-                json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "size": upload.expected_size, "transferred": upload.received, "status": "running" }),
-            );
+            return Ok(upload_progress_payload(
+                task_id,
+                &upload.session_id,
+                Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                upload.received,
+                upload.expected_size,
+                UploadPhase::Staging,
+                "running",
+            ));
         }
         if let Some(upload) = self
             .finishing_uploads
@@ -4574,9 +4779,19 @@ impl SshRuntime {
             .map_err(|_| "Finishing upload registry is poisoned".to_string())?
             .get(task_id)
         {
-            return Ok(
-                json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "size": upload.size, "transferred": upload.transferred.load(Ordering::Acquire), "status": if upload.cancelled.load(Ordering::Acquire) { "cancelled" } else { "running" } }),
-            );
+            return Ok(upload_progress_payload(
+                task_id,
+                &upload.session_id,
+                Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                upload.transferred.load(Ordering::Acquire),
+                upload.size,
+                UploadPhase::Uploading,
+                if upload.cancelled.load(Ordering::Acquire) {
+                    "cancelled"
+                } else {
+                    "running"
+                },
+            ));
         }
         if let Some(download) = self
             .downloads
@@ -5613,6 +5828,52 @@ fn plugin_error(error: PluginError) -> String {
 mod tests {
     use super::*;
     use russh::{cipher, kex, mac};
+
+    #[test]
+    fn upload_progress_payload_marks_the_phase() {
+        let staging = upload_progress_payload(
+            "t1",
+            "s1",
+            Some("a.bin"),
+            256,
+            1024,
+            UploadPhase::Staging,
+            "running",
+        );
+        assert_eq!(staging["phase"], "staging");
+        assert_eq!(staging["direction"], "upload");
+        assert_eq!(staging["fileName"], "a.bin");
+        assert_eq!(staging["transferred"], 256);
+        assert_eq!(staging["size"], 1024);
+        assert_eq!(staging["status"], "running");
+
+        let pushing = upload_progress_payload(
+            "t1",
+            "s1",
+            None,
+            512,
+            1024,
+            UploadPhase::Uploading,
+            "running",
+        );
+        assert_eq!(pushing["phase"], "uploading");
+        // Non-start events carry no fileName; the workbench keeps its own.
+        assert!(pushing.get("fileName").is_none());
+    }
+
+    #[test]
+    fn upload_cancel_error_tells_abort_reasons_apart() {
+        assert_eq!(
+            upload_cancel_error(Some("user")),
+            "Upload cancelled by user"
+        );
+        assert_eq!(
+            upload_cancel_error(Some(" ack-timeout ")),
+            "Upload cancelled (ack-timeout)"
+        );
+        assert_eq!(upload_cancel_error(None), "Upload cancelled");
+        assert_eq!(upload_cancel_error(Some("   ")), "Upload cancelled");
+    }
 
     #[test]
     fn test_connection_budget_aligns_with_host_deadline() {

@@ -782,8 +782,20 @@ impl Plugin {
                     .complete_download(required_string(&params, "taskId")?, emitter),
             ),
             "sftp/transfer/cancel" => {
-                self.ssh
-                    .cancel_transfer(required_string(&params, "taskId")?, emitter)?;
+                // Optional reason slug from the workbench ("user",
+                // "ack-timeout", ...) surfaces in the ledger so a cancel can
+                // be told apart from a server failure on the next bug report.
+                let reason = params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.chars().take(120).collect::<String>());
+                self.ssh.cancel_transfer(
+                    required_string(&params, "taskId")?,
+                    reason.as_deref(),
+                    emitter,
+                )?;
                 Ok(json!({ "success": true }))
             }
             // 本机落盘能力探测：无宿主 fileTransfer API 时前端据此决定
@@ -1029,10 +1041,18 @@ impl PluginHandler for Plugin {
             return Ok(());
         }
         if let Some(task_id) = channel.strip_prefix("sftp/upload/") {
-            return self
-                .ssh
-                .append_upload(task_id, &data, emitter)
-                .map_err(to_plugin_error);
+            // Binary handler failures are only logged by the SDK loop, so the
+            // workbench would otherwise learn about a desynced/missing upload
+            // only through a 30s ack timeout. Mirror the failure as an event
+            // it can react to immediately.
+            if let Err(error) = self.ssh.append_upload(task_id, &data, emitter) {
+                let _ = emitter.event(
+                    "sftp/upload/error",
+                    json!({ "taskId": task_id, "error": error }),
+                );
+                return Err(to_plugin_error(error));
+            }
+            return Ok(());
         }
         Err(PluginError::new(
             -32601,

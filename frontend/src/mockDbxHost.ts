@@ -459,7 +459,15 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     result = { ...localPrefsState };
   }
   else if (method === "sftp/upload/start") result = { taskId: `visual-upload-${++fixtureUploadCount.value}`, chunkSize: 262144 };
-  else if (method === "sftp/upload/finish") result = { success: true };
+  else if (method === "sftp/upload/finish") {
+    // 镜像真实契约（issue #60）：finish 立即返回，推送在后台进行，终态经
+    // progress 事件回传。mock 无真实推送，直接补发完成事件。
+    const taskId = String((params as Record<string, unknown>).taskId || "");
+    result = { success: true, phase: "uploading" };
+    queueMicrotask(() => {
+      for (const listener of eventListeners) listener({ method: "sftp/transfer/progress", params: { taskId, direction: "upload", transferred: 0, size: 0, phase: "uploading", status: "completed" } });
+    });
+  }
   else if (method === "sftp/transfer/cancel") result = { success: true };
   else if (method === "sftp/write" || method === "sudo/writeFile") {
     // 镜像真实契约：整文件覆写（sftp/write 用 remotePath、sudo/writeFile 用
@@ -809,7 +817,10 @@ window.dbxPlugin = {
       const bytes = typeof data === "string" ? Uint8Array.from(atob(data), (value) => value.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
       const offset = Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, false));
       const taskId = channel.slice("sftp/upload/".length);
-      for (const listener of eventListeners) listener({ method: "sftp/upload/ack", params: { taskId, nextOffset: offset + Math.max(0, bytes.byteLength - 8) } });
+      const nextOffset = offset + Math.max(0, bytes.byteLength - 8);
+      for (const listener of eventListeners) listener({ method: "sftp/upload/ack", params: { taskId, nextOffset } });
+      // 镜像真实 sidecar 的 staging 进度事件（phase 字段见 issue #60 修复）。
+      for (const listener of eventListeners) listener({ method: "sftp/transfer/progress", params: { taskId, direction: "upload", transferred: nextOffset, size: 0, phase: "staging", status: "running" } });
       return;
     }
     if (!channel.startsWith("ssh/terminal/in/")) return;
