@@ -754,13 +754,15 @@ def main() -> None:
 
             def interrupt_loop():
                 # The echo can be split across binary frames, so scan a
-                # rolling tail over the concatenated stream.
+                # rolling tail over the concatenated stream. Each frame
+                # payload carries an 8-byte BE sequence prefix; strip it or a
+                # frame-boundary split inside the marker never reassembles.
                 gate = time.monotonic() + 20.0
                 consumed = len(client.binary_frames)
                 tail = b""
                 while not stop.is_set() and time.monotonic() < gate:
                     frames = client.binary_frames
-                    tail = (tail + b"".join(payload
+                    tail = (tail + b"".join(payload[8:]
                                             for _, payload in frames[consumed:]))[-2048:]
                     consumed = len(frames)
                     if go_marker in tail.decode(errors="replace"):

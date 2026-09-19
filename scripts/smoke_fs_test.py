@@ -1066,12 +1066,16 @@ def main() -> None:
                 # Wait for the command echo, then mash ^C until the call ends.
                 # The echo can be split across binary frames, so scan a rolling
                 # tail over the concatenated stream instead of single frames.
+                # Each frame payload carries an 8-byte BE sequence prefix, and
+                # the echo can be split across a frame boundary — strip the
+                # prefix first or the interleaved sequence bytes break the
+                # marker in two forever (observed CI flake root cause).
                 gate = time.monotonic() + 20.0
                 consumed = len(client.binary_frames)
                 tail = b""
                 while not stop.is_set() and time.monotonic() < gate:
                     frames = client.binary_frames
-                    tail = (tail + b"".join(payload
+                    tail = (tail + b"".join(payload[8:]
                                             for _, payload in frames[consumed:]))[-2048:]
                     consumed = len(frames)
                     if go_marker in tail.decode(errors="replace"):
