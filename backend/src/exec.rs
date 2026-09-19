@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_encoding::{BASE32, HEXLOWER};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use russh::client::Handle;
 use russh::ChannelMsg;
 use sha1::Sha1;
@@ -640,19 +640,19 @@ fn hotp(key: &[u8], counter: u64, digits: u32, algorithm: TotpAlgorithm) -> Stri
     let message = counter.to_be_bytes();
     let digest: Vec<u8> = match algorithm {
         TotpAlgorithm::Sha1 => {
-            let mut mac =
-                <Hmac<Sha1> as Mac>::new_from_slice(key).expect("HMAC accepts keys of any length");
+            let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(key)
+                .expect("HMAC accepts keys of any length");
             mac.update(&message);
             mac.finalize().into_bytes().to_vec()
         }
         TotpAlgorithm::Sha256 => {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
                 .expect("HMAC accepts keys of any length");
             mac.update(&message);
             mac.finalize().into_bytes().to_vec()
         }
         TotpAlgorithm::Sha512 => {
-            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key)
+            let mut mac = <Hmac<Sha512> as KeyInit>::new_from_slice(key)
                 .expect("HMAC accepts keys of any length");
             mac.update(&message);
             mac.finalize().into_bytes().to_vec()

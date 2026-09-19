@@ -25,8 +25,6 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use rand::rngs::OsRng;
-use rand::RngCore;
 use zeroize::Zeroizing;
 
 const DEK_LEN: usize = 32;
@@ -331,10 +329,10 @@ fn seal(
     let cipher = Aes256Gcm::new_from_slice(dek)
         .map_err(|error| format!("Failed to initialize vault cipher: {error}"))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    getrandom::fill(&mut nonce_bytes).expect("OS CSPRNG failure");
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            &Nonce::try_from(&nonce_bytes[..]).expect("12-byte GCM nonce"),
             Payload {
                 msg: plaintext.as_bytes(),
                 aad: aad(field, profile_id).as_bytes(),
@@ -364,7 +362,7 @@ fn open(
         .map_err(|error| format!("Failed to initialize vault cipher: {error}"))?;
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(nonce_bytes),
+            &Nonce::try_from(nonce_bytes).expect("12-byte GCM nonce"),
             Payload {
                 msg: ciphertext,
                 aad: aad(field, profile_id).as_bytes(),
@@ -376,7 +374,7 @@ fn open(
 
 fn random_dek() -> Zeroizing<[u8; DEK_LEN]> {
     let mut dek = Zeroizing::new([0u8; DEK_LEN]);
-    OsRng.fill_bytes(dek.as_mut());
+    getrandom::fill(dek.as_mut()).expect("OS CSPRNG failure");
     dek
 }
 
