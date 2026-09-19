@@ -299,6 +299,10 @@ def main() -> None:
                     # The shim runs as the terminal command so both prompts
                     # appear on the PTY the trigger engine observes.
                     "remote_command": SHIM_PATH,
+                    # The engine only mounts when this switch is on (default
+                    # off since 0.4.77); without it the cases below would
+                    # silently SKIP forever instead of exercising triggers.
+                    "triggers_enabled": True,
                     "triggers": {
                         "timeoutSecs": 30,
                         "stages": [
