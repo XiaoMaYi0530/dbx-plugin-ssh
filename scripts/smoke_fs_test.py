@@ -1020,14 +1020,18 @@ def main() -> None:
                                             for _, payload in frames[consumed:]))[-2048:]
                     consumed = len(frames)
                     if go_marker in tail.decode(errors="replace"):
+                        gate_state["phase"] = "echo-seen"
                         break
                     stop.wait(0.05)
+                gate_state["phase"] = "fired"
+                gate_state["frames_at_gate_exit"] = len(client.binary_frames)
                 deadline = time.monotonic() + 15.0
                 while not stop.is_set() and time.monotonic() < deadline:
                     send_ctrl_c()
                     sends["count"] += 1
                     stop.wait(1.0)
 
+            gate_state = {"phase": "waiting-for-echo", "frames_at_gate_exit": 0}
             worker = threading.Thread(target=interrupt_loop, daemon=True)
             worker.start()
             started = time.monotonic()
@@ -1046,7 +1050,9 @@ def main() -> None:
                 # delivery stalled); sends>0 means the ^C frames were written
                 # but the command still survived — log it either way.
                 raise AssertionError("interrupted command still completed "
-                                     f"(elapsed={elapsed:.1f}s sends={sends['count']})")
+                                     f"(gate={gate_state['phase']} "
+                                     f"frames={gate_state['frames_at_gate_exit']} "
+                                     f"elapsed={elapsed:.1f}s sends={sends['count']})")
             if result.get("incomplete") is not False:
                 raise AssertionError(f"incomplete={result.get('incomplete')!r}, want False")
             if elapsed >= 15.0:
