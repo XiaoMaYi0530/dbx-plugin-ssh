@@ -981,6 +981,10 @@ def main() -> None:
             if result.get("incomplete") is not True:
                 raise AssertionError(f"incomplete={result.get('incomplete')!r}, want True")
             send_ctrl_c()
+            # Give the ^C time to land and the shell to return to a prompt so
+            # the recovery call's capture starts clean (its settle window can
+            # otherwise fire on the ^C-echo prompt before the recovery line).
+            time.sleep(0.5)
             recovered = call_tool_embedded("ssh_exec", {"command": "echo recovered"})
             output = str(recovered.get("output", ""))
             if "recovered" not in output:
@@ -989,21 +993,66 @@ def main() -> None:
 
         def case_agent_manual_interrupt():
             # Human-intervention semantics: a Ctrl-C typed into the terminal
-            # (Timer thread writing the PTY input frame is thread-safe — only
-            # the socket write races nothing) aborts the command early.
+            # aborts the running command. Two timing hazards are pinned here
+            # (both observed as real CI flakes on loaded runners):
+            # - a ^C fired before the injected command reaches the shell lands
+            #   on an empty prompt (or mid-line: bash saw "leep") and is
+            #   wasted, so the interrupts are gated on the command echo
+            #   appearing in the PTY stream (binary_frames) before starting;
+            # - the captured output contains the echoed command line, so the
+            #   success marker is assembled by the shell ("N""OTDONE") and the
+            #   echo itself can never match the assertion.
             ts = int(time.time())
-            timer = threading.Timer(2.0, send_ctrl_c)
-            timer.start()
+            go_marker = f"INJGO-{ts}"
+            stop = threading.Event()
+            sends = {"count": 0}
+
+            def interrupt_loop():
+                # Wait for the command echo, then mash ^C until the call ends.
+                # The echo can be split across binary frames, so scan a rolling
+                # tail over the concatenated stream instead of single frames.
+                gate = time.monotonic() + 20.0
+                consumed = len(client.binary_frames)
+                tail = b""
+                while not stop.is_set() and time.monotonic() < gate:
+                    frames = client.binary_frames
+                    tail = (tail + b"".join(payload
+                                            for _, payload in frames[consumed:]))[-2048:]
+                    consumed = len(frames)
+                    if go_marker in tail.decode(errors="replace"):
+                        gate_state["phase"] = "echo-seen"
+                        break
+                    stop.wait(0.05)
+                gate_state["phase"] = "fired"
+                gate_state["frames_at_gate_exit"] = len(client.binary_frames)
+                deadline = time.monotonic() + 15.0
+                while not stop.is_set() and time.monotonic() < deadline:
+                    send_ctrl_c()
+                    sends["count"] += 1
+                    stop.wait(1.0)
+
+            gate_state = {"phase": "waiting-for-echo", "frames_at_gate_exit": 0}
+            worker = threading.Thread(target=interrupt_loop, daemon=True)
+            worker.start()
             started = time.monotonic()
             try:
-                result = call_tool_embedded("ssh_exec",
-                                            {"command": f"sleep 20 && echo NOTDONE-{ts}"})
+                result = call_tool_embedded(
+                    "ssh_exec",
+                    {"command": f"echo {go_marker} >/dev/null && "
+                                f"sleep 20 && echo \"N\"\"OTDONE-{ts}\""})
             finally:
-                timer.cancel()
+                stop.set()
+                worker.join(timeout=5)
             elapsed = time.monotonic() - started
             output = str(result.get("output", ""))
             if f"NOTDONE-{ts}" in output:
-                raise AssertionError("interrupted command still completed")
+                # sends=0 means the gate never saw the command echo (PTY output
+                # delivery stalled); sends>0 means the ^C frames were written
+                # but the command still survived — log it either way.
+                raise AssertionError("interrupted command still completed "
+                                     f"(gate={gate_state['phase']} "
+                                     f"frames={gate_state['frames_at_gate_exit']} "
+                                     f"elapsed={elapsed:.1f}s sends={sends['count']})")
             if result.get("incomplete") is not False:
                 raise AssertionError(f"incomplete={result.get('incomplete')!r}, want False")
             if elapsed >= 15.0:

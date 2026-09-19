@@ -407,7 +407,8 @@ fn decode_base32_secret(text: &str) -> Result<Vec<u8>, String> {
 /// byte-compatible with `tssh ExpectSendTotpN`.
 fn totp_code(secret: &[u8], now_ms: u64) -> String {
     let counter = (now_ms / 1000) / 30;
-    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha1> as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(&counter.to_be_bytes());
     let digest = mac.finalize().into_bytes();
     let offset = (digest[digest.len() - 1] & 0x0f) as usize;
@@ -431,7 +432,7 @@ fn decode_tssh_enc_secret(hex_text: &str, error_context: &str) -> Result<String,
     }
     let cipher = Aes256Gcm::new(TSSH_ENC_SECRET_KEY.into());
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(&blob[..12]), &blob[12..])
+        .decrypt(&Nonce::try_from(&blob[..12]).expect("12-byte GCM nonce"), &blob[12..])
         .map_err(|_| {
             format!(
                 "{error_context}: tssh --enc-secret blob failed to decrypt (was it produced by tssh --enc-secret?)"
@@ -1585,7 +1586,7 @@ mod tests {
         fn tssh_encrypt(plaintext: &[u8]) -> String {
             use aes_gcm::aead::Aead;
             let cipher = Aes256Gcm::new(TSSH_ENC_SECRET_KEY.into());
-            let nonce = Nonce::from_slice(b"0123456789ab");
+            let nonce = &Nonce::try_from(&b"0123456789ab"[..]).expect("12-byte GCM nonce");
             // tssh Seal(nonce, nonce, secret, nil) prefixes the nonce itself.
             let mut blob = nonce.to_vec();
             blob.extend_from_slice(&cipher.encrypt(nonce, plaintext).unwrap());

@@ -745,13 +745,42 @@ def main() -> None:
 
         def case_24_manual_interrupt():
             ts = int(time.time())
-            timer = threading.Timer(2.0, send_ctrl_c)
-            timer.start()
+            # Same echo-gated hardening as the smoke suite's manual-interrupt
+            # case: a ^C fired before the injected command reaches the shell
+            # is wasted (empty prompt or mid-line), so gate on the command
+            # echo in the PTY stream and mash ^C until the call ends.
+            go_marker = f"INJGO-{ts}"
+            stop = threading.Event()
+
+            def interrupt_loop():
+                # The echo can be split across binary frames, so scan a
+                # rolling tail over the concatenated stream.
+                gate = time.monotonic() + 20.0
+                consumed = len(client.binary_frames)
+                tail = b""
+                while not stop.is_set() and time.monotonic() < gate:
+                    frames = client.binary_frames
+                    tail = (tail + b"".join(payload
+                                            for _, payload in frames[consumed:]))[-2048:]
+                    consumed = len(frames)
+                    if go_marker in tail.decode(errors="replace"):
+                        break
+                    stop.wait(0.05)
+                deadline = time.monotonic() + 15.0
+                while not stop.is_set() and time.monotonic() < deadline:
+                    send_ctrl_c()
+                    stop.wait(1.0)
+
+            worker = threading.Thread(target=interrupt_loop, daemon=True)
+            worker.start()
             began = time.monotonic()
             try:
-                result = call_tool(f"sleep 20 && echo NOTDONE-{ts}", timeout=60)
+                result = call_tool(f"echo {go_marker} >/dev/null && "
+                                   f"sleep 20 && echo \"N\"\"OTDONE-{ts}\"",
+                                   timeout=60)
             finally:
-                timer.cancel()
+                stop.set()
+                worker.join(timeout=5)
             elapsed = time.monotonic() - began
             output = str(result.get("output", ""))
             if f"NOTDONE-{ts}" in output:

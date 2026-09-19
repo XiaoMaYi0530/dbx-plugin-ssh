@@ -8,20 +8,20 @@ authors = ["jinpy"]
 [workspace]
 
 [dependencies]
-aes-gcm = "0.10"
-base64 = "0.22"
+aes-gcm = "0.11"
+base64 = "0.23"
 data-encoding = "2"
 dbx-plugin-sdk = "0.1.0"
-hmac = "0.12"
-rand = "0.8"
+getrandom = "0.4"
+hmac = "0.13"
 # Terminal trigger (expect) stage patterns — see src/triggers.rs.
 regex = "1"
-russh = { version = "0.60", features = ["des"] }
-russh-sftp = "2.3.0"
+russh = { version = "0.62", features = ["des"] }
+russh-sftp = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
@@ -31,12 +31,11 @@ pageant = "0.2"
 
 # The OS keychain tier only ships where a native keychain exists; the Linux
 # secret-service backend pulls libdbus (absent in store build containers and
-# on headless servers), so Linux always uses the keyfile tier.
+# on headless servers), so Linux always uses the keyfile tier. keyring 4's
+# default "v1" feature keeps the Entry API and target-gates each native
+# backend (apple keychain / windows native), so no explicit feature list.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-keyring = { version = "3", features = [
-    "apple-native",
-    "windows-native",
-] }
+keyring = "4"
 
 # The DBX sidecar SDK is vendored under shared/ so a standalone checkout does
 # not depend on the source monorepo or a sibling host checkout. See

@@ -658,6 +658,26 @@ fn enqueue_terminal_input(
         .map_err(|error| format!("SSH input queue is closed: {error}"))
 }
 
+/// Deterministic pick among a connection's live sessions: the oldest one (the
+/// connection's primary workbench), by monotonic creation sequence.
+/// Candidates are `(session_id, created_seq, connected)`; disconnected
+/// sessions never win. Purity is the point — the caller feeds it from a
+/// HashMap whose iteration order is randomized per process, and the chosen
+/// session must not depend on that order (a created_at tie-break could not
+/// save it: two workbenches often open within the same second).
+fn select_primary_session<I>(candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = (String, u64, bool)>,
+{
+    candidates
+        .into_iter()
+        .filter(|(_, _, connected)| *connected)
+        .min_by(|(a_id, a_created, _), (b_id, b_created, _)| {
+            a_created.cmp(b_created).then_with(|| a_id.cmp(b_id))
+        })
+        .map(|(id, _, _)| id)
+}
+
 /// Terminal activity keepalive payload: space + backspace. Net-zero on a
 /// shell prompt (an empty line never enters history), movement-only in
 /// full-screen apps; protocol-level keepalives don't count as keyboard
@@ -780,6 +800,10 @@ struct SessionEntry {
     connected: AtomicBool,
     /// Unix seconds when the session was opened (for `ssh/sessions/list`).
     created_at_secs: u64,
+    /// Monotonic per-runtime creation counter. created_at_secs has second
+    /// granularity, so two workbenches opened in the same second would tie;
+    /// the sequence gives `session_id_for_connection` a true creation order.
+    created_seq: u64,
     handle: Arc<Handle<SshClient>>,
     /// Open jump-host connections that carry this session's target tunnel;
     /// kept alive alongside the target handle.
@@ -977,6 +1001,8 @@ pub struct SshRuntime {
     /// the context the resolver needs for the remembered-approval store and
     /// the audit ledger (the resolver only knows the challenge id).
     agent_challenges: Mutex<HashMap<String, PendingChallenge>>,
+    /// Monotonic session creation counter (see `SessionEntry::created_seq`).
+    session_seq: AtomicU64,
     /// Trust-on-first-use for unknown host keys (MCP stdio mode).
     auto_trust: bool,
     pub prompts: PromptBroker,
@@ -1008,6 +1034,7 @@ impl SshRuntime {
             finishing_uploads: Mutex::new(HashMap::new()),
             downloads: Mutex::new(HashMap::new()),
             transfer_history: Mutex::new(VecDeque::new()),
+            session_seq: AtomicU64::new(0),
             sudo_keepalive: Arc::new(Mutex::new(HashMap::new())),
             metrics_cache: Mutex::new(HashMap::new()),
             exec_tasks: Mutex::new(HashMap::new()),
@@ -1162,6 +1189,7 @@ impl SshRuntime {
             keepalive_interval_secs: connection.keepalive_interval_secs,
             connected: AtomicBool::new(true),
             created_at_secs: unix_now_secs(),
+            created_seq: self.session_seq.fetch_add(1, Ordering::Relaxed),
             handle,
             jump_chain,
             orchestration: orchestration.clone(),
@@ -2227,15 +2255,25 @@ impl SshRuntime {
     }
 
     pub async fn session_id_for_connection(&self, connection_id: &str) -> Result<String, String> {
-        self.sessions
-            .read()
-            .await
+        // The caller holds only the connection id, so with several workbenches
+        // on one connection this must pick deterministically: the oldest live
+        // session (the connection's primary workbench). HashMap iteration
+        // order is randomized per process — picking "whatever comes first"
+        // sent terminal-routed execs and the workbench's ^C to different
+        // PTYs on every other launch.
+        let sessions = self.sessions.read().await;
+        let candidates = sessions
             .iter()
-            .find(|(_, session)| {
-                session.connection_id == connection_id && session.connected.load(Ordering::Acquire)
-            })
-            .map(|(id, _)| id.clone())
-            .ok_or("No active SSH session exists for this connection".to_string())
+            .filter(|(_, session)| session.connection_id == connection_id)
+            .map(|(id, session)| {
+                (
+                    id.clone(),
+                    session.created_seq,
+                    session.connected.load(Ordering::Acquire),
+                )
+            });
+        select_primary_session(candidates)
+            .ok_or_else(|| "No active SSH session exists for this connection".to_string())
     }
 
     /// `ssh/agent/mode/get`: connection-scoped agent terminal mode probe for
@@ -6167,6 +6205,35 @@ mod tests {
         assert!(bash.contains("PROMPT_COMMAND"));
         assert!(bash.contains("dbx-directory-ready-session-1"));
         assert!(zsh.contains("precmd_functions"));
+    }
+
+    #[test]
+    fn primary_session_pick_is_deterministic_not_iteration_order() {
+        // HashMap iteration order is randomized per process; whichever entry
+        // "comes first" must not decide where terminal-routed commands run.
+        let older_first = select_primary_session(vec![
+            ("1111".to_string(), 0, true),
+            ("2222".to_string(), 1, true),
+        ]);
+        let newer_first = select_primary_session(vec![
+            ("2222".to_string(), 1, true),
+            ("1111".to_string(), 0, true),
+        ]);
+        assert_eq!(older_first.as_deref(), Some("1111"));
+        assert_eq!(newer_first.as_deref(), Some("1111"));
+    }
+
+    #[test]
+    fn primary_session_pick_skips_disconnected_and_tiebreaks_by_id() {
+        assert_eq!(
+            select_primary_session(vec![
+                ("3333".to_string(), 0, false),
+                ("2222".to_string(), 1, true),
+            ])
+            .as_deref(),
+            Some("2222")
+        );
+        assert_eq!(select_primary_session(Vec::new()), None);
     }
 
     #[test]
