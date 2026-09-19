@@ -162,7 +162,13 @@ import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRe
 import { toolbarTintStyle } from "./lib/toolbarTint";
 import { createGhostClickGuard } from "./lib/ghostClickGuard";
 import { createRequestEpoch } from "./lib/requestEpoch";
-import { sanitizeSftpEntries, sftpEntryIconKind } from "./lib/sftpEntries";
+import {
+  DEFAULT_VISIBLE_COLUMNS,
+  sanitizeSftpEntries,
+  sanitizeVisibleColumns,
+  sftpEntryIconKind,
+  type SftpColumn,
+} from "./lib/sftpEntries";
 import { resolveRemotePath, splitRemotePathSegments } from "./lib/remotePathInput";
 import { shouldCommitRename } from "./lib/sftpRename";
 import { folderDownloadOutcome, type FolderDownloadFinish } from "./lib/sftpFolderDownload";
@@ -212,6 +218,9 @@ interface SftpEntry {
   modifiedAt?: number;
   permissions?: string;
   contentType?: string;
+  /** 属主用户/属组（includeOwner 时由 sidecar 返回；缺失显示 "-"）。 */
+  owner?: string;
+  group?: string;
 }
 
 interface SftpStatInfo {
@@ -251,7 +260,6 @@ interface TransferTask {
   error?: string;
   // saveToLocal 下载完成后的本机落盘路径（用于展示与在文件管理器中定位）。
   localPath?: string;
-<<<<<<< HEAD
   // 上传分两阶段计数（issue #60）：staging=字节缓存进本地 spool（快），
   // uploading=字节真正推到 SFTP 服务器（慢）。transferred 只反映 uploading，
   // staged 单独记录 staging 字节，面板不再出现"3G→100M"回跳与假速度。
@@ -409,7 +417,7 @@ interface McpSizeSettings {
   connectionScope?: string[];
 }
 
-type SftpColumn = "size" | "modified" | "permissions";
+// 列类型移到 lib/sftpEntries（issue #34：owner/group 属主/属组列，默认关）。
 type SftpSortColumn = "name" | "size" | "modified";
 
 const IMAGE_MIME_BY_EXTENSION: Record<string, string> = { png: "png", jpg: "jpeg", jpeg: "jpeg", gif: "gif", webp: "webp", svg: "svg+xml", bmp: "bmp", ico: "x-icon" };
@@ -539,7 +547,7 @@ const sftpHomePath = ref("");
 const termSelectCopy = ref(loadSelectCopyEnabled());
 const followDirectory = ref(false);
 const directoryTrackingSupported = ref<boolean | undefined>();
-const visibleColumns = ref<SftpColumn[]>(["size", "modified"]);
+const visibleColumns = ref<SftpColumn[]>([...DEFAULT_VISIBLE_COLUMNS]);
 const sort = ref<{ column: SftpSortColumn; direction: "asc" | "desc" }>({ column: "name", direction: "asc" });
 const transferTasks = reactive<Record<string, TransferTask>>({});
 // 断点续传（F1）：暂停中的任务（两分片之间生效）；等待恢复的回调登记表。
@@ -1125,8 +1133,16 @@ const terminalTransferBusy = computed(() => zmodemBusy.value || trzszBusy.value)
 const trzszBusy = computed(() => trzszPhase.value === "waiting" || trzszPhase.value === "transferring");
 const trzszOverlayVisible = computed(() => trzszPhase.value !== "idle");
 const sftpGridStyle = computed(() => ({
-  gridTemplateColumns: ["minmax(120px, 1fr)", visibleColumns.value.includes("size") ? "72px" : "", visibleColumns.value.includes("modified") ? "128px" : "", visibleColumns.value.includes("permissions") ? "84px" : ""].filter(Boolean).join(" "),
-  minWidth: `${180 + (visibleColumns.value.includes("size") ? 78 : 0) + (visibleColumns.value.includes("modified") ? 134 : 0) + (visibleColumns.value.includes("permissions") ? 90 : 0)}px`,
+  gridTemplateColumns: [
+    "minmax(120px, 1fr)",
+    visibleColumns.value.includes("size") ? "72px" : "",
+    visibleColumns.value.includes("modified") ? "128px" : "",
+    // 属主/属组（issue #34）：等宽两列，窄面板靠横向滚动而不是挤压。
+    visibleColumns.value.includes("owner") ? "96px" : "",
+    visibleColumns.value.includes("group") ? "96px" : "",
+    visibleColumns.value.includes("permissions") ? "84px" : "",
+  ].filter(Boolean).join(" "),
+  minWidth: `${180 + (visibleColumns.value.includes("size") ? 78 : 0) + (visibleColumns.value.includes("modified") ? 134 : 0) + (visibleColumns.value.includes("owner") ? 102 : 0) + (visibleColumns.value.includes("group") ? 102 : 0) + (visibleColumns.value.includes("permissions") ? 90 : 0)}px`,
 }));
 const sftpFiltersActive = computed(() => sftpSearch.value.trim() !== "" || sftpTypeFilter.value !== "all");
 const visibleEntries = computed(() => filterSftpEntries(sortedEntries.value, sftpSearch.value, sftpTypeFilter.value));
@@ -1152,7 +1168,7 @@ function restoreUiState() {
   sftpPaneOpen.value = resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
   followDirectory.value = state.followDirectory === true;
   sudoMode.value = state.sudoMode === true && canWrite.value;
-  visibleColumns.value = Array.isArray(state.visibleColumns) ? state.visibleColumns.filter((column): column is SftpColumn => ["size", "modified", "permissions"].includes(column)) : ["size", "modified"];
+  visibleColumns.value = sanitizeVisibleColumns(state.visibleColumns);
   lastSequence = typeof state.terminalSequence === "number" ? state.terminalSequence : 0;
 }
 
@@ -3486,6 +3502,8 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false) {
     const result = await window.dbxPlugin.invoke<{ entries: SftpEntry[] }>(sudoMode.value ? "sudo/listDir" : "sftp/list", {
       sessionId: session.value.sessionId,
       path: normalized,
+      // 属主/属组列开启时才要 owner/group 数据（sudo/listDir 恒定附带）。
+      includeOwner: visibleColumns.value.includes("owner") || visibleColumns.value.includes("group"),
     });
     if (!listEpoch.isCurrent(epochId)) return;
     // R3-P2-3：响应容错——非数组/畸形行走 sanitize（null entries → 空数组、
@@ -3819,8 +3837,14 @@ function startDividerDrag(event: PointerEvent) {
 }
 
 function toggleColumn(column: SftpColumn) {
+  const hadOwnerData = visibleColumns.value.includes("owner") || visibleColumns.value.includes("group");
   visibleColumns.value = visibleColumns.value.includes(column) ? visibleColumns.value.filter((value) => value !== column) : [...visibleColumns.value, column];
   persistState();
+  // 属主/属组列从关到开：当前列表可能没有 owner/group 数据（此前请求没带
+  // includeOwner），重拉一次目录；关列不需要重拉。
+  if ((column === "owner" || column === "group") && !hadOwnerData && session.value && !sudoMode.value) {
+    void loadDirectory();
+  }
 }
 
 function toggleSort(column: SftpSortColumn) {
@@ -7489,7 +7513,7 @@ onBeforeUnmount(() => {
               <button class="icon-button icon-violet" :title="t('customizeColumns')" @click.stop="toggleColumnsMenu"><Columns3 /></button>
             </PopoverAnchor>
             <PopoverContent class="popover columns-popover" align="end" :side-offset="5">
-            <label v-for="column in (['size', 'modified', 'permissions'] as SftpColumn[])" :key="column"><input type="checkbox" :checked="visibleColumns.includes(column)" @change="toggleColumn(column)" />{{ t(column) }}</label>
+            <label v-for="column in (['size', 'modified', 'owner', 'group', 'permissions'] as SftpColumn[])" :key="column"><input type="checkbox" :checked="visibleColumns.includes(column)" @change="toggleColumn(column)" />{{ t(column) }}</label>
             <hr class="columns-popover-separator" />
             <label :title="t('sftpPane.defaultOpenHint')"><input type="checkbox" :checked="sftpPaneDefaultOpen" @change="toggleSftpPaneDefaultOpen" />{{ t("sftpPane.defaultOpen") }}</label>
             </PopoverContent>
@@ -8096,6 +8120,9 @@ onBeforeUnmount(() => {
                 <button @click="toggleSort('name')">{{ t("name") }}<component :is="sortIcon('name')" /></button>
                 <button v-if="visibleColumns.includes('size')" @click="toggleSort('size')">{{ t("size") }}<component :is="sortIcon('size')" /></button>
                 <button v-if="visibleColumns.includes('modified')" @click="toggleSort('modified')">{{ t("modified") }}<component :is="sortIcon('modified')" /></button>
+                <!-- 属主/属组（issue #34）：用户在前，缺失显示 "-"，不参与排序。 -->
+                <span v-if="visibleColumns.includes('owner')" :title="t('owner')">{{ t("owner") }}</span>
+                <span v-if="visibleColumns.includes('group')" :title="t('group')">{{ t("group") }}</span>
                 <span v-if="visibleColumns.includes('permissions')">{{ t("permissions") }}</span>
               </div>
               <div v-if="loadingFiles" class="empty"><Loader2 class="spinning" />{{ t("loading") }}</div>
@@ -8132,6 +8159,8 @@ onBeforeUnmount(() => {
                 </span>
                 <span v-if="visibleColumns.includes('size')" class="numeric">{{ entry.kind === "file" ? formatBytes(entry.size) : "" }}</span>
                 <span v-if="visibleColumns.includes('modified')">{{ formatModified(entry.modifiedAt) }}</span>
+                <span v-if="visibleColumns.includes('owner')" class="mono" :title="entry.owner">{{ entry.owner || "-" }}</span>
+                <span v-if="visibleColumns.includes('group')" class="mono" :title="entry.group">{{ entry.group || "-" }}</span>
                 <span v-if="visibleColumns.includes('permissions')" class="mono">{{ entry.permissions }}</span>
               </button>
               <div v-if="!loadingFiles && !visibleEntries.length" class="empty">{{ entries.length ? t("sftpSearch.noMatch") : t("emptyFolder") }}</div>

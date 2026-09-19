@@ -261,9 +261,15 @@ impl Plugin {
             "sftp/list" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
-                let entries = self
-                    .runtime
-                    .block_on(self.ssh.sftp_list_path(session_id, path))?;
+                let include_owner = params
+                    .get("includeOwner")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let entries = self.runtime.block_on(self.ssh.sftp_list_path(
+                    session_id,
+                    path,
+                    include_owner,
+                ))?;
                 Ok(json!({ "entries": entries }))
             }
             "sftp/read" => {
@@ -952,9 +958,11 @@ impl Plugin {
     fn filesystem_list(&self, params: Value) -> Result<Value, String> {
         let session_id = self.filesystem_session(&params)?;
         let path = filesystem_path(&params)?;
+        // Host filesystem-provider listings stay on the zero-round-trip path;
+        // owner names are opt-in via `sftp/list` only.
         let entries = self
             .runtime
-            .block_on(self.ssh.sftp_list_path(&session_id, &path))?;
+            .block_on(self.ssh.sftp_list_path(&session_id, &path, false))?;
         Ok(json!({ "entries": entries }))
     }
 

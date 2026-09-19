@@ -189,6 +189,8 @@ struct LsEntry {
     size: u64,
     modified_at: Option<u64>,
     permissions: Option<String>,
+    owner: Option<String>,
+    group: Option<String>,
 }
 
 /// Maps a symbolic mode column to the `sftp/list` kind vocabulary.
@@ -284,12 +286,21 @@ fn parse_ls_line(line: &str) -> Option<LsEntry> {
     if name.is_empty() || name == "." || name == ".." {
         return None;
     }
+    // Owner/group sit in fields 3/4 on both layouts and `ls -la` always
+    // prints them, so sudo listings get names without an extra round trip.
+    let (owner, group) = if fields.len() >= 4 {
+        (Some(fields[2].to_string()), Some(fields[3].to_string()))
+    } else {
+        (None, None)
+    };
     Some(LsEntry {
         name,
         kind: kind_from_mode_string(mode),
         size,
         modified_at,
         permissions: mode_string_to_octal(mode).map(format_mode_bits),
+        owner,
+        group,
     })
 }
 
@@ -327,6 +338,8 @@ fn parse_ls_output(directory: &str, ls_output: &str) -> Vec<SftpEntry> {
                 modified_at: entry.modified_at,
                 permissions: entry.permissions,
                 content_type: content_type_for_path(&path),
+                owner: entry.owner,
+                group: entry.group,
             }
         })
         .collect();
@@ -715,18 +728,23 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
         assert_eq!(directory.modified_at, Some(1720000003));
         assert_eq!(directory.permissions.as_deref(), Some("0755"));
         assert!(directory.content_type.is_none());
+        assert_eq!(directory.owner.as_deref(), Some("root"));
+        assert_eq!(directory.group.as_deref(), Some("root"));
 
         let link = &entries[1];
         assert_eq!(link.kind, "symlink");
         assert_eq!(link.uri, "sftp:/var/data/link");
         assert_eq!(link.size, Some(11));
         assert_eq!(link.permissions.as_deref(), Some("0777"));
+        assert_eq!(link.owner.as_deref(), Some("root"));
 
         let file = &entries[2];
         assert_eq!(file.kind, "file");
         assert_eq!(file.size, Some(123));
         assert_eq!(file.permissions.as_deref(), Some("0644"));
         assert_eq!(file.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(file.owner.as_deref(), Some("root"));
+        assert_eq!(file.group.as_deref(), Some("root"));
     }
 
     #[test]
@@ -749,6 +767,8 @@ lrwxrwxrwx    1 root     root            11 Jan 15 10:23 lnk
         assert!(log.modified_at.is_none());
         assert_eq!(log.permissions.as_deref(), Some("0644"));
         assert_eq!(log.uri, "sftp:/mnt/old.log");
+        assert_eq!(log.owner.as_deref(), Some("root"));
+        assert_eq!(log.group.as_deref(), Some("root"));
 
         let link = &entries[0];
         assert_eq!(link.kind, "symlink");

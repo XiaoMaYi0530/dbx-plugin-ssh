@@ -32,7 +32,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `mcp/settings/get`、`mcp/settings/set` | MCP SFTP 尺寸限制策略（maxRead/maxUpload/maxDownload，持久化，`--mcp` 同源生效）；`localTransferRoot` 配置 `sftp_upload`/`sftp_download` 本地传输根（绝对路径或空串回落默认根=临时目录+插件数据目录；敏感路径黑名单任何模式叠加生效） |
 | `sftp/chmod` | 修改远端路径权限位（八进制） |
 | `sftp/diskUsage` | 路径所在挂载的磁盘用量 |
-| `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/read` 支持可选 `offset` 分片续读，见下文） |
+| `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/list` 支持可选 `includeOwner` 附加属主/属组；`sftp/read` 支持可选 `offset` 分片续读，见下文） |
 | `sftp/createDirectory`、`sftp/rename`、`sftp/delete` | SFTP 写操作 |
 | `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传；`finish` 校验后交后台任务推送并立即返回，见「上传两阶段计数与收尾语义」） |
 | `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文；桌面端可选 `downloadDir` 指定本机绝对保存目录） |
@@ -280,7 +280,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 | --- | --- | --- | --- |
 | `path` | string | 是 | 远端目录路径 |
 
-返回 `{ path, entries }`，`entries` 为 `SftpEntry` 数组，结构与 `sftp/list` 完全一致（`name`、`uri`、`kind`、`size`、`modifiedAt`、`permissions`、`contentType`，可选字段缺省时省略）。错误：路径不存在或不是目录；sudo 不可用。
+返回 `{ path, entries }`，`entries` 为 `SftpEntry` 数组，结构与 `sftp/list` 完全一致（`name`、`uri`、`kind`、`size`、`modifiedAt`、`permissions`、`contentType`，可选字段缺省时省略），并恒定附带 `owner`/`group` 属主与属组名字（来自 `ls -la` 解析，无额外往返；解析不到时省略）。错误：路径不存在或不是目录；sudo 不可用。
 
 ### sudo/readFile
 
@@ -354,6 +354,17 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 ## 扩展文件操作
 
 `sftp/*` 扩展方法基于 russh-sftp 原生协议与远端 `tar` 命令，提供 `Stat` / `Exists` / `Touch` / `WriteFile` / `Archive` / `Extract` 能力，走常规 SFTP 通道（无 sudo）。公共参数：均必填 `sessionId`（string，会话 id），下文参数表不再重复列出；写操作（`touch` / `write` / `archive` / `extract`）被只读连接拒绝。
+
+### sftp/list
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 远端目录路径 |
+| `includeOwner` | boolean | 否 | 是否附加属主/属组信息，默认 `false` |
+
+返回 `{ entries: SftpEntry[] }`。`SftpEntry` 基础字段：`name`、`uri`、`kind`（`file`/`directory`/`symlink`/`other`）、`size`、`modifiedAt`、`permissions`、`contentType`（可选字段缺省时省略）。
+
+`includeOwner: true` 时，每个条目可携带可选 `owner`、`group` 字符串字段（属主用户、属组）：优先服务器直接提供的名字（SFTPv4+ 属主属性），数字 uid/gid 次之，SFTPv3 服务器（如 OpenSSH）再经一次只读 `ls -l` 往返升级为名字——该次往返失败（无 shell、无 `ls`、超时）时静默保留数字或省略字段，不影响列表本身。字段缺失即"未知"，由 UI 显示 `-`。省略 `includeOwner`（或为 `false`）时不输出这两个字段，与历史响应完全一致。`sudo/listDir` 恒定返回 `owner`/`group`（`ls -la` 解析附带，无额外往返）。
 
 ### sftp/stat
 
