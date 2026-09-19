@@ -4553,12 +4553,21 @@ function goToPath(path: string) {
 // 框聚焦后 Enter 进入编辑态，输入行为与原先完全一致（复用 submitPathInput）。
 const pathBarEditing = ref(false);
 const pathBarInputEl = ref<HTMLInputElement | null>(null);
+// 进入编辑瞬间的路径快照：Esc 是显式取消手势，把草稿还原成编辑前的显示值
+// （失焦仍保留草稿，与输入框既有语义一致——只有 Esc 回滚）。
+const pathBarDraft = ref("");
 const pathCrumbs = computed(() => splitRemotePathSegments(currentPath.value));
 
 function beginPathBarEdit() {
   if (pathBarEditing.value) return;
+  pathBarDraft.value = currentPath.value;
   pathBarEditing.value = true;
   void nextTick(() => pathBarInputEl.value?.focus());
+}
+
+function cancelPathBarEdit() {
+  currentPath.value = pathBarDraft.value;
+  pathBarEditing.value = false;
 }
 
 // R3-P2-4：路径栏提交统一入口——`~`（home 已探测时）展开、`.`/`..` 段消解
@@ -7537,8 +7546,9 @@ onBeforeUnmount(() => {
               <!-- 目录下载：在传文件相对路径，让长传输有可感知的推进。 -->
               <p v-if="task.currentFile" class="transfer-path mono" :title="task.currentFile">{{ task.currentFile }}</p>
               <p v-if="task.localPath" class="transfer-path mono" :title="task.localPath">{{ task.localPath }}</p>
-              <!-- 目录下载部分失败：完成后仍标注哪些文件没拿到。 -->
-              <p v-if="task.failedCount" class="task-error" :title="task.failureSample">{{ t("folderDownload.failedCard", { count: task.failedCount }) }}</p>
+              <!-- 目录下载部分失败的汇总由完成 toast 承担：failedCount 与终态
+                   同拍赋值，终态卡随即转入历史区，活跃卡上的失败行永远渲染
+                   不到（UI 回归确认），故不再放置死分支。 -->
               <div v-if="transferPausable(task.status) || task.status === 'queued' || task.status === 'running' || task.localPath" class="transfer-actions">
                 <button v-if="transferPausable(task.status)" class="icon-button" :title="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" :aria-label="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" @click="toggleTransferPause(task)"><Play v-if="pausedTaskIds.has(task.taskId)" /><Pause v-else /></button>
                 <button v-if="task.status === 'queued' || task.status === 'running'" class="icon-button" :title="t('cancel')" :aria-label="t('cancel')" @click="cancelTransfer(task)"><X /></button>
@@ -7993,7 +8003,7 @@ onBeforeUnmount(() => {
               v-model="currentPath"
               spellcheck="false"
               @keydown.enter="submitPathInput"
-              @keydown.esc="pathBarEditing = false"
+              @keydown.esc="cancelPathBarEdit"
               @blur="pathBarEditing = false"
             />
             <nav v-show="!pathBarEditing" class="path-crumbs" tabindex="0" @click="beginPathBarEdit" @keydown.enter.self.prevent="beginPathBarEdit">
