@@ -7470,13 +7470,7 @@ matrix-ed25519";
             false,
             "mangled by rich-text copy",
         );
-        // SEC1 传统 EC PEM。
-        assert_actionable(
-            EC_SEC1_PEM,
-            &decode_error_of(EC_SEC1_PEM, None),
-            false,
-            "legacy 'EC PRIVATE KEY' (SEC1)",
-        );
+        // SEC1 传统 EC PEM 自 russh 0.62 起已可直接解码，改归有效密钥用例。
         // PKCS#8 + 不支持的 PBKDF2 PRF。
         assert_actionable(
             PKCS8_PBES2_ENCRYPTED,
@@ -7545,6 +7539,8 @@ matrix-ed25519";
             Some("123")
         )
         .is_ok());
+        // russh 0.62 起支持 SEC1 传统 EC PEM，不再作为解码失败场景。
+        assert!(decode_secret_key(&normalize_private_key_text(EC_SEC1_PEM), None).is_ok());
         assert!(!looks_like_public_key(OPENSSH_ED25519_PLAIN));
         assert!(looks_like_public_key(ED25519_PUBLIC_ONELINER));
     }
