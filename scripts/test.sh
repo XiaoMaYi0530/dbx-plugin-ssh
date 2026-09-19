@@ -50,6 +50,10 @@ echo "==> sidecar release build"
 cargo build --release --manifest-path backend/Cargo.toml
 
 echo "==> package .dbxp"
+# 与 build.sh 一致：把 CLI 内部 cargo build 重定向到热的 backend/target。
+# 不重定向时 CLI 用一次性 dist/.build-rust-<triple> 暂存目录——整树冷编译，
+# 且会被并发/下一次打包的清理踩掉（表现为写 .fingerprint 时 ENOENT）。
+export CARGO_TARGET_DIR="$ROOT/backend/target"
 # CLI 打包的内部 cargo build 会把 Rust SDK patch 覆盖到 DBX_PLUGIN_SDK_ROOT；
 # 未设置时 npm 包装器注入 CLI 自带 sdk-root，vendored SDK（shared/sdk/）的本地
 # 修复进不了产物——用垫片把 SDK 根指回 vendored 副本，打完做字节级反例断言。
