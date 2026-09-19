@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-plugin-ssh"
-version = "0.4.79"
+version = "0.4.80"
 dependencies = [
  "aes-gcm",
  "base64",
