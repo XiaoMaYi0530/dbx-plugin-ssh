@@ -4911,7 +4911,7 @@ impl SshRuntime {
     /// `sftp/transfer/cancel`. `reason` is an optional workbench slug ("user",
     /// "ack-timeout", ...) recorded in the ledger event so a cancellation can
     /// be told apart from a server failure on the next bug report.
-    pub fn cancel_transfer(
+    pub async fn cancel_transfer(
         &self,
         task_id: &str,
         reason: Option<&str>,
@@ -4949,7 +4949,7 @@ impl SshRuntime {
                     "cancelled",
                 );
                 task["error"] = json!(upload_cancel_error(reason));
-                task
+                (task, upload.session_id.clone(), upload.remote_path.clone())
             });
         if let Some(upload) = upload.as_ref() {
             let _ = std::fs::remove_file(&upload.local_path);
@@ -4968,6 +4968,27 @@ impl SshRuntime {
         if upload.is_none() && download.is_none() && finishing.is_none() {
             return Err("Transfer task was not found".to_string());
         }
+        // 推送阶段取消的远端收尾提前：推送循环要到下一个分块边界才观察到
+        // cancelled 标志并自行删除远端临时文件，取消 RPC 返回后立刻列目录会
+        // 看见最长一个分块周期的 .part 残留（#60 回归记录的竞窗）。这里
+        // best-effort 提前删掉 .part。只删临时件，绝不碰 .backup——取消可能与
+        // 提交链的 target→backup→target 往返并发，删 backup 会破坏回滚；
+        // 与推送循环自身的 remove 并发安全（重复删除只是一次无害的 NoSuchFile）。
+        if let Some((_, session_id, remote_path)) = finishing.as_ref() {
+            if let Ok((temporary, _backup)) = remote_transfer_paths(remote_path, task_id) {
+                match self.sftp(session_id).await {
+                    Ok(sftp) => {
+                        if let Err(error) = sftp.lock().await.remove_file(temporary).await {
+                            eprintln!("[sftp] cancel cleanup: remote temp not removed: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[sftp] cancel cleanup: session unavailable: {error}")
+                    }
+                }
+            }
+        }
+        let finishing = finishing.map(|(task, _, _)| task);
         let task = upload
             .as_ref()
             .map(|upload| {

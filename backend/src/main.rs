@@ -815,11 +815,11 @@ impl Plugin {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(|value| value.chars().take(120).collect::<String>());
-                self.ssh.cancel_transfer(
+                self.runtime.block_on(self.ssh.cancel_transfer(
                     required_string(&params, "taskId")?,
                     reason.as_deref(),
                     emitter,
-                )?;
+                ))?;
                 Ok(json!({ "success": true }))
             }
             // 本机落盘能力探测：无宿主 fileTransfer API 时前端据此决定
