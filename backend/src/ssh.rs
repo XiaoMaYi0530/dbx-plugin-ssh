@@ -2985,12 +2985,7 @@ impl SshRuntime {
         let mut result = entries
             .map(|entry| {
                 let metadata = entry.metadata();
-                let kind = match entry.file_type() {
-                    FileType::File => "file",
-                    FileType::Dir => "directory",
-                    FileType::Symlink => "symlink",
-                    FileType::Other => "other",
-                };
+                let kind = classify_entry_kind(entry.file_type());
                 SftpEntry {
                     name: entry.file_name(),
                     uri: sftp_uri(&entry.path()),
@@ -5480,6 +5475,32 @@ async fn commit_remote_file(
     Ok(())
 }
 
+/// Classifies a READDIR entry into the wire `kind` vocabulary of `sftp/list`.
+///
+/// russh-sftp derives `FileType` solely from the POSIX type bits in the
+/// server-supplied READDIR `permissions` field; a server that omits
+/// PERMISSIONS (or sends permissions without type bits — seen on
+/// virtual/disk-mount SFTP services) collapses every entry to
+/// `FileType::Other`. Issue #36 family: such entries used to be reported as
+/// `"other"`, which the UI rendered as a generic text-document icon instead
+/// of a file icon.
+///
+/// Rules:
+/// - `Dir` / `File` / `Symlink` pass the server declaration through;
+/// - `Other` (missing/unusable type bits) degrades to `"file"`: nothing on
+///   the wire distinguishes files from directories at that point, and
+///   "unknown renders as a file" matches FileZilla's behaviour. Real
+///   directories on conforming servers always carry the DIR type bit, so
+///   they never reach this branch.
+fn classify_entry_kind(file_type: FileType) -> &'static str {
+    match file_type {
+        FileType::File => "file",
+        FileType::Dir => "directory",
+        FileType::Symlink => "symlink",
+        FileType::Other => "file",
+    }
+}
+
 fn content_type_for_path(path: &str) -> Option<String> {
     let extension = path.rsplit('.').next()?.to_ascii_lowercase();
     let content_type = match extension.as_str() {
@@ -5619,6 +5640,18 @@ mod tests {
         assert_eq!(test_dial_budget_secs(30, true), 29);
         assert_eq!(test_dial_budget_secs(30, false), 9);
         assert_eq!(test_dial_budget_secs(1, true), 1);
+    }
+
+    #[test]
+    fn classify_entry_kind_maps_wire_types() {
+        // Directories stay directories; only `kind === "directory"` renders a
+        // folder icon in the UI.
+        assert_eq!(classify_entry_kind(FileType::Dir), "directory");
+        assert_eq!(classify_entry_kind(FileType::File), "file");
+        assert_eq!(classify_entry_kind(FileType::Symlink), "symlink");
+        // Missing/unusable type bits (no PERMISSIONS flag, or permissions
+        // without S_IFMT bits) must degrade to a file icon, never a folder.
+        assert_eq!(classify_entry_kind(FileType::Other), "file");
     }
 
     #[test]

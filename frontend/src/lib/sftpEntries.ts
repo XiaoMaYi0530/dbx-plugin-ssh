@@ -19,6 +19,15 @@ export interface SftpSanitizedEntry {
 
 const KNOWN_KINDS: readonly SftpEntryKind[] = ["file", "directory", "symlink", "other"];
 
+/** kind → 图标类别（issue #36）：只有 `directory` 才允许显示文件夹图标；
+ * symlink 渲染为链接文档；`other`/未知（含旧 sidecar 的容错输入）一律按
+ * 普通文件渲染，保证无扩展名/普通文件永远不会出现文件夹图标。 */
+export function sftpEntryIconKind(kind: string | undefined): "folder" | "file" | "link" {
+  if (kind === "directory") return "folder";
+  if (kind === "symlink") return "link";
+  return "file";
+}
+
 export function sanitizeSftpEntries(value: unknown): SftpSanitizedEntry[] {
   if (!Array.isArray(value)) return [];
   const entries: SftpSanitizedEntry[] = [];

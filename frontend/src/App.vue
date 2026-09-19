@@ -160,7 +160,7 @@ import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRe
 import { toolbarTintStyle } from "./lib/toolbarTint";
 import { createGhostClickGuard } from "./lib/ghostClickGuard";
 import { createRequestEpoch } from "./lib/requestEpoch";
-import { sanitizeSftpEntries } from "./lib/sftpEntries";
+import { sanitizeSftpEntries, sftpEntryIconKind } from "./lib/sftpEntries";
 import { resolveRemotePath } from "./lib/remotePathInput";
 import { shouldCommitRename } from "./lib/sftpRename";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
@@ -7800,8 +7800,10 @@ onBeforeUnmount(() => {
                 @keydown="onFileRowKeydown($event, entry)"
               >
                 <span class="file-name">
-                  <Folder v-if="entry.kind === 'directory'" class="folder-icon" />
-                  <FileIcon v-else-if="entry.kind === 'file'" />
+                  <!-- issue #36：图标只认 sftpEntryIconKind —— 仅 directory 出文件夹，
+                       other/未知一律文件图标，symlink 保持链接文档。 -->
+                  <Folder v-if="sftpEntryIconKind(entry.kind) === 'folder'" class="folder-icon" />
+                  <FileIcon v-else-if="sftpEntryIconKind(entry.kind) === 'file'" />
                   <FileText v-else />
                   <input
                     v-if="renamingPath === entry.uri"
