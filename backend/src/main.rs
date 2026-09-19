@@ -21,6 +21,7 @@ mod session_recording;
 mod sftp_bookmarks;
 mod sftp_copy;
 mod sftp_ext;
+mod sftp_tree;
 mod ssh;
 mod ssh_algorithms;
 mod sudo_allowlist;
@@ -768,6 +769,23 @@ impl Plugin {
                     save_to_local,
                     download_dir.as_deref(),
                     conflict,
+                    emitter,
+                ))
+            }
+            // 递归目录下载：远端 read_dir 走树（不碰 shell、不产生远端临时
+            // 包），逐文件复用下方分块下载管线，本地按相对路径镜像；分块与
+            // finish/cancel 与单文件下载共用（任务在同一个注册表里）。
+            "sftp/download/tree/start" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let remote_path = required_string(&params, "remotePath")?;
+                let download_dir = params
+                    .get("downloadDir")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.runtime.block_on(self.ssh.start_tree_download(
+                    session_id,
+                    remote_path,
+                    download_dir.as_deref(),
                     emitter,
                 ))
             }
