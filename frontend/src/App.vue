@@ -5893,14 +5893,18 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
   try {
     term = new Terminal({ cols: COLS, rows: ROWS });
     term.open(host);
-    // xterm 6 移除了 canvas 渲染器：DOM 渲染器不产出 canvas，逐帧取像素
-    // 必须挂 WebGL renderer（addon 内部 preserveDrawingBuffer，drawImage
-    // 出来的帧才稳定）。渲染器随终端 dispose，不长期占用浏览器有限的
-    // WebGL context；GPU 被禁/context 耗尽时挂不上 renderer（DOM 渲染无
-    // canvas），走下方 !screen 分支给出 replayExportFailed 明确错误，而
-    // 不是永远空帧。
-    attachWebglRenderer(term, () => new WebglAddon());
-    const screen = host.querySelector("canvas") as HTMLCanvasElement | null;
+    // xterm 6 移除了 canvas 渲染器：DOM 渲染器不产出 canvas，逐帧取像素必须
+    // 挂 WebGL renderer。两个此前就存在的坑在此一并修掉：screenElement 下第
+    // 一块 canvas 是链接下划线的 2d renderLayer（透明，querySelector 会抓错），
+    // 真画布按「能取到 webgl2 上下文」选中（getContext 幂等无副作用）；
+    // preserveDrawingBuffer 是 WebglAddon 的构造参数（默认 false，关闭时合成
+    // 后回读全零像素），导出终端显式开启——主终端不取像素，维持默认。GPU 被
+    // 禁/context 耗尽挂不上 renderer（DOM 渲染无 canvas）时，走 !screen 分支
+    // 给出 replayExportFailed 明确错误，而不是永远空帧。
+    attachWebglRenderer(term, () => new WebglAddon(true));
+    const screen =
+      (Array.from(host.querySelectorAll("canvas")) as HTMLCanvasElement[])
+        .find((c) => c.getContext("webgl2")) ?? null;
     const canvas = document.createElement("canvas");
     const context = canvas.getContext("2d");
     if (!screen || !context) throw new Error(t("replayExportFailed"));
