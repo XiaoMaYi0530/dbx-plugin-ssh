@@ -955,6 +955,30 @@ fn session_info_payload(
     })
 }
 
+/// Total order for `sftp/transfer/history` rows (issue #18). Newest first by
+/// `startedAt`; rows without one — live snapshots whose start record never
+/// landed on disk — count as the most recent activity and lead the list;
+/// `taskId` breaks every tie so the order no longer depends on the HashMap
+/// iteration order of the in-memory registries. Pure so tests can exercise
+/// it without a runtime.
+fn compare_history_rows(a: &Value, b: &Value) -> std::cmp::Ordering {
+    fn started(task: &Value) -> Option<u64> {
+        task.get("startedAt").and_then(Value::as_u64)
+    }
+    fn task_id(task: &Value) -> &str {
+        task.get("taskId").and_then(Value::as_str).unwrap_or("")
+    }
+    match (started(a), started(b)) {
+        (Some(left), Some(right)) => right.cmp(&left).then_with(|| task_id(a).cmp(task_id(b))),
+        // Rows without a timestamp (live snapshots) lead the list as the
+        // most recent activity; `Less`/`Greater` place a timestamped row
+        // strictly after a timestamp-less one.
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => task_id(a).cmp(task_id(b)),
+    }
+}
+
 pub struct SshRuntime {
     connections: RwLock<HashMap<String, StoredConnection>>,
     sessions: Arc<AsyncRwLock<HashMap<String, Arc<SessionEntry>>>>,
@@ -4667,11 +4691,13 @@ impl SshRuntime {
         if let Some(filter) = session_id {
             tasks.retain(|task| task.get("sessionId").and_then(Value::as_str) == Some(filter));
         }
-        // Newest first by startedAt; rows without one sort last (stable).
-        tasks.sort_by(|a, b| {
-            let started = |task: &Value| task.get("startedAt").and_then(Value::as_u64).unwrap_or(0);
-            started(b).cmp(&started(a))
-        });
+        // Issue #18: the previous sort keyed on `startedAt` alone and left
+        // rows without one (live rows whose start record never reached the
+        // disk) stacked at the bottom in whatever order the in-memory
+        // registries happened to iterate — so the same task jumped between
+        // the top, middle and bottom of the panel between refreshes. A total
+        // order with a taskId tiebreak keeps every poll deterministic.
+        tasks.sort_by(compare_history_rows);
         tasks.truncate(limit);
         Ok(json!({ "tasks": tasks }))
     }
@@ -6677,6 +6703,77 @@ mod tests {
             .build_transfer_history(Some("s2"), 50, &no_connection)
             .unwrap();
         assert!(other["tasks"].as_array().unwrap().is_empty());
+    }
+
+    /// Issue #18: the history order must be a total order — newest first by
+    /// `startedAt`, ties broken by `taskId`, live rows without a start
+    /// record on top — so repeated polls cannot reshuffle equal/missing
+    /// keys into different positions.
+    #[test]
+    fn transfer_history_order_is_total_and_stable() {
+        let rows = vec![
+            json!({ "taskId": "b", "startedAt": 2_000 }),
+            json!({ "taskId": "a", "startedAt": 2_000 }),
+            json!({ "taskId": "z" }),
+            json!({ "taskId": "c", "startedAt": 3_000 }),
+            json!({ "taskId": "y" }),
+            json!({ "taskId": "a-old", "startedAt": 1 }),
+        ];
+        let mut sorted = rows.clone();
+        sorted.sort_by(compare_history_rows);
+        let ids: Vec<&str> = sorted
+            .iter()
+            .map(|task| task["taskId"].as_str().unwrap())
+            .collect();
+        // Missing timestamps lead (live rows), taskId tiebreak; then newest
+        // started first, again tie-broken by taskId.
+        assert_eq!(ids, vec!["y", "z", "c", "a", "b", "a-old"]);
+        // Any permutation of the same rows yields the identical order —
+        // the property the previous `startedAt`-only sort lacked.
+        for start in 0..rows.len() {
+            let mut rotated = rows.clone();
+            rotated.rotate_left(start);
+            rotated.sort_by(compare_history_rows);
+            let rotated_ids: Vec<&str> = rotated
+                .iter()
+                .map(|task| task["taskId"].as_str().unwrap())
+                .collect();
+            assert_eq!(rotated_ids, ids);
+        }
+    }
+
+    /// Issue #18: two live downloads whose start records never reached the
+    /// disk (lost cross-process write) used to render in HashMap iteration
+    /// order — a different order on every sidecar restart. The taskId
+    /// tiebreak makes the merged history deterministic.
+    #[test]
+    fn transfer_history_live_rows_without_start_context_sort_by_task_id() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+        for task_id in ["t-zulu", "t-alpha", "t-mike"] {
+            runtime.downloads.lock().unwrap().insert(
+                task_id.to_string(),
+                DownloadState {
+                    session_id: "s1".to_string(),
+                    remote_path: format!("/{task_id}.bin"),
+                    file_name: format!("{task_id}.bin"),
+                    size: 8,
+                    next_offset: 0,
+                    sink: None,
+                },
+            );
+        }
+        let no_connection = |_: &str| String::new();
+        let tasks = runtime
+            .build_transfer_history(Some("s1"), 50, &no_connection)
+            .unwrap();
+        let ids: Vec<String> = tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["taskId"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["t-alpha", "t-mike", "t-zulu"]);
     }
 
     /// 登录期 2FA 的端到端回归（issue #17 / #30）：密码/公钥先被接受后服务器
