@@ -3419,7 +3419,7 @@ async function archiveSidePath(path: string) {
   }
 }
 
-/** 空白处右键：新建文件夹 / 新建文件 / 刷新（与行菜单共用同一 ContextMenu 根；
+/** 空白处右键：新建文件夹 / 新建文件 / 上传文件 / 刷新（与行菜单共用同一 ContextMenu 根；
  *  行右键已由 showFileMenu 先行接管，这里按事件目标兜底空白区）。 */
 function onFileAreaContextMenu(event: MouseEvent) {
   if ((event.target as HTMLElement).closest(".file-row")) return;
@@ -3429,7 +3429,7 @@ function onFileAreaContextMenu(event: MouseEvent) {
   blankMenu.value = true;
 }
 
-function blankMenuAction(action: "mkdir" | "newFile" | "refresh") {
+function blankMenuAction(action: "mkdir" | "newFile" | "upload" | "refresh") {
   const menu = blankMenu.value;
   blankMenu.value = false;
   if (!menu) return;
@@ -3440,6 +3440,8 @@ function blankMenuAction(action: "mkdir" | "newFile" | "refresh") {
   if (action === "mkdir") {
     operationDraft.value = "";
     operationDialog.value = "mkdir";
+  } else if (action === "upload") {
+    void chooseUpload();
   } else {
     openNewFileDialog();
   }
@@ -8007,10 +8009,11 @@ onBeforeUnmount(() => {
                   <ContextMenuSeparator />
                   <ContextMenuItem variant="destructive" :disabled="!canWrite" @select="deleteTarget = fileMenu.entry"><Trash2 />{{ t("delete") }}</ContextMenuItem>
                 </template>
-                <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 刷新 -->
+                <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 上传文件 / 刷新 -->
                 <template v-else>
                   <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('mkdir')"><FolderPlus />{{ t("newFolder") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('newFile')"><FilePlus />{{ t("sftpNewFile.action") }}</ContextMenuItem>
+                  <ContextMenuItem :disabled="!connected || !canWrite" @select="blankMenuAction('upload')"><FileUp />{{ t("upload") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!connected || loadingFiles" @select="blankMenuAction('refresh')"><RefreshCw />{{ t("refresh") }}</ContextMenuItem>
                 </template>
               </ContextMenuContent>
