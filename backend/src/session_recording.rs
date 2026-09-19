@@ -407,6 +407,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Issue #12 回归：「只点击了录制然后终止」产出仅含 header 的录制
+    /// （0 事件），必须照常列入列表且可经 RPC 同路径（cast_path + 删文件）
+    /// 删除，删除后从列表消失。
+    #[test]
+    fn header_only_recording_is_listed_and_deletable() {
+        let dir = temp_dir();
+        let recorder = SessionRecorder::start(&dir, "rec-empty", "c", "h", "s", 80, 24).unwrap();
+        recorder.finish().unwrap();
+
+        let list = list_recordings(&dir);
+        assert_eq!(
+            list.len(),
+            1,
+            "header-only recording still shows in the list"
+        );
+        assert_eq!(list[0]["recordingId"], "rec-empty");
+        assert_eq!(
+            list[0]["durationSecs"], 0.0,
+            "no events means zero duration"
+        );
+
+        let path = cast_path(&dir, "rec-empty").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+        assert!(
+            list_recordings(&dir).is_empty(),
+            "deleted recording leaves the list"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cast_path_rejects_traversal() {
         let dir = temp_dir();
