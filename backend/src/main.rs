@@ -21,6 +21,7 @@ mod session_recording;
 mod sftp_bookmarks;
 mod sftp_copy;
 mod sftp_ext;
+mod sftp_tree;
 mod ssh;
 mod ssh_algorithms;
 mod sudo_allowlist;
@@ -260,9 +261,15 @@ impl Plugin {
             "sftp/list" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
-                let entries = self
-                    .runtime
-                    .block_on(self.ssh.sftp_list_path(session_id, path))?;
+                let include_owner = params
+                    .get("includeOwner")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let entries = self.runtime.block_on(self.ssh.sftp_list_path(
+                    session_id,
+                    path,
+                    include_owner,
+                ))?;
                 Ok(json!({ "entries": entries }))
             }
             "sftp/read" => {
@@ -771,6 +778,23 @@ impl Plugin {
                     emitter,
                 ))
             }
+            // 递归目录下载：远端 read_dir 走树（不碰 shell、不产生远端临时
+            // 包），逐文件复用下方分块下载管线，本地按相对路径镜像；分块与
+            // finish/cancel 与单文件下载共用（任务在同一个注册表里）。
+            "sftp/download/tree/start" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let remote_path = required_string(&params, "remotePath")?;
+                let download_dir = params
+                    .get("downloadDir")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.runtime.block_on(self.ssh.start_tree_download(
+                    session_id,
+                    remote_path,
+                    download_dir.as_deref(),
+                    emitter,
+                ))
+            }
             "sftp/download/next" => {
                 let task_id = required_string(&params, "taskId")?;
                 let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -782,8 +806,20 @@ impl Plugin {
                     .complete_download(required_string(&params, "taskId")?, emitter),
             ),
             "sftp/transfer/cancel" => {
-                self.ssh
-                    .cancel_transfer(required_string(&params, "taskId")?, emitter)?;
+                // Optional reason slug from the workbench ("user",
+                // "ack-timeout", ...) surfaces in the ledger so a cancel can
+                // be told apart from a server failure on the next bug report.
+                let reason = params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.chars().take(120).collect::<String>());
+                self.runtime.block_on(self.ssh.cancel_transfer(
+                    required_string(&params, "taskId")?,
+                    reason.as_deref(),
+                    emitter,
+                ))?;
                 Ok(json!({ "success": true }))
             }
             // 本机落盘能力探测：无宿主 fileTransfer API 时前端据此决定
@@ -835,11 +871,20 @@ impl Plugin {
                 local_fs::target_exists(dir, name)
             }
             // 在文件管理器中定位已完成的下载。只允许 reveal 传输历史里
-            // 记录过的 localPath，不能成为任意路径打开原语。
+            // 记录过的 localPath，不能成为任意路径打开原语。目标文件已被
+            // 移走/改名时回落到其父目录，再退到插件的下载目录（配置或
+            // 默认），而不是让文件管理器落到系统的文档目录（issue #18）。
             "local/reveal" => {
                 let path = required_string(&params, "path")?;
-                let history = transfer_history::load_history(&plugin_data_dir());
-                local_downloads::reveal_validated(&history, std::path::Path::new(path))?;
+                let data_dir = plugin_data_dir();
+                let history = transfer_history::load_history(&data_dir);
+                let recorded = std::path::PathBuf::from(&path);
+                local_downloads::reveal_validated(&history, &recorded)?;
+                let target = local_downloads::reveal_target(
+                    &recorded,
+                    &local_downloads::reveal_download_dir(&data_dir),
+                );
+                local_downloads::reveal_in_file_manager(&target)?;
                 Ok(json!({ "success": true }))
             }
             // 在默认应用中打开已完成的本机下载；同样只允许打开传输历史中
@@ -913,9 +958,11 @@ impl Plugin {
     fn filesystem_list(&self, params: Value) -> Result<Value, String> {
         let session_id = self.filesystem_session(&params)?;
         let path = filesystem_path(&params)?;
+        // Host filesystem-provider listings stay on the zero-round-trip path;
+        // owner names are opt-in via `sftp/list` only.
         let entries = self
             .runtime
-            .block_on(self.ssh.sftp_list_path(&session_id, &path))?;
+            .block_on(self.ssh.sftp_list_path(&session_id, &path, false))?;
         Ok(json!({ "entries": entries }))
     }
 
@@ -1029,10 +1076,18 @@ impl PluginHandler for Plugin {
             return Ok(());
         }
         if let Some(task_id) = channel.strip_prefix("sftp/upload/") {
-            return self
-                .ssh
-                .append_upload(task_id, &data, emitter)
-                .map_err(to_plugin_error);
+            // Binary handler failures are only logged by the SDK loop, so the
+            // workbench would otherwise learn about a desynced/missing upload
+            // only through a 30s ack timeout. Mirror the failure as an event
+            // it can react to immediately.
+            if let Err(error) = self.ssh.append_upload(task_id, &data, emitter) {
+                let _ = emitter.event(
+                    "sftp/upload/error",
+                    json!({ "taskId": task_id, "error": error }),
+                );
+                return Err(to_plugin_error(error));
+            }
+            return Ok(());
         }
         Err(PluginError::new(
             -32601,

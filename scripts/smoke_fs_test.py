@@ -215,6 +215,7 @@ def main() -> None:
         ssh_dir = f"{home}/.ssh"
         touch_path = f"{home}/.dbx-fs-smoke-touch"
         write_path = f"{home}/.dbx-fs-smoke-write"
+        perms_path = f"{home}/.dbx-fs-smoke-perms.sh"
         archive_path = f"{home}/.dbx-parity-test.tar.gz"
         extract_dir = f"{home}/.dbx-parity-extract"
         sudo_dir = f"{home}/.sudo-test"
@@ -261,6 +262,25 @@ def main() -> None:
             print(f"    wrote and read back {write_path}")
             req("sftp/delete", {"sessionId": session_id, "path": write_path})
 
+        def case_sftp_write_preserves_permissions():
+            # Issue #37: saving over an existing file must not drop its
+            # permission bits (e.g. the executable bit of a script).
+            req("sftp/write", {"sessionId": session_id, "remotePath": perms_path,
+                               "dataBase64": base64.b64encode(b"#!/bin/sh\necho one\n").decode()})
+            req("sftp/chmod", {"sessionId": session_id, "path": perms_path, "mode": "0755"})
+            updated = b"#!/bin/sh\necho two\n"
+            req("sftp/write", {"sessionId": session_id, "remotePath": perms_path,
+                               "dataBase64": base64.b64encode(updated).decode()})
+            mode = req("sftp/stat", {"sessionId": session_id, "path": perms_path}).get("mode")
+            if mode != "0755":
+                raise AssertionError(f"mode after overwrite save={mode!r}, want '0755'")
+            read_back = req("sftp/read", {"sessionId": session_id, "path": perms_path, "maxBytes": 4096})
+            content = base64.b64decode(read_back.get("dataBase64", "")).decode(errors="replace")
+            if content != updated.decode():
+                raise AssertionError(f"read-back mismatch after overwrite: {content!r}")
+            print(f"    {perms_path}: mode stayed 0755 after overwrite save")
+            req("sftp/delete", {"sessionId": session_id, "path": perms_path})
+
         def case_sftp_archive():
             try:  # archive source must exist; create ~/.ssh if the container lacks it
                 req("sftp/createDirectory", {"sessionId": session_id, "path": ssh_dir})
@@ -289,6 +309,32 @@ def main() -> None:
                 raise AssertionError(f"{extract_dir} kind={kind!r}, want directory")
             req("sftp/delete", {"sessionId": session_id, "path": extract_dir, "recursive": True})
             req("sftp/delete", {"sessionId": session_id, "path": archive_path})
+
+        def case_sftp_list_owner():
+            """issue #34: includeOwner 附加属主/属组；缺省时字段必须缺席。"""
+            # 不带 includeOwner：wire 与历史版本一致，不得出现 owner/group。
+            plain = client.request("sftp/list", {"sessionId": session_id, "path": home})
+            rows = plain.get("entries") or []
+            if not rows:
+                raise AssertionError(f"{home} listing unexpectedly empty")
+            leaked = [e.get("name") for e in rows if "owner" in e or "group" in e]
+            if leaked:
+                raise AssertionError(f"owner/group present without includeOwner: {leaked}")
+            # 带 includeOwner=true：条目应有 owner（名字或数字 uid，v3 增强失败
+            # 时保留数字；两者都是字符串）。服务器既无 shell 又不给 uid 的极端
+            # 情况跳过而不是失败。
+            enriched = client.request("sftp/list", {"sessionId": session_id, "path": home,
+                                                    "includeOwner": True})
+            erows = enriched.get("entries") or []
+            with_owner = [(e.get("name"), e.get("owner"), e.get("group")) for e in erows]
+            print(f"    sample: {with_owner[:3]}")
+            if all(owner is None for _, owner, _ in with_owner):
+                print("    SKIP: server reports neither names nor numeric uid/gid")
+                return
+            bad = [(name, owner) for name, owner, _ in with_owner
+                   if owner is not None and not isinstance(owner, str)]
+            if bad:
+                raise AssertionError(f"owner must be a string or absent: {bad}")
 
         # -- sudo_fs group (container sshuser has NOPASSWD sudo) ------------------
 
@@ -324,6 +370,15 @@ def main() -> None:
             print(f"    {sudo_dir}: {names}")
             if sudo_file.rsplit("/", 1)[-1] not in names:
                 raise AssertionError(f"inner file missing from listing: {names}")
+            # issue #34: ls -la 解析附带属主/属组，字段恒定存在。
+            for entry in result.get("entries", []):
+                owner, group = entry.get("owner"), entry.get("group")
+                if not isinstance(owner, str) or not isinstance(group, str) or not owner or not group:
+                    raise AssertionError(
+                        f"sudo/listDir entry {entry.get('name')!r} missing owner/group: "
+                        f"{owner!r}/{group!r}"
+                    )
+            print(f"    owners: {[(e.get('name'), e.get('owner'), e.get('group')) for e in result.get('entries', [])][:3]}")
 
         def case_sudo_write_read():
             payload = b"sudo parity\n"
@@ -1079,9 +1134,12 @@ def main() -> None:
         report.run("sftp/exists true/false", "sftp/exists", case_sftp_exists)
         report.run("sftp/touch + sftp/stat empty file", "sftp/touch", case_sftp_touch_stat)
         report.run("sftp/write + sftp/read round-trip", "sftp/write", case_sftp_write_read)
+        report.run("sftp/write overwrite keeps chmod 0755", "sftp/write",
+                   case_sftp_write_preserves_permissions)
         archive_case = "sftp/archive .ssh -> tar.gz"
         report.run(archive_case, "sftp/archive", case_sftp_archive)
         report.run("sftp/extract tar.gz -> directory", "sftp/extract", case_sftp_extract, needs=archive_case)
+        report.run("sftp/list includeOwner owner/group", "sftp/list", case_sftp_list_owner)
 
         print("\n--- sudo_fs group ---")
         report.run("sudo/stat /config", "sudo/stat", case_sudo_stat)

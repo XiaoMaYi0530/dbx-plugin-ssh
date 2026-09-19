@@ -179,6 +179,16 @@ def main() -> None:
         # land before finishing (atomic rename) the transfer
         time.sleep(1)
         client.request("sftp/upload/finish", {"taskId": task_id})
+        # finish hands the remote push to a sidecar background task (issue #60):
+        # poll until the terminal status lands before reading the file back.
+        status = {}
+        for _ in range(100):
+            status = client.request("sftp/transfer/status", {"taskId": task_id})
+            if status.get("status") in ("completed", "failed", "cancelled"):
+                break
+            time.sleep(0.1)
+        if status.get("status") != "completed":
+            fail(f"upload did not complete after finish: {json.dumps(status)[:160]}")
         read_back = client.request("sftp/read", {"sessionId": session_id, "path": write_path, "maxBytes": 4096})
         read_content = base64.b64decode(read_back.get("dataBase64", "")).decode(errors="replace")
         if "dbx smoke test" not in read_content:

@@ -131,6 +131,7 @@ import { sanitizeCommandOutput } from "./lib/terminalOutputText";
 import { normalizeTerminalInputBytes } from "./lib/terminalInput";
 import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
+import { mergeTransferProgress, transferCancelReason, type TransferPhase } from "./lib/transferProgress";
 import { DBX_POPOVER, resolveAppearance, TERMINAL_ANSI, type DbxPluginAppearanceInput } from "./lib/appearance";
 import { isDbxPluginTheme, onHostThemeChange, themeToAppearance } from "./lib/hostTheme";
 import { AGENT_MODES, approvalRemainingSecs, buildAgentResolveBody, dropAgentPrompt, enqueueAgentPrompt, sanitizeRememberedCommands, type AgentFinishPayload, type AgentNoticePayload, type AgentPromptPayload, type AgentTerminalMode } from "./lib/agentTerminal";
@@ -149,6 +150,7 @@ import {
 } from "./lib/keywordHighlight";
 import { pushSample, sparklinePath, METRICS_SAMPLE_CAPACITY } from "./lib/metricsSparkline";
 import { transferPausable, matchResumableUpload, canResumeUpload, type ResumableUploadTask } from "./lib/transferResume";
+import { isLiveTransferStatus, sortTransferTasks } from "./lib/transferOrder";
 import { buildTimeline, eventIndexAtTime, gifFramePlan, mergeEventPages, replayDuration, type RecordingSummary, type ReplayEvent, type ReplayEventPage } from "./lib/replayScheduler";
 import { encodeGif } from "./lib/gifEncoder";
 import { canKillProcess, sortProcessRows, type ProcessSortKey } from "./lib/processActions";
@@ -159,9 +161,16 @@ import { pickLiveSessionForReattach, type SessionSummary } from "./lib/sessionRe
 import { toolbarTintStyle } from "./lib/toolbarTint";
 import { createGhostClickGuard } from "./lib/ghostClickGuard";
 import { createRequestEpoch } from "./lib/requestEpoch";
-import { sanitizeSftpEntries } from "./lib/sftpEntries";
-import { resolveRemotePath } from "./lib/remotePathInput";
+import {
+  DEFAULT_VISIBLE_COLUMNS,
+  sanitizeSftpEntries,
+  sanitizeVisibleColumns,
+  sftpEntryIconKind,
+  type SftpColumn,
+} from "./lib/sftpEntries";
+import { resolveRemotePath, splitRemotePathSegments } from "./lib/remotePathInput";
 import { shouldCommitRename } from "./lib/sftpRename";
+import { folderDownloadOutcome, type FolderDownloadFinish } from "./lib/sftpFolderDownload";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
 import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRendererLike } from "./lib/terminalWebgl";
 import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from "./lib/terminalClickCursor";
@@ -208,6 +217,9 @@ interface SftpEntry {
   modifiedAt?: number;
   permissions?: string;
   contentType?: string;
+  /** 属主用户/属组（includeOwner 时由 sidecar 返回；缺失显示 "-"）。 */
+  owner?: string;
+  group?: string;
 }
 
 interface SftpStatInfo {
@@ -247,6 +259,20 @@ interface TransferTask {
   error?: string;
   // saveToLocal 下载完成后的本机落盘路径（用于展示与在文件管理器中定位）。
   localPath?: string;
+  // 上传分两阶段计数（issue #60）：staging=字节缓存进本地 spool（快），
+  // uploading=字节真正推到 SFTP 服务器（慢）。transferred 只反映 uploading，
+  // staged 单独记录 staging 字节，面板不再出现"3G→100M"回跳与假速度。
+  phase?: TransferPhase;
+  staged?: number;
+  // 本工作台首次见到该任务的时间（issue #18 排序：live 行缺 startedAt 时
+  // 用它兜底，保证活跃区顺序稳定可解释）。
+  joinedAt?: number;
+  // 目录下载（sftp/download/tree/start）扩展：整树文件数、在传相对路径与
+  // 失败汇总（完成但部分文件失败时面板提示）。（issue #46）
+  fileCount?: number;
+  currentFile?: string;
+  failedCount?: number;
+  failureSample?: string;
 }
 
 // sftp/transfer/history 行（落盘历史 + 内存 live 合并视图）：status 沿用现有枚举、无 queued。
@@ -293,6 +319,10 @@ interface DownloadInfo {
   chunkSize: number;
   // 断点续传：start 带 offset 时回显的恢复起点。
   resumeOffset?: number;
+  // 目录下载（tree/start）扩展：扫描得到的整树规模。
+  fileCount?: number;
+  dirCount?: number;
+  skippedCount?: number;
 }
 
 interface ExecResult {
@@ -386,7 +416,7 @@ interface McpSizeSettings {
   connectionScope?: string[];
 }
 
-type SftpColumn = "size" | "modified" | "permissions";
+// 列类型移到 lib/sftpEntries（issue #34：owner/group 属主/属组列，默认关）。
 type SftpSortColumn = "name" | "size" | "modified";
 
 const IMAGE_MIME_BY_EXTENSION: Record<string, string> = { png: "png", jpg: "jpeg", jpeg: "jpeg", gif: "gif", webp: "webp", svg: "svg+xml", bmp: "bmp", ico: "x-icon" };
@@ -516,7 +546,7 @@ const sftpHomePath = ref("");
 const termSelectCopy = ref(loadSelectCopyEnabled());
 const followDirectory = ref(false);
 const directoryTrackingSupported = ref<boolean | undefined>();
-const visibleColumns = ref<SftpColumn[]>(["size", "modified"]);
+const visibleColumns = ref<SftpColumn[]>([...DEFAULT_VISIBLE_COLUMNS]);
 const sort = ref<{ column: SftpSortColumn; direction: "asc" | "desc" }>({ column: "name", direction: "asc" });
 const transferTasks = reactive<Record<string, TransferTask>>({});
 // 断点续传（F1）：暂停中的任务（两分片之间生效）；等待恢复的回调登记表。
@@ -926,6 +956,9 @@ let pendingTerminalInput = "";
 let activeTerminalSessionId = "";
 const pendingTerminalFrames = new Map<number, { stream: number; data: Uint8Array }>();
 const uploadAckWaiters = new Map<string, { nextOffset: number; resolve: () => void; reject: (error: Error) => void; timer: number }>();
+// 上传收尾等待器（issue #60）：finish RPC 只负责把远端推送交给 sidecar
+// 后台任务，真正的完成/失败经终态 progress 事件回传，这里据此结算。
+const transferCompletionWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
 const downloadChunkWaiters = new Map<string, { offset: number; resolve: (bytes: Uint8Array) => void; reject: (error: Error) => void; timer: number }>();
 const transferSamples = new Map<string, TransferSpeedSample>();
 // Download task ids the user cancelled from the transfer panel; lets the download
@@ -1083,9 +1116,14 @@ const sortedEntries = computed(() => {
     return result * direction;
   });
 });
-// Object insertion order is the order a task joined this workbench. Do not
-// sort by taskId: task IDs are UUIDs, so doing so randomly reorders a batch.
-const transferList = computed(() => Object.values(transferTasks));
+// 活跃区只显示进行中的任务（queued/running），按 transferOrder 的稳定规则
+// 排序：先开始/先加入的排最上，同键用 taskId 兜底（issue #18）。此前这里
+// 按对象插入序渲染全部任务：插入序来自后端 HashMap 迭代序 + 事件到达序，
+// 终态行还永久堆积，同一张卡就会在面板里"一会儿在上、一会儿在中间、一会儿
+// 在下"。终态行由历史区承接（落盘 + 内存合并视图），转终态的同一拍刷新。
+const transferList = computed(() =>
+  sortTransferTasks(Object.values(transferTasks).filter((task) => isLiveTransferStatus(task.status))),
+);
 const activeTransfers = computed(() => transferList.value.filter((task) => task.status === "queued" || task.status === "running").length);
 const zmodemBusy = computed(() => zmodemState.value !== "idle");
 const zmodemPercent = computed(() => zmodemTotalSize.value > 0 ? Math.min(100, Math.round((zmodemTransferred.value / zmodemTotalSize.value) * 100)) : 0);
@@ -1094,8 +1132,16 @@ const terminalTransferBusy = computed(() => zmodemBusy.value || trzszBusy.value)
 const trzszBusy = computed(() => trzszPhase.value === "waiting" || trzszPhase.value === "transferring");
 const trzszOverlayVisible = computed(() => trzszPhase.value !== "idle");
 const sftpGridStyle = computed(() => ({
-  gridTemplateColumns: ["minmax(120px, 1fr)", visibleColumns.value.includes("size") ? "72px" : "", visibleColumns.value.includes("modified") ? "128px" : "", visibleColumns.value.includes("permissions") ? "84px" : ""].filter(Boolean).join(" "),
-  minWidth: `${180 + (visibleColumns.value.includes("size") ? 78 : 0) + (visibleColumns.value.includes("modified") ? 134 : 0) + (visibleColumns.value.includes("permissions") ? 90 : 0)}px`,
+  gridTemplateColumns: [
+    "minmax(120px, 1fr)",
+    visibleColumns.value.includes("size") ? "72px" : "",
+    visibleColumns.value.includes("modified") ? "128px" : "",
+    // 属主/属组（issue #34）：等宽两列，窄面板靠横向滚动而不是挤压。
+    visibleColumns.value.includes("owner") ? "96px" : "",
+    visibleColumns.value.includes("group") ? "96px" : "",
+    visibleColumns.value.includes("permissions") ? "84px" : "",
+  ].filter(Boolean).join(" "),
+  minWidth: `${180 + (visibleColumns.value.includes("size") ? 78 : 0) + (visibleColumns.value.includes("modified") ? 134 : 0) + (visibleColumns.value.includes("owner") ? 102 : 0) + (visibleColumns.value.includes("group") ? 102 : 0) + (visibleColumns.value.includes("permissions") ? 90 : 0)}px`,
 }));
 const sftpFiltersActive = computed(() => sftpSearch.value.trim() !== "" || sftpTypeFilter.value !== "all");
 const visibleEntries = computed(() => filterSftpEntries(sortedEntries.value, sftpSearch.value, sftpTypeFilter.value));
@@ -1121,7 +1167,7 @@ function restoreUiState() {
   sftpPaneOpen.value = resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
   followDirectory.value = state.followDirectory === true;
   sudoMode.value = state.sudoMode === true && canWrite.value;
-  visibleColumns.value = Array.isArray(state.visibleColumns) ? state.visibleColumns.filter((column): column is SftpColumn => ["size", "modified", "permissions"].includes(column)) : ["size", "modified"];
+  visibleColumns.value = sanitizeVisibleColumns(state.visibleColumns);
   lastSequence = typeof state.terminalSequence === "number" ? state.terminalSequence : 0;
 }
 
@@ -2195,6 +2241,18 @@ function handleEvent(event: DbxPluginEvent) {
     }
     return;
   }
+  // sidecar 拒收上传分片（offset 失配/任务丢失/spool 写失败）时立即失败在途
+  // ack 等待器，不再等满 30s 超时后才用一个含糊的 ack-timeout 收场（issue #60）。
+  if (event.method === "sftp/upload/error") {
+    const taskId = String(event.params.taskId || "");
+    const waiter = uploadAckWaiters.get(taskId);
+    if (waiter) {
+      window.clearTimeout(waiter.timer);
+      uploadAckWaiters.delete(taskId);
+      waiter.reject(Object.assign(new Error(String(event.params.error || "upload rejected")), { code: "upload-append-failed" }));
+    }
+    return;
+  }
   if (event.method === "sftp/transfer/progress") updateTransfer(event.params);
 }
 
@@ -2202,25 +2260,70 @@ function updateTransfer(params: Record<string, unknown>) {
   const taskId = String(params.taskId || "");
   if (!taskId) return;
   const existing = transferTasks[taskId];
-  const transferred = Number(params.transferred ?? existing?.transferred ?? 0);
-  const sample = sampleTransferSpeed(transferSamples.get(taskId), transferred, performance.now());
-  transferSamples.set(taskId, sample);
-  transferSpeeds[taskId] = sample.speed;
+  const status = normalizeTransferStatus(params.status, existing?.status);
+  const progress = mergeTransferProgress(existing, params);
+  // 速度只采样真实网络推送（uploading 阶段）：staging 字节走本机内存/磁盘，
+  // 计入会显示 20MB/s 级别的假速度（issue #60）。阶段切换时重置采样窗口。
+  const phaseChanged = progress.phase !== existing?.phase;
+  if (progress.phase === "staging") {
+    transferSamples.delete(taskId);
+    transferSpeeds[taskId] = 0;
+  } else {
+    const sample = sampleTransferSpeed(phaseChanged ? undefined : transferSamples.get(taskId), progress.transferred, performance.now());
+    transferSamples.set(taskId, sample);
+    transferSpeeds[taskId] = sample.speed;
+  }
+  // 目录下载事件附带的树内字段（fileCount/currentFile）有则透传；
+  // 文件下载事件不带这些键，保持原有行为。（issue #46）
+  const fileCount = params.fileCount !== undefined ? Number(params.fileCount) : existing?.fileCount;
+  const currentFile = typeof params.currentFile === "string" ? params.currentFile : existing?.currentFile;
   transferTasks[taskId] = {
     taskId,
     sessionId: String(params.sessionId || existing?.sessionId || ""),
     direction: params.direction === "download" ? "download" : existing?.direction || "upload",
     fileName: String(params.fileName || existing?.fileName || ""),
-    size: Number(params.size ?? existing?.size ?? 0),
-    transferred,
-    status: normalizeTransferStatus(params.status, existing?.status),
+    size: progress.size,
+    transferred: progress.transferred,
+    staged: progress.staged,
+    phase: progress.phase,
+    status,
     error: typeof params.error === "string" ? params.error : existing?.error,
+    joinedAt: existing?.joinedAt ?? Date.now(),
+    fileCount: Number.isFinite(fileCount) && fileCount! > 0 ? fileCount : undefined,
+    currentFile: currentFile || undefined,
   };
-  if (!existing && (transferTasks[taskId].status === "queued" || transferTasks[taskId].status === "running")) openTransferPanel();
+  settleTransferCompletion(taskId, status);
+  if (!existing && isLiveTransferStatus(transferTasks[taskId].status)) {
+    // 面板已开时不得重开：openTransferPanel 的"先收口再开"会卸载弹层、
+    // 复位滚动位置，用户正往下看历史时会被弹回顶部（issue #18）。互斥族
+    // 保证面板开着时没有其他弹层，直接置 open 即可。
+    if (!transferPanelOpen.value) transferPanelOpen.value = true;
+  }
 }
 
 function normalizeTransferStatus(value: unknown, fallback: TransferTask["status"] = "running"): TransferTask["status"] {
   return ["queued", "running", "completed", "cancelled", "failed"].includes(String(value)) ? String(value) as TransferTask["status"] : fallback;
+}
+
+/** 终态事件结算 finish 之后的收尾等待器：completed 兑现，cancelled/failed 拒绝。 */
+function settleTransferCompletion(taskId: string, status: TransferTask["status"]) {
+  const waiter = transferCompletionWaiters.get(taskId);
+  if (!waiter || (status !== "completed" && status !== "cancelled" && status !== "failed")) return;
+  transferCompletionWaiters.delete(taskId);
+  if (status === "completed") waiter.resolve();
+  else waiter.reject(Object.assign(new Error(transferTasks[taskId]?.error || t(`transferStatus.${status}`)), { code: "transfer-terminal" }));
+}
+
+/** 挂起直到该任务收到终态 progress 事件（完成/取消/失败）；注册前已终态则立即结算。 */
+function waitForTransferCompletion(taskId: string) {
+  const existing = transferTasks[taskId];
+  const status = existing?.status;
+  if (status === "completed" || status === "cancelled" || status === "failed") {
+    return status === "completed" ? Promise.resolve() : Promise.reject(Object.assign(new Error(existing?.error || t(`transferStatus.${status}`)), { code: "transfer-terminal" }));
+  }
+  return new Promise<void>((resolve, reject) => {
+    transferCompletionWaiters.set(taskId, { resolve, reject });
+  });
 }
 
 async function openSession(forceNew = false, bootRestore = false, isRetry = false) {
@@ -2530,7 +2633,18 @@ function openNewSessionTab() {
 async function restoreTransfers() {
   if (!session.value) return;
   const result = await window.dbxPlugin.invoke<{ tasks: TransferTask[] }>("sftp/transfer/list", { sessionId: session.value.sessionId }).catch(() => ({ tasks: [] }));
-  for (const task of result.tasks) transferTasks[task.taskId] = task;
+  for (const task of result.tasks) {
+    // 后端 list 的 staging 行把 spool 字节放在 transferred 里；恢复到本地
+    // 状态时归位到 staged，避免重挂后进度条展示阶段计数（issue #60）。
+    if (task.phase === "staging") {
+      task.staged = task.transferred;
+      task.transferred = 0;
+    }
+    const existing = transferTasks[task.taskId];
+    // joinedAt 只在首次见到时落一次：后端返回序（HashMap 迭代序）不再影响
+    // 活跃区排序（issue #18）。
+    transferTasks[task.taskId] = { ...task, joinedAt: existing?.joinedAt ?? Date.now() };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2562,12 +2676,16 @@ async function reconcileActiveTransfers() {
   for (const task of Object.values(transferTasks)) {
     if (task.status !== "queued" && task.status !== "running") continue;
     try {
-      const status = await window.dbxPlugin.invoke<{ transferred?: number; status: string }>("sftp/transfer/status", { taskId: task.taskId });
+      const status = await window.dbxPlugin.invoke<{ transferred?: number; status: string; phase?: string }>("sftp/transfer/status", { taskId: task.taskId });
       const normalized = normalizeTransferStatus(status.status, "running");
       // task.status 此处必为 queued/running（上方守卫），终态即差异。
       if (normalized !== "queued" && normalized !== "running") {
         task.status = normalized;
-        if (status.transferred) task.transferred = status.transferred;
+        if (status.transferred != null) {
+          // staging 阶段的 transferred 字段是 spool 字节数，不能覆盖真实推送计数。
+          if (status.phase === "staging") task.staged = status.transferred;
+          else task.transferred = status.transferred;
+        }
       }
     } catch {
       task.status = "failed";
@@ -2629,15 +2747,24 @@ async function refreshTransferPanel() {
   await reconcileActiveTransfers();
 }
 
-// 打开传输面板或最后一个活动任务结束时拉取历史：历史区常驻展示，活跃任务只影响列表而不遮挡快照。
+// 打开传输面板或任一任务转为终态时拉取历史：终态卡从活跃区消失的同一拍
+// 进入历史区，不等最后一个任务结束（issue #18：有传输任务时历史也要可查）。
 // 打开面板的同时对账活跃任务，防止错过终态事件的行永远卡在 running。
 watch(transferPanelOpen, (open) => {
   if (open) {
     void refreshTransferPanel();
   }
 });
-watch(activeTransfers, (count, previous) => {
-  if (count === 0 && previous > 0 && transferPanelOpen.value) void refreshTransferHistory();
+const liveTransferIds = computed(() =>
+  transferList.value.map((task) => task.taskId).join("|"),
+);
+watch(liveTransferIds, (current, previous) => {
+  if (!transferPanelOpen.value) return;
+  const before = new Set((previous ?? "").split("|").filter(Boolean));
+  const after = new Set(current.split("|").filter(Boolean));
+  // 只有任务离开活跃集合（转终态）才刷新；新任务加入由面板打开路径负责。
+  const departed = [...before].some((taskId) => !after.has(taskId));
+  if (departed) void refreshTransferHistory();
 });
 
 async function refreshResumableUploads() {
@@ -3325,7 +3452,7 @@ async function archiveSidePath(path: string) {
   }
 }
 
-/** 空白处右键：新建文件夹 / 新建文件 / 刷新（与行菜单共用同一 ContextMenu 根；
+/** 空白处右键：新建文件夹 / 新建文件 / 上传文件 / 刷新（与行菜单共用同一 ContextMenu 根；
  *  行右键已由 showFileMenu 先行接管，这里按事件目标兜底空白区）。 */
 function onFileAreaContextMenu(event: MouseEvent) {
   if ((event.target as HTMLElement).closest(".file-row")) return;
@@ -3335,7 +3462,7 @@ function onFileAreaContextMenu(event: MouseEvent) {
   blankMenu.value = true;
 }
 
-function blankMenuAction(action: "mkdir" | "newFile" | "refresh") {
+function blankMenuAction(action: "mkdir" | "newFile" | "upload" | "refresh") {
   const menu = blankMenu.value;
   blankMenu.value = false;
   if (!menu) return;
@@ -3346,6 +3473,8 @@ function blankMenuAction(action: "mkdir" | "newFile" | "refresh") {
   if (action === "mkdir") {
     operationDraft.value = "";
     operationDialog.value = "mkdir";
+  } else if (action === "upload") {
+    void chooseUpload();
   } else {
     openNewFileDialog();
   }
@@ -3372,6 +3501,8 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false) {
     const result = await window.dbxPlugin.invoke<{ entries: SftpEntry[] }>(sudoMode.value ? "sudo/listDir" : "sftp/list", {
       sessionId: session.value.sessionId,
       path: normalized,
+      // 属主/属组列开启时才要 owner/group 数据（sudo/listDir 恒定附带）。
+      includeOwner: visibleColumns.value.includes("owner") || visibleColumns.value.includes("group"),
     });
     if (!listEpoch.isCurrent(epochId)) return;
     // R3-P2-3：响应容错——非数组/畸形行走 sanitize（null entries → 空数组、
@@ -3705,8 +3836,14 @@ function startDividerDrag(event: PointerEvent) {
 }
 
 function toggleColumn(column: SftpColumn) {
+  const hadOwnerData = visibleColumns.value.includes("owner") || visibleColumns.value.includes("group");
   visibleColumns.value = visibleColumns.value.includes(column) ? visibleColumns.value.filter((value) => value !== column) : [...visibleColumns.value, column];
   persistState();
+  // 属主/属组列从关到开：当前列表可能没有 owner/group 数据（此前请求没带
+  // includeOwner），重拉一次目录；关列不需要重拉。
+  if ((column === "owner" || column === "group") && !hadOwnerData && session.value && !sudoMode.value) {
+    void loadDirectory();
+  }
 }
 
 function toggleSort(column: SftpSortColumn) {
@@ -4410,12 +4547,35 @@ function goToPath(path: string) {
   void loadDirectory(path);
 }
 
+// #54 路径栏分段回跳：非编辑态把路径渲染成一串分段 chip（根目录 / 也可点击
+// 回根），点击任一分段经 goToPath 直接回到对应前缀；点击分段以外区域或导航
+// 框聚焦后 Enter 进入编辑态，输入行为与原先完全一致（复用 submitPathInput）。
+const pathBarEditing = ref(false);
+const pathBarInputEl = ref<HTMLInputElement | null>(null);
+// 进入编辑瞬间的路径快照：Esc 是显式取消手势，把草稿还原成编辑前的显示值
+// （失焦仍保留草稿，与输入框既有语义一致——只有 Esc 回滚）。
+const pathBarDraft = ref("");
+const pathCrumbs = computed(() => splitRemotePathSegments(currentPath.value));
+
+function beginPathBarEdit() {
+  if (pathBarEditing.value) return;
+  pathBarDraft.value = currentPath.value;
+  pathBarEditing.value = true;
+  void nextTick(() => pathBarInputEl.value?.focus());
+}
+
+function cancelPathBarEdit() {
+  currentPath.value = pathBarDraft.value;
+  pathBarEditing.value = false;
+}
+
 // R3-P2-4：路径栏提交统一入口——`~`（home 已探测时）展开、`.`/`..` 段消解
 // 及基础归一，下游 joinRemote/exists 拼接与路径历史不再携带未规范路径。
 function submitPathInput() {
   if (!connected.value) return;
   const target = resolveRemotePath(currentPath.value, sftpHomePath.value || undefined);
   currentPath.value = target;
+  pathBarEditing.value = false;
   void loadDirectory(target);
 }
 
@@ -4478,12 +4638,17 @@ async function uploadSource(name: string, size: number, readChunk: (offset: numb
     ? { sessionId: session.value.sessionId, remotePath: resume.remotePath, size, resumeTaskId: resume.taskId }
     : { sessionId: session.value.sessionId, remotePath: joinRemote(targetDir ?? currentPath.value, name), size });
   const startOffset = info.resumeOffset ?? 0;
-  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: name, size, transferred: startOffset, status: startOffset > 0 ? "running" : "queued" };
+  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: name, size, transferred: startOffset, status: startOffset > 0 ? "running" : "queued", joinedAt: Date.now() };
   try {
     let offset = startOffset;
     while (offset < size) {
       await waitWhilePaused(info.taskId);
-      const chunk = await readChunk(offset, info.chunkSize);
+      let chunk: Uint8Array;
+      try {
+        chunk = await readChunk(offset, info.chunkSize);
+      } catch (cause) {
+        throw Object.assign(cause instanceof Error ? cause : new Error(String(cause)), { code: "upload-read-failed" });
+      }
       if (!chunk.byteLength) throw new Error(t("errors.localFileShortRead"));
       const payload = new Uint8Array(8 + chunk.byteLength);
       writeU64(payload, 0, offset);
@@ -4494,9 +4659,17 @@ async function uploadSource(name: string, size: number, readChunk: (offset: numb
       await ack;
       offset = nextOffset;
     }
-    await window.dbxPlugin.invoke("sftp/upload/finish", { taskId: info.taskId }, { timeoutMs: 30 * 60 * 1000 });
+    // finish RPC 只把远端推送交给 sidecar 后台任务就返回（多 GB 文件的推送
+    // 可达数十分钟，长持 RPC 会被桥上任何一端的 deadline 判死并"自动取消"，
+    // issue #60）；真正的完成/失败由终态 progress 事件回传，这里等它落地。
+    try {
+      await window.dbxPlugin.invoke("sftp/upload/finish", { taskId: info.taskId }, { timeoutMs: 60_000 });
+    } catch (cause) {
+      throw Object.assign(cause instanceof Error ? cause : new Error(String(cause)), { code: "upload-start-failed" });
+    }
+    await waitForTransferCompletion(info.taskId);
   } catch (cause) {
-    await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: info.taskId }).catch(() => undefined);
+    await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: info.taskId, reason: transferCancelReason(cause) }).catch(() => undefined);
     throw cause;
   }
 }
@@ -4508,7 +4681,7 @@ function waitForUploadAck(taskId: string, nextOffset: number) {
       try {
         const status = await window.dbxPlugin.invoke<{ transferred: number; status: string }>("sftp/transfer/status", { taskId });
         if (status.transferred >= nextOffset && status.status === "running") resolve();
-        else reject(new Error(t("errors.uploadAckTimeout")));
+        else reject(Object.assign(new Error(t("errors.uploadAckTimeout")), { code: "upload-ack-timeout" }));
       } catch (cause) {
         reject(cause instanceof Error ? cause : new Error(String(cause)));
       }
@@ -4537,6 +4710,11 @@ function probeLocalCapabilities() {
 
 async function downloadEntry(entry: SftpEntry) {
   fileMenu.value = undefined;
+  // 目录条目走递归文件夹下载（tree/start + 同一分块管线）；文件沿用单文件管线。
+  if (entry.kind === "directory") {
+    await downloadDirectoryEntry(entry);
+    return;
+  }
   openTransferPanel();
   if (!session.value || entry.kind !== "file") return;
   // Prefer the sidecar local sink on desktop so completed downloads retain a
@@ -4573,7 +4751,7 @@ async function downloadEntry(entry: SftpEntry) {
       downloadDir: dirOverride || loadDownloadDir() || undefined,
       conflict: conflict === "overwrite" ? "overwrite" : undefined,
     });
-    transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued" };
+    transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued", joinedAt: Date.now() };
     target = fileTransfer ? await fileTransfer.beginSave({ name: info.fileName, size: info.size }) : undefined;
     let offset = 0;
     while (offset < info.size) {
@@ -4654,6 +4832,132 @@ async function downloadEntry(entry: SftpEntry) {
       // 失败闭环：横幅带「重试」，按原入口完整重跑（含询问/冲突流程）。
       showError(cause, "sftp", () => void downloadEntry(entry));
     }
+  }
+}
+
+// —— 递归文件夹下载（issue #46）：目录条目 → sftp/download/tree/start ——
+// 复用单文件下载的分块循环（saveToLocal 语义：字节留在 sidecar 落盘，前端
+// 只跟进度）；与文件下载的差异：必须本机落盘（web/docker 无本地文件系统时
+// 不可用），循环跑到 eof 为止（空树也会先收到一次空 eof 块），根名撞车由
+// sidecar 自动让位（无「覆盖」语义），取消/未完成时 sidecar 整树删除。
+async function downloadDirectoryEntry(entry: SftpEntry) {
+  fileMenu.value = undefined;
+  openTransferPanel();
+  if (!session.value || entry.kind !== "directory") return;
+  const local = await probeLocalCapabilities();
+  if (!local?.canSaveLocal) {
+    showError(new Error(t("folderDownload.unsupported")));
+    return;
+  }
+  // 「使用默认地址」关闭时先选保存目录；取消则整次下载不发生。
+  let dirOverride = "";
+  let setDefaultAfter = false;
+  if (!loadDownloadUseDefaultDir()) {
+    const chosen = await askDownloadTarget(entry.name);
+    if (chosen === undefined) return;
+    dirOverride = chosen.dir.trim();
+    setDefaultAfter = chosen.setDefault;
+  }
+  let info: DownloadInfo | undefined;
+  try {
+    // start 里做远端递归扫描（有界）：树很大时这一步本身耗时，给足超时。
+    info = await window.dbxPlugin.invoke<DownloadInfo>("sftp/download/tree/start", {
+      sessionId: session.value.sessionId,
+      remotePath: pathFromUri(entry.uri),
+      downloadDir: dirOverride || loadDownloadDir() || undefined,
+    }, { timeoutMs: 10 * 60 * 1000 });
+    transferTasks[info.taskId] = {
+      taskId: info.taskId,
+      sessionId: session.value.sessionId,
+      direction: "download",
+      fileName: info.fileName,
+      size: info.size,
+      transferred: 0,
+      status: "running",
+      fileCount: info.fileCount,
+    };
+    let offset = 0;
+    while (true) {
+      await waitWhilePaused(info.taskId);
+      const chunkPromise = waitForDownloadChunk(info.taskId, offset);
+      const nextPromise = window.dbxPlugin.invoke<{ length: number; eof: boolean }>("sftp/download/next", { taskId: info.taskId, offset });
+      // 取消会通过分块等待器中断；吞掉在途请求的拒绝避免 unhandled rejection。
+      nextPromise.catch(() => undefined);
+      const result = await nextPromise;
+      const chunk = await chunkPromise;
+      if (!result.eof && result.length === 0) throw new Error(t("errors.downloadEmptyChunk"));
+      offset += result.length;
+      if (chunk.byteLength && chunk.byteLength !== result.length) throw new Error(t("errors.downloadChunkLength"));
+      const task = transferTasks[info.taskId];
+      if (task) {
+        task.status = "running";
+        task.transferred = offset;
+      }
+      if (result.eof) break;
+    }
+    const finish = await window.dbxPlugin.invoke<FolderDownloadFinish>("sftp/download/finish", { taskId: info.taskId }, { timeoutMs: 30 * 60 * 1000 });
+    cancelledTransferTasks.delete(info.taskId);
+    const outcome = folderDownloadOutcome(finish);
+    const task = transferTasks[info.taskId];
+    if (task) {
+      task.status = "completed";
+      task.transferred = info.size;
+      if (outcome.localPath) task.localPath = outcome.localPath;
+      task.failedCount = outcome.failedCount || undefined;
+      task.failureSample = outcome.failureSample || undefined;
+      task.currentFile = undefined;
+    }
+    const revealActions = outcome.localPath
+      ? [
+          {
+            label: t("revealInFolder"),
+            run: () => {
+              const savedPath = outcome.localPath;
+              if (savedPath) void revealTransferTarget(savedPath);
+            },
+          },
+        ]
+      : [];
+    let message: string;
+    if (outcome.partial) {
+      message = t("folderDownload.completedWithFailures", { path: outcome.localPath, count: outcome.failedCount, total: outcome.fileCount });
+    } else {
+      message = t("downloadedToDir", { count: outcome.fileCount, path: outcome.localPath });
+    }
+    if (outcome.skippedCount) message += t("folderDownload.skippedNote", { count: outcome.skippedCount });
+    showNotice(message, revealActions);
+    if (setDefaultAfter) applyChosenDirAsDefault(dirOverride);
+  } catch (cause) {
+    if (info) {
+      const waiter = downloadChunkWaiters.get(info.taskId);
+      if (waiter) {
+        window.clearTimeout(waiter.timer);
+        downloadChunkWaiters.delete(info.taskId);
+      }
+      await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: info.taskId }).catch(() => undefined);
+      if (cancelledTransferTasks.delete(info.taskId)) {
+        const task = transferTasks[info.taskId];
+        if (task) task.status = "cancelled";
+        showNotice(t("transferStatus.cancelled"));
+      } else {
+        showError(cause, "sftp", () => void downloadDirectoryEntry(entry));
+      }
+    } else {
+      showError(cause, "sftp", () => void downloadDirectoryEntry(entry));
+    }
+  }
+}
+
+// 多选批量下载：文件与目录混选，逐项走各自管线（单项失败不阻断剩余项）。
+async function batchDownload() {
+  const menu = fileMenu.value;
+  fileMenu.value = undefined;
+  if (!menu) return;
+  const uris = menu.selection.length ? menu.selection : [menu.entry.uri];
+  const targets = entries.value.filter((entry) => uris.includes(entry.uri));
+  for (const entry of targets) {
+    if (entry.kind !== "file" && entry.kind !== "directory") continue;
+    await downloadEntry(entry);
   }
 }
 
@@ -4739,7 +5043,8 @@ async function cancelTransfer(task: TransferTask) {
     }
     cancelledTransferTasks.add(task.taskId);
   }
-  await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: task.taskId }).catch((cause) => showError(cause));
+  // reason=user 让后端账本把"用户主动取消"与异常清理区分开（issue #60）。
+  await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: task.taskId, reason: "user" }).catch((cause) => showError(cause));
 }
 
 async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T) => Promise<void>) {
@@ -6840,6 +7145,22 @@ function transferPercent(task: TransferTask) {
   return task.size > 0 ? Math.min(100, Math.round((task.transferred / task.size) * 100)) : task.status === "completed" ? 100 : 0;
 }
 
+/** staging 阶段进度条走不定态（推送计数尚未开始），uploading 用真实百分比。 */
+function transferBarValue(task: TransferTask): number | undefined {
+  return task.phase === "staging" ? undefined : transferPercent(task);
+}
+
+/** staging 行展示的字节数：spool 进度；其余阶段是已推送/已接收计数。 */
+function transferShownBytes(task: TransferTask): number {
+  return task.phase === "staging" ? task.staged ?? 0 : task.transferred;
+}
+
+/** 精确字节数 tooltip：化解 5.9GB(十进制) vs 5.49GiB(二进制) 的口径困惑（issue #60）。 */
+function transferBytesTitle(task: TransferTask): string | undefined {
+  if (!(task.size > 0)) return undefined;
+  return `${transferShownBytes(task).toLocaleString()} / ${task.size.toLocaleString()} bytes`;
+}
+
 function readU64(bytes: Uint8Array, offset: number) {
   return Number(new DataView(bytes.buffer, bytes.byteOffset + offset, 8).getBigUint64(0, false));
 }
@@ -7198,7 +7519,7 @@ onBeforeUnmount(() => {
               <button class="icon-button icon-violet" :title="t('customizeColumns')" @click.stop="toggleColumnsMenu"><Columns3 /></button>
             </PopoverAnchor>
             <PopoverContent class="popover columns-popover" align="end" :side-offset="5">
-            <label v-for="column in (['size', 'modified', 'permissions'] as SftpColumn[])" :key="column"><input type="checkbox" :checked="visibleColumns.includes(column)" @change="toggleColumn(column)" />{{ t(column) }}</label>
+            <label v-for="column in (['size', 'modified', 'owner', 'group', 'permissions'] as SftpColumn[])" :key="column"><input type="checkbox" :checked="visibleColumns.includes(column)" @change="toggleColumn(column)" />{{ t(column) }}</label>
             <hr class="columns-popover-separator" />
             <label :title="t('sftpPane.defaultOpenHint')"><input type="checkbox" :checked="sftpPaneDefaultOpen" @change="toggleSftpPaneDefaultOpen" />{{ t("sftpPane.defaultOpen") }}</label>
             </PopoverContent>
@@ -7216,10 +7537,15 @@ onBeforeUnmount(() => {
             <h3>{{ t("transfers") }}</h3>
             <div v-if="!transferList.length" class="empty compact">{{ t("noTransfers") }}</div>
             <article v-for="task in transferList" :key="task.taskId" class="transfer-card">
-              <div class="transfer-title"><FileUp v-if="task.direction === 'upload'" /><Download v-else /><span>{{ task.fileName || task.taskId }}</span><strong>{{ transferPercent(task) }}%</strong></div>
-              <progress :value="transferPercent(task)" max="100" />
-              <div class="transfer-meta"><span>{{ t(`transferStatus.${task.status}`) }}</span><span>{{ formatBytes(task.transferred) }} / {{ formatBytes(task.size) }}</span><span v-if="transferSpeeds[task.taskId]">{{ formatBytes(transferSpeeds[task.taskId]) }}/s</span></div>
+              <div class="transfer-title"><FileUp v-if="task.direction === 'upload'" /><Download v-else /><span>{{ task.fileName || task.taskId }}</span><strong v-if="task.phase !== 'staging'">{{ transferPercent(task) }}%</strong></div>
+              <progress :value="transferBarValue(task)" max="100" />
+              <div class="transfer-meta"><span>{{ t(`transferStatus.${task.status}`) }}</span><span :title="transferBytesTitle(task)">{{ formatBytes(transferShownBytes(task)) }} / {{ formatBytes(task.size) }}</span><span v-if="transferSpeeds[task.taskId]">{{ formatBytes(transferSpeeds[task.taskId]) }}/s</span></div>
+              <!-- 目录下载：在传文件相对路径，让长传输有可感知的推进。 -->
+              <p v-if="task.currentFile" class="transfer-path mono" :title="task.currentFile">{{ task.currentFile }}</p>
               <p v-if="task.localPath" class="transfer-path mono" :title="task.localPath">{{ task.localPath }}</p>
+              <!-- 目录下载部分失败的汇总由完成 toast 承担：failedCount 与终态
+                   同拍赋值，终态卡随即转入历史区，活跃卡上的失败行永远渲染
+                   不到（UI 回归确认），故不再放置死分支。 -->
               <div v-if="transferPausable(task.status) || task.status === 'queued' || task.status === 'running' || task.localPath" class="transfer-actions">
                 <button v-if="transferPausable(task.status)" class="icon-button" :title="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" :aria-label="t(pausedTaskIds.has(task.taskId) ? 'transferResume' : 'transferPause')" @click="toggleTransferPause(task)"><Play v-if="pausedTaskIds.has(task.taskId)" /><Pause v-else /></button>
                 <button v-if="task.status === 'queued' || task.status === 'running'" class="icon-button" :title="t('cancel')" :aria-label="t('cancel')" @click="cancelTransfer(task)"><X /></button>
@@ -7664,7 +7990,27 @@ onBeforeUnmount(() => {
           <button class="icon-button" :title="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
           <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
           <button class="icon-button icon-cyan" :title="t('refresh')" :disabled="!connected || loadingFiles" @click="loadDirectory()"><RefreshCw :class="{ spinning: loadingFiles }" /></button>
-          <input v-model="currentPath" spellcheck="false" @keydown.enter="submitPathInput" />
+          <!-- #54 路径栏双态：非编辑态把当前路径渲染成可点击分段（末段为当前位置），
+               点击分段直接回跳、点击分段外区域进入编辑；编辑态是原先的完整输入框，
+               提交后回到分段展示。分段切分走 remotePathInput（有单测）。 -->
+          <div class="path-bar">
+            <input
+              v-show="pathBarEditing"
+              ref="pathBarInputEl"
+              v-model="currentPath"
+              spellcheck="false"
+              @keydown.enter="submitPathInput"
+              @keydown.esc="cancelPathBarEdit"
+              @blur="pathBarEditing = false"
+            />
+            <nav v-show="!pathBarEditing" class="path-crumbs" tabindex="0" @click="beginPathBarEdit" @keydown.enter.self.prevent="beginPathBarEdit">
+              <template v-for="(crumb, index) in pathCrumbs" :key="crumb.path">
+                <span v-if="index" class="path-crumb-sep" aria-hidden="true">/</span>
+                <button v-if="index < pathCrumbs.length - 1" class="path-crumb mono" :title="crumb.path" @click.stop="goToPath(crumb.path)">{{ crumb.name }}</button>
+                <span v-else class="path-crumb current mono" :title="crumb.path" aria-current="location">{{ crumb.name }}</span>
+              </template>
+            </nav>
+          </div>
           <div>
             <Popover :open="bookmarkSaveOpen" @update:open="(open) => { if (!open) bookmarkSaveOpen = false; }">
               <PopoverAnchor as-child>
@@ -7781,6 +8127,9 @@ onBeforeUnmount(() => {
                 <button @click="toggleSort('name')">{{ t("name") }}<component :is="sortIcon('name')" /></button>
                 <button v-if="visibleColumns.includes('size')" @click="toggleSort('size')">{{ t("size") }}<component :is="sortIcon('size')" /></button>
                 <button v-if="visibleColumns.includes('modified')" @click="toggleSort('modified')">{{ t("modified") }}<component :is="sortIcon('modified')" /></button>
+                <!-- 属主/属组（issue #34）：用户在前，缺失显示 "-"，不参与排序。 -->
+                <span v-if="visibleColumns.includes('owner')" :title="t('owner')">{{ t("owner") }}</span>
+                <span v-if="visibleColumns.includes('group')" :title="t('group')">{{ t("group") }}</span>
                 <span v-if="visibleColumns.includes('permissions')">{{ t("permissions") }}</span>
               </div>
               <div v-if="loadingFiles" class="empty"><Loader2 class="spinning" />{{ t("loading") }}</div>
@@ -7797,8 +8146,10 @@ onBeforeUnmount(() => {
                 @keydown="onFileRowKeydown($event, entry)"
               >
                 <span class="file-name">
-                  <Folder v-if="entry.kind === 'directory'" class="folder-icon" />
-                  <FileIcon v-else-if="entry.kind === 'file'" />
+                  <!-- issue #36：图标只认 sftpEntryIconKind —— 仅 directory 出文件夹，
+                       other/未知一律文件图标，symlink 保持链接文档。 -->
+                  <Folder v-if="sftpEntryIconKind(entry.kind) === 'folder'" class="folder-icon" />
+                  <FileIcon v-else-if="sftpEntryIconKind(entry.kind) === 'file'" />
                   <FileText v-else />
                   <input
                     v-if="renamingPath === entry.uri"
@@ -7815,6 +8166,8 @@ onBeforeUnmount(() => {
                 </span>
                 <span v-if="visibleColumns.includes('size')" class="numeric">{{ entry.kind === "file" ? formatBytes(entry.size) : "" }}</span>
                 <span v-if="visibleColumns.includes('modified')">{{ formatModified(entry.modifiedAt) }}</span>
+                <span v-if="visibleColumns.includes('owner')" class="mono" :title="entry.owner">{{ entry.owner || "-" }}</span>
+                <span v-if="visibleColumns.includes('group')" class="mono" :title="entry.group">{{ entry.group || "-" }}</span>
                 <span v-if="visibleColumns.includes('permissions')" class="mono">{{ entry.permissions }}</span>
               </button>
               <div v-if="!loadingFiles && !visibleEntries.length" class="empty">{{ entries.length ? t("sftpSearch.noMatch") : t("emptyFolder") }}</div>
@@ -7823,6 +8176,7 @@ onBeforeUnmount(() => {
               <ContextMenuContent>
                 <!-- 多选感知：右键时已多选（selection > 1）→ 菜单整体切换为批量区，单项动作隐藏 -->
                 <template v-if="fileMenu && fileMenu.selection.length > 1">
+                  <ContextMenuItem @select="batchDownload"><Download />{{ t("download") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @select="batchArchive()"><Archive />{{ t("sftpBatch.archive") }}</ContextMenuItem>
                   <ContextMenuItem variant="destructive" :disabled="!canWrite || archiveBusy || batchDeleteSubmitting" @select="batchDeleteOpen = true"><Trash2 />{{ t("sftpBatch.delete") }}</ContextMenuItem>
                   <ContextMenuSeparator />
@@ -7830,7 +8184,7 @@ onBeforeUnmount(() => {
                 </template>
                 <template v-else-if="fileMenu">
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @select="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</ContextMenuItem>
-                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file'" @select="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</ContextMenuItem>
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file' || fileMenu.entry.kind === 'directory'" @select="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="beginRename(fileMenu.entry)"><Pencil />{{ t("rename") }}</ContextMenuItem>
                   <ContextMenuItem @select="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</ContextMenuItem>
@@ -7845,10 +8199,11 @@ onBeforeUnmount(() => {
                   <ContextMenuSeparator />
                   <ContextMenuItem variant="destructive" :disabled="!canWrite" @select="deleteTarget = fileMenu.entry"><Trash2 />{{ t("delete") }}</ContextMenuItem>
                 </template>
-                <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 刷新 -->
+                <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 上传文件 / 刷新 -->
                 <template v-else>
                   <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('mkdir')"><FolderPlus />{{ t("newFolder") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('newFile')"><FilePlus />{{ t("sftpNewFile.action") }}</ContextMenuItem>
+                  <ContextMenuItem :disabled="!connected || !canWrite" @select="blankMenuAction('upload')"><FileUp />{{ t("upload") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!connected || loadingFiles" @select="blankMenuAction('refresh')"><RefreshCw />{{ t("refresh") }}</ContextMenuItem>
                 </template>
               </ContextMenuContent>

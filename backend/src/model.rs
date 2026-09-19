@@ -801,6 +801,13 @@ pub struct SftpEntry {
     pub permissions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// Entry owner, names preferred over numeric ids (same semantics as
+    /// `sftp/stat`); only populated when the listing requests it. Missing
+    /// stays absent so the UI renders "-".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

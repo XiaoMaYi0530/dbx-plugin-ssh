@@ -14,7 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::model::normalize_remote_path;
-use crate::ssh::SshRuntime;
+use crate::ssh::{apply_preserved_permissions, SshRuntime};
 
 /// Largest payload [`write_file`] accepts in one call; bigger files must go
 /// through the streaming upload slot (`sftp/upload/start`).
@@ -294,14 +294,18 @@ fn direct_write_paths(target: &str, task_id: &str) -> (String, String) {
 }
 
 /// Renames a finished temporary file onto its target; an existing target is
-/// moved aside first and restored if the rename fails.
+/// moved aside first and restored if the rename fails. The target's
+/// permission bits ride along onto the staged file, so an overwritten script
+/// keeps its executable bit (issue #37).
 async fn commit_temporary_file(
     sftp: &Arc<AsyncMutex<SftpSession>>,
     temporary: &str,
     target: &str,
     backup: &str,
 ) -> Result<(), String> {
-    let target_exists = sftp.lock().await.metadata(target.to_string()).await.is_ok();
+    let target_attributes = sftp.lock().await.metadata(target.to_string()).await.ok();
+    apply_preserved_permissions(sftp, temporary, target_attributes.as_ref()).await?;
+    let target_exists = target_attributes.is_some();
     if target_exists {
         sftp.lock()
             .await

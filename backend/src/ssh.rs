@@ -40,6 +40,7 @@ use crate::model::{
 };
 use crate::quick_commands;
 use crate::session_recording;
+use crate::sftp_tree;
 use crate::ssh_algorithms;
 use crate::sudo_profiles;
 use crate::transfer_history;
@@ -867,11 +868,40 @@ struct DownloadSink {
 #[derive(Clone)]
 struct DownloadState {
     session_id: String,
+    /// Single-file download: the file itself. Folder download: the root
+    /// directory (`tree` is `Some` in that case).
     remote_path: String,
     file_name: String,
+    /// Single-file download: file size. Folder download: aggregate byte total
+    /// across the tree (the progress denominator).
     size: u64,
+    /// Single-file download: next chunk offset. Folder download: aggregate
+    /// transferred bytes across finished files.
     next_offset: u64,
     sink: Option<Arc<DownloadSink>>,
+    /// Present only for recursive folder downloads (`sftp/download/tree/start`);
+    /// the chunk/finish/cancel paths branch on it while sharing the registry,
+    /// progress events and cancel plumbing with plain file downloads.
+    tree: Option<TreeDownloadState>,
+}
+
+/// Live state of one recursive folder download. Files stream through the same
+/// chunked pipeline one at a time: `current` is in flight into `sink`'s
+/// staging `.part` file, which is renamed into place as soon as the file is
+/// complete, so a mid-tree failure leaves no partial file behind.
+#[derive(Clone)]
+struct TreeDownloadState {
+    /// Fresh, collision-free local root directory created by `start`; the
+    /// whole tree is removed from disk when the task is cancelled.
+    root_local: PathBuf,
+    files: VecDeque<sftp_tree::TreeFile>,
+    current: Option<sftp_tree::TreeFile>,
+    current_offset: u64,
+    sink: Option<Arc<DownloadSink>>,
+    file_count: u64,
+    files_done: u64,
+    skipped: u64,
+    failures: Vec<Value>,
 }
 
 struct FinishingUpload {
@@ -880,6 +910,66 @@ struct FinishingUpload {
     size: u64,
     transferred: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
+    /// Cancel reason slug supplied by the workbench ("user", "ack-timeout",
+    /// ...); read by the background push task so the surfaced error tells a
+    /// user abort apart from an error-triggered cleanup.
+    cancel_reason: Arc<Mutex<Option<String>>>,
+}
+
+/// Upload progress phase: `staging` = bytes buffered into the local spool
+/// file, `uploading` = bytes actually pushed to the SFTP server. The two
+/// counters restart independently, and the workbench needs the marker to keep
+/// its progress bar and speed estimate honest (issue #60).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UploadPhase {
+    Staging,
+    Uploading,
+}
+
+impl UploadPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            UploadPhase::Staging => "staging",
+            UploadPhase::Uploading => "uploading",
+        }
+    }
+}
+
+/// Shared shape of every upload progress event; `fileName` is only present on
+/// task-start events (the workbench keeps the name it already displayed).
+fn upload_progress_payload(
+    task_id: &str,
+    session_id: &str,
+    file_name: Option<&str>,
+    transferred: u64,
+    size: u64,
+    phase: UploadPhase,
+    status: &str,
+) -> Value {
+    let mut payload = json!({
+        "taskId": task_id,
+        "sessionId": session_id,
+        "direction": "upload",
+        "transferred": transferred,
+        "size": size,
+        "phase": phase.as_str(),
+        "status": status,
+    });
+    if let Some(file_name) = file_name {
+        payload["fileName"] = json!(file_name);
+    }
+    payload
+}
+
+/// Error text for a cancelled upload. The optional reason slug comes from the
+/// workbench so "Upload cancelled by user" reads differently from an
+/// error-triggered cleanup ("Upload cancelled (ack-timeout)").
+fn upload_cancel_error(reason: Option<&str>) -> String {
+    match reason.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("user") => "Upload cancelled by user".to_string(),
+        Some(reason) => format!("Upload cancelled ({reason})"),
+        None => "Upload cancelled".to_string(),
+    }
 }
 
 /// Background `sudo -nv` refresh loop keeping a connection's sudo timestamp
@@ -977,6 +1067,30 @@ fn session_info_payload(
         "port": endpoint.port,
         "username": endpoint.username,
     })
+}
+
+/// Total order for `sftp/transfer/history` rows (issue #18). Newest first by
+/// `startedAt`; rows without one — live snapshots whose start record never
+/// landed on disk — count as the most recent activity and lead the list;
+/// `taskId` breaks every tie so the order no longer depends on the HashMap
+/// iteration order of the in-memory registries. Pure so tests can exercise
+/// it without a runtime.
+fn compare_history_rows(a: &Value, b: &Value) -> std::cmp::Ordering {
+    fn started(task: &Value) -> Option<u64> {
+        task.get("startedAt").and_then(Value::as_u64)
+    }
+    fn task_id(task: &Value) -> &str {
+        task.get("taskId").and_then(Value::as_str).unwrap_or("")
+    }
+    match (started(a), started(b)) {
+        (Some(left), Some(right)) => right.cmp(&left).then_with(|| task_id(a).cmp(task_id(b))),
+        // Rows without a timestamp (live snapshots) lead the list as the
+        // most recent activity; `Less`/`Greater` place a timestamped row
+        // strictly after a timestamp-less one.
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => task_id(a).cmp(task_id(b)),
+    }
 }
 
 pub struct SshRuntime {
@@ -3016,18 +3130,34 @@ impl SshRuntime {
         &self,
         session_id: &str,
         path: &str,
+        include_owner: bool,
     ) -> Result<Vec<SftpEntry>, String> {
         let sftp = self.sftp(session_id).await?;
         let path = normalize_remote_path(path)?;
-        let entries = sftp.lock().await.read_dir(path).await.map_err(sftp_error)?;
+        let entries = sftp
+            .lock()
+            .await
+            .read_dir(path.clone())
+            .await
+            .map_err(sftp_error)?;
         let mut result = entries
             .map(|entry| {
                 let metadata = entry.metadata();
-                let kind = match entry.file_type() {
-                    FileType::File => "file",
-                    FileType::Dir => "directory",
-                    FileType::Symlink => "symlink",
-                    FileType::Other => "other",
+                let kind = classify_entry_kind(entry.file_type());
+                let (owner, group) = if include_owner {
+                    // Names first (SFTPv4+), numeric ids as the v3 fallback —
+                    // the same semantics `sftp/stat` already documents.
+                    let owner = metadata
+                        .user
+                        .clone()
+                        .or_else(|| metadata.uid.map(|uid| uid.to_string()));
+                    let group = metadata
+                        .group
+                        .clone()
+                        .or_else(|| metadata.gid.map(|gid| gid.to_string()));
+                    (owner, group)
+                } else {
+                    (None, None)
                 };
                 SftpEntry {
                     name: entry.file_name(),
@@ -3037,9 +3167,18 @@ impl SshRuntime {
                     modified_at: metadata.mtime.map(u64::from),
                     permissions: metadata.permissions.map(format_permissions),
                     content_type: content_type_for_path(&entry.path()),
+                    owner,
+                    group,
                 }
             })
             .collect::<Vec<_>>();
+        if include_owner {
+            // One extra read-only round trip upgrades numeric ids to names on
+            // SFTPv3 servers (OpenSSH): `ls -l` puts owner/group in fields 3/4.
+            // Any failure (no shell, no `ls`, timeout) keeps the numeric or
+            // absent values, never the listing itself.
+            enrich_owner_names(self, session_id, &path, &mut result).await;
+        }
         result.sort_by(|left, right| {
             let left_dir = left.kind == "directory";
             let right_dir = right.kind == "directory";
@@ -3928,7 +4067,15 @@ impl SshRuntime {
             emitter
                 .event(
                     "sftp/transfer/progress",
-                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": file_name, "transferred": resume_offset, "size": size, "status": "running" }),
+                    upload_progress_payload(
+                        &task_id,
+                        &session_id,
+                        Some(&file_name),
+                        resume_offset,
+                        size,
+                        UploadPhase::Staging,
+                        "running",
+                    ),
                 )
                 .map_err(plugin_error)?;
             let connection_id = self.session_connection_id(&session_id).await;
@@ -3976,7 +4123,15 @@ impl SshRuntime {
         emitter
             .event(
                 "sftp/transfer/progress",
-                json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": file_name, "transferred": 0, "size": size, "status": "queued" }),
+                upload_progress_payload(
+                    &task_id,
+                    &session_id,
+                    Some(file_name),
+                    0,
+                    size,
+                    UploadPhase::Staging,
+                    "queued",
+                ),
             )
             .map_err(plugin_error)?;
         let connection_id = self.session_connection_id(&session_id).await;
@@ -4080,7 +4235,15 @@ impl SshRuntime {
         emitter
             .event(
                 "sftp/transfer/progress",
-                json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "transferred": upload.received, "size": upload.expected_size, "status": "running" }),
+                upload_progress_payload(
+                    task_id,
+                    &upload.session_id,
+                    None,
+                    upload.received,
+                    upload.expected_size,
+                    UploadPhase::Staging,
+                    "running",
+                ),
             )
             .map_err(plugin_error)?;
         emitter
@@ -4091,8 +4254,16 @@ impl SshRuntime {
             .map_err(plugin_error)
     }
 
+    /// `sftp/upload/finish`: the spool holds the complete file, so hand the
+    /// remote push to a background task on the shared runtime and return at
+    /// once. Holding this RPC open for the whole push used to expose every
+    /// multi-GB upload to RPC deadlines anywhere on the bridge (host,
+    /// workbench, sidecar): once the deadline fired the upload was cancelled
+    /// mid-flight even though nothing was wrong (issue #60). The background
+    /// task reports exclusively through `sftp/transfer/progress` events, which
+    /// no deadline can kill; `phase: "uploading"` marks its events.
     pub async fn finish_upload(
-        &self,
+        self: &Arc<Self>,
         task_id: &str,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
@@ -4126,6 +4297,7 @@ impl SshRuntime {
         drop(file);
         let transferred_bytes = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_reason = Arc::new(Mutex::new(None::<String>));
         self.finishing_uploads
             .lock()
             .map_err(|_| "Finishing upload registry is poisoned".to_string())?
@@ -4137,84 +4309,129 @@ impl SshRuntime {
                     size: expected_size,
                     transferred: transferred_bytes.clone(),
                     cancelled: cancelled.clone(),
+                    cancel_reason: cancel_reason.clone(),
                 },
             );
-        let result: Result<(), String> = async {
-            let sftp = self.sftp(&session_id).await?;
-            let (temporary, backup) = remote_transfer_paths(&remote_path, task_id)?;
-            let mut source = tokio::fs::File::open(&local_path)
-                .await
-                .map_err(|error| format!("Failed to open upload spool file: {error}"))?;
-            let mut target = sftp
-                .lock()
-                .await
-                .create(temporary.clone())
-                .await
-                .map_err(sftp_error)?;
-            let mut transferred = 0_u64;
-            let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
-            loop {
-                if cancelled.load(Ordering::Acquire) {
-                    drop(target);
-                    let _ = sftp.lock().await.remove_file(temporary.clone()).await;
-                    return Err("Upload cancelled".to_string());
-                }
-                let read = source
-                    .read(&mut buffer)
+        let this = self.clone();
+        let emitter = emitter.clone();
+        let task_id = task_id.to_string();
+        let response_task_id = task_id.clone();
+        tokio::spawn(async move {
+            let result: Result<(), String> = async {
+                let sftp = this.sftp(&session_id).await?;
+                let (temporary, backup) = remote_transfer_paths(&remote_path, &task_id)?;
+                let mut source = tokio::fs::File::open(&local_path)
                     .await
-                    .map_err(|error| format!("Failed to read upload spool file: {error}"))?;
-                if read == 0 {
-                    break;
+                    .map_err(|error| format!("Failed to open upload spool file: {error}"))?;
+                let mut target = sftp
+                    .lock()
+                    .await
+                    .create(temporary.clone())
+                    .await
+                    .map_err(sftp_error)?;
+                let mut transferred = 0_u64;
+                let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        let reason = cancel_reason
+                            .lock()
+                            .map(|reason| reason.clone())
+                            .unwrap_or_default();
+                        let error = upload_cancel_error(reason.as_deref());
+                        eprintln!("[sftp] upload {task_id} aborted by cancel ({error})");
+                        drop(target);
+                        let _ = sftp.lock().await.remove_file(temporary.clone()).await;
+                        return Err(error);
+                    }
+                    let read = source
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|error| format!("Failed to read upload spool file: {error}"))?;
+                    if read == 0 {
+                        break;
+                    }
+                    if let Err(error) = target.write_all(&buffer[..read]).await {
+                        drop(target);
+                        let _ = sftp.lock().await.remove_file(temporary.clone()).await;
+                        return Err(format!("SFTP upload failed: {error}"));
+                    }
+                    transferred = transferred.saturating_add(read as u64);
+                    transferred_bytes.store(transferred, Ordering::Release);
+                    emitter
+                        .event(
+                            "sftp/transfer/progress",
+                            upload_progress_payload(
+                                &task_id,
+                                &session_id,
+                                None,
+                                transferred,
+                                expected_size,
+                                UploadPhase::Uploading,
+                                "running",
+                            ),
+                        )
+                        .map_err(plugin_error)?;
                 }
-                if let Err(error) = target.write_all(&buffer[..read]).await {
-                    drop(target);
-                    let _ = sftp.lock().await.remove_file(temporary.clone()).await;
-                    return Err(format!("SFTP upload failed: {error}"));
+                target
+                    .flush()
+                    .await
+                    .map_err(|error| format!("SFTP upload flush failed: {error}"))?;
+                drop(target);
+                commit_remote_file(&sftp, &temporary, &remote_path, &backup).await
+            }
+            .await;
+            match this.finishing_uploads.lock() {
+                Ok(mut finishing) => {
+                    finishing.remove(&task_id);
                 }
-                transferred = transferred.saturating_add(read as u64);
-                transferred_bytes.store(transferred, Ordering::Release);
-                emitter
-                    .event(
-                        "sftp/transfer/progress",
-                        json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "transferred": transferred, "size": expected_size, "status": "running" }),
-                    )
-                    .map_err(plugin_error)?;
+                Err(_) => eprintln!("[sftp] upload {task_id} finishing registry poisoned"),
             }
-            target
-                .flush()
-                .await
-                .map_err(|error| format!("SFTP upload flush failed: {error}"))?;
-            drop(target);
-            commit_remote_file(&sftp, &temporary, &remote_path, &backup).await
-        }
-        .await;
-        self.finishing_uploads
-            .lock()
-            .map_err(|_| "Finishing upload registry is poisoned".to_string())?
-            .remove(task_id);
-        let _ = tokio::fs::remove_file(&local_path).await;
-        remove_upload_meta(&self.transfer_dir, task_id);
-        match result {
-            Ok(()) => {
-                let task = json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": remote_path.rsplit('/').next().unwrap_or("upload"), "transferred": expected_size, "size": expected_size, "status": "completed" });
-                self.record_transfer(task.clone());
-                emitter
-                    .event("sftp/transfer/progress", task)
-                    .map_err(plugin_error)?;
-                Ok(json!({ "success": true, "taskId": task_id, "transferred": expected_size }))
+            let _ = tokio::fs::remove_file(&local_path).await;
+            remove_upload_meta(&this.transfer_dir, &task_id);
+            match result {
+                Ok(()) => {
+                    let task = upload_progress_payload(
+                        &task_id,
+                        &session_id,
+                        Some(remote_path.rsplit('/').next().unwrap_or("upload")),
+                        expected_size,
+                        expected_size,
+                        UploadPhase::Uploading,
+                        "completed",
+                    );
+                    this.record_transfer(task.clone());
+                    if let Err(error) = emitter.event("sftp/transfer/progress", task) {
+                        eprintln!(
+                            "[sftp] upload {task_id} completion event failed: {}",
+                            error.message
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[sftp] upload {task_id} push failed: {error}");
+                    let status = if cancelled.load(Ordering::Acquire) {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    let mut task = upload_progress_payload(
+                        &task_id,
+                        &session_id,
+                        Some(remote_path.rsplit('/').next().unwrap_or("upload")),
+                        transferred_bytes.load(Ordering::Acquire),
+                        expected_size,
+                        UploadPhase::Uploading,
+                        status,
+                    );
+                    task["error"] = json!(error);
+                    this.record_transfer(task.clone());
+                    let _ = emitter.event("sftp/transfer/progress", task);
+                }
             }
-            Err(error) => {
-                let status = if cancelled.load(Ordering::Acquire) {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
-                let task = json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": remote_path.rsplit('/').next().unwrap_or("upload"), "transferred": transferred_bytes.load(Ordering::Acquire), "size": expected_size, "status": status, "error": error });
-                self.record_transfer(task.clone());
-                let _ = emitter.event("sftp/transfer/progress", task);
-                Err(error)
-            }
-        }
+        });
+        Ok(
+            json!({ "success": true, "taskId": response_task_id, "phase": UploadPhase::Uploading.as_str(), "accepted": expected_size }),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4320,6 +4537,7 @@ impl SshRuntime {
                     size,
                     next_offset: offset,
                     sink,
+                    tree: None,
                 },
             );
         emitter
@@ -4342,6 +4560,309 @@ impl SshRuntime {
         )
     }
 
+    /// `sftp/download/tree/start`: recursive folder download. Pure SFTP — the
+    /// remote tree is walked with `read_dir` (no shell, no remote temp
+    /// archive), regular files stream one at a time through the same chunked
+    /// `sftp/download/next` pipeline as plain downloads, and the local layout
+    /// mirrors the remote one under a fresh, collision-free folder (empty
+    /// directories included). Symlinks are never followed (cycle protection);
+    /// per-file problems are recorded and skipped so one bad file cannot sink
+    /// the whole tree.
+    pub async fn start_tree_download(
+        &self,
+        session_id: &str,
+        remote_path: &str,
+        download_dir: Option<&str>,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        if self.active_transfer_count(session_id)? >= 3 {
+            return Err("This SSH session already has three active transfers".to_string());
+        }
+        let root_remote = normalize_remote_path(remote_path)?;
+        let sftp = self.sftp(session_id).await?;
+        let metadata = sftp
+            .lock()
+            .await
+            .symlink_metadata(root_remote.clone())
+            .await
+            .map_err(sftp_error)?;
+        if metadata.is_symlink() {
+            return Err(
+                "Refusing to download a symlink as a folder; download its target instead"
+                    .to_string(),
+            );
+        }
+        if !metadata.is_dir() {
+            return Err("Folder download needs a remote directory".to_string());
+        }
+        // 本地根目录：与单文件下载共用目录语义（偏好下载目录 / 自定义绝对
+        // 目录），根名撞车让位 " (n)"。落点在 start 时定死，任务取消或未完成
+        // 时整树删除，所以提前占名不会留下悬空目录。
+        let base_dir = download_dir
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                local_downloads::downloads_base_dir(|key| std::env::var_os(key), &self.data_dir)
+            });
+        if !base_dir.is_absolute() {
+            return Err("Download directory must be an absolute path".to_string());
+        }
+        std::fs::create_dir_all(&base_dir).map_err(|error| {
+            format!(
+                "Failed to create download directory '{}': {error}",
+                base_dir.display()
+            )
+        })?;
+        let root_name = root_remote
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("download");
+        let root_local = local_downloads::final_download_path(&base_dir, root_name, false);
+        std::fs::create_dir_all(&root_local).map_err(|error| {
+            format!(
+                "Failed to create download folder '{}': {error}",
+                root_local.display()
+            )
+        })?;
+        let scan = match scan_remote_tree(&sftp, &root_remote).await {
+            Ok(scan) => scan,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&root_local);
+                return Err(error);
+            }
+        };
+        // 本地目录骨架先行：空目录也保留。
+        for relative in &scan.dirs {
+            let Some(path) = sftp_tree::safe_tree_path(&root_local, relative) else {
+                continue;
+            };
+            if let Err(error) = std::fs::create_dir_all(&path) {
+                let _ = std::fs::remove_dir_all(&root_local);
+                return Err(format!(
+                    "Failed to create local folder '{}': {error}",
+                    path.display()
+                ));
+            }
+        }
+        let total = scan.total_bytes();
+        let file_count = scan.file_count();
+        let dir_count = scan.dir_count();
+        let skipped = scan.skipped;
+        let file_name = root_local
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root_name.to_string());
+        let task_id = Uuid::new_v4().to_string();
+        self.downloads
+            .lock()
+            .map_err(|_| "Download registry is poisoned".to_string())?
+            .insert(
+                task_id.clone(),
+                DownloadState {
+                    session_id: session_id.to_string(),
+                    remote_path: root_remote.clone(),
+                    file_name: file_name.clone(),
+                    size: total,
+                    next_offset: 0,
+                    sink: None,
+                    tree: Some(TreeDownloadState {
+                        root_local: root_local.clone(),
+                        files: VecDeque::from(scan.files),
+                        current: None,
+                        current_offset: 0,
+                        sink: None,
+                        file_count,
+                        files_done: 0,
+                        skipped,
+                        failures: scan.failures,
+                    }),
+                },
+            );
+        emitter
+            .event(
+                "sftp/transfer/progress",
+                json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "fileName": file_name, "transferred": 0, "size": total, "status": "queued", "fileCount": file_count }),
+            )
+            .map_err(plugin_error)?;
+        let connection_id = self.session_connection_id(session_id).await;
+        self.record_transfer_start(
+            &task_id,
+            session_id,
+            &connection_id,
+            "download",
+            &file_name,
+            total,
+        );
+        Ok(
+            json!({ "taskId": task_id, "fileName": file_name, "size": total, "chunkSize": TRANSFER_CHUNK_SIZE, "fileCount": file_count, "dirCount": dir_count, "skippedCount": skipped }),
+        )
+    }
+
+    /// Chunk pump for folder downloads. `next_offset` stays the aggregate byte
+    /// position across the tree; when the in-flight file completes it is
+    /// renamed into place and the next queued file opens within the same call,
+    /// so the caller's chunk loop is identical to a plain download. A tree
+    /// whose queue is drained answers with an empty eof chunk (this is also
+    /// how a zero-byte tree completes — the frontend loop runs until eof, not
+    /// until the byte total).
+    async fn download_tree_chunk(
+        &self,
+        task_id: &str,
+        offset: u64,
+        download: DownloadState,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        if offset != download.next_offset {
+            return Err(format!(
+                "Download offset mismatch: expected {}, received {offset}",
+                download.next_offset
+            ));
+        }
+        let sftp = self.sftp(&download.session_id).await?;
+        let Some(mut tree) = download.tree.clone() else {
+            return Err("Download task is not a folder download".to_string());
+        };
+        loop {
+            if tree.current.is_none() {
+                let Some(file) = tree.files.pop_front() else {
+                    // 队列耗尽：空树或全部走完。最后一批文件的改名/失败登记
+                    // 就发生在本次调用里，先把状态写回，finish 才能看到完整
+                    // 汇总；随后补发一个空 eof 块，让前端的分块等待器（只认
+                    // 二进制帧）与单文件语义保持一致。
+                    {
+                        let mut downloads = self
+                            .downloads
+                            .lock()
+                            .map_err(|_| "Download registry is poisoned".to_string())?;
+                        if let Some(current) = downloads.get_mut(task_id) {
+                            if let Some(tree_state) = current.tree.as_mut() {
+                                *tree_state = tree.clone();
+                            }
+                        }
+                    }
+                    let mut payload = Vec::with_capacity(8);
+                    payload.extend_from_slice(&offset.to_be_bytes());
+                    emitter
+                        .binary(&format!("sftp/download/{task_id}"), &payload)
+                        .map_err(plugin_error)?;
+                    return Ok(
+                        json!({ "taskId": task_id, "offset": offset, "length": 0, "eof": true, "fileName": download.file_name }),
+                    );
+                };
+                match open_tree_sink(&tree.root_local, &file.relative).await {
+                    Ok(sink) => {
+                        tree.sink = Some(Arc::new(sink));
+                        tree.current = Some(file);
+                        tree.current_offset = 0;
+                    }
+                    Err(error) => {
+                        tree.failures
+                            .push(json!({ "path": file.relative, "error": error }));
+                        continue;
+                    }
+                }
+            }
+            let file = tree.current.clone().expect("current file is present");
+            let remaining = file.size - tree.current_offset;
+            if remaining == 0 {
+                // 当前文件收尾：暂存 .part 改名落位（空文件也会在这一步真实
+                // 落地），失败记入汇总且不中断整树。
+                finalize_tree_current(self, &mut tree).await;
+                continue;
+            }
+            let mut source = match sftp.lock().await.open(file.remote_path.clone()).await {
+                Ok(source) => source,
+                Err(error) => {
+                    tree.failures
+                        .push(json!({ "path": file.relative, "error": sftp_error(error) }));
+                    discard_tree_current(&mut tree);
+                    continue;
+                }
+            };
+            if let Err(error) = source
+                .seek(std::io::SeekFrom::Start(tree.current_offset))
+                .await
+            {
+                tree.failures.push(json!({ "path": file.relative, "error": format!("SFTP download seek failed: {error}") }));
+                discard_tree_current(&mut tree);
+                continue;
+            }
+            let requested = remaining.min(TRANSFER_CHUNK_SIZE as u64) as usize;
+            let mut chunk = vec![0_u8; requested];
+            let length = match source.read(&mut chunk).await {
+                Ok(length) => length,
+                Err(error) => {
+                    tree.failures.push(json!({ "path": file.relative, "error": format!("SFTP download failed: {error}") }));
+                    discard_tree_current(&mut tree);
+                    continue;
+                }
+            };
+            if length == 0 {
+                // 远端文件比扫描时短：只记失败，不把半成品留在本地。
+                tree.failures.push(
+                    json!({ "path": file.relative, "error": "file shrank below its scanned size" }),
+                );
+                discard_tree_current(&mut tree);
+                continue;
+            }
+            chunk.truncate(length);
+            // 克隆 Arc 而非借用，写失败的清理路径需要 &mut tree。
+            if let Some(sink) = tree.sink.clone() {
+                if let Err(error) = sink.file.lock().await.write_all(&chunk).await {
+                    tree.failures.push(json!({ "path": file.relative, "error": format!("Failed to write local download file: {error}") }));
+                    discard_tree_current(&mut tree);
+                    continue;
+                }
+            }
+            tree.current_offset += length as u64;
+            // 文件耗尽即在本调用内收尾（改名落位）：eof 与落位必须同帧，否则
+            // eof 后调用方直接 finish，最后一个文件会被记成未传输。
+            if tree.current_offset >= file.size {
+                finalize_tree_current(self, &mut tree).await;
+            }
+            let next_offset = offset + length as u64;
+            let mut payload = Vec::with_capacity(8 + length);
+            payload.extend_from_slice(&offset.to_be_bytes());
+            payload.extend_from_slice(&chunk);
+            emitter
+                .binary(&format!("sftp/download/{task_id}"), &payload)
+                .map_err(plugin_error)?;
+            {
+                let mut downloads = self
+                    .downloads
+                    .lock()
+                    .map_err(|_| "Download registry is poisoned".to_string())?;
+                let current = downloads
+                    .get_mut(task_id)
+                    .ok_or("Download task was not found")?;
+                if current.next_offset != offset {
+                    return Err("Download task changed while a chunk was in flight".to_string());
+                }
+                current.next_offset = next_offset;
+                if let Some(tree_state) = current.tree.as_mut() {
+                    *tree_state = tree.clone();
+                }
+            }
+            let current_remaining = tree
+                .current
+                .as_ref()
+                .map(|file| file.size - tree.current_offset)
+                .unwrap_or(0);
+            let eof = sftp_tree::tree_eof(tree.files.len(), current_remaining);
+            emitter
+                .event(
+                    "sftp/transfer/progress",
+                    json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "transferred": next_offset, "size": download.size, "status": "running", "fileCount": tree.file_count, "fileIndex": tree.files_done + u64::from(tree.current.is_some()), "currentFile": tree.current.as_ref().map(|file| file.relative.clone()) }),
+                )
+                .map_err(plugin_error)?;
+            return Ok(
+                json!({ "taskId": task_id, "offset": offset, "length": length, "eof": eof, "fileName": download.file_name }),
+            );
+        }
+    }
+
     pub async fn download_chunk(
         &self,
         task_id: &str,
@@ -4358,6 +4879,11 @@ impl SshRuntime {
                 .cloned()
                 .ok_or("Download task was not found")?
         };
+        if download.tree.is_some() {
+            return self
+                .download_tree_chunk(task_id, offset, download, emitter)
+                .await;
+        }
         if offset != download.next_offset {
             return Err(format!(
                 "Download offset mismatch: expected {}, received {offset}",
@@ -4420,7 +4946,15 @@ impl SshRuntime {
         )
     }
 
-    pub fn cancel_transfer(&self, task_id: &str, emitter: &PluginEmitter) -> Result<(), String> {
+    /// `sftp/transfer/cancel`. `reason` is an optional workbench slug ("user",
+    /// "ack-timeout", ...) recorded in the ledger event so a cancellation can
+    /// be told apart from a server failure on the next bug report.
+    pub async fn cancel_transfer(
+        &self,
+        task_id: &str,
+        reason: Option<&str>,
+        emitter: &PluginEmitter,
+    ) -> Result<(), String> {
         let upload = self
             .uploads
             .lock()
@@ -4438,7 +4972,22 @@ impl SshRuntime {
             .get(task_id)
             .map(|upload| {
                 upload.cancelled.store(true, Ordering::Release);
-                json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.size, "transferred": upload.transferred.load(Ordering::Acquire), "status": "cancelled" })
+                if let Ok(mut slot) = upload.cancel_reason.lock() {
+                    if slot.is_none() {
+                        *slot = reason.map(str::to_string);
+                    }
+                }
+                let mut task = upload_progress_payload(
+                    task_id,
+                    &upload.session_id,
+                    Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                    upload.transferred.load(Ordering::Acquire),
+                    upload.size,
+                    UploadPhase::Uploading,
+                    "cancelled",
+                );
+                task["error"] = json!(upload_cancel_error(reason));
+                (task, upload.session_id.clone(), upload.remote_path.clone())
             });
         if let Some(upload) = upload.as_ref() {
             let _ = std::fs::remove_file(&upload.local_path);
@@ -4448,16 +4997,58 @@ impl SshRuntime {
             if let Some(sink) = download.sink.as_ref() {
                 let _ = std::fs::remove_file(&sink.part_path);
             }
+            // 文件夹下载的取消语义：整棵半成品目录删除，不在下载目录里留
+            // 部分内容（根目录是本任务创建的让位新目录，删除不伤及他物）。
+            if let Some(tree) = download.tree.as_ref() {
+                let _ = std::fs::remove_dir_all(&tree.root_local);
+            }
         }
         if upload.is_none() && download.is_none() && finishing.is_none() {
             return Err("Transfer task was not found".to_string());
         }
+        // 推送阶段取消的远端收尾提前：推送循环要到下一个分块边界才观察到
+        // cancelled 标志并自行删除远端临时文件，取消 RPC 返回后立刻列目录会
+        // 看见最长一个分块周期的 .part 残留（#60 回归记录的竞窗）。这里
+        // best-effort 提前删掉 .part。只删临时件，绝不碰 .backup——取消可能与
+        // 提交链的 target→backup→target 往返并发，删 backup 会破坏回滚；
+        // 与推送循环自身的 remove 并发安全（重复删除只是一次无害的 NoSuchFile）。
+        if let Some((_, session_id, remote_path)) = finishing.as_ref() {
+            if let Ok((temporary, _backup)) = remote_transfer_paths(remote_path, task_id) {
+                match self.sftp(session_id).await {
+                    Ok(sftp) => {
+                        if let Err(error) = sftp.lock().await.remove_file(temporary).await {
+                            eprintln!("[sftp] cancel cleanup: remote temp not removed: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[sftp] cancel cleanup: session unavailable: {error}")
+                    }
+                }
+            }
+        }
+        let finishing = finishing.map(|(task, _, _)| task);
         let task = upload
             .as_ref()
-            .map(|upload| json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.expected_size, "transferred": upload.received, "status": "cancelled" }))
+            .map(|upload| {
+                let mut task = upload_progress_payload(
+                    task_id,
+                    &upload.session_id,
+                    Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                    upload.received,
+                    upload.expected_size,
+                    UploadPhase::Staging,
+                    "cancelled",
+                );
+                task["error"] = json!(upload_cancel_error(reason));
+                task
+            })
             .or_else(|| download.as_ref().map(|download| json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "cancelled" })))
             .or(finishing)
             .expect("a transfer was present");
+        eprintln!(
+            "[sftp] transfer {task_id} cancelled (reason={})",
+            reason.unwrap_or("unspecified")
+        );
         self.record_transfer(task.clone());
         emitter
             .event("sftp/transfer/progress", task)
@@ -4475,6 +5066,11 @@ impl SshRuntime {
             .map_err(|_| "Download registry is poisoned".to_string())?
             .remove(task_id)
             .ok_or("Download task was not found".to_string())?;
+        if download.tree.is_some() {
+            return self
+                .complete_tree_download(download, task_id, emitter)
+                .await;
+        }
         let record_failed = |error: &str| {
             self.record_transfer(json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "failed", "error": error }));
         };
@@ -4512,6 +5108,57 @@ impl SshRuntime {
             "success": true,
             "taskId": task_id,
             "localPath": local_path.as_ref().map(|path| path.to_string_lossy()),
+        }))
+    }
+
+    /// Tree flavor of `sftp/download/finish`: every queued file must be
+    /// drained (eof), otherwise the whole folder is torn down — there is no
+    /// tree resume, so a half-downloaded folder never lingers on disk. A
+    /// drained tree completes even when individual files failed: the summary
+    /// (`failedCount` + inline samples) is the contract for the workbench
+    /// notice.
+    async fn complete_tree_download(
+        &self,
+        download: DownloadState,
+        task_id: &str,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        let Some(tree) = download.tree.clone() else {
+            return Err("Download task is not a folder download".to_string());
+        };
+        let remaining = tree.files.len() + usize::from(tree.current.is_some());
+        if remaining > 0 {
+            // 未传完：整树拆除（无目录续传语义），失败入账。
+            let _ = std::fs::remove_dir_all(&tree.root_local);
+            let error =
+                format!("Folder download is incomplete: {remaining} file(s) not transferred");
+            self.record_transfer(json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "failed", "error": error }));
+            return Err(error);
+        }
+        if let Some(sink) = tree.sink.as_ref() {
+            // 正常路径不会到达（current 已全部收尾）；防御性清理残留 .part。
+            let _ = std::fs::remove_file(&sink.part_path);
+        }
+        let (failed_count, failed_files) = sftp_tree::failure_report(&tree.failures);
+        let mut task = json!({
+            "taskId": task_id, "sessionId": download.session_id, "direction": "download",
+            "fileName": download.file_name, "size": download.size, "transferred": download.next_offset,
+            "status": "completed",
+            "fileCount": tree.file_count, "failedCount": failed_count, "skippedCount": tree.skipped,
+        });
+        task["localPath"] = json!(tree.root_local.to_string_lossy());
+        self.record_transfer(task.clone());
+        emitter
+            .event("sftp/transfer/progress", task)
+            .map_err(plugin_error)?;
+        Ok(json!({
+            "success": true,
+            "taskId": task_id,
+            "localPath": tree.root_local.to_string_lossy(),
+            "fileCount": tree.file_count,
+            "failedCount": failed_count,
+            "skippedCount": tree.skipped,
+            "failedFiles": failed_files,
         }))
     }
 
@@ -4569,19 +5216,41 @@ impl SshRuntime {
             .filter(|task| task.get("sessionId").and_then(Value::as_str) == Some(session_id))
             .cloned()
             .collect::<Vec<_>>();
-        tasks.extend(uploads
-            .iter()
-            .filter(|(_, upload)| upload.session_id == session_id)
-            .map(|(task_id, upload)| {
-                json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.expected_size, "transferred": upload.received, "status": "running" })
-            })
-            .collect::<Vec<_>>());
+        tasks.extend(
+            uploads
+                .iter()
+                .filter(|(_, upload)| upload.session_id == session_id)
+                .map(|(task_id, upload)| {
+                    upload_progress_payload(
+                        task_id,
+                        session_id,
+                        Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                        upload.received,
+                        upload.expected_size,
+                        UploadPhase::Staging,
+                        "running",
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
         tasks.extend(
             finishing_uploads
                 .iter()
                 .filter(|(_, upload)| upload.session_id == session_id)
                 .map(|(task_id, upload)| {
-                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "upload", "fileName": upload.remote_path.rsplit('/').next().unwrap_or("upload"), "size": upload.size, "transferred": upload.transferred.load(Ordering::Acquire), "status": if upload.cancelled.load(Ordering::Acquire) { "cancelled" } else { "running" } })
+                    upload_progress_payload(
+                        task_id,
+                        session_id,
+                        Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                        upload.transferred.load(Ordering::Acquire),
+                        upload.size,
+                        UploadPhase::Uploading,
+                        if upload.cancelled.load(Ordering::Acquire) {
+                            "cancelled"
+                        } else {
+                            "running"
+                        },
+                    )
                 }),
         );
         tasks.extend(
@@ -4589,7 +5258,11 @@ impl SshRuntime {
                 .iter()
                 .filter(|(_, download)| download.session_id == session_id)
                 .map(|(task_id, download)| {
-                    json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "running" })
+                    let mut row = json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "running" });
+                    if let Some(tree) = download.tree.as_ref() {
+                        row["fileCount"] = json!(tree.file_count);
+                    }
+                    row
                 }),
         );
         Ok(json!({ "tasks": tasks }))
@@ -4602,9 +5275,15 @@ impl SshRuntime {
             .map_err(|_| "Upload registry is poisoned".to_string())?
             .get(task_id)
         {
-            return Ok(
-                json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "size": upload.expected_size, "transferred": upload.received, "status": "running" }),
-            );
+            return Ok(upload_progress_payload(
+                task_id,
+                &upload.session_id,
+                Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                upload.received,
+                upload.expected_size,
+                UploadPhase::Staging,
+                "running",
+            ));
         }
         if let Some(upload) = self
             .finishing_uploads
@@ -4612,9 +5291,19 @@ impl SshRuntime {
             .map_err(|_| "Finishing upload registry is poisoned".to_string())?
             .get(task_id)
         {
-            return Ok(
-                json!({ "taskId": task_id, "sessionId": upload.session_id, "direction": "upload", "size": upload.size, "transferred": upload.transferred.load(Ordering::Acquire), "status": if upload.cancelled.load(Ordering::Acquire) { "cancelled" } else { "running" } }),
-            );
+            return Ok(upload_progress_payload(
+                task_id,
+                &upload.session_id,
+                Some(upload.remote_path.rsplit('/').next().unwrap_or("upload")),
+                upload.transferred.load(Ordering::Acquire),
+                upload.size,
+                UploadPhase::Uploading,
+                if upload.cancelled.load(Ordering::Acquire) {
+                    "cancelled"
+                } else {
+                    "running"
+                },
+            ));
         }
         if let Some(download) = self
             .downloads
@@ -4622,9 +5311,15 @@ impl SshRuntime {
             .map_err(|_| "Download registry is poisoned".to_string())?
             .get(task_id)
         {
-            return Ok(
-                json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "size": download.size, "transferred": download.next_offset, "status": "running" }),
-            );
+            let mut status = json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "size": download.size, "transferred": download.next_offset, "status": "running" });
+            if let Some(tree) = download.tree.as_ref() {
+                status["fileCount"] = json!(tree.file_count);
+                status["filesRemaining"] =
+                    json!(tree.files.len() + usize::from(tree.current.is_some()));
+                status["currentFile"] =
+                    json!(tree.current.as_ref().map(|file| file.relative.clone()));
+            }
+            return Ok(status);
         }
         if let Some(task) = self
             .transfer_history
@@ -4705,11 +5400,13 @@ impl SshRuntime {
         if let Some(filter) = session_id {
             tasks.retain(|task| task.get("sessionId").and_then(Value::as_str) == Some(filter));
         }
-        // Newest first by startedAt; rows without one sort last (stable).
-        tasks.sort_by(|a, b| {
-            let started = |task: &Value| task.get("startedAt").and_then(Value::as_u64).unwrap_or(0);
-            started(b).cmp(&started(a))
-        });
+        // Issue #18: the previous sort keyed on `startedAt` alone and left
+        // rows without one (live rows whose start record never reached the
+        // disk) stacked at the bottom in whatever order the in-memory
+        // registries happened to iterate — so the same task jumped between
+        // the top, middle and bottom of the panel between refreshes. A total
+        // order with a taskId tiebreak keeps every poll deterministic.
+        tasks.sort_by(compare_history_rows);
         tasks.truncate(limit);
         Ok(json!({ "tasks": tasks }))
     }
@@ -5163,8 +5860,9 @@ async fn authenticate_private_key_result(
             }
         }
     };
-    let private_key =
-        decoded.map_err(|error| format!("Failed to decode SSH private key: {error}"))?;
+    let private_key = decoded.map_err(|error| {
+        private_key_decode_failure(&key_text, &error, stored_passphrase.is_some())
+    })?;
     let hash = session
         .best_supported_rsa_hash()
         .await
@@ -5207,10 +5905,264 @@ async fn resolve_private_key_text(connection: &StoredConnection) -> Result<Strin
 /// Normalizes text artifacts around a PEM/PPK key. `russh` matches PEM begin
 /// markers exactly at the start of a line, so a UTF-8 BOM or indentation on
 /// the first line otherwise becomes the opaque `Could not read key` error.
+/// Beyond the original CRLF/BOM/indent handling this also strips paste-time
+/// pollution that can never occur in a real key file: zero-width characters,
+/// `<br>` tags from web-page copies, trailing whitespace on marker lines,
+/// smart dashes, and whitespace inside base64 body lines (terminal copy that
+/// re-wrapped the text). Marker lines are rebuilt into their canonical
+/// `-----BEGIN … -----` form. No key semantics change: directive lines such
+/// as `DEK-Info:` are preserved as-is.
 fn normalize_private_key_text(text: &str) -> String {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let normalized = normalized.strip_prefix('\u{feff}').unwrap_or(&normalized);
-    normalized.trim_start().to_string()
+    let cleaned = strip_invisible_paste_artifacts(normalized);
+    let mut rebuilt: Vec<String> = Vec::new();
+    let mut in_pem_body = false;
+    for line in cleaned.split('\n') {
+        let trimmed = line.trim();
+        // Drop leading blank/indent-only lines, like the previous whole-text
+        // trim_start did.
+        if rebuilt.is_empty() && trimmed.is_empty() {
+            continue;
+        }
+        if looks_like_marker_line(trimmed) {
+            rebuilt.push(normalize_pem_marker_line(trimmed));
+            in_pem_body = trimmed.contains("BEGIN");
+            continue;
+        }
+        if in_pem_body {
+            let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            if !compact.is_empty() && compact.chars().all(is_pem_base64_char) {
+                rebuilt.push(compact);
+                continue;
+            }
+        }
+        rebuilt.push(trimmed.to_string());
+    }
+    // Trailing per-line whitespace is already gone; keep the original tail
+    // (including its final newline) so the resolved text stays byte-identical
+    // apart from the pollution fixes.
+    rebuilt.join("\n")
+}
+
+/// Removes characters and tags that only arrive via rich-text or web-page
+/// copying: zero-width space/joiners, stray mid-text BOMs, and `<br>` tags
+/// in any letter case. A valid key file never contains any of them, so the
+/// removal cannot alter real key content.
+fn strip_invisible_paste_artifacts(text: &str) -> String {
+    let filtered: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{feff}'))
+        .collect();
+    let lower = filtered.to_lowercase();
+    let mut remove = vec![false; filtered.len()];
+    for tag in ["<br />", "<br/>", "<br>"] {
+        let mut from = 0;
+        while let Some(offset) = lower[from..].find(tag) {
+            let start = from + offset;
+            for byte in remove.iter_mut().skip(start).take(tag.len()) {
+                *byte = true;
+            }
+            from = start + tag.len();
+        }
+    }
+    let mut out = String::with_capacity(filtered.len());
+    for (index, c) in filtered.char_indices() {
+        if !remove[index] {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// ASCII base64 alphabet plus the padding sign, as PEM bodies use it.
+fn is_pem_base64_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '/' || c == '+' || c == '='
+}
+
+/// Marker-line detection that also accepts smart dashes, which rich-text
+/// editors substitute for the ASCII hyphens of `-----BEGIN … -----`.
+fn looks_like_marker_line(line: &str) -> bool {
+    let starts_with_dash = line
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '-' | '\u{2013}' | '\u{2014}' | '\u{2212}'));
+    starts_with_dash && (line.contains("BEGIN") || line.contains("END"))
+}
+
+/// Rebuilds a PEM begin/end marker into the canonical five-dash form, fixing
+/// smart dashes (— – −), doubled inner spaces, and trailing whitespace, all
+/// of which make `russh`'s exact marker match fail with `Could not read key`.
+fn normalize_pem_marker_line(line: &str) -> String {
+    let ascii_dashes: String = line
+        .chars()
+        .map(|c| match c {
+            '\u{2013}' | '\u{2014}' | '\u{2212}' => '-',
+            other => other,
+        })
+        .collect();
+    let mut collapsed = String::with_capacity(ascii_dashes.len());
+    let mut previous_was_space = false;
+    for c in ascii_dashes.chars() {
+        if c.is_whitespace() {
+            if !previous_was_space {
+                collapsed.push(' ');
+                previous_was_space = true;
+            }
+        } else {
+            collapsed.push(c);
+            previous_was_space = false;
+        }
+    }
+    let core = collapsed.trim().trim_matches('-').trim();
+    if core.starts_with("BEGIN") || core.starts_with("END") {
+        format!("-----{core}-----")
+    } else {
+        collapsed
+    }
+}
+
+/// Detects the one-line authorized-keys form and PEM public/certificate
+/// envelopes so a pasted public key is reported as such instead of as an
+/// opaque decode failure.
+fn looks_like_public_key(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    for header in [
+        "-----BEGIN PUBLIC KEY-----",
+        "-----BEGIN OPENSSH PUBLIC KEY-----",
+        "-----BEGIN SSH2 PUBLIC KEY-----",
+        "-----BEGIN CERTIFICATE-----",
+    ] {
+        if trimmed.contains(header) {
+            return true;
+        }
+    }
+    let first = trimmed.lines().next().unwrap_or("");
+    let mut parts = first.split_whitespace();
+    let (Some(kind), Some(blob)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let looks_like_algorithm = kind.starts_with("ssh-")
+        || kind.starts_with("ecdsa-")
+        || kind.starts_with("sk-ssh-")
+        || kind.starts_with("sk-ecdsa-");
+    looks_like_algorithm && blob.len() >= 40 && blob.chars().all(is_pem_base64_char)
+}
+
+fn has_html_escaped_entities(text: &str) -> bool {
+    text.contains("&lt;")
+        || text.contains("&gt;")
+        || text.contains("&quot;")
+        || text.contains("&amp;")
+}
+
+/// Turns a raw `decode_secret_key` failure into an actionable message while
+/// always preserving the underlying decoder error verbatim (never swallow
+/// detail). Classification is a pure function of the key text and the error,
+/// so tests cover every branch without an SSH server. This only rewords the
+/// failure — authentication flow, passphrase handling, and decoding itself
+/// are untouched.
+pub(crate) fn private_key_decode_failure(
+    key_text: &str,
+    error: &russh::keys::Error,
+    passphrase_provided: bool,
+) -> String {
+    fn detailed(guidance: &str, error: &russh::keys::Error) -> String {
+        format!("Failed to decode SSH private key: {guidance} (decoder error: {error})")
+    }
+    let raw = error.to_string();
+    if key_text.contains("PuTTY-User-Key-File-") {
+        if matches!(error, russh::keys::Error::KeyIsEncrypted) || raw.contains("encrypted") {
+            return detailed(
+                "this PuTTY PPK key is encrypted; fill in the private key passphrase field \
+                 for this connection, then reconnect",
+                error,
+            );
+        }
+        if raw.contains("MAC") {
+            return detailed(
+                "the PuTTY PPK did not verify — the passphrase appears to be incorrect, or \
+                 the file is damaged; check the private key passphrase field or re-export \
+                 the key from PuTTYgen",
+                error,
+            );
+        }
+        return detailed(
+            "this PuTTY PPK file could not be parsed; export it from PuTTYgen again \
+             (Conversions → Export OpenSSH key) and paste the OpenSSH-format key",
+            error,
+        );
+    }
+    if looks_like_public_key(key_text) {
+        return detailed(
+            "the pasted text looks like a PUBLIC key or certificate, not a private key; \
+             paste the matching private key file contents, including the \
+             -----BEGIN … PRIVATE KEY----- and -----END … PRIVATE KEY----- lines",
+            error,
+        );
+    }
+    if matches!(error, russh::keys::Error::KeyIsEncrypted) {
+        return detailed(
+            "this private key is encrypted; fill in the private key passphrase field for \
+             this connection, then reconnect",
+            error,
+        );
+    }
+    if raw.contains("PKCS#5 algorithm") && raw.contains("unsupported") {
+        return detailed(
+            "the encrypted PKCS#8 key uses a PBKDF2 variant this decoder does not \
+             support; re-export the key in OpenSSH format (ssh-keygen -p -f <keyfile>) \
+             or without a passphrase",
+            error,
+        );
+    }
+    if key_text.contains("-----BEGIN EC PRIVATE KEY-----") && raw.starts_with("Der:") {
+        return detailed(
+            "legacy 'EC PRIVATE KEY' (SEC1) PEM is not supported by this decoder; convert \
+             the key once (ssh-keygen -p -f <keyfile>, or openssl pkcs8 -topk8 -nocrypt \
+             -in <keyfile>) and paste the converted key",
+            error,
+        );
+    }
+    if passphrase_provided
+        && (raw.contains("cryptographic error") || raw.contains("Unpad") || raw.contains("MAC"))
+    {
+        return detailed(
+            "the key did not decrypt with the stored passphrase — check or update the \
+             private key passphrase field, or the key file is damaged",
+            error,
+        );
+    }
+    if raw.contains("Base64 decoding error") {
+        return detailed(
+            "the key body is not valid base64 — the text was probably truncated or \
+             mangled while copying; re-copy the complete key from the original file",
+            error,
+        );
+    }
+    if matches!(error, russh::keys::Error::CouldNotReadKey) {
+        if has_html_escaped_entities(key_text) {
+            return detailed(
+                "the text looks HTML-escaped (&lt;, &quot;, …); copy the key from the \
+                 original file as plain text, not from a web page or chat window",
+                error,
+            );
+        }
+        if key_text.contains("-----BEGIN") {
+            return detailed(
+                "a PEM header was found but not in a recognizable form — the key was \
+                 probably mangled by rich-text copy (altered dashes or extra characters); \
+                 re-copy the key from the original file as plain text",
+                error,
+            );
+        }
+        return detailed(
+            "no PEM private-key header (-----BEGIN … PRIVATE KEY-----) was found; paste \
+             the complete key file contents, including the BEGIN and END lines",
+            error,
+        );
+    }
+    detailed("the key could not be decoded", error)
 }
 
 fn expand_private_key_path(path: &str) -> PathBuf {
@@ -5378,6 +6330,163 @@ async fn delete_directory_tree(
     Ok(())
 }
 
+/// Recursively walks a remote directory over SFTP and collects the folder
+/// download plan (breadth-first, so parents are read before children):
+/// regular files in download order, the directory layout, symlink/special
+/// skips and per-path failures. Only root-level problems (not a readable
+/// directory) abort; a failing subdirectory is recorded and the walk goes on.
+/// Symlinks are never followed, so server-side cycles cannot loop the walk.
+async fn scan_remote_tree(
+    sftp: &Arc<AsyncMutex<SftpSession>>,
+    root: &str,
+) -> Result<sftp_tree::TreeScan, String> {
+    let mut scan = sftp_tree::TreeScan::new();
+    let mut pending: VecDeque<(String, String)> = VecDeque::new();
+    pending.push_back((root.to_string(), String::new()));
+    while let Some((dir_remote, dir_relative)) = pending.pop_front() {
+        let entries = sftp.lock().await.read_dir(dir_remote.clone()).await;
+        let entries = match entries {
+            Ok(entries) => entries,
+            Err(error) => {
+                if dir_relative.is_empty() {
+                    return Err(sftp_error(error));
+                }
+                scan.record_failure(
+                    &dir_relative,
+                    format!("directory is not readable: {}", sftp_error(error)),
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let name = entry.file_name();
+            let child_relative = if dir_relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{dir_relative}/{name}")
+            };
+            match entry.file_type() {
+                FileType::Dir => {
+                    let Some(relative) = sftp_tree::sanitize_relative(&child_relative) else {
+                        scan.record_failure(
+                            &child_relative,
+                            "directory name is not usable on the local filesystem",
+                        );
+                        continue;
+                    };
+                    match scan.push_dir(&relative) {
+                        Ok(true) => pending.push_back((format!("{dir_remote}/{name}"), relative)),
+                        Ok(false) => {}
+                        Err(capacity) => return Err(capacity.to_string()),
+                    }
+                }
+                FileType::File => {
+                    let Some(relative) = sftp_tree::sanitize_relative(&child_relative) else {
+                        scan.record_failure(
+                            &child_relative,
+                            "file name is not usable on the local filesystem",
+                        );
+                        continue;
+                    };
+                    let remote_child = format!("{dir_remote}/{name}");
+                    let size = match entry.metadata().size {
+                        Some(size) => size,
+                        None => {
+                            scan.record_failure(
+                                &child_relative,
+                                "directory listing did not report the file size",
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(capacity) = scan.push_file(relative, remote_child, size) {
+                        return Err(capacity.to_string());
+                    }
+                }
+                _ => scan.skip(),
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// Creates the parent directories for one queued tree file and opens its
+/// staging `.part` file. The relative path is re-validated (sanitize +
+/// containment) so nothing server-reported can place bytes outside the
+/// download root. A stale `.part` from a crashed earlier attempt is replaced,
+/// never appended to.
+async fn open_tree_sink(root_local: &Path, relative: &str) -> Result<DownloadSink, String> {
+    let Some(final_path) = sftp_tree::safe_tree_path(root_local, relative) else {
+        return Err("path escapes the download folder".to_string());
+    };
+    let name = final_path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    let final_dir = final_path.parent().unwrap_or(root_local).to_path_buf();
+    std::fs::create_dir_all(&final_dir).map_err(|error| {
+        format!(
+            "Failed to create local folder '{}': {error}",
+            final_dir.display()
+        )
+    })?;
+    let part_path = final_dir.join(format!("{name}.part"));
+    let _ = std::fs::remove_file(&part_path);
+    let file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&part_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to create local download file '{}': {error}",
+                part_path.display()
+            )
+        })?;
+    Ok(DownloadSink {
+        part_path,
+        final_dir,
+        overwrite: false,
+        file: AsyncMutex::new(file),
+    })
+}
+
+/// Drops the in-flight tree file after a failure: the staging `.part` is
+/// deleted so a failed file never leaves partial bytes behind.
+fn discard_tree_current(tree: &mut TreeDownloadState) {
+    if let Some(sink) = tree.sink.take() {
+        let _ = std::fs::remove_file(&sink.part_path);
+    }
+    tree.current = None;
+    tree.current_offset = 0;
+}
+
+/// Completes the in-flight tree file: the staging `.part` is flushed and
+/// renamed into place. Failures are recorded and the file simply vanishes
+/// from the local tree (no partial bytes) while the walk continues.
+async fn finalize_tree_current(runtime: &SshRuntime, tree: &mut TreeDownloadState) {
+    if let Some(sink) = tree.sink.take() {
+        if let Some(file) = tree.current.clone() {
+            let name = file
+                .relative
+                .rsplit('/')
+                .next()
+                .unwrap_or(&file.relative)
+                .to_string();
+            match runtime.finalize_download_sink(&sink, &name).await {
+                Ok(_) => tree.files_done += 1,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&sink.part_path);
+                    tree.failures
+                        .push(json!({ "path": file.relative, "error": error }));
+                }
+            }
+        }
+    }
+    tree.current = None;
+    tree.current_offset = 0;
+}
+
 /// Reads an upload spool meta file (`upload-<taskId>.json`). Corrupt or
 /// missing files yield `None` — a resume request against them is rejected.
 fn read_upload_meta(path: &Path) -> Option<Value> {
@@ -5482,13 +6591,57 @@ fn remote_transfer_paths(target: &str, task_id: &str) -> Result<(String, String)
     ))
 }
 
+/// Permission attributes carried over from an existing target to the staged
+/// replacement file: the mode's permission bits (`0o7777`, so an executable
+/// script keeps its `+x` across saves) and nothing else. Ownership (uid/gid)
+/// is deliberately not preserved — SETSTAT on uid/gid needs elevated
+/// privileges, so the replacement keeps the writing user's own ownership.
+fn preserved_target_permissions(
+    target: &russh_sftp::protocol::FileAttributes,
+) -> Option<russh_sftp::protocol::FileAttributes> {
+    let permissions = target.permissions?;
+    Some(russh_sftp::protocol::FileAttributes {
+        permissions: Some(permissions & 0o7777),
+        ..Default::default()
+    })
+}
+
+/// Applies [`preserved_target_permissions`] to the staged file before the
+/// rename. A SETSTAT failure aborts the commit with the original target
+/// untouched instead of silently saving a permission-downgraded copy (issue
+/// #37: an executable script must not lose its `+x` on every save).
+pub(crate) async fn apply_preserved_permissions(
+    sftp: &Arc<AsyncMutex<SftpSession>>,
+    temporary: &str,
+    target: Option<&russh_sftp::protocol::FileAttributes>,
+) -> Result<(), String> {
+    if let Some(attributes) = target.and_then(preserved_target_permissions) {
+        let mode = attributes.permissions.unwrap_or_default();
+        if let Err(error) = sftp
+            .lock()
+            .await
+            .set_metadata(temporary.to_string(), attributes)
+            .await
+        {
+            let _ = sftp.lock().await.remove_file(temporary.to_string()).await;
+            return Err(format!(
+                "SFTP save failed while preserving permissions {}: {error}; original file left unchanged",
+                format_permissions(mode),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn commit_remote_file(
     sftp: &Arc<AsyncMutex<SftpSession>>,
     temporary: &str,
     target: &str,
     backup: &str,
 ) -> Result<(), String> {
-    let target_exists = sftp.lock().await.metadata(target.to_string()).await.is_ok();
+    let target_attributes = sftp.lock().await.metadata(target.to_string()).await.ok();
+    apply_preserved_permissions(sftp, temporary, target_attributes.as_ref()).await?;
+    let target_exists = target_attributes.is_some();
     if target_exists {
         sftp.lock()
             .await
@@ -5518,6 +6671,32 @@ async fn commit_remote_file(
     Ok(())
 }
 
+/// Classifies a READDIR entry into the wire `kind` vocabulary of `sftp/list`.
+///
+/// russh-sftp derives `FileType` solely from the POSIX type bits in the
+/// server-supplied READDIR `permissions` field; a server that omits
+/// PERMISSIONS (or sends permissions without type bits — seen on
+/// virtual/disk-mount SFTP services) collapses every entry to
+/// `FileType::Other`. Issue #36 family: such entries used to be reported as
+/// `"other"`, which the UI rendered as a generic text-document icon instead
+/// of a file icon.
+///
+/// Rules:
+/// - `Dir` / `File` / `Symlink` pass the server declaration through;
+/// - `Other` (missing/unusable type bits) degrades to `"file"`: nothing on
+///   the wire distinguishes files from directories at that point, and
+///   "unknown renders as a file" matches FileZilla's behaviour. Real
+///   directories on conforming servers always carry the DIR type bit, so
+///   they never reach this branch.
+fn classify_entry_kind(file_type: FileType) -> &'static str {
+    match file_type {
+        FileType::File => "file",
+        FileType::Dir => "directory",
+        FileType::Symlink => "symlink",
+        FileType::Other => "file",
+    }
+}
+
 fn content_type_for_path(path: &str) -> Option<String> {
     let extension = path.rsplit('.').next()?.to_ascii_lowercase();
     let content_type = match extension.as_str() {
@@ -5535,6 +6714,131 @@ fn content_type_for_path(path: &str) -> Option<String> {
 
 fn format_permissions(value: u32) -> String {
     format!("{:04o}", value & 0o7777)
+}
+
+/// Budget for the one `ls -l` round trip that upgrades numeric owner ids to
+/// names. Generous enough for slow links, still bounded so a wedged shell
+/// cannot stall directory listings.
+const OWNER_LOOKUP_TIMEOUT_SECS: u64 = 10;
+
+/// Whether an owner/group value still benefits from the `ls -l` name lookup:
+/// absent, or a numeric id string (SFTPv3 servers report `0`, `1000`, ...).
+fn owner_needs_name(value: &Option<String>) -> bool {
+    match value {
+        None => true,
+        Some(value) => !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+    }
+}
+
+/// Overwrites numeric/absent owner/group values on `entries` with names read
+/// from one read-only `ls -l` round trip. Best effort by design: no shell,
+/// no `ls`, a timeout or unparsable output all leave the listing untouched
+/// (numeric ids or absent fields, which the UI renders as "-").
+async fn enrich_owner_names(
+    runtime: &SshRuntime,
+    session_id: &str,
+    path: &str,
+    entries: &mut [SftpEntry],
+) {
+    if entries.is_empty() || !entries.iter().any(|entry| owner_needs_name(&entry.owner)) {
+        return;
+    }
+    let session = match runtime.session(session_id).await {
+        Ok(session) => session,
+        Err(_) => return,
+    };
+    // GNU renders epoch mtimes with `--time-style=+%s` (same trick sudo_fs
+    // uses); BusyBox/BSD reject that option, so a plain `ls -l` retry covers
+    // the classic layout. Owner/group sit in fields 3/4 on both.
+    let gnu = format!("ls -l --time-style=+%s -- {}", exec::shell_quote(path));
+    let output = match exec::exec_plain(
+        &session.handle,
+        &gnu,
+        Duration::from_secs(OWNER_LOOKUP_TIMEOUT_SECS),
+        &[],
+    )
+    .await
+    {
+        Ok(outcome) => outcome.output,
+        Err(_) => {
+            let plain = format!("ls -l -- {}", exec::shell_quote(path));
+            match exec::exec_plain(
+                &session.handle,
+                &plain,
+                Duration::from_secs(OWNER_LOOKUP_TIMEOUT_SECS),
+                &[],
+            )
+            .await
+            {
+                Ok(outcome) => outcome.output,
+                Err(_) => return,
+            }
+        }
+    };
+    let names = parse_ls_owner_map(&output);
+    if names.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        if let Some((owner, group)) = names.get(&entry.name) {
+            if owner_needs_name(&entry.owner) {
+                entry.owner = Some(owner.clone());
+            }
+            if owner_needs_name(&entry.group) {
+                entry.group = Some(group.clone());
+            }
+        }
+    }
+}
+
+/// Parses `ls -l` output into `name -> (owner, group)`. Owner/group sit in
+/// fields 3/4 of every layout; the name start depends on whether the date
+/// collapsed into one epoch field (GNU `--time-style=+%s`, name from field 6)
+/// or spread over three classic fields (name from field 8). Returns an empty
+/// map for headers (`total`, `ls:` diagnostics) and unparsable rows.
+fn parse_ls_owner_map(output: &str) -> HashMap<String, (String, String)> {
+    let mut map = HashMap::new();
+    for line in output.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with("total") || line.starts_with("ls:") {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 7 || fields[0].len() < 10 {
+            continue;
+        }
+        let name_start = if fields[5].parse::<u64>().is_ok() {
+            6
+        } else {
+            8
+        };
+        if fields.len() <= name_start {
+            continue;
+        }
+        let mut name = fields[name_start..].join(" ");
+        // `ls -l` renders symlinks as "name -> target"; keep only the name.
+        if let Some((head, _)) = name.split_once(" -> ") {
+            name = head.to_string();
+        }
+        let name = unquote_ls_output_name(&name);
+        if name.is_empty() {
+            continue;
+        }
+        map.entry(name)
+            .or_insert_with(|| (fields[2].to_string(), fields[3].to_string()));
+    }
+    map
+}
+
+/// Undoes the quoting `ls` applies to unusual names when its stdout is a
+/// terminal (possible when `sudo_use_pty` is enabled): shell-escape style
+/// renders `weird name's` as `'weird name'\''s'`.
+fn unquote_ls_output_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        return trimmed[1..trimmed.len() - 1].replace("'\\''", "'");
+    }
+    trimmed.to_string()
 }
 
 fn directory_tracking_marker(session_id: &str) -> Vec<u8> {
@@ -5653,10 +6957,151 @@ mod tests {
     use russh::{cipher, kex, mac};
 
     #[test]
+    fn upload_progress_payload_marks_the_phase() {
+        let staging = upload_progress_payload(
+            "t1",
+            "s1",
+            Some("a.bin"),
+            256,
+            1024,
+            UploadPhase::Staging,
+            "running",
+        );
+        assert_eq!(staging["phase"], "staging");
+        assert_eq!(staging["direction"], "upload");
+        assert_eq!(staging["fileName"], "a.bin");
+        assert_eq!(staging["transferred"], 256);
+        assert_eq!(staging["size"], 1024);
+        assert_eq!(staging["status"], "running");
+
+        let pushing = upload_progress_payload(
+            "t1",
+            "s1",
+            None,
+            512,
+            1024,
+            UploadPhase::Uploading,
+            "running",
+        );
+        assert_eq!(pushing["phase"], "uploading");
+        // Non-start events carry no fileName; the workbench keeps its own.
+        assert!(pushing.get("fileName").is_none());
+    }
+
+    #[test]
+    fn upload_cancel_error_tells_abort_reasons_apart() {
+        assert_eq!(
+            upload_cancel_error(Some("user")),
+            "Upload cancelled by user"
+        );
+        assert_eq!(
+            upload_cancel_error(Some(" ack-timeout ")),
+            "Upload cancelled (ack-timeout)"
+        );
+        assert_eq!(upload_cancel_error(None), "Upload cancelled");
+        assert_eq!(upload_cancel_error(Some("   ")), "Upload cancelled");
+    }
+
+    #[test]
+    fn numeric_or_absent_owner_values_ask_for_names() {
+        assert!(owner_needs_name(&None));
+        assert!(owner_needs_name(&Some("0".to_string())));
+        assert!(owner_needs_name(&Some("1000".to_string())));
+        // Already a name (SFTPv4+ attribute or a previous lookup): no work.
+        assert!(!owner_needs_name(&Some("root".to_string())));
+        // Defensive: an empty string would render as "-" either way.
+        assert!(!owner_needs_name(&Some(String::new())));
+    }
+
+    #[test]
+    fn parse_ls_owner_map_reads_gnu_epoch_layout() {
+        let output = "\
+total 20
+drwxr-xr-x  3 root root 4096 1720000000 .
+drwxr-xr-x  1 root wheel 4096 1720000001 ..
+-rw-r--r--  1 alice docker  123 1720000002 notes.txt
+drwxr-xr-x  2 root root 4096 1720000003 sub dir with spaces
+lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
+";
+        let map = parse_ls_owner_map(output);
+        assert_eq!(
+            map.get("notes.txt"),
+            Some(&("alice".to_string(), "docker".to_string()))
+        );
+        assert_eq!(
+            map.get("sub dir with spaces"),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+        // Symlink arrow is stripped from the name key.
+        assert_eq!(
+            map.get("link"),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+        // "." / ".." come along but harmless: they never match SftpEntry names.
+        assert_eq!(
+            map.get("."),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_ls_owner_map_reads_classic_layout() {
+        // BusyBox/BSD dates spread over three fields; owner/group stay in
+        // fields 3/4 regardless.
+        let output = "\
+-rw-r--r--    1 root     root          4096 Jan 15 10:23 readme.md
+-rw-r--r--    1 svc     deploy          123 Jan 15  2024 old.log
+";
+        let map = parse_ls_owner_map(output);
+        assert_eq!(
+            map.get("readme.md"),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+        assert_eq!(
+            map.get("old.log"),
+            Some(&("svc".to_string(), "deploy".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_ls_owner_map_ignores_headers_and_noise() {
+        assert!(parse_ls_owner_map("").is_empty());
+        assert!(parse_ls_owner_map("total 20\n").is_empty());
+        assert!(parse_ls_owner_map("ls: cannot open '/x': Permission denied\n").is_empty());
+        // A row too short to carry owner/group is dropped, not misparsed.
+        assert!(parse_ls_owner_map("-rw-r--r-- 1 x\n").is_empty());
+    }
+
+    #[test]
+    fn parse_ls_owner_map_keeps_first_row_for_duplicate_names() {
+        let output = "\
+-rw-r--r--  1 root root 1 1720000000 a.txt
+-rw-r--r--  1 amy ops  2 1720000001 a.txt
+";
+        let map = parse_ls_owner_map(output);
+        assert_eq!(
+            map.get("a.txt"),
+            Some(&("root".to_string(), "root".to_string()))
+        );
+    }
+
+    #[test]
     fn test_connection_budget_aligns_with_host_deadline() {
         assert_eq!(test_dial_budget_secs(30, true), 29);
         assert_eq!(test_dial_budget_secs(30, false), 9);
         assert_eq!(test_dial_budget_secs(1, true), 1);
+    }
+
+    #[test]
+    fn classify_entry_kind_maps_wire_types() {
+        // Directories stay directories; only `kind === "directory"` renders a
+        // folder icon in the UI.
+        assert_eq!(classify_entry_kind(FileType::Dir), "directory");
+        assert_eq!(classify_entry_kind(FileType::File), "file");
+        assert_eq!(classify_entry_kind(FileType::Symlink), "symlink");
+        // Missing/unusable type bits (no PERMISSIONS flag, or permissions
+        // without S_IFMT bits) must degrade to a file icon, never a folder.
+        assert_eq!(classify_entry_kind(FileType::Other), "file");
     }
 
     #[test]
@@ -5784,6 +7229,324 @@ mod tests {
         assert!(normalized.starts_with("-----BEGIN PRIVATE KEY-----\n"));
         assert!(!normalized.contains('\r'));
         assert!(decode_secret_key(&normalized, None).is_ok());
+    }
+
+    // —— #21: 私钥解码错误分类与粘贴污损修复 ————————————————————————————
+    // 以下密钥全部为本仓库测试现场生成的废弃密钥或 ssh-key 上游公开测试
+    // fixture,绝不包含真实凭据。口令仅为测试值。
+
+    /// 废弃测试密钥(本机为编写测试生成,无对应主机)。
+    const OPENSSH_ED25519_PLAIN: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDkhRLM2wxmY826/LvkQeMRNf9pptlryFMSddhmTmhSrwAAAJiaGi/pmhov
+6QAAAAtzc2gtZWQyNTUxOQAAACDkhRLM2wxmY826/LvkQeMRNf9pptlryFMSddhmTmhSrw
+AAAEA41GJvRrU3mTnSyjUyLinDInc6VUNdHcvGr1te4YW7S+SFEszbDGZjzbr8u+RB4xE1
+/2mm2WvIUxJ12GZOaFKvAAAADm1hdHJpeC1lZDI1NTE5AQIDBAUGBw==
+-----END OPENSSH PRIVATE KEY-----";
+
+    /// 同上,口令为 "test-phrase"。
+    const OPENSSH_ED25519_ENCRYPTED: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAd8e+k64
+ZPDgMURR64zer1AAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIMcQDHXhSWOHA0pR
+VYE3X8bEgjf0QVAcOzZ+6mZKzIa/AAAAoLKviiOSbTqOH2s7O+Y2AxZzne4kYYb0uZhpHH
+eGHpS7VjhQLlN/B1cgyfNWqdROswIXdPbDL1uC5nzv8MAvH4lEobnNgZWVaxKoIAyTP3v+
+c/3nQJQxJ1klouO/ojHcFFumbY4C+lRMGRhPIvtDj1alq5lvefD/3VmtK/jbeA8zuXcdv9
+1QXkLgYJ5A3wpFPs7x/jgDn/v3e6jAwfZoZLU=
+-----END OPENSSH PRIVATE KEY-----";
+
+    const ENCRYPTED_TEST_PASSPHRASE: &str = "test-phrase";
+
+    /// ssh-key 上游公开测试 fixture(user@example.com,无口令)。
+    const PPK3_ED25519_PLAIN: &str = "\
+PuTTY-User-Key-File-3: ssh-ed25519
+Encryption: none
+Comment: user@example.com
+Public-Lines: 2
+AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XF
+Sqti
+Private-Lines: 1
+AAAAILYGwiLRDBba4WxwpNRRc0cuxhfgXGVpINJuVsCPtZHt
+Private-MAC: 94140d0344fad6aa1bf7b71e9c93db11ccac8a232f8a51e11c024869d608c82d";
+
+    /// 同一上游 fixture,口令为 "123"。
+    const PPK3_ED25519_ENCRYPTED: &str = "\
+PuTTY-User-Key-File-3: ssh-ed25519
+Encryption: aes256-cbc
+Comment: user@example.com
+Public-Lines: 2
+AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XF
+Sqti
+Key-Derivation: Argon2id
+Argon2-Memory: 8192
+Argon2-Passes: 34
+Argon2-Parallelism: 1
+Argon2-Salt: 63d1d43f7bf7700720496646a2f5ec17
+Private-Lines: 1
+DyWtExZ3dxFutnb12tIwXBC6kWdozrvP+r6faHKBGDb4+qEar9XBiC0BmGySMHUi
+Private-MAC: 52fd00d4ef47ebc506e4e709486c0c6bc0606e24fe2c6cb1b3d168f4da238a66";
+
+    /// 废弃测试密钥(SEC1 传统 EC PEM,russh 不支持此封装)。
+    const EC_SEC1_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+MIIBaAIBAQQgOtPbXkrREPIS68niEPbISV5VZmM4655BvEie7U9k/4CggfowgfcC
+AQEwLAYHKoZIzj0BAQIhAP////8AAAABAAAAAAAAAAAAAAAA////////////////
+MFsEIP////8AAAABAAAAAAAAAAAAAAAA///////////////8BCBaxjXYqjqT57Pr
+vVV2mIa8ZR0GsMxTsPY7zjw+J9JgSwMVAMSdNgiG5wSTamZ44ROdJreBn36QBEEE
+axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpZP40Li/hp/m47n60p8D54W
+K84zV2sxXs7LtkBoN79R9QIhAP////8AAAAA//////////+85vqtpxeehPO5ysL8
+YyVRAgEBoUQDQgAERtRtbHHreGHq8c0a0GvFRsZ+3BfCcILOVeIpInh5O9ddBZQI
+Q/TyBph+JFB6VjJb6neA04jwsdD13REn2e7/og==
+-----END EC PRIVATE KEY-----";
+
+    /// 废弃测试密钥(PKCS#8 + PBES2/hmacWithSHA256,口令 "test-phrase";
+    /// russh 的 PKCS#5 解析不支持该 PRF)。
+    const PKCS8_PBES2_ENCRYPTED: &str = "\
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIICzzBJBgkqhkiG9w0BBQ0wPDAbBgkqhkiG9w0BBQwwDgQIOcKjFZoZ/fsCAggA
+MB0GCWCGSAFlAwQBAgQQTfxxn8bDf+3cTfXy9sHVtgSCAoBF4F4/74FYKIDBbFxE
+BXPvQRgnRTL6FWGD983/u9CueKi26cAty4N75cDEPwbq4xk/DMGhQTiSymv4SOK3
+MBgZ/hb8jHWIp8SrZ2IvP14uM/EsVAvLgmnlu8JH/Q4BfYLbo4tvY88Wwx93GXdW
+Ik6S30w+iDo/BTZ7by9mFITWD3DcIYpsrCgmn/MhQ/cRy7Eoe4wkMruMsY4aG4Tb
+K1gDN/dLL/jrafcwDx1sjA71BmVf0bNKR9CBk1sZ5i5d4D0YSFRI4t8TG15cjb/l
+NQwi9ykch3t6ojtQvHT645Z8kiTYjfPEyqgEWtSZd+69QAJ0Gl1XEqb+kH7eyMOL
+oyMOfoX+Z3cEHCNY5/FZvFUTLmVX+OjzYY34LvzoSICeCr7HE+cnkRBEdpbLgyw9
+LPlnpp7RWOXr8pidnr7vg7tN6sWnqM8JwPubDgl2gE1jUiqKHSWXHq6kEVEVA9Y4
+uRBKE24j+FrPYGRjoKVXyPX0gjhqp66GDGaBCWs7LzdFO10IPxDKM6GJ8AxKLk9X
+UVXqyvDfC9lh6YAHmTKmNYnKkEijdKkP7Uw57n8aWr1tw5xLyhABLZEGhPLcyazN
+z7fnjJ+3LAEqD5dlZaczncsdFmZh1naKswCmSrwZOEbAeGbaZvdsHqspYwXGBTna
+Q+KW8/vygV6WQZLnVu36rIkJq56Hzo3JFo3p2GOY/Pk1o82xFTm/fS3Pm3FWoapa
+SiK9nBQ20ok8efOFN535UDWrmOMKcZTF/ZgpjKPCPFwaDFlpgtbWbUW+1ABMYv4g
+GkWbTKmDiaAreK3qjVWf20UuzxzSFk/QS1dxTHoNv8NsvWAJp7AZv2WV6Bj+k9Is
+sfwQ
+-----END ENCRYPTED PRIVATE KEY-----";
+
+    /// 与 OPENSSH_ED25519_PLAIN 同钥的公钥单行形态(误粘场景)。
+    const ED25519_PUBLIC_ONELINER: &str = "\
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOSFEszbDGZjzbr8u+RB4xE1/2mm2WvIUxJ12GZOaFKv \
+matrix-ed25519";
+
+    fn decode_error_of(text: &str, passphrase: Option<&str>) -> russh::keys::Error {
+        decode_secret_key(text, passphrase).expect_err("sample must fail to decode")
+    }
+
+    fn assert_actionable(text: &str, error: &russh::keys::Error, provided: bool, guidance: &str) {
+        let message = private_key_decode_failure(text, error, provided);
+        assert!(
+            message.starts_with("Failed to decode SSH private key: "),
+            "{message}"
+        );
+        // 底层错误永远原样保留,不吞细节。
+        assert!(
+            message.contains(&format!("(decoder error: {error})")),
+            "{message}"
+        );
+        assert!(message.contains(guidance), "{message}");
+    }
+
+    #[test]
+    fn paste_artifacts_are_normalized_and_then_decode() {
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "marker trailing space",
+                OPENSSH_ED25519_PLAIN.replace(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----",
+                    "-----BEGIN OPENSSH PRIVATE KEY----- ",
+                ),
+            ),
+            (
+                "marker inner double space",
+                OPENSSH_ED25519_PLAIN.replace(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----",
+                    "-----BEGIN  OPENSSH  PRIVATE  KEY-----",
+                ),
+            ),
+            (
+                "smart dashes",
+                OPENSSH_ED25519_PLAIN
+                    .replace("-----BEGIN", "——–BEGIN")
+                    .replace("-----END", "——–END"),
+            ),
+            ("zero-width characters", {
+                let mut text = OPENSSH_ED25519_PLAIN
+                    .replace("-----BEGIN OPENSSH", "-----\u{200b}BEGIN\u{200b} OPENSSH");
+                text.insert(40, '\u{200b}');
+                text
+            }),
+            (
+                "web-page <br> tags",
+                OPENSSH_ED25519_PLAIN
+                    .replace('\n', "<br>\n")
+                    .replacen("<br>", "<BR>", 1),
+            ),
+            ("re-wrapped body lines", {
+                let mut lines: Vec<String> =
+                    OPENSSH_ED25519_PLAIN.lines().map(str::to_string).collect();
+                lines[1].insert_str(24, "  ");
+                lines[2].insert(24, '\t');
+                lines.join("\n")
+            }),
+            (
+                "crlf plus bom plus indent",
+                format!(
+                    "\u{feff}   \r\n{}\r\n",
+                    OPENSSH_ED25519_PLAIN.replace('\n', "\r\n")
+                ),
+            ),
+        ];
+        for (label, polluted) in &cases {
+            let normalized = normalize_private_key_text(polluted);
+            let decoded = decode_secret_key(&normalized, None);
+            assert!(decoded.is_ok(), "{label}: {normalized:?}");
+        }
+    }
+
+    #[test]
+    fn paste_artifact_normalization_preserves_directive_lines() {
+        // PKCS#5 传统加密 PEM 的 DEK-Info 指令行必须原样保留(含 IV 十六进制)。
+        let text = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\
+            DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF \n\nabc= \n\
+            -----END RSA PRIVATE KEY-----\n";
+        let normalized = normalize_private_key_text(text);
+        assert!(normalized.contains("DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n"));
+        assert!(normalized.contains("Proc-Type: 4,ENCRYPTED\n"));
+        assert!(normalized.contains("\nabc=\n"));
+    }
+
+    #[test]
+    fn decode_errors_are_classified_into_actionable_guidance() {
+        // 加密 OpenSSH 密钥、未填口令。
+        assert_actionable(
+            OPENSSH_ED25519_ENCRYPTED,
+            &decode_error_of(OPENSSH_ED25519_ENCRYPTED, None),
+            false,
+            "fill in the private key passphrase field",
+        );
+        // 加密 OpenSSH 密钥、口令错误。
+        assert_actionable(
+            OPENSSH_ED25519_ENCRYPTED,
+            &decode_error_of(OPENSSH_ED25519_ENCRYPTED, Some("wrong-phrase")),
+            true,
+            "did not decrypt with the stored passphrase",
+        );
+        // 公钥单行形态被误当私钥。
+        assert_actionable(
+            ED25519_PUBLIC_ONELINER,
+            &decode_error_of(ED25519_PUBLIC_ONELINER, None),
+            false,
+            "looks like a PUBLIC key or certificate",
+        );
+        assert_actionable(
+            "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----",
+            &decode_error_of(
+                "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----",
+                None,
+            ),
+            false,
+            "looks like a PUBLIC key or certificate",
+        );
+        // 完全不是密钥文本。
+        assert_actionable(
+            "hello world, this is not a key",
+            &decode_error_of("hello world, this is not a key", None),
+            false,
+            "no PEM private-key header",
+        );
+        // HTML 转义污染(无法自动修复,指引重新复制)。
+        let html_escaped = "&lt;p&gt;-----BEGIN OPENSSH PRIVATE KEY-----&lt;/p&gt;";
+        assert_actionable(
+            html_escaped,
+            &decode_error_of(html_escaped, None),
+            false,
+            "looks HTML-escaped",
+        );
+        // BEGIN 存在但标记无法修复(类型名内部断行)。
+        let broken_marker =
+            "-----BEGIN OPENSSH PRIVATE-KEY-----\nbody\n-----END OPENSSH PRIVATE-KEY-----";
+        assert_actionable(
+            broken_marker,
+            &decode_error_of(broken_marker, None),
+            false,
+            "mangled by rich-text copy",
+        );
+        // SEC1 传统 EC PEM。
+        assert_actionable(
+            EC_SEC1_PEM,
+            &decode_error_of(EC_SEC1_PEM, None),
+            false,
+            "legacy 'EC PRIVATE KEY' (SEC1)",
+        );
+        // PKCS#8 + 不支持的 PBKDF2 PRF。
+        assert_actionable(
+            PKCS8_PBES2_ENCRYPTED,
+            &decode_error_of(PKCS8_PBES2_ENCRYPTED, Some(ENCRYPTED_TEST_PASSPHRASE)),
+            true,
+            "PBKDF2 variant",
+        );
+        // PuTTY PPK 加密、未填口令。
+        assert_actionable(
+            PPK3_ED25519_ENCRYPTED,
+            &decode_error_of(PPK3_ED25519_ENCRYPTED, None),
+            false,
+            "this PuTTY PPK key is encrypted",
+        );
+        // PuTTY PPK 口令错误(MAC 校验失败)。
+        assert_actionable(
+            PPK3_ED25519_ENCRYPTED,
+            &decode_error_of(PPK3_ED25519_ENCRYPTED, Some("wrong")),
+            true,
+            "the passphrase appears to be incorrect",
+        );
+        // PuTTY PPK 结构损坏。
+        let corrupt_ppk = PPK3_ED25519_PLAIN.replace("Public-Lines: 2", "Public-Lines: 3");
+        assert_actionable(
+            &corrupt_ppk,
+            &decode_error_of(&corrupt_ppk, None),
+            false,
+            "export it from PuTTYgen",
+        );
+        // base64 主体损坏(终端复制插空格、未走归一化的原始文本)。
+        let mut lines: Vec<&str> = OPENSSH_ED25519_PLAIN.lines().collect();
+        let mut second = lines[1].to_string();
+        second.insert(20, ' ');
+        lines[1] = &second;
+        let spaced_body = lines.join("\n");
+        assert_actionable(
+            &spaced_body,
+            &decode_error_of(&spaced_body, None),
+            false,
+            "not valid base64",
+        );
+        // 兜底:未知错误仍保留原文,只加一句说明。
+        let junk_key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----";
+        assert_actionable(
+            junk_key,
+            &decode_error_of(junk_key, None),
+            false,
+            "the key could not be decoded",
+        );
+    }
+
+    #[test]
+    fn valid_keys_still_decode_after_normalization() {
+        assert!(
+            decode_secret_key(&normalize_private_key_text(OPENSSH_ED25519_PLAIN), None).is_ok()
+        );
+        assert!(decode_secret_key(
+            &normalize_private_key_text(OPENSSH_ED25519_ENCRYPTED),
+            Some(ENCRYPTED_TEST_PASSPHRASE)
+        )
+        .is_ok());
+        assert!(decode_secret_key(&normalize_private_key_text(PPK3_ED25519_PLAIN), None).is_ok());
+        assert!(decode_secret_key(
+            &normalize_private_key_text(PPK3_ED25519_ENCRYPTED),
+            Some("123")
+        )
+        .is_ok());
+        assert!(!looks_like_public_key(OPENSSH_ED25519_PLAIN));
+        assert!(looks_like_public_key(ED25519_PUBLIC_ONELINER));
     }
 
     #[tokio::test]
@@ -6707,6 +8470,7 @@ mod tests {
                 size: 9,
                 next_offset: 5,
                 sink: None,
+                tree: None,
             },
         );
         let no_connection = |_: &str| String::new();
@@ -6744,6 +8508,78 @@ mod tests {
             .build_transfer_history(Some("s2"), 50, &no_connection)
             .unwrap();
         assert!(other["tasks"].as_array().unwrap().is_empty());
+    }
+
+    /// Issue #18: the history order must be a total order — newest first by
+    /// `startedAt`, ties broken by `taskId`, live rows without a start
+    /// record on top — so repeated polls cannot reshuffle equal/missing
+    /// keys into different positions.
+    #[test]
+    fn transfer_history_order_is_total_and_stable() {
+        let rows = vec![
+            json!({ "taskId": "b", "startedAt": 2_000 }),
+            json!({ "taskId": "a", "startedAt": 2_000 }),
+            json!({ "taskId": "z" }),
+            json!({ "taskId": "c", "startedAt": 3_000 }),
+            json!({ "taskId": "y" }),
+            json!({ "taskId": "a-old", "startedAt": 1 }),
+        ];
+        let mut sorted = rows.clone();
+        sorted.sort_by(compare_history_rows);
+        let ids: Vec<&str> = sorted
+            .iter()
+            .map(|task| task["taskId"].as_str().unwrap())
+            .collect();
+        // Missing timestamps lead (live rows), taskId tiebreak; then newest
+        // started first, again tie-broken by taskId.
+        assert_eq!(ids, vec!["y", "z", "c", "a", "b", "a-old"]);
+        // Any permutation of the same rows yields the identical order —
+        // the property the previous `startedAt`-only sort lacked.
+        for start in 0..rows.len() {
+            let mut rotated = rows.clone();
+            rotated.rotate_left(start);
+            rotated.sort_by(compare_history_rows);
+            let rotated_ids: Vec<&str> = rotated
+                .iter()
+                .map(|task| task["taskId"].as_str().unwrap())
+                .collect();
+            assert_eq!(rotated_ids, ids);
+        }
+    }
+
+    /// Issue #18: two live downloads whose start records never reached the
+    /// disk (lost cross-process write) used to render in HashMap iteration
+    /// order — a different order on every sidecar restart. The taskId
+    /// tiebreak makes the merged history deterministic.
+    #[test]
+    fn transfer_history_live_rows_without_start_context_sort_by_task_id() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SshRuntime::new(data_dir.path().to_path_buf());
+        for task_id in ["t-zulu", "t-alpha", "t-mike"] {
+            runtime.downloads.lock().unwrap().insert(
+                task_id.to_string(),
+                DownloadState {
+                    session_id: "s1".to_string(),
+                    remote_path: format!("/{task_id}.bin"),
+                    file_name: format!("{task_id}.bin"),
+                    size: 8,
+                    next_offset: 0,
+                    sink: None,
+                    tree: None,
+                },
+            );
+        }
+        let no_connection = |_: &str| String::new();
+        let tasks = runtime
+            .build_transfer_history(Some("s1"), 50, &no_connection)
+            .unwrap();
+        let ids: Vec<String> = tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["taskId"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["t-alpha", "t-mike", "t-zulu"]);
     }
 
     /// 登录期 2FA 的端到端回归（issue #17 / #30）：密码/公钥先被接受后服务器
@@ -7216,6 +9052,50 @@ mod tests {
                 "russh 服务端清零 partial success，客户端据此拒绝继续"
             );
             assert!(answers.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn preserved_permissions_keep_mode_bits_and_drop_everything_else() {
+            // Issue #37: the mode's permission bits (including setuid/setgid/
+            // sticky) must ride onto the staged file; the file-type bits of
+            // st_mode and the uid/gid/size/timestamps must not.
+            let target = russh_sftp::protocol::FileAttributes {
+                size: Some(12),
+                uid: Some(1000),
+                gid: Some(1000),
+                permissions: Some(0o100755),
+                atime: Some(1),
+                mtime: Some(2),
+                ..Default::default()
+            };
+            let preserved = preserved_target_permissions(&target).expect("permissions present");
+            assert_eq!(preserved.permissions, Some(0o755));
+            // Only permission bits travel: the staged file already has its own
+            // identity, and SETSTAT on uid/gid needs elevated privileges.
+            assert_eq!(preserved.size, None);
+            assert_eq!(preserved.uid, None);
+            assert_eq!(preserved.user, None);
+            assert_eq!(preserved.gid, None);
+            assert_eq!(preserved.group, None);
+            assert_eq!(preserved.atime, None);
+            assert_eq!(preserved.mtime, None);
+            let sticky = russh_sftp::protocol::FileAttributes {
+                permissions: Some(0o101755),
+                ..Default::default()
+            };
+            let preserved = preserved_target_permissions(&sticky).expect("permissions present");
+            assert_eq!(preserved.permissions, Some(0o1755));
+        }
+
+        #[test]
+        fn preserved_permissions_skip_targets_without_mode_information() {
+            // Servers may omit permission attributes entirely; without a mode
+            // to preserve there is nothing to SETSTAT.
+            let target = russh_sftp::protocol::FileAttributes {
+                size: Some(3),
+                ..Default::default()
+            };
+            assert!(preserved_target_permissions(&target).is_none());
         }
     }
 }

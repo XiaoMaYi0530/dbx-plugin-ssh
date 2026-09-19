@@ -19,6 +19,7 @@ const messages = {
       timeout: "The connection timed out. Check network reachability, firewalls and VPN routes.",
       hostKey: "The server's host key was rejected. If the server was rebuilt, open the Known hosts panel to update the stored entry, then reconnect.",
       network: "The server is unreachable over the network. Check routing and firewalls, then press Reconnect.",
+      keyFormat: "The SSH private key could not be decoded. Re-paste the complete private key (including the BEGIN/END lines) — public keys, PuTTY PPK files or text mangled while copying all cause this. If the key is protected, fill in the private key passphrase field. The raw error shows the specific cause.",
     },
     connectCard: {
       waitingReopen: "Credentials unavailable — reopen this connection from the DBX sidebar; retrying automatically…",
@@ -225,6 +226,8 @@ const messages = {
     size: "Size",
     modified: "Modified",
     permissions: "Permissions",
+    owner: "Owner",
+    group: "Group",
     loading: "Loading...",
     emptyFolder: "This folder is empty",
     items: "{count} items",
@@ -297,6 +300,7 @@ const messages = {
     transferStatus: {
       queued: "Queued",
       running: "Transferring",
+      staging: "Buffering",
       completed: "Completed",
       cancelled: "Cancelled",
       failed: "Failed",
@@ -354,6 +358,7 @@ const messages = {
       timeout: "La conexión agotó el tiempo de espera. Comprueba la accesibilidad de la red, los cortafuegos y las rutas VPN.",
       hostKey: "La clave de host del servidor fue rechazada. Si el servidor se reconstruyó, abre el panel de Hosts conocidos para actualizar la entrada guardada y vuelve a conectar.",
       network: "No se puede alcanzar el servidor por la red. Revisa el enrutamiento y los cortafuegos y pulsa Reconectar.",
+      keyFormat: "No se pudo decodificar la clave privada SSH. Vuelve a pegar la clave privada completa (incluidas las líneas BEGIN/END): las claves públicas, los archivos PuTTY PPK o el texto dañado al copiar lo provocan. Si la clave está protegida, rellena el campo «Frase de contraseña de la clave». El error original indica la causa concreta.",
     },
     connectCard: {
       waitingReopen: "Credenciales no disponibles: vuelve a abrir esta conexión desde la lista de DBX; reintentando automáticamente…",
@@ -560,6 +565,8 @@ const messages = {
     size: "Tamaño",
     modified: "Modificado",
     permissions: "Permisos",
+    owner: "Propietario",
+    group: "Grupo",
     loading: "Cargando...",
     emptyFolder: "Esta carpeta está vacía",
     items: "{count} elementos",
@@ -629,7 +636,7 @@ const messages = {
       invalid: "Introduzca un número entero positivo de MiB en cada límite.",
       saved: "Límites MCP guardados",
     },
-    transferStatus: { queued: "En cola", running: "Transfiriendo", completed: "Completado", cancelled: "Cancelado", failed: "Fallido" },
+    transferStatus: { queued: "En cola", running: "Transfiriendo", staging: "Almacenando", completed: "Completado", cancelled: "Cancelado", failed: "Fallido" },
     highlightRules: {
       title: "Resaltado de palabras clave",
       add: "Añadir regla",
@@ -683,6 +690,7 @@ const messages = {
       timeout: "Connessione scaduta. Verifica raggiungibilità di rete, firewall e route VPN.",
       hostKey: "La host key del server è stata rifiutata. Se il server è stato ricostruito, apri il pannello Host noti per aggiornare la voce salvata, poi riconnettiti.",
       network: "Il server non è raggiungibile in rete. Controlla routing e firewall, poi premi Riconnetti.",
+      keyFormat: "Impossibile decodificare la chiave privata SSH. Incolla di nuovo la chiave privata completa (incluse le righe BEGIN/END): chiavi pubbliche, file PuTTY PPK o testo danneggiato durante la copia lo causano. Se la chiave è protetta, compila il campo «Passphrase chiave privata». L'errore originale indica la causa specifica.",
     },
     connectCard: {
       waitingReopen: "Credenziali non disponibili: riapri questa connessione dall'elenco di DBX; nuovo tentativo automatico in corso…",
@@ -889,6 +897,8 @@ const messages = {
     size: "Dimensione",
     modified: "Modificato",
     permissions: "Permessi",
+    owner: "Proprietario",
+    group: "Gruppo",
     loading: "Caricamento...",
     emptyFolder: "Questa cartella è vuota",
     items: "{count} elementi",
@@ -958,7 +968,7 @@ const messages = {
       invalid: "Inserisci un numero intero positivo di MiB per ogni limite.",
       saved: "Limiti MCP salvati",
     },
-    transferStatus: { queued: "In coda", running: "Trasferimento", completed: "Completato", cancelled: "Annullato", failed: "Non riuscito" },
+    transferStatus: { queued: "In coda", running: "Trasferimento", staging: "Buffering", completed: "Completato", cancelled: "Annullato", failed: "Non riuscito" },
     highlightRules: {
       title: "Evidenziazione parole chiave",
       add: "Aggiungi regola",
@@ -1012,6 +1022,7 @@ const messages = {
       timeout: "接続がタイムアウトしました。ネットワークの到達性・ファイアウォール・VPN 経路を確認してください。",
       hostKey: "サーバーのホスト鍵が拒否されました。サーバーを再構築した場合は、「既知のホスト」パネルで保存済みのエントリを更新してから再接続してください。",
       network: "ネットワーク経由でサーバーに到達できません。ルーティングとファイアウォールを確認してから、再接続を押してください。",
+      keyFormat: "SSH 秘密鍵をデコードできませんでした。秘密鍵を全文（BEGIN/END 行を含む）貼り直してください。公開鍵・PuTTY PPK・コピー時に壊れたテキストもこの原因になります。鍵が保護されている場合は「秘密鍵のパスフレーズ」欄に入力してください。具体的な原因は元のエラーを参照してください。",
     },
     connectCard: {
       waitingReopen: "資格情報が利用できません — DBX の接続一覧からこの接続を開き直してください。自動で再試行しています…",
@@ -1218,6 +1229,8 @@ const messages = {
     size: "サイズ",
     modified: "更新日時",
     permissions: "権限",
+    owner: "所有者",
+    group: "グループ",
     loading: "読み込み中...",
     emptyFolder: "このフォルダーは空です",
     items: "{count} 項目",
@@ -1287,7 +1300,7 @@ const messages = {
       invalid: "各上限に正の整数（MiB）を入力してください。",
       saved: "MCP サイズ上限を保存しました",
     },
-    transferStatus: { queued: "待機中", running: "転送中", completed: "完了", cancelled: "キャンセル", failed: "失敗" },
+    transferStatus: { queued: "待機中", running: "転送中", staging: "バッファ中", completed: "完了", cancelled: "キャンセル", failed: "失敗" },
     highlightRules: {
       title: "キーワード ハイライト",
       add: "ルールを追加",
@@ -1341,6 +1354,7 @@ const messages = {
       timeout: "A conexão expirou. Verifique a acessibilidade da rede, firewalls e rotas de VPN.",
       hostKey: "A host key do servidor foi rejeitada. Se o servidor foi reconstruído, abra o painel de Hosts conhecidos para atualizar a entrada salva e reconecte.",
       network: "O servidor está inacessível pela rede. Verifique roteamento e firewalls e pressione Reconectar.",
+      keyFormat: "Não foi possível decodificar a chave privada SSH. Cole novamente a chave privada completa (incluindo as linhas BEGIN/END): chaves públicas, arquivos PuTTY PPK ou texto danificado ao copiar causam isso. Se a chave for protegida, preencha o campo «Frase secreta da chave». O erro original mostra a causa específica.",
     },
     connectCard: {
       waitingReopen: "Credenciais indisponíveis — reabra esta conexão na lista do DBX; tentando novamente automaticamente…",
@@ -1547,6 +1561,8 @@ const messages = {
     size: "Tamanho",
     modified: "Modificado",
     permissions: "Permissões",
+    owner: "Proprietário",
+    group: "Grupo",
     loading: "Carregando...",
     emptyFolder: "Esta pasta está vazia",
     items: "{count} itens",
@@ -1616,7 +1632,7 @@ const messages = {
       invalid: "Informe um número inteiro positivo de MiB para cada limite.",
       saved: "Limites MCP salvos",
     },
-    transferStatus: { queued: "Na fila", running: "Transferindo", completed: "Concluído", cancelled: "Cancelado", failed: "Falhou" },
+    transferStatus: { queued: "Na fila", running: "Transferindo", staging: "Bufferizando", completed: "Concluído", cancelled: "Cancelado", failed: "Falhou" },
     highlightRules: {
       title: "Realce de palavras-chave",
       add: "Adicionar regra",
@@ -1670,6 +1686,7 @@ const messages = {
       timeout: "连接超时。请检查网络可达性、防火墙与 VPN 路由。",
       hostKey: "服务器主机密钥被拒绝。若服务器曾重装，请在「已知主机」面板更新记录，然后重新连接。",
       network: "网络无法到达服务器。请检查路由与防火墙，然后点击“重新连接”。",
+      keyFormat: "SSH 私钥无法解析。请重新粘贴完整私钥（含 BEGIN/END 行）：公钥、PuTTY PPK 或复制时损坏的文本都会导致此错误。若私钥设有口令，请填写「私钥口令」字段。具体原因见原始错误信息。",
     },
     connectCard: {
       waitingReopen: "凭据已不可用：请在 DBX 左侧连接列表重新打开该连接，正在自动重试…",
@@ -1876,6 +1893,8 @@ const messages = {
     size: "大小",
     modified: "修改时间",
     permissions: "权限",
+    owner: "用户",
+    group: "用户组",
     loading: "加载中...",
     emptyFolder: "此文件夹为空",
     items: "共 {count} 项",
@@ -1948,6 +1967,7 @@ const messages = {
     transferStatus: {
       queued: "等待中",
       running: "传输中",
+      staging: "缓冲中",
       completed: "已完成",
       cancelled: "已取消",
       failed: "失败",
@@ -2005,6 +2025,7 @@ const messages = {
       timeout: "連線逾時。請檢查網路可達性、防火牆與 VPN 路由。",
       hostKey: "伺服器主機金鑰被拒絕。若伺服器曾重裝，請在「已知主機」面板更新記錄，然後重新連線。",
       network: "網路無法抵達伺服器。請檢查路由與防火牆，然後點擊「重新連線」。",
+      keyFormat: "SSH 私密金鑰無法解析。請重新貼上完整私密金鑰（含 BEGIN/END 行）：公鑰、PuTTY PPK 或複製時損毀的文字都會導致此錯誤。若金鑰設有通關密語，請填寫「私鑰密語」欄位。具體原因請見原始錯誤訊息。",
     },
     connectCard: {
       waitingReopen: "憑據已不可用：請在 DBX 左側連線清單重新開啟此連線，正在自動重試…",
@@ -2211,6 +2232,8 @@ const messages = {
     size: "大小",
     modified: "修改時間",
     permissions: "權限",
+    owner: "擁有者",
+    group: "群組",
     loading: "載入中...",
     emptyFolder: "此資料夾為空",
     items: "共 {count} 項",
@@ -2283,6 +2306,7 @@ const messages = {
     transferStatus: {
       queued: "等候中",
       running: "傳輸中",
+      staging: "緩衝中",
       completed: "已完成",
       cancelled: "已取消",
       failed: "失敗",
@@ -2337,13 +2361,13 @@ const supplemental: Record<string, Record<string, string>> = {
 // Transfer/recording UI actions are kept here so the generated compact
 // supplemental tables remain easy to audit without editing seven giant lines.
 const transferUiMessages: Record<string, Record<string, string>> = {
-  en: { "downloadSettings.title": "Downloads", "downloadSettings.directory": "Save downloaded files to", "downloadSettings.default": "System Downloads folder", "downloadSettings.hint": "Use an absolute local path. Leave empty to use the system Downloads folder.", "downloadSettings.setDefaultThisTime": "Make this folder the new default", "downloadSettings.browse": "Browse…", replayExportFailed: "GIF export failed: no graphics renderer available (WebGL/canvas)", downloadedTo: "{name} saved to {path}", downloadedToDir: "{count} files saved to {path}", recordingStop: "Stop recording", recordingsClear: "Clear all recordings", recordingsClearConfirm: "Delete all {count} recordings? This cannot be undone.", recordingsCleared: "{count} recordings cleared", "folderPicker.title": "Choose folder", "folderPicker.thisPC": "This PC", "folderPicker.parentDir": "Up one level", "folderPicker.empty": "No subfolders here", "folderPicker.placeholderPath": "Type a path and press Enter", "folderPicker.placeholderDrives": "Pick a drive or type a path", "folderPicker.confirm": "Choose this folder", "downloadSettings.conflictTitle": "When the file already exists", "downloadSettings.conflict.rename": "Auto-rename", "downloadSettings.conflict.ask": "Ask me", "downloadSettings.conflict.overwrite": "Overwrite existing file", "downloadSettings.conflictHint": "Auto-rename example: report.pdf → report (1).pdf", "downloadConflict.title": "File already exists", "downloadConflict.message": "\"{name}\" already exists in the target folder.", retry: "Retry", "transfersHistory.clear": "Clear transfer history", "transfersHistory.clearConfirm": "Clear all transfer history? This cannot be undone.", "transfersHistory.cleared": "Transfer history cleared", revealInFolder: "Reveal in folder", openDownloadedFile: "Open downloaded file" },
-  "zh-CN": { "downloadSettings.title": "下载设置", "downloadSettings.directory": "下载保存目录", "downloadSettings.default": "系统 Downloads 文件夹", "downloadSettings.hint": "填写本机绝对路径；留空使用系统 Downloads 文件夹。", "downloadSettings.setDefaultThisTime": "将此次选择的目录设为默认地址", "downloadSettings.browse": "浏览…", replayExportFailed: "GIF 导出失败：当前环境没有可用的图形渲染器（WebGL/Canvas）", downloadedTo: "{name} 已保存到 {path}", downloadedToDir: "{count} 个文件已保存到 {path}", recordingStop: "停止录制", recordingsClear: "清空录制记录", recordingsClearConfirm: "删除全部 {count} 条录制记录？此操作不可撤销。", recordingsCleared: "已清空 {count} 条录制记录", "folderPicker.title": "选择目录", "folderPicker.thisPC": "此电脑", "folderPicker.parentDir": "上一级", "folderPicker.empty": "该目录下没有子文件夹", "folderPicker.placeholderPath": "输入路径后回车跳转", "folderPicker.placeholderDrives": "选择磁盘或输入路径", "folderPicker.confirm": "选择此目录", "downloadSettings.conflictTitle": "文件已存在时", "downloadSettings.conflict.rename": "自动重命名", "downloadSettings.conflict.ask": "询问我", "downloadSettings.conflict.overwrite": "覆盖已有文件", "downloadSettings.conflictHint": "自动重命名示例：report.pdf → report (1).pdf", "downloadConflict.title": "文件已存在", "downloadConflict.message": "目标目录中已存在「{name}」。", retry: "重试", "transfersHistory.clear": "清空传输历史", "transfersHistory.clearConfirm": "清空全部传输历史？此操作不可撤销。", "transfersHistory.cleared": "传输历史已清空", revealInFolder: "在文件夹中显示", openDownloadedFile: "打开已下载文件" },
-  "zh-TW": { "downloadSettings.title": "下載設定", "downloadSettings.directory": "下載儲存目錄", "downloadSettings.default": "系統 Downloads 資料夾", "downloadSettings.hint": "填寫本機絕對路徑；留空使用系統 Downloads 資料夾。", "downloadSettings.setDefaultThisTime": "將此次選擇的目錄設為預設位置", "downloadSettings.browse": "瀏覽…", replayExportFailed: "GIF 匯出失敗：目前環境沒有可用的圖形渲染器（WebGL/Canvas）", downloadedTo: "{name} 已儲存到 {path}", downloadedToDir: "{count} 個檔案已儲存到 {path}", recordingStop: "停止錄製", recordingsClear: "清空錄製記錄", recordingsClearConfirm: "刪除全部 {count} 條錄製記錄？此操作無法復原。", recordingsCleared: "已清空 {count} 條錄製記錄", "folderPicker.title": "選擇目錄", "folderPicker.thisPC": "此電腦", "folderPicker.parentDir": "上一層", "folderPicker.empty": "該目錄下沒有子資料夾", "folderPicker.placeholderPath": "輸入路徑後 Enter 跳轉", "folderPicker.placeholderDrives": "選擇磁碟或輸入路徑", "folderPicker.confirm": "選擇此目錄", "downloadSettings.conflictTitle": "檔案已存在時", "downloadSettings.conflict.rename": "自動重新命名", "downloadSettings.conflict.ask": "詢問我", "downloadSettings.conflict.overwrite": "覆蓋已有檔案", "downloadSettings.conflictHint": "自動重新命名範例：report.pdf → report (1).pdf", "downloadConflict.title": "檔案已存在", "downloadConflict.message": "目標目錄中已存在「{name}」。", retry: "重試", "transfersHistory.clear": "清空傳輸歷史", "transfersHistory.clearConfirm": "清空全部傳輸歷史？此操作無法復原。", "transfersHistory.cleared": "傳輸歷史已清空", revealInFolder: "在資料夾中顯示", openDownloadedFile: "開啟已下載檔案" },
-  es: { "downloadSettings.title": "Descargas", "downloadSettings.directory": "Guardar archivos descargados en", "downloadSettings.default": "Carpeta Descargas del sistema", "downloadSettings.hint": "Usa una ruta local absoluta. Déjalo vacío para usar Descargas del sistema.", "downloadSettings.setDefaultThisTime": "Convertir esta carpeta en la nueva predeterminada", "downloadSettings.browse": "Examinar…", replayExportFailed: "Error al exportar el GIF: no hay renderizador gráfico disponible (WebGL/canvas)", downloadedTo: "{name} guardado en {path}", downloadedToDir: "{count} archivos guardados en {path}", recordingStop: "Detener grabación", recordingsClear: "Borrar todas las grabaciones", recordingsClearConfirm: "¿Eliminar las {count} grabaciones? No se puede deshacer.", recordingsCleared: "{count} grabaciones eliminadas", "folderPicker.title": "Elegir carpeta", "folderPicker.thisPC": "Este equipo", "folderPicker.parentDir": "Subir un nivel", "folderPicker.empty": "No hay subcarpetas", "folderPicker.placeholderPath": "Escribe una ruta y pulsa Enter", "folderPicker.placeholderDrives": "Elige una unidad o escribe una ruta", "folderPicker.confirm": "Elegir esta carpeta", "downloadSettings.conflictTitle": "Si el archivo ya existe", "downloadSettings.conflict.rename": "Renombrar automáticamente", "downloadSettings.conflict.ask": "Preguntarme", "downloadSettings.conflict.overwrite": "Sobrescribir el archivo existente", "downloadSettings.conflictHint": "Ejemplo de renombrado: report.pdf → report (1).pdf", "downloadConflict.title": "El archivo ya existe", "downloadConflict.message": "«{name}» ya existe en la carpeta de destino.", retry: "Reintentar", "transfersHistory.clear": "Borrar historial de transferencias", "transfersHistory.clearConfirm": "¿Borrar todo el historial de transferencias? No se puede deshacer.", "transfersHistory.cleared": "Historial de transferencias borrado", revealInFolder: "Mostrar en la carpeta", openDownloadedFile: "Abrir archivo descargado" },
-  it: { "downloadSettings.title": "Download", "downloadSettings.directory": "Salva i file scaricati in", "downloadSettings.default": "Cartella Download di sistema", "downloadSettings.hint": "Usa un percorso locale assoluto. Lascia vuoto per usare Download di sistema.", "downloadSettings.setDefaultThisTime": "Rendi questa cartella la nuova predefinita", "downloadSettings.browse": "Sfoglia…", replayExportFailed: "Esportazione GIF non riuscita: nessun renderer grafico disponibile (WebGL/canvas)", downloadedTo: "{name} salvato in {path}", downloadedToDir: "{count} file salvati in {path}", recordingStop: "Interrompi registrazione", recordingsClear: "Cancella tutte le registrazioni", recordingsClearConfirm: "Eliminare tutte le {count} registrazioni? L'operazione non può essere annullata.", recordingsCleared: "{count} registrazioni eliminate", "folderPicker.title": "Scegli cartella", "folderPicker.thisPC": "Questo PC", "folderPicker.parentDir": "Livello superiore", "folderPicker.empty": "Nessuna sottocartella", "folderPicker.placeholderPath": "Digita un percorso e premi Invio", "folderPicker.placeholderDrives": "Scegli un'unità o digita un percorso", "folderPicker.confirm": "Scegli questa cartella", "downloadSettings.conflictTitle": "Quando il file esiste già", "downloadSettings.conflict.rename": "Rinomina automaticamente", "downloadSettings.conflict.ask": "Chiedimi", "downloadSettings.conflict.overwrite": "Sovrascrivi il file esistente", "downloadSettings.conflictHint": "Esempio di rinomina: report.pdf → report (1).pdf", "downloadConflict.title": "Il file esiste già", "downloadConflict.message": "«{name}» esiste già nella cartella di destinazione.", retry: "Riprova", "transfersHistory.clear": "Cancella cronologia trasferimenti", "transfersHistory.clearConfirm": "Cancellare tutta la cronologia dei trasferimenti? L'operazione non può essere annullata.", "transfersHistory.cleared": "Cronologia trasferimenti cancellata", revealInFolder: "Mostra nella cartella", openDownloadedFile: "Apri file scaricato" },
-  ja: { "downloadSettings.title": "ダウンロード", "downloadSettings.directory": "保存先", "downloadSettings.default": "システムの Downloads フォルダー", "downloadSettings.hint": "ローカルの絶対パスを指定します。空欄ならシステムの Downloads を使います。", "downloadSettings.setDefaultThisTime": "このフォルダーを新しい既定にする", "downloadSettings.browse": "参照…", replayExportFailed: "GIF のエクスポートに失敗しました：利用できるグラフィックレンダラー（WebGL/Canvas）がありません", downloadedTo: "{name} を {path} に保存しました", downloadedToDir: "{count} 個のファイルを {path} に保存しました", recordingStop: "録画を停止", recordingsClear: "すべての録画を削除", recordingsClearConfirm: "{count} 件の録画をすべて削除しますか？元に戻せません。", recordingsCleared: "{count} 件の録画を削除しました", "folderPicker.title": "フォルダーを選択", "folderPicker.thisPC": "PC", "folderPicker.parentDir": "上の階層へ", "folderPicker.empty": "サブフォルダーがありません", "folderPicker.placeholderPath": "パスを入力して Enter", "folderPicker.placeholderDrives": "ドライブを選択またはパスを入力", "folderPicker.confirm": "このフォルダーを選択", "downloadSettings.conflictTitle": "同名ファイルが存在する場合", "downloadSettings.conflict.rename": "自動でリネーム", "downloadSettings.conflict.ask": "確認する", "downloadSettings.conflict.overwrite": "既存ファイルを上書き", "downloadSettings.conflictHint": "自動リネーム例：report.pdf → report (1).pdf", "downloadConflict.title": "ファイルが既に存在します", "downloadConflict.message": "保存先に「{name}」は既に存在します。", retry: "再試行", "transfersHistory.clear": "転送履歴を消去", "transfersHistory.clearConfirm": "すべての転送履歴を消去しますか？元に戻せません。", "transfersHistory.cleared": "転送履歴を消去しました", revealInFolder: "フォルダーで表示", openDownloadedFile: "ダウンロードしたファイルを開く" },
-  "pt-BR": { "downloadSettings.title": "Downloads", "downloadSettings.directory": "Salvar arquivos baixados em", "downloadSettings.default": "Pasta Downloads do sistema", "downloadSettings.hint": "Use um caminho local absoluto. Deixe vazio para usar a pasta Downloads do sistema.", "downloadSettings.setDefaultThisTime": "Tornar esta pasta a nova padrão", "downloadSettings.browse": "Procurar…", replayExportFailed: "Falha ao exportar GIF: nenhum renderizador gráfico disponível (WebGL/canvas)", downloadedTo: "{name} salvo em {path}", downloadedToDir: "{count} arquivos salvos em {path}", recordingStop: "Parar gravação", recordingsClear: "Limpar todas as gravações", recordingsClearConfirm: "Excluir todas as {count} gravações? Não é possível desfazer.", recordingsCleared: "{count} gravações excluídas", "folderPicker.title": "Escolher pasta", "folderPicker.thisPC": "Este computador", "folderPicker.parentDir": "Subir um nível", "folderPicker.empty": "Sem subpastas", "folderPicker.placeholderPath": "Digite um caminho e pressione Enter", "folderPicker.placeholderDrives": "Escolha uma unidade ou digite um caminho", "folderPicker.confirm": "Escolher esta pasta", "downloadSettings.conflictTitle": "Quando o arquivo já existe", "downloadSettings.conflict.rename": "Renomear automaticamente", "downloadSettings.conflict.ask": "Perguntar", "downloadSettings.conflict.overwrite": "Sobrescrever o arquivo existente", "downloadSettings.conflictHint": "Exemplo de renomeação: report.pdf → report (1).pdf", "downloadConflict.title": "O arquivo já existe", "downloadConflict.message": "\"{name}\" já existe na pasta de destino.", retry: "Tentar novamente", "transfersHistory.clear": "Limpar histórico de transferências", "transfersHistory.clearConfirm": "Limpar todo o histórico de transferências? Não é possível desfazer.", "transfersHistory.cleared": "Histórico de transferências limpo", revealInFolder: "Mostrar na pasta", openDownloadedFile: "Abrir arquivo baixado" },
+  en: { "downloadSettings.title": "Downloads", "downloadSettings.directory": "Save downloaded files to", "downloadSettings.default": "System Downloads folder", "downloadSettings.hint": "Use an absolute local path. Leave empty to use the system Downloads folder.", "downloadSettings.setDefaultThisTime": "Make this folder the new default", "downloadSettings.browse": "Browse…", replayExportFailed: "GIF export failed: no graphics renderer available (WebGL/canvas)", downloadedTo: "{name} saved to {path}", downloadedToDir: "{count} files saved to {path}", recordingStop: "Stop recording", recordingsClear: "Clear all recordings", recordingsClearConfirm: "Delete all {count} recordings? This cannot be undone.", recordingsCleared: "{count} recordings cleared", "folderPicker.title": "Choose folder", "folderPicker.thisPC": "This PC", "folderPicker.parentDir": "Up one level", "folderPicker.empty": "No subfolders here", "folderPicker.placeholderPath": "Type a path and press Enter", "folderPicker.placeholderDrives": "Pick a drive or type a path", "folderPicker.confirm": "Choose this folder", "downloadSettings.conflictTitle": "When the file already exists", "downloadSettings.conflict.rename": "Auto-rename", "downloadSettings.conflict.ask": "Ask me", "downloadSettings.conflict.overwrite": "Overwrite existing file", "downloadSettings.conflictHint": "Auto-rename example: report.pdf → report (1).pdf", "downloadConflict.title": "File already exists", "downloadConflict.message": "\"{name}\" already exists in the target folder.", retry: "Retry", "transfersHistory.clear": "Clear transfer history", "transfersHistory.clearConfirm": "Clear all transfer history? This cannot be undone.", "transfersHistory.cleared": "Transfer history cleared", revealInFolder: "Reveal in folder", openDownloadedFile: "Open downloaded file", "folderDownload.unsupported": "Folder downloads need the local Downloads folder, which is not available in this environment.", "folderDownload.completedWithFailures": "Folder saved to {path}, but {count} of {total} files failed.", "folderDownload.skippedNote": " ({count} symlink/special entries skipped)", "folderDownload.failedCard": "{count} file(s) failed" },
+  "zh-CN": { "downloadSettings.title": "下载设置", "downloadSettings.directory": "下载保存目录", "downloadSettings.default": "系统 Downloads 文件夹", "downloadSettings.hint": "填写本机绝对路径；留空使用系统 Downloads 文件夹。", "downloadSettings.setDefaultThisTime": "将此次选择的目录设为默认地址", "downloadSettings.browse": "浏览…", replayExportFailed: "GIF 导出失败：当前环境没有可用的图形渲染器（WebGL/Canvas）", downloadedTo: "{name} 已保存到 {path}", downloadedToDir: "{count} 个文件已保存到 {path}", recordingStop: "停止录制", recordingsClear: "清空录制记录", recordingsClearConfirm: "删除全部 {count} 条录制记录？此操作不可撤销。", recordingsCleared: "已清空 {count} 条录制记录", "folderPicker.title": "选择目录", "folderPicker.thisPC": "此电脑", "folderPicker.parentDir": "上一级", "folderPicker.empty": "该目录下没有子文件夹", "folderPicker.placeholderPath": "输入路径后回车跳转", "folderPicker.placeholderDrives": "选择磁盘或输入路径", "folderPicker.confirm": "选择此目录", "downloadSettings.conflictTitle": "文件已存在时", "downloadSettings.conflict.rename": "自动重命名", "downloadSettings.conflict.ask": "询问我", "downloadSettings.conflict.overwrite": "覆盖已有文件", "downloadSettings.conflictHint": "自动重命名示例：report.pdf → report (1).pdf", "downloadConflict.title": "文件已存在", "downloadConflict.message": "目标目录中已存在「{name}」。", retry: "重试", "transfersHistory.clear": "清空传输历史", "transfersHistory.clearConfirm": "清空全部传输历史？此操作不可撤销。", "transfersHistory.cleared": "传输历史已清空", revealInFolder: "在文件夹中显示", openDownloadedFile: "打开已下载文件", "folderDownload.unsupported": "此环境没有本机下载目录，无法下载文件夹。", "folderDownload.completedWithFailures": "文件夹已保存到 {path}，但 {total} 个文件中有 {count} 个失败。", "folderDownload.skippedNote": "（已跳过 {count} 个符号链接/特殊条目）", "folderDownload.failedCard": "{count} 个文件下载失败" },
+  "zh-TW": { "downloadSettings.title": "下載設定", "downloadSettings.directory": "下載儲存目錄", "downloadSettings.default": "系統 Downloads 資料夾", "downloadSettings.hint": "填寫本機絕對路徑；留空使用系統 Downloads 資料夾。", "downloadSettings.setDefaultThisTime": "將此次選擇的目錄設為預設位置", "downloadSettings.browse": "瀏覽…", replayExportFailed: "GIF 匯出失敗：目前環境沒有可用的圖形渲染器（WebGL/Canvas）", downloadedTo: "{name} 已儲存到 {path}", downloadedToDir: "{count} 個檔案已儲存到 {path}", recordingStop: "停止錄製", recordingsClear: "清空錄製記錄", recordingsClearConfirm: "刪除全部 {count} 條錄製記錄？此操作無法復原。", recordingsCleared: "已清空 {count} 條錄製記錄", "folderPicker.title": "選擇目錄", "folderPicker.thisPC": "此電腦", "folderPicker.parentDir": "上一層", "folderPicker.empty": "該目錄下沒有子資料夾", "folderPicker.placeholderPath": "輸入路徑後 Enter 跳轉", "folderPicker.placeholderDrives": "選擇磁碟或輸入路徑", "folderPicker.confirm": "選擇此目錄", "downloadSettings.conflictTitle": "檔案已存在時", "downloadSettings.conflict.rename": "自動重新命名", "downloadSettings.conflict.ask": "詢問我", "downloadSettings.conflict.overwrite": "覆蓋已有檔案", "downloadSettings.conflictHint": "自動重新命名範例：report.pdf → report (1).pdf", "downloadConflict.title": "檔案已存在", "downloadConflict.message": "目標目錄中已存在「{name}」。", retry: "重試", "transfersHistory.clear": "清空傳輸歷史", "transfersHistory.clearConfirm": "清空全部傳輸歷史？此操作無法復原。", "transfersHistory.cleared": "傳輸歷史已清空", revealInFolder: "在資料夾中顯示", openDownloadedFile: "開啟已下載檔案", "folderDownload.unsupported": "此環境沒有本機下載資料夾，無法下載資料夾。", "folderDownload.completedWithFailures": "資料夾已儲存到 {path}，但 {total} 個檔案中有 {count} 個失敗。", "folderDownload.skippedNote": "（已跳過 {count} 個符號連結/特殊項目）", "folderDownload.failedCard": "{count} 個檔案下載失敗" },
+  es: { "downloadSettings.title": "Descargas", "downloadSettings.directory": "Guardar archivos descargados en", "downloadSettings.default": "Carpeta Descargas del sistema", "downloadSettings.hint": "Usa una ruta local absoluta. Déjalo vacío para usar Descargas del sistema.", "downloadSettings.setDefaultThisTime": "Convertir esta carpeta en la nueva predeterminada", "downloadSettings.browse": "Examinar…", replayExportFailed: "Error al exportar el GIF: no hay renderizador gráfico disponible (WebGL/canvas)", downloadedTo: "{name} guardado en {path}", downloadedToDir: "{count} archivos guardados en {path}", recordingStop: "Detener grabación", recordingsClear: "Borrar todas las grabaciones", recordingsClearConfirm: "¿Eliminar las {count} grabaciones? No se puede deshacer.", recordingsCleared: "{count} grabaciones eliminadas", "folderPicker.title": "Elegir carpeta", "folderPicker.thisPC": "Este equipo", "folderPicker.parentDir": "Subir un nivel", "folderPicker.empty": "No hay subcarpetas", "folderPicker.placeholderPath": "Escribe una ruta y pulsa Enter", "folderPicker.placeholderDrives": "Elige una unidad o escribe una ruta", "folderPicker.confirm": "Elegir esta carpeta", "downloadSettings.conflictTitle": "Si el archivo ya existe", "downloadSettings.conflict.rename": "Renombrar automáticamente", "downloadSettings.conflict.ask": "Preguntarme", "downloadSettings.conflict.overwrite": "Sobrescribir el archivo existente", "downloadSettings.conflictHint": "Ejemplo de renombrado: report.pdf → report (1).pdf", "downloadConflict.title": "El archivo ya existe", "downloadConflict.message": "«{name}» ya existe en la carpeta de destino.", retry: "Reintentar", "transfersHistory.clear": "Borrar historial de transferencias", "transfersHistory.clearConfirm": "¿Borrar todo el historial de transferencias? No se puede deshacer.", "transfersHistory.cleared": "Historial de transferencias borrado", revealInFolder: "Mostrar en la carpeta", openDownloadedFile: "Abrir archivo descargado", "folderDownload.unsupported": "Las descargas de carpetas necesitan la carpeta local de descargas, que no está disponible en este entorno.", "folderDownload.completedWithFailures": "Carpeta guardada en {path}, pero {count} de {total} archivos fallaron.", "folderDownload.skippedNote": " ({count} enlaces simbólicos/entradas especiales omitidos)", "folderDownload.failedCard": "{count} archivos fallidos" },
+  it: { "downloadSettings.title": "Download", "downloadSettings.directory": "Salva i file scaricati in", "downloadSettings.default": "Cartella Download di sistema", "downloadSettings.hint": "Usa un percorso locale assoluto. Lascia vuoto per usare Download di sistema.", "downloadSettings.setDefaultThisTime": "Rendi questa cartella la nuova predefinita", "downloadSettings.browse": "Sfoglia…", replayExportFailed: "Esportazione GIF non riuscita: nessun renderer grafico disponibile (WebGL/canvas)", downloadedTo: "{name} salvato in {path}", downloadedToDir: "{count} file salvati in {path}", recordingStop: "Interrompi registrazione", recordingsClear: "Cancella tutte le registrazioni", recordingsClearConfirm: "Eliminare tutte le {count} registrazioni? L'operazione non può essere annullata.", recordingsCleared: "{count} registrazioni eliminate", "folderPicker.title": "Scegli cartella", "folderPicker.thisPC": "Questo PC", "folderPicker.parentDir": "Livello superiore", "folderPicker.empty": "Nessuna sottocartella", "folderPicker.placeholderPath": "Digita un percorso e premi Invio", "folderPicker.placeholderDrives": "Scegli un'unità o digita un percorso", "folderPicker.confirm": "Scegli questa cartella", "downloadSettings.conflictTitle": "Quando il file esiste già", "downloadSettings.conflict.rename": "Rinomina automaticamente", "downloadSettings.conflict.ask": "Chiedimi", "downloadSettings.conflict.overwrite": "Sovrascrivi il file esistente", "downloadSettings.conflictHint": "Esempio di rinomina: report.pdf → report (1).pdf", "downloadConflict.title": "Il file esiste già", "downloadConflict.message": "«{name}» esiste già nella cartella di destinazione.", retry: "Riprova", "transfersHistory.clear": "Cancella cronologia trasferimenti", "transfersHistory.clearConfirm": "Cancellare tutta la cronologia dei trasferimenti? L'operazione non può essere annullata.", "transfersHistory.cleared": "Cronologia trasferimenti cancellata", revealInFolder: "Mostra nella cartella", openDownloadedFile: "Apri file scaricato", "folderDownload.unsupported": "Il download delle cartelle richiede la cartella Download locale, non disponibile in questo ambiente.", "folderDownload.completedWithFailures": "Cartella salvata in {path}, ma {count} file su {total} non sono stati scaricati.", "folderDownload.skippedNote": " ({count} collegamenti simbolici/voci speciali ignorati)", "folderDownload.failedCard": "{count} file non scaricati" },
+  ja: { "downloadSettings.title": "ダウンロード", "downloadSettings.directory": "保存先", "downloadSettings.default": "システムの Downloads フォルダー", "downloadSettings.hint": "ローカルの絶対パスを指定します。空欄ならシステムの Downloads を使います。", "downloadSettings.setDefaultThisTime": "このフォルダーを新しい既定にする", "downloadSettings.browse": "参照…", replayExportFailed: "GIF のエクスポートに失敗しました：利用できるグラフィックレンダラー（WebGL/Canvas）がありません", downloadedTo: "{name} を {path} に保存しました", downloadedToDir: "{count} 個のファイルを {path} に保存しました", recordingStop: "録画を停止", recordingsClear: "すべての録画を削除", recordingsClearConfirm: "{count} 件の録画をすべて削除しますか？元に戻せません。", recordingsCleared: "{count} 件の録画を削除しました", "folderPicker.title": "フォルダーを選択", "folderPicker.thisPC": "PC", "folderPicker.parentDir": "上の階層へ", "folderPicker.empty": "サブフォルダーがありません", "folderPicker.placeholderPath": "パスを入力して Enter", "folderPicker.placeholderDrives": "ドライブを選択またはパスを入力", "folderPicker.confirm": "このフォルダーを選択", "downloadSettings.conflictTitle": "同名ファイルが存在する場合", "downloadSettings.conflict.rename": "自動でリネーム", "downloadSettings.conflict.ask": "確認する", "downloadSettings.conflict.overwrite": "既存ファイルを上書き", "downloadSettings.conflictHint": "自動リネーム例：report.pdf → report (1).pdf", "downloadConflict.title": "ファイルが既に存在します", "downloadConflict.message": "保存先に「{name}」は既に存在します。", retry: "再試行", "transfersHistory.clear": "転送履歴を消去", "transfersHistory.clearConfirm": "すべての転送履歴を消去しますか？元に戻せません。", "transfersHistory.cleared": "転送履歴を消去しました", revealInFolder: "フォルダーで表示", openDownloadedFile: "ダウンロードしたファイルを開く", "folderDownload.unsupported": "フォルダーのダウンロードにはローカルの Downloads フォルダーが必要です。この環境では利用できません。", "folderDownload.completedWithFailures": "フォルダーを {path} に保存しましたが、{total} 個中 {count} 個のファイルが失敗しました。", "folderDownload.skippedNote": "（シンボリックリンク/特殊エントリ {count} 件をスキップ）", "folderDownload.failedCard": "{count} 個のファイルが失敗" },
+  "pt-BR": { "downloadSettings.title": "Downloads", "downloadSettings.directory": "Salvar arquivos baixados em", "downloadSettings.default": "Pasta Downloads do sistema", "downloadSettings.hint": "Use um caminho local absoluto. Deixe vazio para usar a pasta Downloads do sistema.", "downloadSettings.setDefaultThisTime": "Tornar esta pasta a nova padrão", "downloadSettings.browse": "Procurar…", replayExportFailed: "Falha ao exportar GIF: nenhum renderizador gráfico disponível (WebGL/canvas)", downloadedTo: "{name} salvo em {path}", downloadedToDir: "{count} arquivos salvos em {path}", recordingStop: "Parar gravação", recordingsClear: "Limpar todas as gravações", recordingsClearConfirm: "Excluir todas as {count} gravações? Não é possível desfazer.", recordingsCleared: "{count} gravações excluídas", "folderPicker.title": "Escolher pasta", "folderPicker.thisPC": "Este computador", "folderPicker.parentDir": "Subir um nível", "folderPicker.empty": "Sem subpastas", "folderPicker.placeholderPath": "Digite um caminho e pressione Enter", "folderPicker.placeholderDrives": "Escolha uma unidade ou digite um caminho", "folderPicker.confirm": "Escolher esta pasta", "downloadSettings.conflictTitle": "Quando o arquivo já existe", "downloadSettings.conflict.rename": "Renomear automaticamente", "downloadSettings.conflict.ask": "Perguntar", "downloadSettings.conflict.overwrite": "Sobrescrever o arquivo existente", "downloadSettings.conflictHint": "Exemplo de renomeação: report.pdf → report (1).pdf", "downloadConflict.title": "O arquivo já existe", "downloadConflict.message": "\"{name}\" já existe na pasta de destino.", retry: "Tentar novamente", "transfersHistory.clear": "Limpar histórico de transferências", "transfersHistory.clearConfirm": "Limpar todo o histórico de transferências? Não é possível desfazer.", "transfersHistory.cleared": "Histórico de transferências limpo", revealInFolder: "Mostrar na pasta", openDownloadedFile: "Abrir arquivo baixado", "folderDownload.unsupported": "O download de pastas precisa da pasta local de Downloads, indisponível neste ambiente.", "folderDownload.completedWithFailures": "Pasta salva em {path}, mas {count} de {total} arquivos falharam.", "folderDownload.skippedNote": " ({count} links simbólicos/entradas especiais ignorados)", "folderDownload.failedCard": "{count} arquivos falharam" },
 };
 for (const locale of Object.keys(transferUiMessages)) {
   supplemental[locale] = { ...(supplemental[locale] ?? {}), ...transferUiMessages[locale] };

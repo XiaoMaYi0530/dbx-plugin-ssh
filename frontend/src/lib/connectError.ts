@@ -9,7 +9,14 @@
  * failures (SFTP paths, zmodem, approvals) keep their original messages.
  */
 
-export type ConnectErrorKind = "dns" | "refused" | "hostKey" | "auth" | "timeout" | "network";
+export type ConnectErrorKind =
+  | "dns"
+  | "refused"
+  | "hostKey"
+  | "auth"
+  | "timeout"
+  | "network"
+  | "keyFormat";
 
 const CONNECT_ERROR_PATTERNS: ReadonlyArray<readonly [ConnectErrorKind, RegExp]> = [
   // Name resolution: sidecar wraps dial errors as "SSH connection failed:
@@ -24,6 +31,14 @@ const CONNECT_ERROR_PATTERNS: ReadonlyArray<readonly [ConnectErrorKind, RegExp]>
   ["hostKey", /host key/i],
   ["hostKey", /unknownkey/i],
   ["hostKey", /known[_ ]?hosts/i],
+  // Local private-key decoding failures (issue #21): the sidecar emits
+  // "Failed to decode SSH private key: … (decoder error: …)", plus the raw
+  // russh wording for legacy paths and the file-read failure. These patterns
+  // are narrow so "SSH private-key authentication failed" (a server-side
+  // rejection) keeps classifying as auth.
+  ["keyFormat", /failed to decode ssh private key/i],
+  ["keyFormat", /could not read key/i],
+  ["keyFormat", /failed to read ssh private key/i],
   ["auth", /authentication/i],
   ["auth", /permission denied/i],
   ["auth", /access denied/i],
