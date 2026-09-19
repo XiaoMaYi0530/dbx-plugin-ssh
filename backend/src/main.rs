@@ -847,11 +847,20 @@ impl Plugin {
                 local_fs::target_exists(dir, name)
             }
             // 在文件管理器中定位已完成的下载。只允许 reveal 传输历史里
-            // 记录过的 localPath，不能成为任意路径打开原语。
+            // 记录过的 localPath，不能成为任意路径打开原语。目标文件已被
+            // 移走/改名时回落到其父目录，再退到插件的下载目录（配置或
+            // 默认），而不是让文件管理器落到系统的文档目录（issue #18）。
             "local/reveal" => {
                 let path = required_string(&params, "path")?;
-                let history = transfer_history::load_history(&plugin_data_dir());
-                local_downloads::reveal_validated(&history, std::path::Path::new(path))?;
+                let data_dir = plugin_data_dir();
+                let history = transfer_history::load_history(&data_dir);
+                let recorded = std::path::PathBuf::from(&path);
+                local_downloads::reveal_validated(&history, &recorded)?;
+                let target = local_downloads::reveal_target(
+                    &recorded,
+                    &local_downloads::reveal_download_dir(&data_dir),
+                );
+                local_downloads::reveal_in_file_manager(&target)?;
                 Ok(json!({ "success": true }))
             }
             // 在默认应用中打开已完成的本机下载；同样只允许打开传输历史中

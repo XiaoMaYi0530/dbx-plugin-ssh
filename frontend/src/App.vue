@@ -151,6 +151,7 @@ import {
 } from "./lib/keywordHighlight";
 import { pushSample, sparklinePath, METRICS_SAMPLE_CAPACITY } from "./lib/metricsSparkline";
 import { transferPausable, matchResumableUpload, canResumeUpload, type ResumableUploadTask } from "./lib/transferResume";
+import { isLiveTransferStatus, sortTransferTasks } from "./lib/transferOrder";
 import { buildTimeline, eventIndexAtTime, gifFramePlan, mergeEventPages, replayDuration, type RecordingSummary, type ReplayEvent, type ReplayEventPage } from "./lib/replayScheduler";
 import { encodeGif } from "./lib/gifEncoder";
 import { canKillProcess, sortProcessRows, type ProcessSortKey } from "./lib/processActions";
@@ -254,6 +255,9 @@ interface TransferTask {
   // staged 单独记录 staging 字节，面板不再出现"3G→100M"回跳与假速度。
   phase?: TransferPhase;
   staged?: number;
+  // 本工作台首次见到该任务的时间（issue #18 排序：live 行缺 startedAt 时
+  // 用它兜底，保证活跃区顺序稳定可解释）。
+  joinedAt?: number;
 }
 
 // sftp/transfer/history 行（落盘历史 + 内存 live 合并视图）：status 沿用现有枚举、无 queued。
@@ -1093,9 +1097,14 @@ const sortedEntries = computed(() => {
     return result * direction;
   });
 });
-// Object insertion order is the order a task joined this workbench. Do not
-// sort by taskId: task IDs are UUIDs, so doing so randomly reorders a batch.
-const transferList = computed(() => Object.values(transferTasks));
+// 活跃区只显示进行中的任务（queued/running），按 transferOrder 的稳定规则
+// 排序：先开始/先加入的排最上，同键用 taskId 兜底（issue #18）。此前这里
+// 按对象插入序渲染全部任务：插入序来自后端 HashMap 迭代序 + 事件到达序，
+// 终态行还永久堆积，同一张卡就会在面板里"一会儿在上、一会儿在中间、一会儿
+// 在下"。终态行由历史区承接（落盘 + 内存合并视图），转终态的同一拍刷新。
+const transferList = computed(() =>
+  sortTransferTasks(Object.values(transferTasks).filter((task) => isLiveTransferStatus(task.status))),
+);
 const activeTransfers = computed(() => transferList.value.filter((task) => task.status === "queued" || task.status === "running").length);
 const zmodemBusy = computed(() => zmodemState.value !== "idle");
 const zmodemPercent = computed(() => zmodemTotalSize.value > 0 ? Math.min(100, Math.round((zmodemTransferred.value / zmodemTotalSize.value) * 100)) : 0);
@@ -2248,9 +2257,15 @@ function updateTransfer(params: Record<string, unknown>) {
     phase: progress.phase,
     status,
     error: typeof params.error === "string" ? params.error : existing?.error,
+    joinedAt: existing?.joinedAt ?? Date.now(),
   };
   settleTransferCompletion(taskId, status);
-  if (!existing && (transferTasks[taskId].status === "queued" || transferTasks[taskId].status === "running")) openTransferPanel();
+  if (!existing && isLiveTransferStatus(transferTasks[taskId].status)) {
+    // 面板已开时不得重开：openTransferPanel 的"先收口再开"会卸载弹层、
+    // 复位滚动位置，用户正往下看历史时会被弹回顶部（issue #18）。互斥族
+    // 保证面板开着时没有其他弹层，直接置 open 即可。
+    if (!transferPanelOpen.value) transferPanelOpen.value = true;
+  }
 }
 
 function normalizeTransferStatus(value: unknown, fallback: TransferTask["status"] = "running"): TransferTask["status"] {
@@ -2592,7 +2607,10 @@ async function restoreTransfers() {
       task.staged = task.transferred;
       task.transferred = 0;
     }
-    transferTasks[task.taskId] = task;
+    const existing = transferTasks[task.taskId];
+    // joinedAt 只在首次见到时落一次：后端返回序（HashMap 迭代序）不再影响
+    // 活跃区排序（issue #18）。
+    transferTasks[task.taskId] = { ...task, joinedAt: existing?.joinedAt ?? Date.now() };
   }
 }
 
@@ -2696,15 +2714,24 @@ async function refreshTransferPanel() {
   await reconcileActiveTransfers();
 }
 
-// 打开传输面板或最后一个活动任务结束时拉取历史：历史区常驻展示，活跃任务只影响列表而不遮挡快照。
+// 打开传输面板或任一任务转为终态时拉取历史：终态卡从活跃区消失的同一拍
+// 进入历史区，不等最后一个任务结束（issue #18：有传输任务时历史也要可查）。
 // 打开面板的同时对账活跃任务，防止错过终态事件的行永远卡在 running。
 watch(transferPanelOpen, (open) => {
   if (open) {
     void refreshTransferPanel();
   }
 });
-watch(activeTransfers, (count, previous) => {
-  if (count === 0 && previous > 0 && transferPanelOpen.value) void refreshTransferHistory();
+const liveTransferIds = computed(() =>
+  transferList.value.map((task) => task.taskId).join("|"),
+);
+watch(liveTransferIds, (current, previous) => {
+  if (!transferPanelOpen.value) return;
+  const before = new Set((previous ?? "").split("|").filter(Boolean));
+  const after = new Set(current.split("|").filter(Boolean));
+  // 只有任务离开活跃集合（转终态）才刷新；新任务加入由面板打开路径负责。
+  const departed = [...before].some((taskId) => !after.has(taskId));
+  if (departed) void refreshTransferHistory();
 });
 
 async function refreshResumableUploads() {
@@ -4559,7 +4586,7 @@ async function uploadSource(name: string, size: number, readChunk: (offset: numb
     ? { sessionId: session.value.sessionId, remotePath: resume.remotePath, size, resumeTaskId: resume.taskId }
     : { sessionId: session.value.sessionId, remotePath: joinRemote(targetDir ?? currentPath.value, name), size });
   const startOffset = info.resumeOffset ?? 0;
-  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: name, size, transferred: startOffset, status: startOffset > 0 ? "running" : "queued" };
+  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: name, size, transferred: startOffset, status: startOffset > 0 ? "running" : "queued", joinedAt: Date.now() };
   try {
     let offset = startOffset;
     while (offset < size) {
@@ -4667,7 +4694,7 @@ async function downloadEntry(entry: SftpEntry) {
       downloadDir: dirOverride || loadDownloadDir() || undefined,
       conflict: conflict === "overwrite" ? "overwrite" : undefined,
     });
-    transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued" };
+    transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued", joinedAt: Date.now() };
     target = fileTransfer ? await fileTransfer.beginSave({ name: info.fileName, size: info.size }) : undefined;
     let offset = 0;
     while (offset < info.size) {

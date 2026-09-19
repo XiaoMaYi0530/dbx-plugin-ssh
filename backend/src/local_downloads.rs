@@ -230,20 +230,75 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
                 }
             });
     }
-    if cfg!(windows) {
-        let selected = format!("/select,{}", path.as_os_str().to_string_lossy());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Explorer mis-parses a whole-argument-quoted "/select,<path>" (what
+        // std::process::Command produces for arguments containing spaces, as
+        // in ".../AccessClient_Win (4).msi") and silently falls back to its
+        // default folder — the OS Documents directory (issue #18). Build the
+        // raw argument so the quoting wraps only the path, the canonical
+        // `explorer /select,"<path>"` form.
         return std::process::Command::new("explorer")
-            .arg(selected)
+            .raw_arg(explorer_select_arg(path))
             .spawn()
             .map(|_| ())
             .map_err(|error| format!("Failed to launch Explorer: {error}"));
     }
-    let parent = path.parent().unwrap_or(path);
-    std::process::Command::new("xdg-open")
-        .arg(parent)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("Failed to launch file manager: {error}"))
+    #[cfg(not(windows))]
+    {
+        let parent = path.parent().unwrap_or(path);
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Failed to launch file manager: {error}"))
+    }
+}
+
+/// The `explorer /select` argument for `path`, with the quoting wrapped
+/// around the path only. Pure so the quoting rule is testable off-Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn explorer_select_arg(path: &Path) -> String {
+    format!("/select,\"{}\"", path.as_os_str().to_string_lossy())
+}
+
+/// Resolves what `local/reveal` should actually open (issue #18): the
+/// recorded file while it still exists, else its parent folder when that is
+/// present (the file may have been moved or renamed by a " (n)" collision),
+/// else the plugin's download directory — the same directory downloads land
+/// in — so the button never falls through to an arbitrary OS default like
+/// the Documents folder.
+pub fn reveal_target(recorded: &Path, download_dir: &Path) -> PathBuf {
+    if recorded.exists() {
+        return recorded.to_path_buf();
+    }
+    if let Some(parent) = recorded.parent() {
+        if parent.is_dir() {
+            return parent.to_path_buf();
+        }
+    }
+    download_dir.to_path_buf()
+}
+
+/// The download directory the reveal fallback opens: the configured
+/// `downloadDir` preference when it resolves, else the resolved default
+/// (`downloads_base_dir`). Both are created on demand so the revealed
+/// folder always exists.
+pub fn reveal_download_dir(data_dir: &Path) -> PathBuf {
+    let configured = crate::preferences::load_preferences(data_dir)
+        .get("downloadDir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute());
+    if let Some(dir) = configured {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+    }
+    let dir = downloads_base_dir(|key| std::env::var_os(key), data_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 /// Opens a downloaded file with the operating system's default application.
@@ -476,5 +531,67 @@ mod tests {
             Path::new("/Downloads/a.txt")
         ));
         assert!(!is_recorded_download(&history, Path::new("/etc/passwd")));
+    }
+
+    /// Issue #18: reveal must never fall through to an arbitrary OS default
+    /// (the Documents folder) when the recorded file is gone. The fallback
+    /// chain is recorded file → its parent folder → the download directory.
+    #[test]
+    fn reveal_target_falls_back_to_parent_then_download_dir() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let downloads = tempfile::tempdir().expect("downloads");
+        // Existing file: reveal it itself.
+        let file = downloads.path().join("keep.txt");
+        std::fs::write(&file, b"x").expect("write");
+        assert_eq!(reveal_target(&file, data_dir.path()), file);
+        // Missing file inside an existing folder: reveal the folder so the
+        // user still lands next to where the download was saved.
+        let missing = downloads.path().join("moved-away.txt");
+        assert_eq!(reveal_target(&missing, data_dir.path()), downloads.path());
+        // Missing file in a missing folder: land in the download directory.
+        let gone = downloads.path().join("no-such-dir").join("gone.txt");
+        assert_eq!(reveal_target(&gone, downloads.path()), downloads.path());
+    }
+
+    /// Issue #18: the reveal fallback directory honors the configured
+    /// `downloadDir` preference (same directory downloads are saved into),
+    /// and falls back to the resolved default when it is unset or relative.
+    #[test]
+    fn reveal_download_dir_prefers_configured_then_default() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let configured = tempfile::tempdir().expect("configured");
+        crate::preferences::save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "downloadDir": configured.path().to_string_lossy() }),
+        )
+        .expect("save");
+        assert_eq!(reveal_download_dir(data_dir.path()), configured.path());
+        // No preference: the resolved default is used and exists afterwards.
+        let bare = tempfile::tempdir().expect("bare");
+        let dir = reveal_download_dir(bare.path());
+        assert!(dir.is_dir());
+        // A relative preference is not trusted; the default wins.
+        crate::preferences::save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "downloadDir": "relative/dir" }),
+        )
+        .expect("save relative");
+        let fallback = reveal_download_dir(data_dir.path());
+        assert_ne!(fallback, PathBuf::from("relative/dir"));
+        assert!(fallback.is_absolute());
+    }
+
+    /// Issue #18: Explorer's /select argument must quote the path only. A
+    /// whole-argument-quoted "/select,C:\... (4).msi" is mis-parsed by
+    /// Explorer, which then opens its default folder (Documents).
+    #[test]
+    fn explorer_select_argument_quotes_path_only() {
+        let arg = explorer_select_arg(Path::new(r"C:\Users\15754\Downloads\a (4).msi"));
+        assert_eq!(arg, r#"/select,"C:\Users\15754\Downloads\a (4).msi""#);
+        // Space-free paths keep the same canonical shape.
+        assert_eq!(
+            explorer_select_arg(Path::new(r"C:\Downloads\a.msi")),
+            r#"/select,"C:\Downloads\a.msi""#
+        );
     }
 }
