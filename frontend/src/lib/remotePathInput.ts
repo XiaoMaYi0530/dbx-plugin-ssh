@@ -28,3 +28,27 @@ export function resolveRemotePath(path: string, home?: string): string {
   }
   return `/${resolved.join("/")}`.replace(/\/{2,}/g, "/");
 }
+
+/** 分段回跳（issue #54）用的路径分段：name 为展示文本，path 为可跳转的规范绝对路径。 */
+export interface RemotePathSegment {
+  name: string;
+  path: string;
+}
+
+/**
+ * 把远端路径切成根 + 逐级前缀的分段（issue #54）：先经 resolveRemotePath 归一，
+ * 根目录只返回单段（此时没有可回跳的前缀）；深路径返回 `["/", "aa", "bb", …]`
+ * 形态，每段携带可直接交给 loadDirectory 的绝对路径，供路径栏渲染可点击 chip。
+ */
+export function splitRemotePathSegments(path: string): RemotePathSegment[] {
+  const normalized = resolveRemotePath(path);
+  if (normalized === "/") return [{ name: "/", path: "/" }];
+  const parts = normalized.slice(1).split("/");
+  return [
+    { name: "/", path: "/" },
+    ...parts.map((name, index) => ({
+      name,
+      path: `/${parts.slice(0, index + 1).join("/")}`,
+    })),
+  ];
+}

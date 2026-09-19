@@ -329,9 +329,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .sftp-pane { container-type: inline-size; }
 @container (max-width: 520px) {
   .path-toolbar { row-gap: 3px; }
-  /* 同名旧规则 .path-toolbar input（flex:1; min-width:110px）特异性相同且位置
-     靠后，这里用 .sftp-pane 前缀压过它，否则输入框不会独占一行。 */
-  .sftp-pane .path-toolbar > input { flex: 1 0 100%; min-width: 0; order: 99; }
+  /* 同名旧规则 .path-toolbar .path-bar（flex:1; min-width:110px）特异性相同且位置
+     靠后，这里用 .sftp-pane 前缀压过它，否则路径框不会独占一行。 */
+  .sftp-pane .path-toolbar > .path-bar { flex: 1 0 100%; min-width: 0; order: 99; }
   .path-toolbar .sudo-label > span:last-child { display: none; }
   .path-toolbar .sudo-label { margin-left: 0; }
 }
@@ -346,6 +346,17 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
   color: var(--foreground);
 }
 .path-toolbar input { height: 26px; flex: 1; min-width: 110px; font-family: var(--terminal-font-family); }
+/* 路径栏分段回跳（issue #54）：.path-bar 与原输入框同位同尺寸（flex:1、26px 高），
+   非编辑态渲染 path-crumbs（外观对齐 path-toolbar input 的描边/底色），编辑态
+   仍是原先的输入框；分段悬停反馈对齐 path-item（accent 底），末段为当前位置
+   不可点。超长路径按段内省略，不撑破工具栏；窄面板折行见上方 @container。 */
+.path-bar { display: flex; flex: 1; height: 26px; min-width: 110px; }
+.path-crumbs { display: flex; flex: 1; min-width: 0; overflow: hidden; align-items: center; gap: 2px; padding: 0 3px; border: 1px solid var(--border); border-radius: var(--radius); background: color-mix(in srgb, var(--background) 95%, var(--foreground)); cursor: text; }
+.path-crumbs:focus-visible { outline: 1px solid var(--primary); outline-offset: -1px; }
+.path-crumb { flex: 0 1 auto; min-width: 0; height: 100%; overflow: hidden; border: 0; border-radius: 3px; padding: 0 3px; background: transparent; color: var(--foreground); font-size: 12px; line-height: 24px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.path-crumb:hover { background: var(--accent); }
+.path-crumb.current { cursor: default; }
+.path-crumb-sep { flex: none; color: var(--muted-foreground); font-size: 11px; user-select: none; }
 /* 原生 select 已全部迁到 reka Select（触发钮外观由 wrapper 工具类负责）；
    焦点描边由全局 button:focus-visible 规则覆盖触发钮。 */
 .path-toolbar input:focus, .modal input:focus, .modal textarea:focus,
