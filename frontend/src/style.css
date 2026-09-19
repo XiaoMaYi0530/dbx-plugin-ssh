@@ -194,7 +194,16 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    内容其高亮块（如 Last login 的 IP）会浮到卡片遮罩之上。 */
 .terminal-host { position: absolute; z-index: 0; inset: 0; background: var(--ssh-terminal-background); }
 .terminal-host .xterm { height: 100%; padding: 5px 0 8px 10px; background: var(--ssh-terminal-background); }
-.terminal-host .xterm-viewport { scrollbar-width: none !important; }
+.terminal-host .xterm-viewport {
+  scrollbar-width: none !important;
+  /* xterm 6：主题背景色改内联到 .xterm-scrollable-element（内容盒，避开了
+     .xterm 的 padding），viewport 不再内联着色、保留库默认 #000，其矩形
+     （absolute inset:0）仍覆盖整个 .xterm —— padding 环带与 fit 富余露出
+     黑边。这里跟随插件终端背景色压掉库默认值（本文件在 xterm.css 之后
+     导入，同特异性后者生效；若未来 xterm 恢复 viewport 内联着色，内联
+     同为主题色，此规则自然让位）。 */
+  background: var(--ssh-terminal-background);
+}
 .terminal-overlay { position: absolute; z-index: 2; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 24px; background: var(--ssh-terminal-background); color: var(--muted-foreground); text-align: center; }
 .terminal-overlay p { margin: 0; font-size: 12px; }
 
