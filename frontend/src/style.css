@@ -730,6 +730,16 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .session-pill .session-pill-countdown { flex: 0 0 auto; opacity: 0.85; font-variant-numeric: tabular-nums; }
 .session-pill.session-error { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
 .session-pill.session-error .session-dot { background: var(--destructive); }
+.session-pill.session-local { color: var(--violet-foreground, var(--foreground)); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.session-pill.session-local .session-dot { background: var(--primary); }
+
+/* 本地终端退出态覆盖层（VS Code 式：退出码 + 重开/关闭出口）。挂在
+   .terminal-overlay 内，复用其居中与背景。 */
+.local-exit-card { display: flex; align-items: center; flex-direction: column; gap: 10px; max-width: 420px; padding: 28px 32px; border: 1px solid var(--border); border-radius: var(--radius); background: color-mix(in srgb, var(--background) 96%, transparent); }
+.local-exit-card .local-exit-icon { width: 28px; height: 28px; color: var(--muted-foreground); }
+.local-exit-card strong { font-size: 14px; color: var(--foreground); }
+.local-exit-card .local-exit-code { font-size: 12px; }
+.local-exit-card .local-exit-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 
 /* OSC 633 command marker strip at the bottom-left of the terminal pane; hidden
    unless the remote shell integration emits 633 frames. The zmodem banner

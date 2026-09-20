@@ -57,6 +57,7 @@ import {
   SquarePlus,
   SquareTerminal,
   Star,
+  Terminal as TerminalIcon,
   TextSelect,
   Trash2,
   TriangleAlert,
@@ -968,6 +969,20 @@ const directoryParser = new Osc7DirectoryParser();
 // OSC 633 shell-integration markers (pure frontend parse; no-op streams pass through).
 const commandMarkerParser = new Osc633CommandParser();
 
+// —— 本地终端（sidecar 所在机器的交互式登录 shell）——
+// 与 SSH 会话共用同一条渲染管线（乱序重组/补发/633 命令标记/输出节流），
+// 同一时刻只展示一个会话：进入本地模式前先经确认关闭 SSH 会话。会话帧用
+// 独立的 sequence/pending 状态，避免与 SSH 流互染。
+const localSession = ref<{ sessionId: string; shell: string } | null>(null);
+const localState = ref<"starting" | "running" | "exited">("exited");
+const localExitCode = ref<number | null>(null);
+const localOpenConfirmOpen = ref(false);
+const localLastSequence = ref(0);
+const localPendingFrames = new Map<number, { stream: number; data: Uint8Array }>();
+let localReplayInFlight = false;
+let localReplayNoProgress = 0;
+const isLocalMode = computed(() => localSession.value !== null);
+
 // Large-output rendering throttle: coalesce consecutive PTY frames into one
 // merged xterm write per animation frame (capped, order preserving). The sink
 // reads `terminal` lazily so it also works across terminal recreation.
@@ -975,8 +990,17 @@ const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle
   sink: (data) => terminal?.write(data),
 });
 const terminalInputQueue = createTerminalInputQueue({
-  send: (sessionId, payload) => window.dbxPlugin.sendBinary(`ssh/terminal/in/${sessionId}`, payload),
+  send: (sessionId, payload) =>
+    window.dbxPlugin.sendBinary(
+      sessionId === localSession.value?.sessionId ? `local/terminal/in/${sessionId}` : `ssh/terminal/in/${sessionId}`,
+      payload,
+    ),
   onError: (cause) => {
+    // 本地会话的输入错误（进程退出/会话被回收）直接落退出态，不走 SSH 重连梯子。
+    if (isLocalMode.value) {
+      markLocalExited(null);
+      return;
+    }
     showError(cause, "terminal");
     // 会话被外部杀掉（宿主重推连接的 disconnect、sidecar 重启）时本 tab 无
     // 事件感知，终端看似活着实则打不进字。输入撞上死会话时按传输断开的
@@ -1009,7 +1033,7 @@ const connection = computed<ConnectionSummary>(() => {
 const canWrite = computed(() => !connection.value.readOnly && !connectionReadOnly.value);
 const selectedEntry = computed(() => entries.value.find((entry) => entry.uri === selectedPath.value));
 const connected = computed(() => terminalState.value === "connected" && !!session.value);
-const sessionStatus = computed<WorkbenchSessionStatus>(() => describeWorkbenchSessionStatus(terminalState.value, { reattaching: reconnectPending.value }));
+const sessionStatus = computed<WorkbenchSessionStatus | "local">(() => (isLocalMode.value ? "local" : describeWorkbenchSessionStatus(terminalState.value, { reattaching: reconnectPending.value })));
 // 连接卡片四态：用户取消优先于底层 terminalState（在途 open 仍是 connecting）；
 // open 成功后的短暂 success 态优先于 connecting；其余（error/disconnected）
 // 统一呈现错误行 + Reconnect。
@@ -1419,7 +1443,7 @@ function createTerminal() {
     searchMatchState.value = resultCount > 0 ? "match" : "no-match";
   });
   disposeInput = terminal.onData((data) => {
-    if (!session.value) return;
+    if (!session.value && !localSession.value) return;
     // 文件传输占用路由：trzsz 持有流时，传输中的输入进 filter（Ctrl+C 停传输、
     // 其余吞掉），等待协商期直接吞掉（防止杂散键入干扰 trz 握手）；zmodem 持有
     // 流时输入保持阻塞，否则走普通 PTY 键盘写入（8 字节序号前缀已封装）。
@@ -1627,7 +1651,7 @@ function trackPendingInput(data: string) {
 }
 
 function sendTerminalBytes(data: Uint8Array) {
-  const sessionId = session.value?.sessionId;
+  const sessionId = localSession.value?.sessionId ?? session.value?.sessionId;
   if (!sessionId) return;
   terminalInputQueue.enqueue(sessionId, normalizeTerminalInputBytes(data));
 }
@@ -1640,7 +1664,9 @@ function scheduleFit() {
       fitAddon.fit();
       // trzsz 进度条按终端列宽渲染（filter 内部文本进度条虽未启用，列宽保持同步）。
       trzszFilter?.setTerminalColumns(terminal.cols);
-      if (session.value) {
+      if (localSession.value) {
+        void window.dbxPlugin.notify("local/terminal/resize", { sessionId: localSession.value.sessionId, cols: terminal.cols, rows: terminal.rows }).catch(() => undefined);
+      } else if (session.value) {
         void window.dbxPlugin.notify("ssh/terminal/resize", { sessionId: session.value.sessionId, cols: terminal.cols, rows: terminal.rows }).catch(() => undefined);
       }
     } catch {
@@ -2073,6 +2099,17 @@ async function saveTrzszDownloadedFiles(files: readonly TrzszDownloadFile[]) {
 }
 
 function handleBinary(event: DbxPluginBinaryEvent) {
+  if (event.channel.startsWith("local/terminal/out/")) {
+    const localId = event.channel.slice("local/terminal/out/".length);
+    if (!localSession.value || localId !== localSession.value.sessionId) return;
+    const payload = bridgeBinaryBytes(event, window.dbxPlugin.decodeBase64);
+    if (payload.length < 9) return;
+    const sequence = readU64(payload, 1);
+    if (sequence <= localLastSequence.value) return;
+    localPendingFrames.set(sequence, { stream: payload[0], data: payload.slice(9) });
+    drainLocalTerminalFrames();
+    return;
+  }
   const sessionId = activeTerminalSessionId || session.value?.sessionId;
   if (sessionId && event.channel === `ssh/terminal/out/${sessionId}`) {
     const payload = bridgeBinaryBytes(event, window.dbxPlugin.decodeBase64);
@@ -2180,6 +2217,54 @@ function drainTerminalFrames() {
   }
 }
 
+// 本地终端输出与 SSH 同一帧协议（stream + u64 sequence），复用乱序重组与
+// 空洞补发；补发失败或 State 帧到来即落退出态——本地会话重启成本极低，
+// 不需要 SSH 那套不可恢复横幅。
+function drainLocalTerminalFrames() {
+  let frame = localPendingFrames.get(localLastSequence.value + 1);
+  while (frame) {
+    localPendingFrames.delete(localLastSequence.value + 1);
+    localLastSequence.value += 1;
+    if (frame.stream === 2) {
+      if (new TextDecoder().decode(frame.data) === "local-terminal-exited") markLocalExited(null);
+    } else {
+      dispatchTerminalOutput(frame.data);
+    }
+    frame = localPendingFrames.get(localLastSequence.value + 1);
+  }
+  if (localPendingFrames.size > TERMINAL_PENDING_FRAME_LIMIT) {
+    localPendingFrames.clear();
+  }
+  const firstPending = Math.min(...localPendingFrames.keys());
+  if (Number.isFinite(firstPending) && firstPending > localLastSequence.value + 1 && !localReplayInFlight && localSession.value) {
+    const sessionId = localSession.value.sessionId;
+    localReplayInFlight = true;
+    const holeAt = localLastSequence.value;
+    void window.dbxPlugin
+      .invoke<ReplayResult>("local/terminal/replay", { sessionId, afterSequence: localLastSequence.value })
+      .then((result) => {
+        if (!result.complete) {
+          markLocalExited(null);
+          return;
+        }
+        if (localLastSequence.value === holeAt) {
+          localReplayNoProgress += 1;
+          if (localReplayNoProgress >= 3) {
+            localLastSequence.value = firstPending - 1;
+            localReplayNoProgress = 0;
+          }
+        } else {
+          localReplayNoProgress = 0;
+        }
+      })
+      .catch(() => markLocalExited(null))
+      .finally(() => {
+        localReplayInFlight = false;
+        drainLocalTerminalFrames();
+      });
+  }
+}
+
 // 传输断开/会话被杀的统一入口：有界退避自动重连，梯子耗尽才落到
 // disconnected 终态等待手动重连。
 function scheduleSessionReconnect() {
@@ -2234,6 +2319,17 @@ function handleEvent(event: DbxPluginEvent) {
     if (terminalState.value === "connected" && !reconnectPending.value) {
       scheduleSessionReconnect();
     }
+    return;
+  }
+  if (event.method === "local/session/state" && event.params.sessionId === localSession.value?.sessionId) {
+    if (event.params.state === "exited") {
+      markLocalExited(typeof event.params.exitCode === "number" ? event.params.exitCode : null);
+    }
+    return;
+  }
+  // 输入打进已被 sidecar 回收的本地会话：立即落退出态（覆盖层给重开出口）。
+  if (event.method === "local/terminal/error" && event.params.sessionId === localSession.value?.sessionId) {
+    markLocalExited(null);
     return;
   }
   if (event.method === "ssh/agent/prompt" && event.params.sessionId === session.value?.sessionId) {
@@ -2576,6 +2672,101 @@ async function closeSession(updateStatus = true) {
     terminalError.value = t("disconnected");
   }
   persistState();
+}
+
+// —— 本地终端生命周期 ——
+// 退出态统一入口：exitCode 为 null 表示 sidecar 未上报（进程被杀/会话已回收），
+// 覆盖层对 null 只显示"已退出"，有值时显示退出码。
+function markLocalExited(code: number | null) {
+  if (!localSession.value || localState.value === "exited") return;
+  localState.value = "exited";
+  if (code !== null) localExitCode.value = code;
+  stopCommandMarkerTick();
+}
+
+async function startLocalTerminal() {
+  if (localState.value === "starting" || isLocalMode.value) return;
+  localState.value = "starting";
+  try {
+    const info = await window.dbxPlugin.invoke<{ sessionId: string; shell: string }>("local/terminal/start", {
+      workbenchId: workbenchId.value,
+      cols: terminal?.cols || 120,
+      rows: terminal?.rows || 32,
+    });
+    if (disposed) {
+      void window.dbxPlugin.invoke("local/session/close", { sessionId: info.sessionId }).catch(() => undefined);
+      return;
+    }
+    localSession.value = { sessionId: info.sessionId, shell: info.shell };
+    localState.value = "running";
+    localExitCode.value = null;
+    localLastSequence.value = 0;
+    localPendingFrames.clear();
+    localReplayNoProgress = 0;
+    resetCommandMarker();
+    await nextTick();
+    scheduleFit();
+    terminal?.focus();
+  } catch (cause) {
+    localState.value = "exited";
+    showError(cause, "terminal");
+  }
+}
+
+async function closeLocalTerminal() {
+  const sessionId = localSession.value?.sessionId;
+  localSession.value = null;
+  localPendingFrames.clear();
+  localOpenConfirmOpen.value = false;
+  if (!sessionId) return;
+  await window.dbxPlugin.invoke("local/session/close", { sessionId }).catch(() => undefined);
+  terminal?.focus();
+}
+
+async function restartLocalTerminal() {
+  await closeLocalTerminal();
+  await startLocalTerminal();
+}
+
+// SSH 会话还连着时先经确认关闭（本地模式与 SSH 会话互斥展示），再开本地终端。
+function requestLocalTerminal() {
+  if (isLocalMode.value || localState.value === "starting") return;
+  if (session.value && (terminalState.value === "connected" || reconnectPending.value)) {
+    localOpenConfirmOpen.value = true;
+    return;
+  }
+  void startLocalTerminal();
+}
+
+async function confirmLocalTerminal() {
+  localOpenConfirmOpen.value = false;
+  await closeSession();
+  await startLocalTerminal();
+}
+
+// webview 重建后接回 sidecar 里仍活着的本地 shell（workbench/close 才回收）。
+async function reattachLocalSession(): Promise<boolean> {
+  try {
+    const result = await window.dbxPlugin.invoke<{ sessions?: Array<{ sessionId: string; workbenchId: string; shell: string }> }>(
+      "local/session/list",
+      {},
+      { timeoutMs: 10_000 },
+    );
+    const match = (result?.sessions || []).find((session) => session.workbenchId === workbenchId.value);
+    if (!match) return false;
+    localSession.value = { sessionId: match.sessionId, shell: match.shell };
+    localState.value = "running";
+    localExitCode.value = null;
+    localLastSequence.value = 0;
+    localPendingFrames.clear();
+    const replay = await window.dbxPlugin.invoke<ReplayResult>("local/terminal/replay", { sessionId: match.sessionId, afterSequence: 0 });
+    if (!replay.complete) markLocalExited(null);
+    await nextTick();
+    scheduleFit();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // 手动重连前请宿主按当前最新配置重开连接：连接在侧边栏被编辑（如改密码）后，
@@ -5236,7 +5427,8 @@ async function sendConfirmedPaste(text: string) {
     terminal?.focus();
     return;
   }
-  if (!session.value || terminalTransferBusy.value) return;
+  if (terminalTransferBusy.value) return;
+  if (!session.value && !localSession.value) return;
   trackPendingInput(text);
   sendTerminalBytes(new TextEncoder().encode(text));
   terminal?.focus();
@@ -6933,6 +7125,7 @@ function trackStableFocus(event: FocusEvent) {
 // 参与聚焦与 Tab 陷阱，但不参与 Esc 关闭）。按模板出现顺序排列，
 // 计数变化驱动聚焦/归还；同层互斥由交互保证。
 const modalOpenStates = computed(() => [
+  localOpenConfirmOpen.value,
   folderPickerTarget.value !== null,
   previewOpen.value,
   pasteConfirm.value,
@@ -7255,6 +7448,11 @@ async function initialize() {
     // 否则打开同一连接的新 Tab 会接管已有 Tab 的 PTY。
     const reattach = await findReattachSession();
     if (reattach) await attachSession(reattach, reattach);
+    // 上一轮本地终端还活着（webview 重建但 sidecar 未退出）：接回并补发，
+    // 避免孤儿 shell 挂在 sidecar 里。
+    else if (await reattachLocalSession()) {
+      // 本地模式接管终端。
+    }
     // bootRestore: 宿主启动恢复 tab 时会异步重放 connect（见 queryStore
     // reconnectRestoredPluginTabs），首个 ssh/session/open 可能先于它落地，
     // inactive 错误在该路径下参与有界重试。
@@ -7399,16 +7597,19 @@ onBeforeUnmount(() => {
       </div>
       <div class="toolbar-actions">
         <button class="icon-button icon-neutral" :title="paneOrder === 'terminal-left' ? t('moveSftpLeft') : t('moveTerminalLeft')" @click="togglePaneOrder"><ArrowLeftRight /></button>
-        <button class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
+        <button class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" :disabled="isLocalMode" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
         <button class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
-        <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting' && !reconnectPending" @click="reconnectNow"><PlugZap /></button>
+        <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
+             已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。 -->
+        <button class="icon-button icon-violet" :class="{ 'is-active': isLocalMode }" :title="isLocalMode ? t('localTerminal.close') : t('localTerminal.open')" @click="isLocalMode ? closeLocalTerminal() : requestLocalTerminal()"><TerminalIcon /></button>
+        <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="isLocalMode || (terminalState === 'connecting' && !reconnectPending)" @click="reconnectNow"><PlugZap /></button>
         <!-- 一键 sudo -v：向当前 PTY 写入命令刷新 sudo 凭据缓存；quick sudo 自动应答
              是否启用由连接设置决定（设置弹窗），工作台不再提供开关。 -->
         <button class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
-        <button class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
-        <button class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
+        <button class="icon-button icon-emerald" :title="t('profilesTitle')" :disabled="isLocalMode" @click="openProfilesManager"><KeyRound /></button>
+        <button class="icon-button icon-cyan" :title="t('alertTriage.title')" :disabled="isLocalMode" @click="openAlertTriage"><Siren /></button>
         <label class="follow-directory-control" :title="t('followTerminal')">
           <Switch size="sm" :model-value="followDirectory" :disabled="!connected" @update:model-value="setDirectoryTracking" />
           <span>{{ t("followTerminal") }}</span>
@@ -7681,7 +7882,7 @@ onBeforeUnmount(() => {
           <span class="record-countdown-number" :key="recordCountdown">{{ recordCountdown }}</span>
           <span class="record-countdown-hint">{{ t("recordingCountdownHint") }}</span>
         </div>
-        <div v-if="terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
+        <div v-if="!isLocalMode && terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
           <ConnectingCard
             :locale="locale"
             :name="connection.name || connectionIdentity"
@@ -7697,6 +7898,19 @@ onBeforeUnmount(() => {
             @connect="startConnect"
             @toggle-logs="connectLogsOpen = !connectLogsOpen"
           />
+        </div>
+        <!-- 本地终端退出态覆盖层：显示退出码（sidecar 未上报时不显示），给
+             重开与关闭两个出口（VS Code 式终端退出体验）。 -->
+        <div v-if="isLocalMode && localState === 'exited'" class="terminal-overlay">
+          <div class="local-exit-card" role="status">
+            <TerminalIcon class="local-exit-icon" />
+            <strong>{{ t("localTerminal.exited") }}</strong>
+            <span v-if="localExitCode !== null" class="mono local-exit-code">{{ t("localTerminal.exitCode", { code: localExitCode }) }}</span>
+            <div class="local-exit-actions">
+              <button class="primary-button" @click="restartLocalTerminal">{{ t("localTerminal.restart") }}</button>
+              <button @click="closeLocalTerminal">{{ t("localTerminal.close") }}</button>
+            </div>
+          </div>
         </div>
         <div v-if="commandMarker.installed" class="terminal-command-marker" :class="{ active: commandMarker.active, failed: !commandMarker.active && commandMarker.exitCode !== null && commandMarker.exitCode !== 0 }" :title="commandMarkerDetails" @click="terminal?.focus()">
           <Loader2 v-if="commandMarker.active" class="spinning" />
@@ -9053,6 +9267,21 @@ onBeforeUnmount(() => {
       @select="onFolderPicked"
       @close="folderPickerTarget = null"
     />
+
+    <!-- 本地终端确认：SSH 会话仍连着时先关闭再进入本地模式 -->
+    <Dialog :open="localOpenConfirmOpen" @update:open="(open) => { if (!open) localOpenConfirmOpen = false; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header>
+          <DialogTitle>{{ t("localTerminal.openConfirmTitle") }}</DialogTitle>
+          <button :title="t('close')" class="icon-button" @click="localOpenConfirmOpen = false"><X /></button>
+        </header>
+        <p class="muted">{{ t("localTerminal.openConfirm") }}</p>
+        <footer>
+          <button @click="localOpenConfirmOpen = false">{{ t("cancel") }}</button>
+          <button class="primary-button" @click="confirmLocalTerminal">{{ t("localTerminal.open") }}</button>
+        </footer>
+      </DialogContent>
+    </Dialog>
 
     <input ref="uploadInput" class="hidden" type="file" multiple @change="onUploadInput" />
     <input ref="zmodemInput" class="hidden" type="file" multiple @change="onZmodemInput" />

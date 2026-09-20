@@ -748,15 +748,18 @@ impl DirectoryHandshakeFilter {
     }
 }
 
+/// Monotonic terminal output journal shared by the SSH and local-terminal
+/// session loops: assigns each chunk a sequence, keeps a bounded tail for
+/// `replay`, and survives transport gaps.
 #[derive(Default)]
-struct ReplayBuffer {
+pub(crate) struct ReplayBuffer {
     frames: VecDeque<TerminalFrame>,
     bytes: usize,
     sequence: u64,
 }
 
 impl ReplayBuffer {
-    fn push(&mut self, stream: TerminalStream, data: Vec<u8>) -> TerminalFrame {
+    pub(crate) fn push(&mut self, stream: TerminalStream, data: Vec<u8>) -> TerminalFrame {
         self.sequence += 1;
         let frame = TerminalFrame {
             sequence: self.sequence,
@@ -774,7 +777,7 @@ impl ReplayBuffer {
         frame
     }
 
-    fn after(&self, sequence: u64) -> Vec<TerminalFrame> {
+    pub(crate) fn after(&self, sequence: u64) -> Vec<TerminalFrame> {
         self.frames
             .iter()
             .filter(|frame| frame.sequence > sequence)
@@ -782,11 +785,16 @@ impl ReplayBuffer {
             .collect()
     }
 
-    fn first_sequence(&self) -> u64 {
+    pub(crate) fn first_sequence(&self) -> u64 {
         self.frames
             .front()
             .map(|frame| frame.sequence)
             .unwrap_or(self.sequence.saturating_add(1))
+    }
+
+    /// Highest assigned sequence (0 until the first push).
+    pub(crate) fn tail_sequence(&self) -> u64 {
+        self.sequence
     }
 }
 

@@ -117,6 +117,16 @@ const messages = {
       tooltipDuration: "Duration",
       tooltipDirectory: "Directory",
     },
+    localTerminal: {
+      open: "Open a local terminal",
+      active: "Local terminal",
+      close: "Close local terminal",
+      openConfirmTitle: "Open local terminal?",
+      openConfirm: "The current SSH session will be closed before the local terminal opens. Reconnect afterwards if needed.",
+      exited: "Local terminal has exited",
+      exitCode: "Exit code {code}",
+      restart: "Reopen",
+    },
     sessionStatus: {
       connecting: "Connecting",
       connected: "Connected",
@@ -124,6 +134,7 @@ const messages = {
       reconnectCountdown: "retry in {seconds}s",
       disconnected: "Disconnected",
       error: "Error",
+      local: "Local",
     },
     reconnectNow: "Reconnect now",
     reconnectBanner: {
@@ -456,6 +467,16 @@ const messages = {
       tooltipDuration: "Duración",
       tooltipDirectory: "Directorio",
     },
+    localTerminal: {
+      open: "Abrir una terminal local",
+      active: "Terminal local",
+      close: "Cerrar la terminal local",
+      openConfirmTitle: "¿Abrir la terminal local?",
+      openConfirm: "La sesión SSH actual se cerrará antes de abrir la terminal local. Vuelve a conectarte después si lo necesitas.",
+      exited: "La terminal local ha finalizado",
+      exitCode: "Código de salida {code}",
+      restart: "Reabrir",
+    },
     sessionStatus: {
       connecting: "Conectando",
       connected: "Conectado",
@@ -463,6 +484,7 @@ const messages = {
       reconnectCountdown: "reintento en {seconds}s",
       disconnected: "Desconectado",
       error: "Error",
+      local: "Local",
     },
     reconnectNow: "Reconectar ahora",
     reconnectBanner: {
@@ -788,6 +810,16 @@ const messages = {
       tooltipDuration: "Durata",
       tooltipDirectory: "Directory",
     },
+    localTerminal: {
+      open: "Apri un terminale locale",
+      active: "Terminale locale",
+      close: "Chiudi il terminale locale",
+      openConfirmTitle: "Aprire il terminale locale?",
+      openConfirm: "La sessione SSH corrente verrà chiusa prima di aprire il terminale locale. Riconnetti in seguito se necessario.",
+      exited: "Il terminale locale è terminato",
+      exitCode: "Codice di uscita {code}",
+      restart: "Riapri",
+    },
     sessionStatus: {
       connecting: "Connessione",
       connected: "Connesso",
@@ -795,6 +827,7 @@ const messages = {
       reconnectCountdown: "riprova tra {seconds}s",
       disconnected: "Disconnesso",
       error: "Errore",
+      local: "Locale",
     },
     reconnectNow: "Riconnetti ora",
     reconnectBanner: {
@@ -1120,6 +1153,16 @@ const messages = {
       tooltipDuration: "所要時間",
       tooltipDirectory: "ディレクトリ",
     },
+    localTerminal: {
+      open: "ローカルターミナルを開く",
+      active: "ローカルターミナル",
+      close: "ローカルターミナルを閉じる",
+      openConfirmTitle: "ローカルターミナルを開きますか？",
+      openConfirm: "ローカルターミナルを開く前に、現在の SSH セッションを終了します。必要なら後で再接続してください。",
+      exited: "ローカルターミナルが終了しました",
+      exitCode: "終了コード {code}",
+      restart: "開き直す",
+    },
     sessionStatus: {
       connecting: "接続中",
       connected: "接続済み",
@@ -1127,6 +1170,7 @@ const messages = {
       reconnectCountdown: "{seconds}秒後に再試行",
       disconnected: "切断",
       error: "エラー",
+      local: "ローカル",
     },
     reconnectNow: "今すぐ再接続",
     reconnectBanner: {
@@ -1452,6 +1496,16 @@ const messages = {
       tooltipDuration: "Duração",
       tooltipDirectory: "Diretório",
     },
+    localTerminal: {
+      open: "Abrir um terminal local",
+      active: "Terminal local",
+      close: "Fechar o terminal local",
+      openConfirmTitle: "Abrir o terminal local?",
+      openConfirm: "A sessão SSH atual será encerrada antes de abrir o terminal local. Reconecte-se depois, se necessário.",
+      exited: "O terminal local foi encerrado",
+      exitCode: "Código de saída {code}",
+      restart: "Reabrir",
+    },
     sessionStatus: {
       connecting: "Conectando",
       connected: "Conectado",
@@ -1459,6 +1513,7 @@ const messages = {
       reconnectCountdown: "nova tentativa em {seconds}s",
       disconnected: "Desconectado",
       error: "Erro",
+      local: "Local",
     },
     reconnectNow: "Reconectar agora",
     reconnectBanner: {
@@ -1784,6 +1839,16 @@ const messages = {
       tooltipDuration: "耗时",
       tooltipDirectory: "目录",
     },
+    localTerminal: {
+      open: "打开本地终端",
+      active: "本地终端",
+      close: "关闭本地终端",
+      openConfirmTitle: "打开本地终端？",
+      openConfirm: "打开本地终端前会关闭当前 SSH 会话，之后可随时重新连接。",
+      exited: "本地终端已退出",
+      exitCode: "退出码 {code}",
+      restart: "重新打开",
+    },
     sessionStatus: {
       connecting: "连接中",
       connected: "已连接",
@@ -1791,6 +1856,7 @@ const messages = {
       reconnectCountdown: "{seconds}秒后重试",
       disconnected: "已断开",
       error: "错误",
+      local: "本地",
     },
     reconnectNow: "立即重连",
     reconnectBanner: {
@@ -2123,6 +2189,16 @@ const messages = {
       tooltipDuration: "耗時",
       tooltipDirectory: "目錄",
     },
+    localTerminal: {
+      open: "開啟本機終端機",
+      active: "本機終端機",
+      close: "關閉本機終端機",
+      openConfirmTitle: "開啟本機終端機？",
+      openConfirm: "開啟本機終端機前會關閉目前的 SSH 工作階段，之後可隨時重新連線。",
+      exited: "本機終端機已結束",
+      exitCode: "結束代碼 {code}",
+      restart: "重新開啟",
+    },
     sessionStatus: {
       connecting: "連線中",
       connected: "已連線",
@@ -2130,6 +2206,7 @@ const messages = {
       reconnectCountdown: "{seconds}秒後重試",
       disconnected: "已中斷",
       error: "錯誤",
+      local: "本機",
     },
     reconnectNow: "立即重連",
     reconnectBanner: {
