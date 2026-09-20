@@ -118,6 +118,31 @@ def main() -> int:
             assert any(s["sessionId"] == session_id for s in listing["sessions"]), "not listed"
             print("resize + list ok")
 
+            # 输入 burst（对齐 SSH burst 回归思路）：60 帧/15ms 全部 ack，
+            # 会话保持存活、无错误事件——SDK lane 有序 + 有界背压在本地通道同样生效。
+            acked = set()
+            scanned = 0  # client.events 只增不减，用游标避免重复计数
+            for i in range(60):
+                client.send_binary(
+                    f"local/terminal/in/{session_id}", struct.pack(">Q", i + 10) + b"x"
+                )
+                time.sleep(0.015)
+            deadline_burst = time.time() + 10
+            while time.time() < deadline_burst and len(acked) < 60:
+                client.request("local/session/list", timeout=5)  # 顺带泵帧
+                while scanned < len(client.events):
+                    event = client.events[scanned]
+                    scanned += 1
+                    if event.get("method") == "local/terminal/inputAck" and 10 <= event["params"]["sequence"] < 70:
+                        acked.add(event["params"]["sequence"])
+                if len(acked) >= 60:
+                    break
+                time.sleep(0.05)
+            assert len(acked) == 60, f"ack coverage {len(acked)}/60"
+            errors = [e for e in client.events if e.get("method") == "local/terminal/error"]
+            assert not errors, f"error events during burst: {errors}"
+            print("burst 60 frames all acked, session alive")
+
             client.request("local/session/close", {"sessionId": session_id})
             event = client.wait_event("local/session/state", timeout=10)
             assert event and event["params"]["state"] == "exited", f"no exit event: {event}"

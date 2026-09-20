@@ -2739,6 +2739,7 @@ async function startLocalTerminal() {
 async function closeLocalTerminal() {
   const sessionId = localSession.value?.sessionId;
   localSession.value = null;
+  localState.value = "exited";
   localPendingFrames.clear();
   localOpenConfirmOpen.value = false;
   localMenuOpen.value = false;
@@ -2752,10 +2753,12 @@ async function restartLocalTerminal() {
   await startLocalTerminal();
 }
 
-// SSH 会话还连着时先经确认关闭（本地模式与 SSH 会话互斥展示），再开本地终端。
+// SSH 会话在连/连接中/重连中时先经确认关闭（本地模式与 SSH 会话互斥展示，
+// connecting 途中放行会让在途 ssh/session/open 成功后与本地会话抢同一终端
+// 视图），再开本地终端。
 function requestLocalTerminal() {
   if (isLocalMode.value || localState.value === "starting") return;
-  if (session.value && (terminalState.value === "connected" || reconnectPending.value)) {
+  if (session.value || reconnectPending.value || terminalState.value === "connecting") {
     localOpenConfirmOpen.value = true;
     return;
   }
