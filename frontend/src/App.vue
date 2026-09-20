@@ -996,6 +996,9 @@ const localShells = ref<Array<{ program: string; name: string; isDefault: boolea
 const localShellsLoading = ref(false);
 // 上次本地会话跟踪到的 cwd：重开时继承（VS Code 新终端继承工作区目录惯例）。
 const localLastCwd = ref("");
+// 本地终端最近命令（633;E 收集， newest-first，cap 20）：右键菜单"重跑"用。
+// 注入关闭时无命令边界，本功能静默缺席。
+const localRecentCommands = ref<string[]>([]);
 // 当前偏好 shell 是否支持注入（ksh/csh/cmd 等裸 shell 灰掉开关）。
 const selectedShellInjectable = computed<boolean | undefined>(() => {
   if (!localShellPref.value) return undefined;
@@ -1743,6 +1746,15 @@ function applyCommandMarker(updates: Osc633StreamUpdates) {
   // strip flips to the running state. The "A" frame's lastExitCode=null reset
   // is ignored on purpose — the finished result stays visible at the prompt
   // until the next command starts.
+  // 最近命令收集：仅 E 帧写 updates.command，故以其存在为准——不能挂在
+  // commandActive 上，E 与 D 常在同一段输出里（命令快进快出时合并后的终值
+  // 是 false），挂在 phase 上会漏采（与 D/A 退出码覆写同源的合并陷阱）。
+  if (isLocalMode.value && updates.command !== undefined && updates.command.trim()) {
+    const command = updates.command.trim();
+    if (command !== localRecentCommands.value[0]) {
+      localRecentCommands.value = [command, ...localRecentCommands.value.filter((c) => c !== command)].slice(0, 20);
+    }
+  }
   if (updates.commandActive === true) {
     commandMarker.exitCode = null;
     commandMarker.durationMs = null;
@@ -2761,6 +2773,15 @@ async function closeLocalTerminal() {
   if (!sessionId) return;
   await window.dbxPlugin.invoke("local/session/close", { sessionId }).catch(() => undefined);
   terminal?.focus();
+}
+
+// 右键菜单"重跑最近命令"：把命令写入本地 PTY（危险命令复用粘贴确认），
+// 补回车立即执行；多行命令归一为回车分隔。
+async function rerunLocalCommand(command: string) {
+  if (!localSession.value) return;
+  const payload = command.replace(/\r\n|\r|\n/g, "\r") + "\r";
+  trackPendingInput(payload);
+  await sendConfirmedPaste(payload);
 }
 
 async function restartLocalTerminal() {
@@ -8332,6 +8353,13 @@ onBeforeUnmount(() => {
         <ContextMenuContent>
           <ContextMenuItem :disabled="!terminal?.hasSelection()" @select="copyTerminalSelection"><Copy />{{ t("terminalCopy") }}</ContextMenuItem>
           <ContextMenuItem :disabled="!connected || terminalTransferBusy" @select="pasteTerminal"><ClipboardPaste />{{ t("terminalPaste") }}</ContextMenuItem>
+          <!-- 本地终端最近命令（VS Code Run Recent Command 简化版）：
+               依赖 shell integration 注入的 633;E 命令行。 -->
+          <template v-if="isLocalMode && localRecentCommands.length">
+            <ContextMenuItem @select="rerunLocalCommand(localRecentCommands[0])"><History />{{ t("localTerminal.rerunLast") }}</ContextMenuItem>
+            <ContextMenuItem v-for="(command, index) in localRecentCommands.slice(0, 5)" :key="index" @select="rerunLocalCommand(command)"><span class="mono local-rerun-command">{{ command }}</span></ContextMenuItem>
+            <ContextMenuSeparator />
+          </template>
           <ContextMenuItem @select="selectAllTerminal"><TextSelect />{{ t("terminalSelectAll") }}</ContextMenuItem>
           <ContextMenuItem @select="openTerminalSearch"><Search />{{ t("terminalSearch.open") }}</ContextMenuItem>
           <ContextMenuItem @select="clearTerminal"><Eraser />{{ t("terminalClear") }}</ContextMenuItem>
