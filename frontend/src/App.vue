@@ -91,6 +91,7 @@ import {
   normalizeDropTargetDir,
   type TerminalSearchOptions,
 } from "./lib/terminalInteraction";
+import { planHostFileDrop } from "./lib/hostFileDrop";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
 import { createTerminalInputQueue } from "./lib/terminalInputQueue";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
@@ -835,7 +836,7 @@ const searchResultCount = ref(0);
 const pasteConfirm = ref<PasteConfirmation>();
 // 终端拖入文件的落点询问：null 表示取消；"cwd" 用 SFTP 当前目录（目录跟随
 // 开启时即 shell cwd）；{ dir } 是用户输入的目标目录（文件原名落其下）。
-const dropUploadPrompt = ref<{ files: File[] }>();
+const dropUploadPrompt = ref<{ files: Array<{ name: string }> }>();
 const dropUploadTarget = ref<"cwd" | "custom">("cwd");
 const dropUploadPathInput = ref("");
 const dropUploadPathInputEl = ref<HTMLInputElement>();
@@ -974,9 +975,34 @@ const commandMarkerParser = new Osc633CommandParser();
 const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle({
   sink: (data) => terminal?.write(data),
 });
+// #33/#71 快速输入丢字母的分层计数：keys(onData 实际路由到 PTY 的按键)、
+// sends(提交给宿主桥的帧)、acks(sidecar 确认收到的帧)、errors(桥拒绝)、
+// swallowed(被 zmodem/trzsz 路由吞掉的按键)。宿主开启 localStorage 的
+// dbx-term-diag=1 后每 2s 在控制台输出；始终挂在 window 上便于随时读取。
+const terminalDiag = reactive({ keys: 0, sends: 0, acks: 0, errors: 0, swallowed: 0 });
+const terminalDiagVisible = ref(false);
+if (typeof window !== "undefined") {
+  (window as unknown as Record<string, unknown>).__dbxTerminalDiag = terminalDiag;
+  let diagEnabled = false;
+  try {
+    diagEnabled = window.localStorage?.getItem("dbx-term-diag") === "1";
+  } catch {
+    // 沙箱策略禁止 localStorage 时诊断保持关闭。
+  }
+  if (diagEnabled) {
+    window.setInterval(() => {
+      console.info("[term-diag]", JSON.stringify(terminalDiag));
+    }, 2000);
+  }
+}
+
 const terminalInputQueue = createTerminalInputQueue({
-  send: (sessionId, payload) => window.dbxPlugin.sendBinary(`ssh/terminal/in/${sessionId}`, payload),
+  send: (sessionId, payload) => {
+    terminalDiag.sends += 1;
+    return window.dbxPlugin.sendBinary(`ssh/terminal/in/${sessionId}`, payload);
+  },
   onError: (cause) => {
+    terminalDiag.errors += 1;
     showError(cause, "terminal");
     // 会话被外部杀掉（宿主重推连接的 disconnect、sidecar 重启）时本 tab 无
     // 事件感知，终端看似活着实则打不进字。输入撞上死会话时按传输断开的
@@ -1426,10 +1452,15 @@ function createTerminal() {
     const route = resolveTerminalInputRoute({ zmodemBusy: zmodemBusy.value, trzszBusy: trzszBusy.value });
     if (route === "trzsz") {
       if (trzszPhase.value === "transferring") trzszFilter?.processTerminalInput(data);
+      terminalDiag.swallowed += 1;
       return;
     }
-    if (route === "blocked") return;
+    if (route === "blocked") {
+      terminalDiag.swallowed += 1;
+      return;
+    }
     trackPendingInput(data);
+    terminalDiag.keys += 1;
     sendTerminalBytes(new TextEncoder().encode(data));
   });
   // 选中复制（可在设置里关闭）：选择一变化即静默写入剪贴板，不弹提示。
@@ -1473,6 +1504,11 @@ function handleTerminalKey(event: KeyboardEvent) {
     event.stopPropagation();
     return false;
   };
+  if (mod && event.shiftKey && (event.key === "d" || event.key === "D")) {
+    // 快速输入丢失诊断浮层（#33/#71）：三计数锁定丢失层，双击浮层关闭。
+    terminalDiagVisible.value = !terminalDiagVisible.value;
+    return consume();
+  }
   if (mod && (event.key === "f" || event.key === "F")) {
     openTerminalSearch();
     return consume();
@@ -2203,6 +2239,10 @@ function scheduleSessionReconnect() {
 }
 
 function handleEvent(event: DbxPluginEvent) {
+  if (event.method === "ssh/terminal/inputAck") {
+    terminalDiag.acks += 1;
+    return;
+  }
   if (event.method === "ssh/batchBar/state") {
     const params = event.params as { source?: string; draft?: string; quickPickId?: string; open?: boolean };
     if (params.source && params.source !== batchBarSourceId) applyRemoteBatchBarState(params);
@@ -4637,18 +4677,63 @@ async function chooseUpload() {
   }
 }
 
-async function uploadHandleFiles(files: Array<{ handleId: string; name: string; size: number }>) {
+async function uploadHandleFiles(files: Array<{ handleId: string; name: string; size: number }>, targetDir?: string) {
   if (!window.dbxPlugin.fileTransfer || !files.length) return;
   await runWithConcurrency(files, 3, async (file) => {
       try {
         await uploadSource(file.name, file.size, async (offset, length) => {
           const result = await window.dbxPlugin.fileTransfer!.read(file.handleId, offset, length);
           return window.dbxPlugin.decodeBase64(result.dataBase64);
-        });
+        }, undefined, targetDir);
       } finally {
         await window.dbxPlugin.fileTransfer!.cancel(file.handleId).catch(() => undefined);
       }
   });
+}
+
+// 宿主 fileTransfer 桥（桌面端）：OS 级拖放由宿主 webview 捕获并路由到本
+// 工作台，文件以已打开的句柄送达；悬停态经 onDragState 推送。落点按面板
+// 状态分流（planHostFileDrop）：SFTP 面板打开 → 当前目录；终端独占 → 走
+// 落点询问；否则忽略。
+let hostFileTransferOffDragState: (() => void) | undefined;
+let hostFileTransferOffDrop: (() => void) | undefined;
+
+function registerHostFileTransferBridge() {
+  const fileTransfer = window.dbxPlugin.fileTransfer;
+  if (!fileTransfer) return;
+  hostFileTransferOffDragState = fileTransfer.onDragState((active) => {
+    if (sftpPaneOpen.value) dragActive.value = active;
+    else if (!active) dragActive.value = false;
+  });
+  hostFileTransferOffDrop = fileTransfer.onDrop((files) => {
+    void handleHostFileDrop(files);
+  });
+}
+
+async function handleHostFileDrop(files: Array<{ handleId: string; name: string; size: number; contentType: string }>) {
+  const plan = planHostFileDrop({
+    files: files.length,
+    connected: connected.value,
+    canWrite: canWrite.value,
+    sftpPaneOpen: sftpPaneOpen.value,
+    terminalTransferBusy: terminalTransferBusy.value,
+  });
+  if (plan.kind === "ignore") return;
+  openTransferPanel();
+  try {
+    if (plan.kind === "terminal") {
+      const choice = await askDropUploadTarget(files);
+      terminal?.focus();
+      if (choice === "cancel") return;
+      await uploadHandleFiles(files, choice === "cwd" ? undefined : choice.dir);
+    } else {
+      await uploadHandleFiles(files);
+      await loadDirectory();
+    }
+    if (files.length) showNotice(t("uploaded", { count: files.length }));
+  } catch (cause) {
+    showError(cause);
+  }
 }
 
 async function uploadLocalFiles(files: readonly File[], targetDir?: string) {
@@ -5152,7 +5237,7 @@ async function runTerminalDropUpload(files: File[]) {
   }
 }
 
-function askDropUploadTarget(files: File[]): Promise<"cancel" | "cwd" | { dir: string }> {
+function askDropUploadTarget(files: Array<{ name: string }>): Promise<"cancel" | "cwd" | { dir: string }> {
   dropUploadTarget.value = "cwd";
   dropUploadPathInput.value = "";
   return new Promise((resolve) => {
@@ -7291,6 +7376,7 @@ onMounted(() => {
   document.addEventListener("pointerdown", hideTooltip, true);
   document.addEventListener("wheel", hideTooltip, true);
   hostFontObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["style"] });
+  registerHostFileTransferBridge();
   void hydrateQuickCommands();
   void hydrateHighlightRules();
   void hydratePrefs();
@@ -7309,6 +7395,8 @@ onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", hideTooltip, true);
   document.removeEventListener("wheel", hideTooltip, true);
   hostFontObserver.disconnect();
+  hostFileTransferOffDragState?.();
+  hostFileTransferOffDrop?.();
   hideTooltip();
   window.clearTimeout(persistTimer);
   window.clearInterval(recordCountdownTimer);
@@ -7648,6 +7736,12 @@ onBeforeUnmount(() => {
         <ContextMenuTrigger as-child>
       <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
         <div ref="terminalHost" class="terminal-host" />
+        <!-- #33/#71 快速输入丢失诊断浮层：Ctrl/Cmd+Shift+D 切换。keys=onData
+             路由到 PTY 的按键、sends=提交宿主桥的帧、acks=sidecar 确认的帧、
+             errors=桥拒绝、swallowed=传输路由吞键。三者对不上即锁定丢失层。 -->
+        <div v-if="terminalDiagVisible" class="terminal-diag-overlay" @dblclick="terminalDiagVisible = false">
+          keys {{ terminalDiag.keys }} · sends {{ terminalDiag.sends }} · acks {{ terminalDiag.acks }} · errors {{ terminalDiag.errors }} · swallowed {{ terminalDiag.swallowed }}
+        </div>
         <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint") }}</strong></div>
         <TerminalSearchPanel
           v-if="searchOpen"
