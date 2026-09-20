@@ -989,10 +989,15 @@ const localShellPref = ref("");
 const localShellIntegrationPref = ref(true);
 // shell 选择器菜单：打开时拉一次 local/shells/list。
 const localMenuOpen = ref(false);
-const localShells = ref<Array<{ program: string; name: string; isDefault: boolean; isUserShell: boolean }>>([]);
+const localShells = ref<Array<{ program: string; name: string; isDefault: boolean; isUserShell: boolean; injectable?: boolean }>>([]);
 const localShellsLoading = ref(false);
 // 上次本地会话跟踪到的 cwd：重开时继承（VS Code 新终端继承工作区目录惯例）。
 const localLastCwd = ref("");
+// 当前偏好 shell 是否支持注入（ksh/csh/cmd 等裸 shell 灰掉开关）。
+const selectedShellInjectable = computed<boolean | undefined>(() => {
+  if (!localShellPref.value) return undefined;
+  return localShells.value.find((entry) => entry.program === localShellPref.value)?.injectable;
+});
 
 // Large-output rendering throttle: coalesce consecutive PTY frames into one
 // merged xterm write per animation frame (capped, order preserving). The sink
@@ -7690,8 +7695,8 @@ onBeforeUnmount(() => {
                 </label>
               </template>
               <p v-else class="muted local-shell-hint">{{ t("localTerminal.shellsUnavailable") }}</p>
-              <label class="agent-mode-option">
-                <input type="checkbox" name="local-shell-integration" :checked="localShellIntegrationPref" @change="setLocalShellIntegrationPref(($event.target as HTMLInputElement).checked)" />
+              <label class="agent-mode-option" :title="selectedShellInjectable === false ? t('localTerminal.injectionUnavailable') : ''">
+                <input type="checkbox" name="local-shell-integration" :checked="localShellIntegrationPref" :disabled="selectedShellInjectable === false" @change="setLocalShellIntegrationPref(($event.target as HTMLInputElement).checked)" />
                 <span>{{ t("localTerminal.injection") }}</span>
               </label>
               <footer class="local-shell-footer">

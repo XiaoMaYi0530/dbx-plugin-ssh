@@ -572,6 +572,9 @@ pub struct ShellEntry {
     pub is_default: bool,
     /// The user's login shell (dscl / $SHELL / USERPROFILE-adjacent).
     pub is_user_shell: bool,
+    /// Whether shell integration injection applies to this shell kind
+    /// (ksh/csh/cmd-style shells open bare, the toggle is inert for them).
+    pub injectable: bool,
 }
 
 /// Pure core of shell discovery: merge candidate program paths in priority
@@ -677,6 +680,7 @@ pub fn discover_shells(platform: Platform) -> Vec<ShellEntry> {
         .into_iter()
         .map(|program| {
             let name = shell_basename(&program);
+            let kind = shell_kind_from_program(&program);
             ShellEntry {
                 name: shell_display_name(&name),
                 is_default: name == shell_basename(&default_program),
@@ -685,6 +689,7 @@ pub fn discover_shells(platform: Platform) -> Vec<ShellEntry> {
                     .filter(|value| !value.is_empty())
                     .map(|value| shell_basename(value) == name)
                     .unwrap_or(false),
+                injectable: injection_plan(kind, Path::new("/dev/null"), None).is_some(),
                 program,
             }
         })
@@ -724,6 +729,7 @@ impl LocalTerminalRuntime {
                     "name": entry.name,
                     "isDefault": entry.is_default,
                     "isUserShell": entry.is_user_shell,
+                    "injectable": entry.injectable,
                 }))
                 .collect::<Vec<_>>(),
         })
@@ -1107,6 +1113,22 @@ mod tests {
     fn shell_discovery_survives_missing_user_shell_and_empty_etc_shells() {
         let merged = merge_shell_candidates(None, &[], &["/bin/bash"], &|p| p == "/bin/bash");
         assert_eq!(merged, vec!["/bin/bash"]);
+    }
+
+    #[test]
+    fn discovery_marks_injectable_kinds() {
+        let platform = if cfg!(windows) {
+            Platform::Windows
+        } else {
+            Platform::Linux
+        };
+        let shells = discover_shells(platform);
+        assert!(!shells.is_empty());
+        for entry in &shells {
+            let kind = shell_kind_from_program(&entry.program);
+            let expected = !matches!(kind, ShellKind::Cmd | ShellKind::Other);
+            assert_eq!(entry.injectable, expected, "entry {}", entry.program);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 export type WorkbenchLocale = "en" | "es" | "it" | "ja" | "pt-BR" | "zh-CN" | "zh-TW";
 
-const messages = {
+export const messages = {
   "en": {
     settingsLoadFailed: "Could not load SSH settings. Retry before saving.",
     alertTriageLoadFailed: "Could not analyze this alert: {error}",
@@ -129,6 +129,7 @@ const messages = {
       settings: "Local terminal settings",
       settingsHint: "Pick the shell the local terminal opens with. Stored for this plugin on this machine.",
       injection: "Inject shell integration (command exit codes, cwd)",
+      injectionUnavailable: "This shell has no integration hooks — it opens bare.",
       defaultBadge: "default",
       userShellBadge: "login",
       shellsUnavailable: "Shell discovery unavailable — the automatic choice will be used.",
@@ -486,6 +487,7 @@ const messages = {
       settings: "Ajustes de la terminal local",
       settingsHint: "Elige la shell con la que se abre la terminal local. Se guarda para este plugin en esta máquina.",
       injection: "Inyectar integración de shell (códigos de salida, cwd)",
+      injectionUnavailable: "Esta shell no tiene ganchos de integración — se abre sin ellos.",
       defaultBadge: "predeterminada",
       userShellBadge: "de inicio",
       shellsUnavailable: "No se pudieron detectar shells — se usará la elección automática.",
@@ -836,6 +838,7 @@ const messages = {
       settings: "Impostazioni del terminale locale",
       settingsHint: "Scegli la shell con cui si apre il terminale locale. Salvata per questo plugin su questa macchina.",
       injection: "Inietta integrazione shell (codici di uscita, cwd)",
+      injectionUnavailable: "Questa shell non ha hook di integrazione — si apre senza.",
       defaultBadge: "predefinita",
       userShellBadge: "login",
       shellsUnavailable: "Individuazione delle shell non disponibile — verrà usata la scelta automatica.",
@@ -1186,6 +1189,7 @@ const messages = {
       settings: "ローカルターミナルの設定",
       settingsHint: "ローカルターミナルが開くシェルを選択します。このマシンのこのプラグイン用に保存されます。",
       injection: "シェル統合を注入（終了コード・cwd）",
+      injectionUnavailable: "このシェルは統合フックがなく、素の状態で起動します。",
       defaultBadge: "デフォルト",
       userShellBadge: "ログイン",
       shellsUnavailable: "シェルを検出できません — 自動選択を使用します。",
@@ -1536,6 +1540,7 @@ const messages = {
       settings: "Configurações do terminal local",
       settingsHint: "Escolha o shell com o qual o terminal local abre. Salvo para este plugin nesta máquina.",
       injection: "Injetar integração de shell (códigos de saída, cwd)",
+      injectionUnavailable: "Este shell não tem ganchos de integração — abre sem eles.",
       defaultBadge: "padrão",
       userShellBadge: "login",
       shellsUnavailable: "Detecção de shells indisponível — a escolha automática será usada.",
@@ -1886,6 +1891,7 @@ const messages = {
       settings: "本地终端设置",
       settingsHint: "选择本地终端打开时使用的 shell，保存为本机插件偏好。",
       injection: "注入 shell integration（命令退出码、cwd）",
+      injectionUnavailable: "该 shell 无注入钩子，将以裸 shell 启动。",
       defaultBadge: "默认",
       userShellBadge: "登录",
       shellsUnavailable: "无法发现可用 shell —— 将使用自动探测。",
@@ -2243,6 +2249,7 @@ const messages = {
       settings: "本機終端機設定",
       settingsHint: "選擇本機終端機開啟時使用的 shell，儲存為本機外掛偏好。",
       injection: "注入 shell integration（結束代碼、cwd）",
+      injectionUnavailable: "該 shell 無注入掛鉤，將以裸 shell 啟動。",
       defaultBadge: "預設",
       userShellBadge: "登入",
       shellsUnavailable: "無法探索可用 shell —— 將使用自動探測。",
