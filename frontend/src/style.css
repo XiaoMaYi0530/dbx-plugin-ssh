@@ -748,6 +748,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .local-shell-popover .local-shell-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; font-size: 9px; color: var(--muted-foreground); }
 .local-shell-popover .local-shell-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
 
+/* BEL 视觉铃：程序输出 \x07 时终端面板边框短促脉冲（alert() 的终端惯例替代） */
+.terminal-pane.bell-flash { animation: terminal-bell-pulse 0.4s ease-out; }
+@keyframes terminal-bell-pulse {
+  0% { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--warning, #e5a400) 70%, transparent); }
+  100% { box-shadow: inset 0 0 0 0 transparent; }
+}
+
 /* OSC 633 command marker strip at the bottom-left of the terminal pane; hidden
    unless the remote shell integration emits 633 frames. The zmodem banner
    (z-index 3) takes precedence when both would overlap. */

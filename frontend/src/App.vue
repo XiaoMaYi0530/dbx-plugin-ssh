@@ -916,6 +916,9 @@ let zoomNoticeTimer = 0;
 let resizeObserver: ResizeObserver | undefined;
 let disposeInput: { dispose(): void } | undefined;
 let disposeSelectionCopy: { dispose(): void } | undefined;
+let disposeBell: { dispose(): void } | undefined;
+let bellFlashTimer = 0;
+const bellFlash = ref(false);
 let unsubscribeEvent: (() => void) | undefined;
 let unsubscribeBinary: (() => void) | undefined;
 let unsubscribeAppearance: (() => void) | undefined;
@@ -1482,6 +1485,13 @@ function createTerminal() {
   disposeSelectionCopy = terminal.onSelectionChange(() => {
     if (!termSelectCopy.value || !terminal?.hasSelection()) return;
     void writeClipboardText(terminal.getSelection(), clipboardDeps()).catch(() => undefined);
+  });
+  // BEL 视觉铃（alert 的前端惯例替代）：程序发 \x07 时面板边框短促脉冲，
+  // 不依赖系统铃声；长任务完成/出错提醒在后台切回即见。
+  disposeBell = terminal.onBell(() => {
+    bellFlash.value = true;
+    window.clearTimeout(bellFlashTimer);
+    bellFlashTimer = window.setTimeout(() => (bellFlash.value = false), 400);
   });
   // 捕获阶段的 paste 监听：拦截 Ctrl+V 之外的所有粘贴路径（浏览器右键菜单等），
   // 统一走风险确认后再写入终端。
@@ -7616,6 +7626,8 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   disposeInput?.dispose();
   disposeSelectionCopy?.dispose();
+  disposeBell?.dispose();
+  window.clearTimeout(bellFlashTimer);
   terminalWriteThrottle.dispose();
   detachHighlightRender();
   terminal?.dispose();
@@ -7952,7 +7964,7 @@ onBeforeUnmount(() => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'bell-flash': bellFlash }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
         <div ref="terminalHost" class="terminal-host" />
         <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint") }}</strong></div>
         <TerminalSearchPanel

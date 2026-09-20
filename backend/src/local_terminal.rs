@@ -36,9 +36,12 @@ use tokio::sync::{mpsc, RwLock};
 use crate::model::TerminalStream;
 use crate::ssh::ReplayBuffer;
 
-/// Extra wait for a killed or EOF'd child to deliver its real exit status
-/// before the exit code is reported as unknown.
+/// Grace for a EOF'd/HUP'd child to exit on its own (zsh/bash flush command
+/// history only on a clean exit) before the killer escalates to SIGKILL.
 const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Second, shorter window after SIGKILL for the waiter thread to deliver the
+/// status; the child is being reaped either way.
+const LOCAL_KILL_GRACE: Duration = Duration::from_secs(2);
 
 const INTEGRATION_ZSH: &str = include_str!("shell_integration/integration.zsh");
 const INTEGRATION_BASH: &str = include_str!("shell_integration/integration.bash");
@@ -139,6 +142,10 @@ impl LocalTerminalRuntime {
         // `-l` with `--rcfile`).
         command.args(&integration.args);
         command.env("TERM", "xterm-256color");
+        // 24-bit color for programs that probe COLORTERM (VS Code sets the
+        // same), plus a detectable marker akin to TERM_PROGRAM=vscode.
+        command.env("COLORTERM", "truecolor");
+        command.env("TERM_PROGRAM", "dbx");
         for (key, value) in &integration.env {
             command.env(key, value);
         }
@@ -373,14 +380,28 @@ fn spawn_pump(
 
     let writer = Arc::new(Mutex::new(writer));
     tokio::spawn(async move {
+        let mut master = Some(master);
         let mut closing = false;
         let mut exit_code: Option<Option<u32>> = None;
         loop {
             if closing {
-                // Bounded grace so a freshly killed child can still deliver
-                // its real exit status; the waiter thread reaps it either way.
-                if let Ok(code) = tokio::time::timeout(LOCAL_CLOSE_GRACE, exit_rx.recv()).await {
-                    exit_code = code;
+                // Graceful-first teardown: with the master dropped the slave
+                // sees EOF and the shell exits cleanly — zsh/bash flush their
+                // command history only on a clean exit, an immediate SIGKILL
+                // would silently drop it. Only a child that outlives the
+                // grace window (hung job, `no hup` shell) gets the killer.
+                match tokio::time::timeout(LOCAL_CLOSE_GRACE, exit_rx.recv()).await {
+                    Ok(code) => {
+                        exit_code = code;
+                    }
+                    Err(_) => {
+                        let _ = killer.kill();
+                        if let Ok(code) =
+                            tokio::time::timeout(LOCAL_KILL_GRACE, exit_rx.recv()).await
+                        {
+                            exit_code = code;
+                        }
+                    }
                 }
                 break;
             }
@@ -408,15 +429,20 @@ fn spawn_pump(
                         }
                     }
                     Some(LocalTerminalCommand::Resize { cols, rows }) => {
-                        let _ = master.resize(PtySize {
-                            rows: rows.clamp(1, u16::MAX as u32) as u16,
-                            cols: cols.clamp(1, u16::MAX as u32) as u16,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
+                        if let Some(master) = master.as_ref() {
+                            let _ = master.resize(PtySize {
+                                rows: rows.clamp(1, u16::MAX as u32) as u16,
+                                cols: cols.clamp(1, u16::MAX as u32) as u16,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                        }
                     }
                     Some(LocalTerminalCommand::Close) | None => {
-                        let _ = killer.kill();
+                        // Drop the master BEFORE the grace window: the slave
+                        // side sees EOF and interactive shells exit (and flush
+                        // history) on their own; killer only after the grace.
+                        drop(master.take());
                         closing = true;
                     }
                 },
@@ -426,8 +452,9 @@ fn spawn_pump(
                 }
             }
         }
-        // Close the master before the goodbye frames so the reader thread
-        // unblocks even when a background child still holds the slave.
+        // The master may already be taken by a graceful Close; dropping the
+        // remaining value here unblocks the reader thread even when a
+        // background child still holds the slave.
         drop(master);
         publish_local_terminal(
             &session_id,

@@ -45,7 +45,7 @@ def collect_until(client, out_channel, in_channel, ready, done, deadline_s=15.0)
         text = bytes(collected)
         if ready(text) and not sent:
             sent = True
-            client.send_binary(in_channel, struct.pack(">Q", 1) + b"echo DBX_SMOKE_$((6*7))_OK\r")
+            client.send_binary(in_channel, struct.pack(">Q", 1) + b"echo DBX_SMOKE_$((6*7))_OK COLORTERM=$COLORTERM\r")
         if done(text):
             return text
         time.sleep(0.1)
@@ -103,12 +103,14 @@ def main() -> int:
                 out,
                 f"local/terminal/in/{session_id}",
                 ready=lambda chunk: b"\x1b]133;A" in chunk,
-                done=lambda chunk: b"\x1b]133;A" in chunk and b"DBX_SMOKE_42_OK" in chunk,
+                done=lambda chunk: b"\x1b]133;A" in chunk and b"DBX_SMOKE_42_OK" in chunk and b"COLORTERM=truecolor" in chunk,
             )
             if integrated:
                 assert b"\x1b]133;A" in text, f"no OSC 133;A prompt mark; tail={text[-160:]!r}"
                 assert b"\x1b]133;D;0" in text, f"no OSC 133;D;0 exit-code mark; tail={text[-160:]!r}"
             assert b"DBX_SMOKE_42_OK" in text, f"echo missing; tail={text[-160:]!r}"
+            if integrated:
+                assert b"COLORTERM=truecolor" in text, "COLORTERM not injected"
             print(f"echo round-trip OK ({len(text)} bytes, integration={integrated})")
 
             client.request(
