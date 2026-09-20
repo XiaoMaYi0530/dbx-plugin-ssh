@@ -4701,11 +4701,11 @@ let hostFileTransferOffDrop: (() => void) | undefined;
 function registerHostFileTransferBridge() {
   const fileTransfer = window.dbxPlugin.fileTransfer;
   if (!fileTransfer) return;
-  hostFileTransferOffDragState = fileTransfer.onDragState((active) => {
+  hostFileTransferOffDragState = fileTransfer.onDragState?.((active) => {
     if (sftpPaneOpen.value) dragActive.value = active;
     else if (!active) dragActive.value = false;
   });
-  hostFileTransferOffDrop = fileTransfer.onDrop((files) => {
+  hostFileTransferOffDrop = fileTransfer.onDrop?.((files) => {
     void handleHostFileDrop(files);
   });
 }
