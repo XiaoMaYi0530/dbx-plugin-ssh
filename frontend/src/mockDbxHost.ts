@@ -485,6 +485,7 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
         { program: "/opt/homebrew/bin/fish", name: "Fish", isDefault: false, isUserShell: true },
         { program: "/bin/zsh", name: "Zsh", isDefault: true, isUserShell: false },
         { program: "/bin/bash", name: "Bash", isDefault: false, isUserShell: false },
+        { program: "/bin/csh", name: "Csh", isDefault: false, isUserShell: false, injectable: false },
       ],
     };
   } else if (method === "local/capabilities") result = { canSaveLocal: false, downloadsDir: "" };
