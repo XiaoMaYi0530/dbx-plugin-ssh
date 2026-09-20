@@ -1031,8 +1031,16 @@ mod tests {
 
     #[test]
     fn bash_injection_swaps_login_for_rcfile_wrapper() {
-        let plan = injection_plan(ShellKind::Bash, Path::new("/tmp/si"), None).expect("bash plan");
-        assert_eq!(plan.0, vec!["--rcfile", "/tmp/si/wrapper.bash"]);
+        let dir = Path::new("/tmp/si");
+        let plan = injection_plan(ShellKind::Bash, dir, None).expect("bash plan");
+        // 期望值经 PathBuf 拼接生成，分隔符断言在 Windows（\）上同样成立。
+        assert_eq!(
+            plan.0,
+            vec![
+                "--rcfile",
+                dir.join("wrapper.bash").to_string_lossy().as_ref()
+            ]
+        );
         assert!(plan.1.is_empty());
     }
 
@@ -1042,12 +1050,26 @@ mod tests {
         let fish = injection_plan(ShellKind::Fish, dir, None).expect("fish plan");
         assert_eq!(fish.0[0], "-l");
         assert_eq!(fish.0[1], "-C");
-        assert_eq!(fish.0[2], "source '/tmp/my si/integration.fish'");
+        assert_eq!(
+            fish.0[2],
+            format!(
+                "source '{}'",
+                escape_posix_single_quoted(dir.join("integration.fish").to_string_lossy().as_ref())
+            )
+        );
 
         let pwsh = injection_plan(ShellKind::PowerShell, dir, None).expect("pwsh plan");
         assert_eq!(pwsh.0[0], "-NoExit");
         assert_eq!(pwsh.0[1], "-Command");
-        assert_eq!(pwsh.0[2], "& '/tmp/my si/integration.ps1'");
+        assert_eq!(
+            pwsh.0[2],
+            format!(
+                "& '{}'",
+                escape_powershell_single_quoted(
+                    dir.join("integration.ps1").to_string_lossy().as_ref()
+                )
+            )
+        );
     }
 
     #[test]
@@ -1059,7 +1081,12 @@ mod tests {
     #[test]
     fn prepare_integration_disabled_falls_back_to_base_args_without_io() {
         let prepared = prepare_integration(ShellKind::Bash, false);
-        assert_eq!(prepared.args, vec!["-l"]);
+        // Windows 无登录参数概念（见 base_args），Unix 一律 -l 登录 shell。
+        if cfg!(windows) {
+            assert!(prepared.args.is_empty());
+        } else {
+            assert_eq!(prepared.args, vec!["-l"]);
+        }
         assert!(prepared.env.is_empty());
         assert!(!prepared.injected);
     }
