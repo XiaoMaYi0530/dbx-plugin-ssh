@@ -59,6 +59,10 @@ pub struct LocalTerminalStartRequest {
     pub shell: Option<String>,
     /// Opt-out of shell integration injection; defaults to on.
     pub shell_integration: Option<bool>,
+    /// Working directory to start in (workbench restart inherits the last
+    /// tracked cwd, VS Code new-terminal-in-workspace style). Must be an
+    /// existing directory; invalid values fall back to the home directory.
+    pub cwd: Option<String>,
 }
 
 enum LocalTerminalCommand {
@@ -108,6 +112,16 @@ impl LocalTerminalRuntime {
             current_platform(),
         );
         let integration = prepare_integration(spec.kind, request.shell_integration.unwrap_or(true));
+        // cwd：显式参数须为现存目录，非法值静默回落家目录（前端传的是上次
+        // 会话跟踪到的 cwd，目录可能已被删除）。
+        let cwd = request
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .or_else(home_dir);
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -128,7 +142,7 @@ impl LocalTerminalRuntime {
         for (key, value) in &integration.env {
             command.env(key, value);
         }
-        if let Some(home) = home_dir() {
+        if let Some(home) = cwd {
             command.cwd(home);
         }
 
@@ -547,6 +561,175 @@ fn pick_shell(
     ShellSpec { program, kind }
 }
 
+/// One row of `local/shells/list`: a launchable shell with display metadata.
+#[derive(Debug, Clone)]
+pub struct ShellEntry {
+    /// Program path/name to spawn (also the stored preference value).
+    pub program: String,
+    /// Basename for display ("zsh", "PowerShell", …).
+    pub name: String,
+    /// The platform default this runtime would pick with no explicit choice.
+    pub is_default: bool,
+    /// The user's login shell (dscl / $SHELL / USERPROFILE-adjacent).
+    pub is_user_shell: bool,
+}
+
+/// Pure core of shell discovery: merge candidate program paths in priority
+/// order (user login shell first, then /etc/shells, then platform defaults),
+/// deduplicating case-insensitively on the basename. `exists` is injected so
+/// tests can simulate the filesystem.
+fn merge_shell_candidates(
+    user_shell: Option<&str>,
+    etc_shells: &[String],
+    fallbacks: &[&str],
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<String> = Vec::new();
+    let mut push = |program: &str| {
+        let program = program.trim();
+        if program.is_empty() || !exists(program) {
+            return;
+        }
+        let key = shell_basename(program);
+        if seen.insert(key) {
+            ordered.push(program.to_string());
+        }
+    };
+    if let Some(value) = user_shell.map(str::trim).filter(|v| !v.is_empty()) {
+        push(value);
+    }
+    for line in etc_shells {
+        let candidate = line.trim();
+        if candidate.is_empty() || candidate.starts_with('#') {
+            continue;
+        }
+        push(candidate);
+    }
+    for candidate in fallbacks {
+        push(candidate);
+    }
+    ordered
+}
+
+/// `/etc/shells` content (Unix). Empty on Windows or when unreadable.
+fn etc_shells() -> Vec<String> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    std::fs::read_to_string("/etc/shells")
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Windows candidate lookup over PATH-style directories (pure in `dirs`).
+fn find_in_dirs(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file())
+}
+
+/// Windows shell candidates, best first: PowerShell 7 if installed, the
+/// always-present Windows PowerShell, cmd, and WSL for Unix tooling.
+fn windows_shell_candidates() -> Vec<String> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    let mut dirs = dirs;
+    if let Some(windir) = std::env::var_os("SystemRoot").map(PathBuf::from) {
+        let system32 = windir.join("System32");
+        dirs.push(system32.clone());
+        dirs.push(system32.join("WindowsPowerShell").join("v1.0"));
+    }
+    ["pwsh.exe", "powershell.exe", "cmd.exe", "wsl.exe"]
+        .iter()
+        .filter_map(|name| find_in_dirs(name, &dirs))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Discover launchable shells for `local/shells/list`: the user's login shell
+/// first, then `/etc/shells` (Unix), then platform defaults — each row marked
+/// with the default/user-shell roles the picker UI renders.
+pub fn discover_shells(platform: Platform) -> Vec<ShellEntry> {
+    let ds_shell = directory_services_shell();
+    let shell_env = std::env::var_os("SHELL").map(|value| value.to_string_lossy().into_owned());
+    let user_shell = ds_shell.as_deref().or(shell_env.as_deref());
+    let fallbacks: Vec<String> = match platform {
+        Platform::Windows => windows_shell_candidates(),
+        _ => {
+            let default = match platform {
+                Platform::MacOS => "/bin/zsh",
+                _ => "/bin/bash",
+            };
+            vec![default.to_string()]
+        }
+    };
+    let exists = |program: &str| Path::new(program).is_file();
+    let ordered = merge_shell_candidates(
+        user_shell,
+        &etc_shells(),
+        &fallbacks.iter().map(String::as_str).collect::<Vec<_>>(),
+        &exists,
+    );
+    let default_program = pick_shell(None, None, None, platform).program;
+    ordered
+        .into_iter()
+        .map(|program| {
+            let name = shell_basename(&program);
+            ShellEntry {
+                name: shell_display_name(&name),
+                is_default: name == shell_basename(&default_program),
+                is_user_shell: user_shell
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| shell_basename(value) == name)
+                    .unwrap_or(false),
+                program,
+            }
+        })
+        .collect()
+}
+
+/// Friendlier picker label: basename without the .exe already applied.
+fn shell_display_name(basename: &str) -> String {
+    match basename {
+        "powershell" => "Windows PowerShell".to_string(),
+        "pwsh" => "PowerShell".to_string(),
+        "wsl" => "WSL".to_string(),
+        other => {
+            let mut name = other.to_string();
+            if let Some(first) = name.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            name
+        }
+    }
+}
+
+impl LocalTerminalRuntime {
+    /// Read-only shell inventory for the workbench's shell picker.
+    pub fn shells(&self) -> Value {
+        let platform = current_platform();
+        json!({
+            "platform": match platform {
+                Platform::MacOS => "macos",
+                Platform::Linux => "linux",
+                Platform::Windows => "windows",
+            },
+            "shells": discover_shells(platform)
+                .iter()
+                .map(|entry| json!({
+                    "program": entry.program,
+                    "name": entry.name,
+                    "isDefault": entry.is_default,
+                    "isUserShell": entry.is_user_shell,
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
 /// macOS only: the user's real login shell from Directory Services, which is
 /// authoritative when `$SHELL` is missing inside a GUI-launched process.
 fn directory_services_shell() -> Option<String> {
@@ -887,6 +1070,51 @@ mod tests {
     fn render_template_substitutes_the_integration_dir() {
         let rendered = render_template("source '{{INTEGRATION_DIR}}/integration.zsh'", "/opt/x");
         assert_eq!(rendered, "source '/opt/x/integration.zsh'");
+    }
+
+    #[test]
+    fn shell_discovery_merges_user_shell_etc_shells_and_defaults() {
+        // /etc/shells 注释与空行跳过；用户 shell 置顶；basename 大小写不敏感去重；
+        // 不存在的候选被 exists 谓词过滤。
+        let exists = |program: &str| {
+            matches!(
+                program,
+                "/opt/homebrew/bin/fish" | "/bin/zsh" | "/bin/bash" | "/usr/bin/fish"
+            )
+        };
+        let merged = merge_shell_candidates(
+            Some("/opt/homebrew/bin/fish"),
+            &[
+                "# comment".to_string(),
+                "".to_string(),
+                "/bin/zsh".to_string(),
+                "/opt/homebrew/bin/FISH".to_string(),
+                "/usr/bin/fish".to_string(),
+                "/bin/bash".to_string(),
+            ],
+            &["/bin/zsh", "/bin/bash"],
+            &exists,
+        );
+        // "/opt/homebrew/bin/FISH" 与 "/usr/bin/fish" 都是 basename fish，
+        // 大小写不敏感去重后只保留先到的用户 shell。
+        assert_eq!(
+            merged,
+            vec!["/opt/homebrew/bin/fish", "/bin/zsh", "/bin/bash"]
+        );
+    }
+
+    #[test]
+    fn shell_discovery_survives_missing_user_shell_and_empty_etc_shells() {
+        let merged = merge_shell_candidates(None, &[], &["/bin/bash"], &|p| p == "/bin/bash");
+        assert_eq!(merged, vec!["/bin/bash"]);
+    }
+
+    #[test]
+    fn display_names_read_naturally() {
+        assert_eq!(shell_display_name("zsh"), "Zsh");
+        assert_eq!(shell_display_name("powershell"), "Windows PowerShell");
+        assert_eq!(shell_display_name("pwsh"), "PowerShell");
+        assert_eq!(shell_display_name("wsl"), "WSL");
     }
 
     #[test]

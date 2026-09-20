@@ -7,6 +7,7 @@ import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
   Archive,
+  ChevronDown,
   Disc,
   Film,
   Pause,
@@ -982,6 +983,16 @@ const localPendingFrames = new Map<number, { stream: number; data: Uint8Array }>
 let localReplayInFlight = false;
 let localReplayNoProgress = 0;
 const isLocalMode = computed(() => localSession.value !== null);
+// —— 本地终端偏好（sidecar preferences.json 持久化；iframe 沙箱无 localStorage）——
+// shell 空串 = 跟随自动探测；integration 缺省开。
+const localShellPref = ref("");
+const localShellIntegrationPref = ref(true);
+// shell 选择器菜单：打开时拉一次 local/shells/list。
+const localMenuOpen = ref(false);
+const localShells = ref<Array<{ program: string; name: string; isDefault: boolean; isUserShell: boolean }>>([]);
+const localShellsLoading = ref(false);
+// 上次本地会话跟踪到的 cwd：重开时继承（VS Code 新终端继承工作区目录惯例）。
+const localLastCwd = ref("");
 
 // Large-output rendering throttle: coalesce consecutive PTY frames into one
 // merged xterm write per animation frame (capped, order preserving). The sink
@@ -1034,6 +1045,12 @@ const canWrite = computed(() => !connection.value.readOnly && !connectionReadOnl
 const selectedEntry = computed(() => entries.value.find((entry) => entry.uri === selectedPath.value));
 const connected = computed(() => terminalState.value === "connected" && !!session.value);
 const sessionStatus = computed<WorkbenchSessionStatus | "local">(() => (isLocalMode.value ? "local" : describeWorkbenchSessionStatus(terminalState.value, { reattaching: reconnectPending.value })));
+// 本地模式徽标附带 shell 名（Local · Zsh），一眼可见当前在哪种 shell 里。
+const sessionPillText = computed(() => {
+  if (!isLocalMode.value || !localSession.value) return t(`sessionStatus.${sessionStatus.value}`);
+  const kind = localSession.value.shell.split(/[\\/]/).pop() || localSession.value.shell;
+  return `${t("sessionStatus.local")} · ${kind}`;
+});
 // 连接卡片四态：用户取消优先于底层 terminalState（在途 open 仍是 connecting）；
 // open 成功后的短暂 success 态优先于 connecting；其余（error/disconnected）
 // 统一呈现错误行 + Reconnect。
@@ -1726,6 +1743,7 @@ function applyCommandMarker(updates: Osc633StreamUpdates) {
   if (updates.lastCommandDuration !== undefined) commandMarker.durationMs = updates.lastCommandDuration;
   if (updates.cwd !== undefined) {
     commandMarker.cwd = updates.cwd;
+    if (isLocalMode.value) localLastCwd.value = updates.cwd;
     // OSC 633 Cwd doubles as a directory-follow fallback when the backend could
     // not install OSC 7 tracking but the remote shell integration emits 633 frames.
     if (followDirectory.value && directoryTrackingSupported.value === false && updates.cwd) {
@@ -2692,6 +2710,11 @@ async function startLocalTerminal() {
       workbenchId: workbenchId.value,
       cols: terminal?.cols || 120,
       rows: terminal?.rows || 32,
+      // 用户在 shell 选择器里记住的 shell；空串 = 跟随自动探测。
+      ...(localShellPref.value ? { shell: localShellPref.value } : {}),
+      ...(localShellIntegrationPref.value ? {} : { shellIntegration: false }),
+      // 重开继承上次 cwd（目录可能已被删，sidecar 会回落家目录）。
+      ...(localLastCwd.value ? { cwd: localLastCwd.value } : {}),
     });
     if (disposed) {
       void window.dbxPlugin.invoke("local/session/close", { sessionId: info.sessionId }).catch(() => undefined);
@@ -2718,6 +2741,7 @@ async function closeLocalTerminal() {
   localSession.value = null;
   localPendingFrames.clear();
   localOpenConfirmOpen.value = false;
+  localMenuOpen.value = false;
   if (!sessionId) return;
   await window.dbxPlugin.invoke("local/session/close", { sessionId }).catch(() => undefined);
   terminal?.focus();
@@ -2742,6 +2766,39 @@ async function confirmLocalTerminal() {
   localOpenConfirmOpen.value = false;
   await closeSession();
   await startLocalTerminal();
+}
+
+// —— shell 选择器：多平台 shell 发现 + 偏好（VS Code terminal profiles 简化版）——
+async function openLocalMenu() {
+  localMenuOpen.value = true;
+  if (localShellsLoading.value || localShells.value.length) return;
+  localShellsLoading.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ shells: typeof localShells.value }>("local/shells/list", {}, { timeoutMs: 10_000 });
+    localShells.value = result.shells || [];
+  } catch {
+    // 旧 sidecar 无发现方法：菜单退化为仅注入开关（start 仍走自动探测）。
+  } finally {
+    localShellsLoading.value = false;
+  }
+}
+
+async function setLocalShellPref(program: string) {
+  localShellPref.value = program;
+  try {
+    await window.dbxPlugin.invoke("local/preferences/set", { localShell: program });
+  } catch {
+    // 旧 sidecar：会话内存态兜底。
+  }
+}
+
+async function setLocalShellIntegrationPref(enabled: boolean) {
+  localShellIntegrationPref.value = enabled;
+  try {
+    await window.dbxPlugin.invoke("local/preferences/set", { localShellIntegration: enabled });
+  } catch {
+    // 旧 sidecar：会话内存态兜底。
+  }
 }
 
 // webview 重建后接回 sidecar 里仍活着的本地 shell（workbench/close 才回收）。
@@ -3876,10 +3933,12 @@ async function hydratePrefs() {
     // 同上：等待 sidecar 权威值。
   }
   try {
-    const prefs = await window.dbxPlugin.invoke<{ downloadDir?: unknown; downloadUseDefaultDir?: unknown; downloadConflictPolicy?: unknown }>("local/preferences/get", {});
+    const prefs = await window.dbxPlugin.invoke<{ downloadDir?: unknown; downloadUseDefaultDir?: unknown; downloadConflictPolicy?: unknown; localShell?: unknown; localShellIntegration?: unknown }>("local/preferences/get", {});
     if (typeof prefs.downloadDir === "string") downloadDirState.value = prefs.downloadDir.trim();
     if (typeof prefs.downloadUseDefaultDir === "boolean") downloadUseDefaultState.value = prefs.downloadUseDefaultDir;
     if (prefs.downloadConflictPolicy !== undefined) downloadConflictState.value = sanitizeConflictPolicy(prefs.downloadConflictPolicy);
+    if (typeof prefs.localShell === "string") localShellPref.value = prefs.localShell;
+    if (typeof prefs.localShellIntegration === "boolean") localShellIntegrationPref.value = prefs.localShellIntegration;
     cachePrefs();
   } catch {
     // 旧 sidecar：保留 localStorage 种子或默认。
@@ -7062,6 +7121,7 @@ function closeToolbarPopovers() {
   highlightMenuOpen.value = false;
   bookmarkSaveOpen.value = false;
   batchTargetsOpen.value = false;
+  localMenuOpen.value = false;
 }
 
 function closeMenus() {
@@ -7571,7 +7631,7 @@ onBeforeUnmount(() => {
           <span v-if="connection.color" class="connection-color" :style="{ backgroundColor: connection.color }" />
           <strong>{{ connectionIdentity }}</strong>
           <span v-if="connection.readOnly || connectionReadOnly" class="read-only-badge">{{ t("readOnly") }}</span>
-          <span class="session-pill" :class="`session-${sessionStatus}`"><span class="session-dot" aria-hidden="true" />{{ t(`sessionStatus.${sessionStatus}`) }}<span v-if="sessionStatus === 'reconnecting' && reconnectCountdown" class="session-pill-countdown mono">{{ t("sessionStatus.reconnectCountdown", { seconds: reconnectCountdown.seconds, attempt: reconnectCountdown.attempt }) }}</span></span>
+          <span class="session-pill" :class="`session-${sessionStatus}`"><span class="session-dot" aria-hidden="true" />{{ sessionPillText }}<span v-if="sessionStatus === 'reconnecting' && reconnectCountdown" class="session-pill-countdown mono">{{ t("sessionStatus.reconnectCountdown", { seconds: reconnectCountdown.seconds, attempt: reconnectCountdown.attempt }) }}</span></span>
         </div>
         <Popover :open="connectionInfoOpen" @update:open="(open) => { if (!open) connectionInfoOpen = false; }">
           <PopoverAnchor as-child>
@@ -7604,6 +7664,43 @@ onBeforeUnmount(() => {
         <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
              已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。 -->
         <button class="icon-button icon-violet" :class="{ 'is-active': isLocalMode }" :title="isLocalMode ? t('localTerminal.close') : t('localTerminal.open')" @click="isLocalMode ? closeLocalTerminal() : requestLocalTerminal()"><TerminalIcon /></button>
+        <div>
+          <!-- 本地终端设置：多平台 shell 选择（local/shells/list 发现）+ 注入开关，
+               记入 sidecar 偏好（iframe 沙箱无 localStorage）。 -->
+          <Popover :open="localMenuOpen" @update:open="(open) => { if (!open) localMenuOpen = false; }">
+            <PopoverAnchor as-child>
+              <button class="icon-button icon-violet local-shell-chevron" :class="{ 'is-active': localMenuOpen }" :title="t('localTerminal.settings')" @click.stop="openLocalMenu"><ChevronDown /></button>
+            </PopoverAnchor>
+            <PopoverContent class="popover local-shell-popover" align="start" :side-offset="5">
+              <h3>{{ t("localTerminal.settings") }}</h3>
+              <p class="muted local-shell-hint">{{ t("localTerminal.settingsHint") }}</p>
+              <div v-if="localShellsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+              <template v-else-if="localShells.length">
+                <label v-for="entry in localShells" :key="entry.program" class="agent-mode-option">
+                  <input type="radio" name="local-shell" :checked="localShellPref ? localShellPref === entry.program : entry.isDefault" @change="setLocalShellPref(entry.program)" />
+                  <span class="local-shell-row">
+                    <strong>{{ entry.name }}</strong>
+                    <span class="mono local-shell-program">{{ entry.program }}</span>
+                    <span v-if="entry.isDefault" class="local-shell-badge">{{ t("localTerminal.defaultBadge") }}</span>
+                    <span v-if="entry.isUserShell" class="local-shell-badge">{{ t("localTerminal.userShellBadge") }}</span>
+                  </span>
+                </label>
+              </template>
+              <p v-else class="muted local-shell-hint">{{ t("localTerminal.shellsUnavailable") }}</p>
+              <label class="agent-mode-option">
+                <input type="checkbox" name="local-shell-integration" :checked="localShellIntegrationPref" @change="setLocalShellIntegrationPref(($event.target as HTMLInputElement).checked)" />
+                <span>{{ t("localTerminal.injection") }}</span>
+              </label>
+              <footer class="local-shell-footer">
+                <!-- 本地模式中按钮保持可用：restart 语义（关当前 → 按新偏好重开）。
+                     仅 starting 期间禁用防双击。 -->
+                <button class="primary-button" :disabled="localState === 'starting'" @click="localMenuOpen = false; isLocalMode ? restartLocalTerminal() : requestLocalTerminal()">
+                  {{ isLocalMode ? t("localTerminal.restart") : t("localTerminal.open") }}
+                </button>
+              </footer>
+            </PopoverContent>
+          </Popover>
+        </div>
         <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="isLocalMode || (terminalState === 'connecting' && !reconnectPending)" @click="reconnectNow"><PlugZap /></button>
         <!-- 一键 sudo -v：向当前 PTY 写入命令刷新 sudo 凭据缓存；quick sudo 自动应答
              是否启用由连接设置决定（设置弹窗），工作台不再提供开关。 -->

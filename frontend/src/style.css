@@ -740,6 +740,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .local-exit-card strong { font-size: 14px; color: var(--foreground); }
 .local-exit-card .local-exit-code { font-size: 12px; }
 .local-exit-card .local-exit-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.local-shell-chevron { margin-left: -6px; }
+.local-shell-popover { min-width: 300px; }
+.local-shell-popover .local-shell-hint { margin: 0 0 8px; font-size: 11px; }
+.local-shell-popover .local-shell-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.local-shell-popover .local-shell-program { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; opacity: 0.75; }
+.local-shell-popover .local-shell-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; font-size: 9px; color: var(--muted-foreground); }
+.local-shell-popover .local-shell-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
 
 /* OSC 633 command marker strip at the bottom-left of the terminal pane; hidden
    unless the remote shell integration emits 633 frames. The zmodem banner

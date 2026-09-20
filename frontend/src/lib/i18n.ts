@@ -126,6 +126,13 @@ const messages = {
       exited: "Local terminal has exited",
       exitCode: "Exit code {code}",
       restart: "Reopen",
+      settings: "Local terminal settings",
+      settingsHint: "Pick the shell the local terminal opens with. Stored for this plugin on this machine.",
+      injection: "Inject shell integration (command exit codes, cwd)",
+      defaultBadge: "default",
+      userShellBadge: "login",
+      shellsUnavailable: "Shell discovery unavailable — the automatic choice will be used.",
+
     },
     sessionStatus: {
       connecting: "Connecting",
@@ -476,6 +483,13 @@ const messages = {
       exited: "La terminal local ha finalizado",
       exitCode: "Código de salida {code}",
       restart: "Reabrir",
+      settings: "Ajustes de la terminal local",
+      settingsHint: "Elige la shell con la que se abre la terminal local. Se guarda para este plugin en esta máquina.",
+      injection: "Inyectar integración de shell (códigos de salida, cwd)",
+      defaultBadge: "predeterminada",
+      userShellBadge: "de inicio",
+      shellsUnavailable: "No se pudieron detectar shells — se usará la elección automática.",
+
     },
     sessionStatus: {
       connecting: "Conectando",
@@ -819,6 +833,13 @@ const messages = {
       exited: "Il terminale locale è terminato",
       exitCode: "Codice di uscita {code}",
       restart: "Riapri",
+      settings: "Impostazioni del terminale locale",
+      settingsHint: "Scegli la shell con cui si apre il terminale locale. Salvata per questo plugin su questa macchina.",
+      injection: "Inietta integrazione shell (codici di uscita, cwd)",
+      defaultBadge: "predefinita",
+      userShellBadge: "login",
+      shellsUnavailable: "Individuazione delle shell non disponibile — verrà usata la scelta automatica.",
+
     },
     sessionStatus: {
       connecting: "Connessione",
@@ -1162,6 +1183,13 @@ const messages = {
       exited: "ローカルターミナルが終了しました",
       exitCode: "終了コード {code}",
       restart: "開き直す",
+      settings: "ローカルターミナルの設定",
+      settingsHint: "ローカルターミナルが開くシェルを選択します。このマシンのこのプラグイン用に保存されます。",
+      injection: "シェル統合を注入（終了コード・cwd）",
+      defaultBadge: "デフォルト",
+      userShellBadge: "ログイン",
+      shellsUnavailable: "シェルを検出できません — 自動選択を使用します。",
+
     },
     sessionStatus: {
       connecting: "接続中",
@@ -1505,6 +1533,13 @@ const messages = {
       exited: "O terminal local foi encerrado",
       exitCode: "Código de saída {code}",
       restart: "Reabrir",
+      settings: "Configurações do terminal local",
+      settingsHint: "Escolha o shell com o qual o terminal local abre. Salvo para este plugin nesta máquina.",
+      injection: "Injetar integração de shell (códigos de saída, cwd)",
+      defaultBadge: "padrão",
+      userShellBadge: "login",
+      shellsUnavailable: "Detecção de shells indisponível — a escolha automática será usada.",
+
     },
     sessionStatus: {
       connecting: "Conectando",
@@ -1848,6 +1883,13 @@ const messages = {
       exited: "本地终端已退出",
       exitCode: "退出码 {code}",
       restart: "重新打开",
+      settings: "本地终端设置",
+      settingsHint: "选择本地终端打开时使用的 shell，保存为本机插件偏好。",
+      injection: "注入 shell integration（命令退出码、cwd）",
+      defaultBadge: "默认",
+      userShellBadge: "登录",
+      shellsUnavailable: "无法发现可用 shell —— 将使用自动探测。",
+
     },
     sessionStatus: {
       connecting: "连接中",
@@ -2198,6 +2240,13 @@ const messages = {
       exited: "本機終端機已結束",
       exitCode: "結束代碼 {code}",
       restart: "重新開啟",
+      settings: "本機終端機設定",
+      settingsHint: "選擇本機終端機開啟時使用的 shell，儲存為本機外掛偏好。",
+      injection: "注入 shell integration（結束代碼、cwd）",
+      defaultBadge: "預設",
+      userShellBadge: "登入",
+      shellsUnavailable: "無法探索可用 shell —— 將使用自動探測。",
+
     },
     sessionStatus: {
       connecting: "連線中",

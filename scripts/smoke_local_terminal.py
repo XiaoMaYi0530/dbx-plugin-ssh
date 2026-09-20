@@ -64,10 +64,33 @@ def main() -> int:
         client = SidecarClient.start(binary=args.binary, data_dir=data_dir)
         try:
             client.initialize()
+
+            # shell 发现：本机至少能列出一个可启动 shell（多平台设置的数据源）。
+            inventory = client.request("local/shells/list")
+            shells = inventory["shells"]
+            assert shells, f"no shells discovered on {inventory.get('platform')}"
+            print("shells:", [f"{s['name']}({s['program']})" for s in shells])
+
+            # 偏好往返：shell 选择 + 注入开关（workbench 设置面板的存储层）。
+            client.request("local/preferences/set", {"localShell": shells[0]["program"], "localShellIntegration": False})
+            prefs = client.request("local/preferences/get")
+            assert prefs.get("localShell") == shells[0]["program"], prefs
+            assert prefs.get("localShellIntegration") is False, prefs
+            client.request("local/preferences/set", {"localShellIntegration": True})
+            assert client.request("local/preferences/get").get("localShellIntegration") is True
+
+            # 显式 shell 启动：返回的 shell 必须回显请求值（cwd 非法值回落家目录）。
             started = client.request(
                 "local/terminal/start",
-                {"workbenchId": "smoke-wb", "cols": 100, "rows": 30},
+                {
+                    "workbenchId": "smoke-wb",
+                    "cols": 100,
+                    "rows": 30,
+                    "shell": shells[0]["program"],
+                    "cwd": "/nonexistent-dir-should-fall-back",
+                },
             )
+            assert started["shell"] == shells[0]["program"], started
             session_id = started["sessionId"]
             print("started:", started)
             # 可注入的 shell（zsh/bash/fish/pwsh）才会置 true；cmd/unknown 为
@@ -99,6 +122,10 @@ def main() -> int:
             event = client.wait_event("local/session/state", timeout=10)
             assert event and event["params"]["state"] == "exited", f"no exit event: {event}"
             print("exit event ok:", event["params"])
+
+            # cwd 继承路径的参数面：合法目录被接受（响应无直接回显，用 list+事件
+            # 之外的方式难以观察；这里只断言非法值不致命——上面 start 已带非法
+            # cwd 且会话成功创建）。
             print("LOCAL TERMINAL SMOKE PASS")
             return 0
         finally:

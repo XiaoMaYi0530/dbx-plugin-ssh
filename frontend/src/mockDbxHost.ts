@@ -260,7 +260,7 @@ const highlightRuleViews = () => [...highlightRulesState].sort((a, b) => a.creat
 // 权限档与连接作用域，镜像持久化 + 校验语义。
 const mcpSettingsState = { execPermissionMode: "autonomous", connectionScope: [] as string[] };
 // 插件级 UI 偏好（local/preferences/get|set）：镜像 sidecar preferences.json 的合并语义。
-const localPrefsState = { downloadDir: "", downloadUseDefaultDir: true, downloadConflictPolicy: "rename" };
+const localPrefsState = { downloadDir: "", downloadUseDefaultDir: true, downloadConflictPolicy: "rename", localShell: "", localShellIntegration: true };
 // 镜像并行批次 ssh/audit/list 的真实形状（AuditEntry：tsMs/tool/connectionId/
 // gate/approval/outcome/exitCode/durationMs/mode/command/output/error，
 // 0.4.77 起带 command/output 尾部）；末条保留计划 §1.1 旧形状（ts 秒 + kind +
@@ -460,7 +460,12 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     localSequence = 0;
     localExited = false;
     setTimeout(() => emitLocalTerminal(localPromptMarks("/Users/demo")), 40);
-    result = { sessionId: localSessionId, shell: "/bin/zsh", shellIntegration: true };
+    result = {
+      sessionId: localSessionId,
+      // 真实 sidecar 回显实际 spawn 的 shell；夹具同样回显请求参数。
+      shell: (params as { shell?: string } | undefined)?.shell || "/bin/zsh",
+      shellIntegration: (params as { shellIntegration?: boolean } | undefined)?.shellIntegration !== false,
+    };
   } else if (method === "local/terminal/resize") result = { success: true };
   else if (method === "local/terminal/replay") {
     result = { frameCount: 0, firstAvailableSequence: localSequence + 1, tailSequence: localSequence, complete: true };
@@ -472,6 +477,15 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
       sessions: localSessionId && !localExited
         ? [{ sessionId: localSessionId, workbenchId: "mock-workbench", shell: "/bin/zsh", createdAt: 0 }]
         : [],
+    };
+  } else if (method === "local/shells/list") {
+    result = {
+      platform: "macos",
+      shells: [
+        { program: "/opt/homebrew/bin/fish", name: "Fish", isDefault: false, isUserShell: true },
+        { program: "/bin/zsh", name: "Zsh", isDefault: true, isUserShell: false },
+        { program: "/bin/bash", name: "Bash", isDefault: false, isUserShell: false },
+      ],
     };
   } else if (method === "local/capabilities") result = { canSaveLocal: false, downloadsDir: "" };
   else if (method === "local/preferences/get") result = { ...localPrefsState };
