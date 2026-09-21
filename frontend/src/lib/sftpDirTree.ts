@@ -1,6 +1,8 @@
 // SFTP 侧栏目录树状态（对标 files 插件 lib/dirTree.ts）：懒加载子目录的
 // 纯函数模型，无 Vue 依赖便于单测；Vue 侧持 reactive 根节点，加载后原地
 // 变更 children/expanded 触发更新。
+import { isHiddenEntry } from "./sftpFileFilters";
+
 export interface DirTreeNode {
   path: string;
   name: string;
@@ -27,10 +29,15 @@ export function findTreeNode(root: DirTreeNode, path: string): DirTreeNode | nul
   return null;
 }
 
-/** sftp/list 结果 → 子节点：仅目录（树内不显示文件）、按名称排序。 */
-export function childTreeNodes(entries: Array<{ path: string; name: string; kind: string }>): DirTreeNode[] {
+/** sftp/list 结果 → 子节点：仅目录（树内不显示文件）、默认隐藏系统/缓存
+ *  目录、按名称排序。`showHidden = true` 时不过滤隐藏目录。 */
+export function childTreeNodes(
+  entries: Array<{ path: string; name: string; kind: string }>,
+  showHidden = false,
+): DirTreeNode[] {
   return entries
     .filter((entry) => entry.kind === "directory")
+    .filter((entry) => showHidden || !isHiddenEntry(entry.name))
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((entry) => createTreeRoot(entry.path, entry.name));
 }
@@ -43,10 +50,11 @@ export function applyTreeChildren(
   root: DirTreeNode,
   parentPath: string,
   entries: Array<{ path: string; name: string; kind: string }>,
+  showHidden = false,
 ): DirTreeNode | null {
   const parent = findTreeNode(root, parentPath);
   if (!parent) return null;
-  parent.children = childTreeNodes(entries);
+  parent.children = childTreeNodes(entries, showHidden);
   parent.loaded = true;
   parent.loading = false;
   parent.expanded = true;

@@ -8,6 +8,8 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
   Archive,
   Disc,
+  Eye,
+  EyeOff,
   Film,
   Pause,
   Play,
@@ -874,6 +876,9 @@ const commandMarker = reactive({
 const commandMarkerElapsed = ref<number | null>(null);
 const sftpSearch = ref("");
 const sftpTypeFilter = ref<SftpTypeFilter>("all");
+/** 默认隐藏以 "." 开头的 Unix 隐藏文件、__pycache__ 等系统缓存条目；
+ *  用户可通过过滤栏眼睛图标切换。 */
+const sftpShowHidden = ref(false);
 const selectedUris = ref<string[]>([]);
 const lastClickedUri = ref("");
 const sftpClipboard = ref<SftpClipboard>();
@@ -1143,8 +1148,8 @@ const sftpGridStyle = computed(() => ({
   ].filter(Boolean).join(" "),
   minWidth: `${180 + (visibleColumns.value.includes("size") ? 78 : 0) + (visibleColumns.value.includes("modified") ? 134 : 0) + (visibleColumns.value.includes("owner") ? 102 : 0) + (visibleColumns.value.includes("group") ? 102 : 0) + (visibleColumns.value.includes("permissions") ? 90 : 0)}px`,
 }));
-const sftpFiltersActive = computed(() => sftpSearch.value.trim() !== "" || sftpTypeFilter.value !== "all");
-const visibleEntries = computed(() => filterSftpEntries(sortedEntries.value, sftpSearch.value, sftpTypeFilter.value));
+const sftpFiltersActive = computed(() => sftpSearch.value.trim() !== "" || sftpTypeFilter.value !== "all" || sftpShowHidden.value);
+const visibleEntries = computed(() => filterSftpEntries(sortedEntries.value, sftpSearch.value, sftpTypeFilter.value, sftpShowHidden.value));
 const selectedEntries = computed(() => entries.value.filter((entry) => selectedUris.value.includes(entry.uri)));
 const currentPathHistory = computed(() => pathHistories[connectionId.value] || []);
 const previewDirty = computed(() => previewEditable.value && previewDraft.value !== previewBaseline.value);
@@ -3294,6 +3299,11 @@ watch(() => session.value?.sessionId, (next, previous) => {
   }
 });
 
+/** showHidden 切换后侧栏树缓存失效——下次展开节点时重新拉取、按新可见性过滤。 */
+watch(sftpShowHidden, () => {
+  markTreeStale(sftpTree.value);
+});
+
 // ---------------------------------------------------------------------------
 // 审计日志查看（IMPL_PLAN_NETCATTY_PARITY §3-B4）：独立工具栏入口，
 // 只读最近 200 条；打开/过滤变化/刷新时拉取，失败静默空态。
@@ -3404,7 +3414,7 @@ async function expandSideTreeNode(node: DirTreeNode) {
         sessionId: session.value.sessionId,
         path: node.path,
       });
-      applyTreeChildren(sftpTree.value, node.path, result.entries.map((entry) => ({ path: pathFromUri(entry.uri), name: entry.name, kind: entry.kind })));
+      applyTreeChildren(sftpTree.value, node.path, result.entries.map((entry) => ({ path: pathFromUri(entry.uri), name: entry.name, kind: entry.kind })), sftpShowHidden.value);
     } catch (cause) {
       showError(cause); // 树展开失败要有反馈，不能静默（对标 files 插件 P-FILES 反馈）
     } finally {
@@ -8133,6 +8143,16 @@ onBeforeUnmount(() => {
                 <SelectItem value="file">{{ t("sftpFilter.files") }}</SelectItem>
               </SelectContent>
             </Select>
+            <button
+              class="icon-button sftp-hidden-toggle"
+              :class="{ 'is-active': sftpShowHidden }"
+              :title="sftpShowHidden ? t('sftpFilter.hideHidden') : t('sftpFilter.showHidden')"
+              :aria-pressed="sftpShowHidden"
+              @click="sftpShowHidden = !sftpShowHidden"
+            >
+              <Eye v-if="sftpShowHidden" />
+              <EyeOff v-else />
+            </button>
           </div>
           <div v-if="selectedUris.length > 1" class="sftp-batch-bar">
             <span>{{ t("sftpBatch.selected", { count: selectedUris.length }) }}</span>
@@ -9071,6 +9091,10 @@ onBeforeUnmount(() => {
 .sftp-search-clear:hover { background: var(--accent); color: var(--foreground); }
 .sftp-search-clear svg { width: 11px; height: 11px; }
 .sftp-type-filter { flex: 0 0 auto; }
+.sftp-hidden-toggle { flex: 0 0 auto; width: 26px; height: 26px; border: 1px solid var(--border); border-radius: var(--radius); background: transparent; color: var(--muted-foreground); cursor: pointer; padding: 0; display: inline-grid; place-items: center; }
+.sftp-hidden-toggle:hover { background: var(--accent); color: var(--foreground); }
+.sftp-hidden-toggle.is-active { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
+.sftp-hidden-toggle svg { width: 14px; height: 14px; }
 .sftp-batch-bar { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid var(--border); padding: 5px 8px; background: color-mix(in srgb, var(--primary) 8%, var(--background)); color: var(--muted-foreground); font-size: 11px; }
 .sftp-batch-bar span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sftp-batch-bar button { display: inline-flex; height: 24px; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: var(--radius); padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; }
