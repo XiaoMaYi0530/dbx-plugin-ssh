@@ -46,8 +46,12 @@ pub async fn stat(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<
         (Some(u), Some(g)) if !u.is_empty() && !g.is_empty() => (Some(u), Some(g)),
         _ => lookup_owner_group_names(runtime, session_id, &path).await,
     };
-    let owner_display = owner_name.clone().or_else(|| metadata.uid.map(|u| u.to_string()));
-    let group_display = group_name.clone().or_else(|| metadata.gid.map(|g| g.to_string()));
+    let owner_display = owner_name
+        .clone()
+        .or_else(|| metadata.uid.map(|u| u.to_string()));
+    let group_display = group_name
+        .clone()
+        .or_else(|| metadata.gid.map(|g| g.to_string()));
     Ok(json!({
         "path": path,
         "kind": kind,

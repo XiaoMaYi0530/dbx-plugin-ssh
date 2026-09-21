@@ -6819,8 +6819,14 @@ pub(crate) async fn lookup_owner_group_names(
         Err(_) => return (None, None),
     };
     let mut parts = output.trim().split_whitespace();
-    let owner = parts.next().filter(|s| !s.is_empty()).map(|s| s.to_string());
-    let group = parts.next().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let owner = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let group = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     (owner, group)
 }
 

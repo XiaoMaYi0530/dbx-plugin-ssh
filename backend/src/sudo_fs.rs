@@ -670,7 +670,8 @@ mod tests {
     #[test]
     fn parses_gnu_stat_lines() {
         // GNU stat -c '%F|%i|%s|%Y|%a|%U|%u|%G|%g' — 9 字段
-        let info = parse_gnu_stat_line("regular file|12345|1024|1720000000|644|root|0|root|0").unwrap();
+        let info =
+            parse_gnu_stat_line("regular file|12345|1024|1720000000|644|root|0|root|0").unwrap();
         assert_eq!(info.kind, "file");
         assert_eq!(info.size, 1024);
         assert_eq!(info.modified_at, 1720000000);
@@ -681,10 +682,9 @@ mod tests {
         assert_eq!(info.group_gid, Some(0));
 
         // 普通用户 alice (uid=1000, gid=1000) 的 SUID 可执行文件
-        let empty = parse_gnu_stat_line(
-            "regular empty file|99|0|1720000002|4755|alice|1000|wheel|1000",
-        )
-        .unwrap();
+        let empty =
+            parse_gnu_stat_line("regular empty file|99|0|1720000002|4755|alice|1000|wheel|1000")
+                .unwrap();
         assert_eq!(empty.kind, "file");
         assert_eq!(empty.mode, "4755");
         assert_eq!(empty.owner_uid, Some(1000));
@@ -697,7 +697,9 @@ mod tests {
         let link = parse_gnu_stat_line("symbolic link|98|11|1720000003|777|root|0|root|0").unwrap();
         assert_eq!(link.kind, "symlink");
 
-        let device = parse_gnu_stat_line("character special file|97|0|1720000004|666|root|0|root|0").unwrap();
+        let device =
+            parse_gnu_stat_line("character special file|97|0|1720000004|666|root|0|root|0")
+                .unwrap();
         assert_eq!(device.kind, "other");
 
         assert!(parse_gnu_stat_line("garbage").is_none());
@@ -718,14 +720,16 @@ mod tests {
         assert_eq!(dir.owner_uid, Some(0));
         assert_eq!(dir.group_gid, Some(0));
 
-        let file = parse_bsd_stat_line("File|99|1024|1720000001|33188|alice|1000|staff|500").unwrap();
+        let file =
+            parse_bsd_stat_line("File|99|1024|1720000001|33188|alice|1000|staff|500").unwrap();
         assert_eq!(file.kind, "file");
         assert_eq!(file.mode, "0644"); // 33188 & 0o7777 = 0o644
         assert_eq!(file.group, "staff");
         assert_eq!(file.owner_uid, Some(1000));
         assert_eq!(file.group_gid, Some(500));
 
-        let link = parse_bsd_stat_line("Symbolic Link|98|11|1720000002|41471|root|0|wheel|0").unwrap();
+        let link =
+            parse_bsd_stat_line("Symbolic Link|98|11|1720000002|41471|root|0|wheel|0").unwrap();
         assert_eq!(link.kind, "symlink");
         assert_eq!(link.mode, "0777"); // 41471 & 0o7777 = 0o7777
     }
