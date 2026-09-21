@@ -540,6 +540,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .terminal-pane.batch-bar-open.marker-visible .terminal-host { inset: 0 0 66px 0; }
 .terminal-pane.batch-bar-open .terminal-command-marker,
 .terminal-pane.batch-bar-open .zmodem-status { bottom: 50px; }
+/* 命令标记状态条可见时，传输横幅上移避免叠压（SSH 终端同样装了 633 标记） */
+.terminal-pane.marker-visible .zmodem-status { bottom: 28px; }
+.terminal-pane.batch-bar-open.marker-visible .zmodem-status { bottom: 70px; }
 .batch-bar { position: absolute; z-index: 5; right: 0; bottom: 0; left: 0; display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding: 4px 8px; background: var(--background); }
 .batch-bar-targets { display: inline-flex; flex: 0 1 auto; min-width: 0; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; white-space: nowrap; }
 .batch-bar-targets:hover { background: color-mix(in srgb, var(--muted) 55%, transparent); }
