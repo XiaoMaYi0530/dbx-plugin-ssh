@@ -614,6 +614,52 @@
         "rename",
         "mkdir"
       ]
+    },
+    {
+      "type": "command",
+      "id": "open-local-terminal",
+      "label": "Local terminal",
+      "description": "Open a local terminal on this machine.",
+      "icon": "assets/local-terminal.svg",
+      "action": {
+        "type": "open-workbench",
+        "workbench": "io.dbx.ssh.workbench",
+        "presentation": "tab",
+        "reuse": "singleton",
+        "instance_key": "local-terminal",
+        "restore": "none",
+        "context": {
+          "plugin": {
+            "mode": "local-terminal"
+          }
+        }
+      }
+    },
+    {
+      "type": "menus",
+      "id": "local-terminal-entrypoints",
+      "items": [
+        {
+          "location": "commandPalette",
+          "command": "open-local-terminal",
+          "group": "primary",
+          "order": 100
+        },
+        {
+          "location": "appToolbar",
+          "command": "open-local-terminal",
+          "group": "navigation",
+          "order": 100,
+          "default_visible": false
+        },
+        {
+          "location": "appSidebar",
+          "command": "open-local-terminal",
+          "group": "primary",
+          "order": 100,
+          "default_visible": true
+        }
+      ]
     }
   ],
   "localizations": {
@@ -621,7 +667,12 @@
       "name": "DBX SSH Terminal",
       "description": "A secure SSH terminal for interactive sessions, SFTP file transfer, remote commands, and guarded server operations.",
       "contributions": {
-        "io.dbx.ssh.connection": {}
+        "io.dbx.ssh.connection": {},
+        "io.dbx.ssh.open-local-terminal": {
+          "label": "Local terminal",
+          "description": "Open a local terminal on this machine."
+        },
+        "io.dbx.ssh.local-terminal-entrypoints": {}
       }
     },
     "es": {
@@ -804,7 +855,12 @@
         "io.dbx.ssh.files": {
           "label": "Archivos SFTP",
           "description": "Sistema de archivos remoto mediante SFTP."
-        }
+        },
+        "io.dbx.ssh.open-local-terminal": {
+          "label": "Terminal local",
+          "description": "Abrir una terminal local en esta máquina."
+        },
+        "io.dbx.ssh.local-terminal-entrypoints": {}
       }
     },
     "it": {
@@ -987,7 +1043,12 @@
         "io.dbx.ssh.files": {
           "label": "File SFTP",
           "description": "File system remoto tramite SFTP."
-        }
+        },
+        "io.dbx.ssh.open-local-terminal": {
+          "label": "Terminale locale",
+          "description": "Apri un terminale locale su questa macchina."
+        },
+        "io.dbx.ssh.local-terminal-entrypoints": {}
       }
     },
     "ja": {
@@ -1170,7 +1231,12 @@
         "io.dbx.ssh.files": {
           "label": "SFTP ファイル",
           "description": "SFTP 経由のリモートファイルシステム。"
-        }
+        },
+        "io.dbx.ssh.open-local-terminal": {
+          "label": "ローカルターミナル",
+          "description": "このマシンでローカルターミナルを開きます。"
+        },
+        "io.dbx.ssh.local-terminal-entrypoints": {}
       }
     },
     "pt-BR": {
@@ -1353,7 +1419,12 @@
         "io.dbx.ssh.files": {
           "label": "Arquivos SFTP",
           "description": "Sistema de arquivos remoto via SFTP."
-        }
+        },
+        "io.dbx.ssh.open-local-terminal": {
+          "label": "Terminal local",
+          "description": "Abrir um terminal local nesta máquina."
+        },
+        "io.dbx.ssh.local-terminal-entrypoints": {}
       }
     },
     "zh-CN": {
@@ -1536,7 +1607,12 @@
         "io.dbx.ssh.files": {
           "label": "SFTP 文件",
           "description": "通过 SFTP 访问远程文件系统。"
-        }
+        },
+        "io.dbx.ssh.open-local-terminal": {
+          "label": "本地终端",
+          "description": "在本机打开一个本地终端。"
+        },
+        "io.dbx.ssh.local-terminal-entrypoints": {}
       }
     },
     "zh-TW": {
@@ -1719,7 +1795,12 @@
         "io.dbx.ssh.files": {
           "label": "SFTP 檔案",
           "description": "透過 SFTP 存取遠端檔案系統。"
-        }
+        },
+        "io.dbx.ssh.open-local-terminal": {
+          "label": "本機終端",
+          "description": "在本機開啟一個本機終端。"
+        },
+        "io.dbx.ssh.local-terminal-entrypoints": {}
       }
     }
   }
