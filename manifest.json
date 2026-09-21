@@ -632,7 +632,9 @@
           "plugin": {
             "mode": "local-terminal"
           }
-        }
+        },
+        "options_action": "local/terminal/launch-options",
+        "connection_targets": true
       }
     },
     {

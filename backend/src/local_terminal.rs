@@ -740,6 +740,36 @@ fn shell_display_name(basename: &str) -> String {
 }
 
 impl LocalTerminalRuntime {
+    /// PR-A4 generic launch-options contract (host dock "+"): returns picker
+    /// entries — auto-detect plus one entry per discovered shell — each carrying
+    /// the context fragment the host merges into its host-authored panel
+    /// context. Business meaning stays on the plugin side; the host renders
+    /// labels and never interprets the contexts.
+    pub fn launch_options(&self) -> Value {
+        let shells = self.shells();
+        let mut entries = Vec::new();
+        entries.push(json!({
+            "label": "Auto-detect shell",
+            "description": "Follow the platform default login shell",
+            "context": { "plugin": { "mode": "local-terminal" } },
+        }));
+        if let Some(list) = shells.get("shells").and_then(|value| value.as_array()) {
+            for shell in list {
+                let program = shell.get("program").and_then(|value| value.as_str()).unwrap_or_default();
+                let name = shell.get("name").and_then(|value| value.as_str()).unwrap_or(program);
+                if program.is_empty() {
+                    continue;
+                }
+                entries.push(json!({
+                    "label": name,
+                    "description": program,
+                    "context": { "plugin": { "mode": "local-terminal", "shell": program } },
+                }));
+            }
+        }
+        json!({ "entries": entries })
+    }
+
     /// Read-only shell inventory for the workbench's shell picker.
     pub fn shells(&self) -> Value {
         let platform = current_platform();
