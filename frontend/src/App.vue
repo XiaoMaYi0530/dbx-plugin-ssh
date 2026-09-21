@@ -2865,6 +2865,9 @@ async function openLocalMenu() {
 // Dock 面板「+」：按 shell 类型经桥 openWorkbench 再开一个面板条目
 // （宿主决定 surface 归属：panel webview 内 → 新面板条目；tab 内 → 新 tab）。
 const localShellSurfaceOpen = ref(false);
+// host.listConnections（PR-A4 通用扩展点）：只读无密的插件自有连接清单，
+// 供面板内连接切换；旧宿主无此方法时降级隐藏连接区。
+const dockConnections = ref<Array<{ id: string; name: string; providerId: string; connectionType?: string; readOnly?: boolean }>>([]);
 async function openLocalShellSurfaceMenu() {
   localShellSurfaceOpen.value = true;
   if (localShellsLoading.value || localShells.value.length) return;
@@ -2877,6 +2880,26 @@ async function openLocalShellSurfaceMenu() {
   } finally {
     localShellsLoading.value = false;
   }
+  try {
+    const listed = await window.dbxPlugin.request<{ connections?: typeof dockConnections.value }>("host.listConnections");
+    dockConnections.value = listed?.connections ?? [];
+  } catch {
+    // 旧宿主无 listConnections 扩展点：连接切换区隐藏。
+    dockConnections.value = [];
+  }
+}
+function openConnectionSurface(connection: (typeof dockConnections.value)[number]) {
+  localShellSurfaceOpen.value = false;
+  void window.dbxPlugin.openWorkbench?.(
+    "io.dbx.ssh.workbench",
+    {
+      connectionId: connection.id,
+      providerId: connection.providerId,
+      connectionType: connection.connectionType,
+      connection: { id: connection.id, name: connection.name, readOnly: connection.readOnly === true },
+    },
+    { forceNew: true },
+  );
 }
 function openLocalShellSurface(program?: string) {
   localShellSurfaceOpen.value = false;
@@ -7865,6 +7888,12 @@ onBeforeUnmount(() => {
                     <button v-for="entry in localShells" :key="entry.program" class="shell-surface-item" @click="openLocalShellSurface(entry.program)">
                       <TerminalIcon class="h-3.5 w-3.5" />{{ entry.name }}<span class="mono local-shell-program">{{ entry.program }}</span>
                     </button>
+                    <template v-if="dockConnections.length">
+                      <p class="shell-surface-header">{{ t("localTerminal.connectionTerminals") }}</p>
+                      <button v-for="connection in dockConnections" :key="`conn-${connection.id}`" class="shell-surface-item" @click="openConnectionSurface(connection)">
+                        <TerminalIcon class="h-3.5 w-3.5" />{{ connection.name }}
+                      </button>
+                    </template>
                   </PopoverContent>
                 </Popover>
                 <button class="primary-button" :disabled="localState === 'starting'" @click="localMenuOpen = false; localShellRestored || isLocalMode ? restartLocalTerminal() : requestLocalTerminal()">

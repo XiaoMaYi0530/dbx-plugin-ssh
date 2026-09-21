@@ -349,8 +349,19 @@ function scheduleDisconnect() {
   }, disconnectAfterMs);
 }
 
-const request: DbxPluginApi["request"] = async <T = unknown>(method: string) =>
-  (method === "host.getContext" ? context : null) as T;
+const request: DbxPluginApi["request"] = async <T = unknown>(method: string) => {
+  if (method === "host.getContext") return context as T;
+  // host.listConnections（PR-A4 扩展点）：返回夹具连接（只读无密），供面板
+  // 连接切换走查；旧宿主语义下未知方法仍回 null（调用方降级）。
+  if (method === "host.listConnections") {
+    return {
+      connections: localOnlyContext
+        ? []
+        : [{ id: "visual-connection", name: "Production SSH", providerId: "io.dbx.ssh.connection", connectionType: "ssh", readOnly: !writable }],
+    } as T;
+  }
+  return null as T;
+};
 
 const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, params?: unknown) => {
   let result: unknown;

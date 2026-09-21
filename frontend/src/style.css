@@ -101,6 +101,14 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 .shell-surface-item:hover {
   background: color-mix(in srgb, currentColor 8%, transparent);
 }
+.shell-surface-header {
+  padding: 4px 8px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
 .shell-surface-item .local-shell-program {
   margin-left: auto;
   opacity: 0.6;
