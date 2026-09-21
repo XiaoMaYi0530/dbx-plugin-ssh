@@ -7829,10 +7829,12 @@ onBeforeUnmount(() => {
       </div>
       <div class="toolbar-actions">
         <button class="icon-button icon-neutral" :title="paneOrder === 'terminal-left' ? t('moveSftpLeft') : t('moveTerminalLeft')" @click="togglePaneOrder"><ArrowLeftRight /></button>
-        <button class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" :disabled="localUiMode" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
+        <!-- Local terminal UI hides SSH-only actions outright (not disabled): the local
+             shell has no SSH session to act on. -->
+        <button v-if="!localUiMode" class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
-        <button class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
         <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
              已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。 -->
         <button class="icon-button icon-violet" :class="{ 'is-active': localUiMode }" :title="localUiMode && !localShellRestored ? t('localTerminal.close') : t('localTerminal.open')" @click="toggleLocalTerminal"><TerminalIcon /></button>
@@ -7903,20 +7905,20 @@ onBeforeUnmount(() => {
             </PopoverContent>
           </Popover>
         </div>
-        <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="localUiMode || (terminalState === 'connecting' && !reconnectPending)" @click="reconnectNow"><PlugZap /></button>
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting' && !reconnectPending" @click="reconnectNow"><PlugZap /></button>
         <!-- 一键 sudo -v：向当前 PTY 写入命令刷新 sudo 凭据缓存；quick sudo 自动应答
              是否启用由连接设置决定（设置弹窗），工作台不再提供开关。 -->
-        <button class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
-        <button class="icon-button icon-emerald" :title="t('profilesTitle')" :disabled="localUiMode" @click="openProfilesManager"><KeyRound /></button>
-        <button class="icon-button icon-cyan" :title="t('alertTriage.title')" :disabled="localUiMode" @click="openAlertTriage"><Siren /></button>
-        <label class="follow-directory-control" :title="t('followTerminal')">
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
+        <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
+        <label v-if="!localUiMode" class="follow-directory-control" :title="t('followTerminal')">
           <Switch size="sm" :model-value="followDirectory" :disabled="!connected" @update:model-value="setDirectoryTracking" />
           <span>{{ t("followTerminal") }}</span>
         </label>
         <span class="toolbar-separator" aria-hidden="true" />
-        <button class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
-        <button class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
-        <div>
+        <button v-if="!localUiMode" class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
+        <button v-if="!localUiMode" class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
+        <div v-if="!localUiMode">
           <Popover :open="quickMenuOpen" @update:open="(open) => { if (!open) quickMenuOpen = false; }">
             <PopoverAnchor as-child>
               <button class="icon-button icon-amber" :title="t('quickCommands')" :disabled="!connected" @click.stop="toggleQuickMenu"><Zap /></button>
