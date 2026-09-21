@@ -77,6 +77,7 @@ AppSidebar 底部新增"插件工作台"区：读取前端插件 registry 中**�
 | --- | --- | --- | --- |
 | M0 | P0：context.localTerminal 直通 + 自查自开 | 插件 | 0.5d |
 | M1 | P1：侧栏全局工作台区 | 宿主 | 1d |
+| M1.5 | 工具栏插件入口（§6：设置→外观可开关，icon+事件声明式注册） | 宿主 2~3d + 插件 0.5d | — |
 | M2 | P2：surface 字段 + BottomDock + 插件 panel 适配 | 宿主+插件 | 4~6d |
 | M3 | Windows 实测（ConPTY、热键、拖拽）随宿主发布 | 双方 | 1d |
 
@@ -96,3 +97,78 @@ AppSidebar 底部新增"插件工作台"区：读取前端插件 registry 中**�
 - [ ] P1：侧栏可见所有独立 workbench 贡献；点击打开；设置项可关。
 - [ ] P2：任意页面 `Ctrl/⌘+J` 呼出/收起；面板内本地终端全功能可用（shell 选择/注入/标记/最近命令）；收起后会话保活（收起期间输出仍在累积，重新展开可见）；拖拽高度持久化；应用退出后面板会话终止。
 - [ ] 回归：原 SSH workbench tab 行为不变；老宿主 + 新插件包（无 surface 字段时）行为不变。
+
+## 6. 工具栏插件入口（设置 → 外观 → 工具栏开关）
+
+P1 的替代/补充形态：把插件入口挂进**既有**的主工具栏显隐体系——插件以
+"icon + 事件声明"注册工具栏项，用户在 设置→外观 的工具栏开关网格里逐项
+控制显隐，点击图标直接打开插件工作台。对用户零新概念（复用已习惯的开关
+位置），对插件零运行时 UI（宿主代为渲染）。
+
+### 6.1 现状锚点
+
+| 事实 | 出处 |
+| --- | --- |
+| 工具栏显隐是固定 14 键布尔表（`dataTransfer`/`pluginCenter`/`ai`/`github`…），持久化在 editorSettings | `apps/desktop/src/stores/settingsStore.ts:921` |
+| 开关网格与全局设置搜索共用 `TOOLBAR_VISIBILITY_ITEMS`（文件头注释明确"新增开关不得缺席搜索"） | `apps/desktop/src/lib/settings/settingsSearch.ts:62` |
+| AppToolbar 以 `{value, label, icon(Lucide 组件), action}` 组装条目，溢出自动收进 More 菜单；`pluginCenter` 是"收进 More"的既有样例 | `apps/desktop/src/components/layout/AppToolbar.vue:443,512` |
+| 插件图标解析已有公共件：`resolvePluginIcon(pluginId, contributionId?) → URL`（读插件包内资产） | `apps/desktop/src/lib/plugins/pluginIconResolver.ts:18` |
+
+### 6.2 设计
+
+**manifest（宿主 runtime 新贡献类型）**
+
+```json
+{
+  "type": "toolbar-item",
+  "id": "local-terminal",
+  "label": "本地终端",
+  "label_i18n": { "en": "Local terminal", "...": "..." },
+  "icon": "assets/toolbar-local-terminal.svg",
+  "workbench": "io.dbx.ssh.workbench",
+  "context": { "localTerminal": true }
+}
+```
+
+- v1 行为固定为 `打开 workbench`（用户诉求"直接打开插件"）：`workbench` 必须引用**同插件**已声明的 workbench 贡献，`context` 原样透传 webview（与 P0 的 `localTerminal` 直通配套，一键即得无连接本地终端）。
+- label 七语复用 manifest 既有 `PluginContributionLocalization` 机制；`icon` 为插件包内资产路径，宿主经 `resolvePluginIcon` 解析。
+- v2 预留：`event` 型（省略 `workbench`，改为把 `toolbarItem/<id>` 请求派发给插件后端，完全镜像 `contextMenu/<id>` 的既有模式），本期不实现。
+
+**宿主 runtime**（`manifest.rs`）：`PluginContribution` 增 `ToolbarItem` 变体 + `id()` 分支 + 校验（id 全局去重、workbench 引用存在且同源、icon 资产存在于包内）；前端 registry 暴露合并后的工具栏项清单（按插件安装序 + 声明序）。
+
+**desktop 侧**
+
+1. `settingsStore`：**不动内置 `ToolbarItems`**（避免持久化形状 churn），新增独立动态记录 `pluginToolbarItems: Record<"plugin:<pluginId>/<itemId>", boolean>`——首次出现默认 `true`；加载时清理"插件已卸载"的陈旧键。
+2. 设置→外观：开关网格在内置项后动态追加插件条目（开关 + `PluginIcon` 图标 + 七语 label）；设置搜索同步追加动态定义（`createToolbarVisibilitySettingsSearchDefinitions` 已接受 items 参数，天然可扩展）。
+3. `AppToolbar`：内置项之后按 registry 追加动态项；`items.icon` 目前是 Lucide 组件类型，需扩为 `Component | 图片URL` 联合并适配渲染；点击 = `openPluginWorkbench(pluginId, workbench, { context }, { forceNew: false })`——复用既有 tab（重复点击不重载，与 §2 tab 复用规则一致）；溢出收 More 菜单的逻辑对动态项自动生效（纯 DOM 测量）。
+
+**SSH 插件侧（0.5d）**：manifest 声明上述 toolbar-item（label 七语、icon、`workbench+context.localTerminal`）→ 工具栏一键开无连接本地终端；与 P0/M0 的 context 直通构成闭环。
+
+### 6.3 版本与兼容
+
+- 新贡献类型 = manifest schema 变更，**老宿主拒装**含该贡献的包 → 与 §2 P2 同策略：宿主先行发版，插件随后抬 `engines.dbx` 下限。
+- 老插件完全不受影响（未声明 toolbar-item 则工具栏无动态项、无新开关）。
+- 插件卸载：动态工具栏项与对应开关随 registry 移除，陈旧布尔键在下次加载时清理。
+
+### 6.4 备选方案对比（已否决）
+
+| 备选 | 否决理由 |
+| --- | --- |
+| 给 `ToolbarItems` 加索引签名混入插件键 | 持久化形状 churn、未知键归一化语义混乱、内置键与插件键生命周期不同 |
+| 复用 `ContextMenu` 贡献 | 该类型绑定已存连接的侧栏菜单上下文，语义不符 |
+| v1 即做 event 派发型 | 用户诉求是"直接打开插件"，openWorkbench 已覆盖；event 型留 v2 按需加 |
+
+### 6.5 风险
+
+- **R6 图标渲染适配**：`items.icon` 需扩联合类型（Lucide 组件 | 插件图标 URL），改动集中在一个渲染分支。
+- **R7 动态开关缺席设置搜索**：settingsSearch 注释红线，动态定义必须并入搜索（见 6.2.2）。
+- **R8 label 本地化**：`PluginContributionLocalization` 是否已覆盖 toolbar-item 类型的回退链需在实施时验证；最简回退为 manifest 内联 `label_i18n`。
+- 其余同 §4（R1 无连接 tab 恢复语义、R5 评审归属）。
+
+### 6.6 验收清单
+
+- [ ] SSH 插件安装后：外观设置出现"本地终端"开关（带插件图标），默认开；设置搜索可搜到。
+- [ ] 工具栏图标点击 → 无连接打开本地终端 tab；再次点击复用既有 tab 不重载。
+- [ ] 开关关闭后图标从工具栏（含 More 菜单）消失，重启后状态保持。
+- [ ] 卸载插件：工具栏项与开关消失，无陈旧键。
+- [ ] 老宿主 + 新插件（含 toolbar-item）：按版本门槛拒绝或忽略，不崩。
