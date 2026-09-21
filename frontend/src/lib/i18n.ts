@@ -149,7 +149,7 @@ const messages = {
       footerMatch: "{matched} / {total} items",
       noMatch: "No files match the current filter",
     },
-    sftpFilter: { all: "All types", folders: "Folders", files: "Files" },
+    sftpFilter: { all: "All types", folders: "Folders", files: "Files", showHidden: "Show hidden files", hideHidden: "Hide hidden files" },
     sftpPane: {
       open: "Open SFTP panel",
       close: "Collapse SFTP panel",
@@ -488,7 +488,7 @@ const messages = {
       footerMatch: "{matched} / {total} elementos",
       noMatch: "Ningún archivo coincide con el filtro actual",
     },
-    sftpFilter: { all: "Todos los tipos", folders: "Carpetas", files: "Archivos" },
+    sftpFilter: { all: "Todos los tipos", folders: "Carpetas", files: "Archivos", showHidden: "Mostrar archivos ocultos", hideHidden: "Ocultar archivos ocultos" },
     sftpPane: {
       open: "Abrir panel SFTP",
       close: "Plegar panel SFTP",
@@ -820,7 +820,7 @@ const messages = {
       footerMatch: "{matched} / {total} elementi",
       noMatch: "Nessun file corrisponde al filtro corrente",
     },
-    sftpFilter: { all: "Tutti i tipi", folders: "Cartelle", files: "File" },
+    sftpFilter: { all: "Tutti i tipi", folders: "Cartelle", files: "File", showHidden: "Mostra file nascosti", hideHidden: "Nascondi file nascosti" },
     sftpPane: {
       open: "Apri pannello SFTP",
       close: "Comprimi pannello SFTP",
@@ -1152,7 +1152,7 @@ const messages = {
       footerMatch: "{matched} / {total} 項目",
       noMatch: "フィルターに一致するファイルはありません",
     },
-    sftpFilter: { all: "すべての種類", folders: "フォルダー", files: "ファイル" },
+    sftpFilter: { all: "すべての種類", folders: "フォルダー", files: "ファイル", showHidden: "隠しファイルを表示", hideHidden: "隠しファイルを非表示" },
     sftpPane: {
       open: "SFTP パネルを開く",
       close: "SFTP パネルを折りたたむ",
@@ -1484,7 +1484,7 @@ const messages = {
       footerMatch: "{matched} / {total} itens",
       noMatch: "Nenhum arquivo corresponde ao filtro atual",
     },
-    sftpFilter: { all: "Todos os tipos", folders: "Pastas", files: "Arquivos" },
+    sftpFilter: { all: "Todos os tipos", folders: "Pastas", files: "Arquivos", showHidden: "Mostrar arquivos ocultos", hideHidden: "Ocultar arquivos ocultos" },
     sftpPane: {
       open: "Abrir painel SFTP",
       close: "Recolher painel SFTP",
@@ -1816,7 +1816,7 @@ const messages = {
       footerMatch: "命中 {matched} / 共 {total} 项",
       noMatch: "没有符合当前筛选条件的文件",
     },
-    sftpFilter: { all: "全部类型", folders: "文件夹", files: "文件" },
+    sftpFilter: { all: "全部类型", folders: "文件夹", files: "文件", showHidden: "显示隐藏文件", hideHidden: "隐藏隐藏文件" },
     sftpPane: {
       open: "打开 SFTP 面板",
       close: "收起 SFTP 面板",
@@ -2155,7 +2155,7 @@ const messages = {
       footerMatch: "命中 {matched} / 共 {total} 項",
       noMatch: "沒有符合目前篩選條件的檔案",
     },
-    sftpFilter: { all: "全部類型", folders: "資料夾", files: "檔案" },
+    sftpFilter: { all: "全部類型", folders: "資料夾", files: "檔案", showHidden: "顯示隱藏檔案", hideHidden: "隱藏隱藏檔案" },
     sftpPane: {
       open: "開啟 SFTP 面板",
       close: "收合 SFTP 面板",
