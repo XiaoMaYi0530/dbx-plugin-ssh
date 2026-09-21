@@ -90,6 +90,8 @@ import {
   resolveTerminalRightClickAction,
   sanitizeSearchOptions,
   sanitizeSelectCopyEnabled,
+  isApplePlatform,
+  isTerminalSelectAllShortcut,
   TERMINAL_SEARCH_OPTIONS_KEY,
   terminalSearchSeedFromSelection,
   canAcceptTerminalDrop,
@@ -1515,6 +1517,9 @@ function setWebglEnabled(next: boolean) {
   webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon());
 }
 
+// Apple 平台用 Cmd+A 直选全选，其余平台 Ctrl+Shift+A（isTerminalSelectAllShortcut）。
+const applePlatform = isApplePlatform();
+
 function handleTerminalKey(event: KeyboardEvent) {
   const mod = event.ctrlKey || event.metaKey;
   if (event.type !== "keydown") return true;
@@ -1530,6 +1535,13 @@ function handleTerminalKey(event: KeyboardEvent) {
   }
   if (mod && event.key === "0") {
     resetTerminalZoom();
+    return consume();
+  }
+  // 全选（electerm/iTerm2 同款）：Apple 平台 Cmd+A、其余 Ctrl+Shift+A；
+  // 裸 Ctrl+A 不拦截，保持发给远端 readline 跳行首。
+  if (isTerminalSelectAllShortcut({ mod, shiftKey: event.shiftKey, metaKey: event.metaKey, key: event.key, applePlatform })) {
+    selectAllTerminal();
+    terminal?.focus();
     return consume();
   }
   if (event.key === "Escape" && searchOpen.value) {

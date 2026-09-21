@@ -35,6 +35,22 @@ export function resolveTerminalKeyAction(options: { mod: boolean; shiftKey: bool
   return "none";
 }
 
+/** Whether the browser runs on Apple hardware（Cmd 是主修饰键，electerm 同判定）。 */
+export function isApplePlatform(userAgent: string = navigator.userAgent): boolean {
+  return /mac/i.test(userAgent);
+}
+
+/**
+ * 全选快捷键判定（electerm/iTerm2 同款）：Apple 平台 Cmd+A 直选，其余平台
+ * Ctrl+Shift+A。裸 Ctrl+A 永不命中——必须继续发给 readline 当"跳行首"。
+ */
+export function isTerminalSelectAllShortcut(options: { mod: boolean; shiftKey: boolean; metaKey: boolean; key: string; applePlatform: boolean }): boolean {
+  const key = options.key.toLowerCase();
+  if (key !== "a") return false;
+  if (options.mod && options.shiftKey) return true;
+  return options.applePlatform && options.metaKey;
+}
+
 export interface TerminalSearchOptions {
   caseSensitive: boolean;
   regex: boolean;
