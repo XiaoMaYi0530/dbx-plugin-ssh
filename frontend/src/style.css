@@ -82,8 +82,10 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
    hidden 负责长主机名截断，弹层不会被裁）。 */
 .identity-side { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; gap: 4px; }
 
-/* Dock panel surface (surface=panel): hide the connection identity block and focus the terminal. */
-.workbench.panel-surface .identity-side {
+/* Dock panel surface (surface=panel): hide the entire workbench toolbar — the
+   panel presents only the terminal. The host dock chrome provides its own
+   close/collapse/maximize controls, so no toolbar widgets are needed. */
+.workbench.panel-surface .toolbar {
   display: none;
 }
 
