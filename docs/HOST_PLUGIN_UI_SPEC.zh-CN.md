@@ -1,306 +1,534 @@
 # DBX 插件 UI 贡献点体系与宿主交互规范（设计提案 v1）
 
-> **一句话结论**：宿主 UI 贡献点从 **5 类扩展到 11 类（另有 2 个可选小件）**，
-> 交互原语从 **2 个扩展到 6 个**；但对标 VS Code 的关键不在数量，而在三个机制
-> ——**command 原子、声明式摆放、两层容错 manifest**。发布即冻结的部分与
-> 必须在发布前钉死的规则见 §6 兼容宪法。
+> **一句话结论**：首版只在现有 5 类贡献点之外增加 `command` 与 `menus`
+> 两类，形成 **7 类稳定贡献点**；工具栏、侧栏与命令面板只是 command 的摆放位置，
+> 不再各自发明动作类型。底部 panel 由 command 的打开方式决定，不固化在 workbench
+> 内容定义上。状态栏、动态 badge、树视图、对象查看器与宿主模态留待运行时状态协议明确后再发布。
 >
-> **文档状态**：提案（待宿主仓评审排期）。本文合并并取代
-> `HOST_TERMINAL_SURFACE.zh-CN.md` 与 `HOST_UI_CONTRIBUTIONS.zh-CN.md`；
-> git 历史保留两文的演进过程。首个消费者（本地终端）的宿主需求在 §7。
+> **文档状态**：提案（待宿主仓评审）。本文取代
+> `HOST_TERMINAL_SURFACE.zh-CN.md` 与 `HOST_UI_CONTRIBUTIONS.zh-CN.md`。
+> 首个消费者——SSH 插件本地终端——见 §8。
+> 面向最终宿主 PR reviewer 的三方对齐、PR 切片和否决门见
+> [`HOST_PLUGIN_UI_PR_REVIEW_GUIDE.zh-CN.md`](./HOST_PLUGIN_UI_PR_REVIEW_GUIDE.zh-CN.md)。
 >
-> **评审归属**：宿主改动走宿主仓（`btroot/dbx`）评审流程；插件 agent 不直接
-> 改宿主仓，本文即宿主侧需求与设计输入。
+> **规范用词**：必须/不得表示发布契约；应当表示强烈建议；可以表示可选行为。
 
 ---
 
-## 1. 背景与问题
+## 1. 背景与现状
 
-### 1.1 现状事实（方案地基，均标注宿主代码锚点）
+### 1.1 已确认的宿主事实
 
 | 事实 | 出处 |
 | --- | --- |
-| 宿主贡献点仅 5 类：`ConnectionProvider` / `Workbench` / `FilesystemProvider` / `ContextMenu` / `ResultView`，**无全局面板/入口类型** | `crates/dbx-plugin-runtime/src/plugins/manifest.rs:227` |
-| 贡献点为内部标签枚举（`tag="type"`，无 `#[serde(other)]`），各贡献结构体 `deny_unknown_fields`——**未知 `type` 值与已知类型内的未知字段/枚举值都会让整个清单反序列化失败 → 拒装** | 同上 `:226`、`:111/:120/:129` |
-| `Workbench` 贡献只有 `id/label/description/icon` 四个字段 | 同上 `:638` |
-| 插件中心已可无连接打开任意 workbench：`PluginContributionsPanel.openWorkbench` → `queryStore.openPluginWorkbench`，`connectionId` 可选 | `apps/desktop/src/components/plugins/PluginContributionsPanel.vue:477`、`:1121` |
-| 插件可编程开 tab：宿主桥 `host.openWorkbench(pluginId, contributionId, context?, {forceNew})`，context 任意 JSON | `apps/desktop/src/lib/plugins/pluginHostBridge.ts:246` |
-| tab 复用规则：同 `pluginId+contributionId+connectionId` 复用既有 tab，不重载 webview；关闭 tab 时宿主发 `workbench/close` | `apps/desktop/src/stores/queryStore.ts:3484` |
-| 底部分屏有先例：SQL 编辑器垂直分屏，拖拽用 `panelResizeState` | `apps/desktop/src/components/layout/SqlEditorWorkspace.vue:12` |
-| 布局为 AppSidebar（左）+ AppTabBar/EditorGroup（主区），**无全局底部 dock / 状态栏** | `apps/desktop/src/components/layout/` |
-| 工具栏显隐是固定 14 键布尔表，持久化在 editorSettings | `apps/desktop/src/stores/settingsStore.ts:921` |
-| 开关网格与全局设置搜索共用 `TOOLBAR_VISIBILITY_ITEMS`（文件头注释明确"新增开关不得缺席搜索"） | `apps/desktop/src/lib/settings/settingsSearch.ts:62` |
-| AppToolbar 以 `{value, label, icon(Lucide 组件), action}` 组装条目，溢出收进 More 菜单 | `apps/desktop/src/components/layout/AppToolbar.vue:443,512` |
-| 插件图标解析已有公共件：`resolvePluginIcon(pluginId, contributionId?) → URL` | `apps/desktop/src/lib/plugins/pluginIconResolver.ts:18` |
-| 崩溃恢复测试只覆盖带 connectionId 的 tab，无连接 tab 未定义 | `apps/desktop/src/stores/__tests__/queryStore.reconnectRestoredPluginTabs.spec.ts` |
+| 当前仅有 `connection-provider`、`workbench`、`filesystem-provider`、`context-menu`、`result-view` 5 类贡献点 | `crates/dbx-plugin-runtime/src/plugins/manifest.rs:227` |
+| Manifest v1 对未知贡献类型和已知类型的未知字段均严格拒绝 | 同上 `:226`、`:111/:120/:129` |
+| `workbench` 当前只定义内容入口，不定义工具栏、侧栏或 panel 摆放 | 同上 `:638` |
+| 插件中心可以无连接打开 workbench，但不会自动生成某个插件私有的模式 context | `PluginContributionsPanel.vue`、`queryStore.openPluginWorkbench` |
+| `window.dbxPlugin.openWorkbench` 只能打开本插件贡献点，桥已绑定插件身份 | `pluginHostBridge.ts` 与 Host API 1.x |
+| 当前 tab 复用主要按 `pluginId + contributionId + connectionId` 判定 | `queryStore.ts:3484` |
+| 工具栏显隐与设置搜索已有统一数据源，溢出项进入 More 菜单 | `settingsStore.ts`、`settingsSearch.ts`、`AppToolbar.vue` |
+| 无连接 tab 的崩溃恢复行为尚无完整回归矩阵 | `queryStore.reconnectRestoredPluginTabs.spec.ts` |
 
-### 1.2 问题
+### 1.2 要解决的问题
 
-1. **插件 UI 被锁死在 webview 内**：工具栏/侧栏/状态栏/底部面板等宿主 chrome，插件无法触达——本地终端的"全局入口"诉求撞的正是这堵墙。
-2. **现有 5 类没有形成体系**：兄弟插件（kafka/ldap/files）实际只用 connection-provider + workbench 两类；context-menu/result-view 无人使用；能力增长只能靠"宿主加特例"。
-3. **manifest 严格校验锁死演进**：每加一个贡献点/枚举值都要宿主发版 + 全体插件抬 `engines` 门槛。
+1. 插件无法声明宿主工具栏、侧栏、命令面板和底部 panel 的入口。
+2. 现有动作语义分散：工作台打开、连接表单 action、连接右键 action 各走不同路径。
+3. 新贡献点缺少安全的版本协商与降级规则。
+4. 插件自定义 context 与宿主生命周期字段尚未形成明确的所有权边界。
+
+### 1.3 非目标
+
+- 首版不把 `connection-provider.actions` 或 `context-menu` 强行迁移成 command；它们有独立的表单、连接上下文和响应语义。
+- 首版不允许 command 任意调用 Sidecar RPC。
+- 首版不发布动态状态栏、badge、原生树视图或后台模态 API。
+- 宿主不实现 PTY、SSH 或业务协议；宿主只提供容器、入口和生命周期。
 
 ---
 
-## 2. VS Code 机制的四条可迁移原则
+## 2. 设计原则
 
-| 原则 | VS Code 事实 | 对 DBX 的含义 |
+1. **command 是通用宿主入口的动作原子**：命令面板、工具栏、侧栏和默认快捷键只引用 command。
+2. **表面与内容分离**：workbench 定义内容；`menus` 定义入口放在哪里；command 定义点击后做什么。
+3. **领域动作不强行抽象**：连接表单 action 和连接生命周期继续使用现有专用契约，直到通用 command 能完整表达其输入与输出。
+4. **宿主身份不可由插件声明**：插件 ID、workbench 实例 ID、surface、restored 等均由宿主产生或覆盖。
+5. **首版严格、未来按 feature 降级**：A1 不引入逐条 `optional`；未来可选能力以完整 feature fragment 为最小降级单元。
+6. **声明不等于激活**：静态入口不得启动 Sidecar；打开 workbench 或执行未来 RPC command 时才激活。
+7. **可见与可执行分离**：placement 决定是否显示；command enablement 决定显示后能否执行。
+8. **运行时对象必须有作用域**：连接、workbench、command invocation 和插件进程各自拥有明确的关闭与回收边界。
+
+---
+
+## 3. 贡献点体系
+
+### 3.1 首版稳定类型：5 + 2 = 7
+
+| 类型 | 处置 | 说明 |
 | --- | --- | --- |
-| **一切皆命令** | 所有可触发行为统一为 `contributes.commands`；菜单/键位/命令面板/状态栏只是命令的"摆放位置"（`menus` + `when` 子句） | 引入一等 command 概念，收编分散的 `connection-provider.actions`、context-menu 动作、openWorkbench 直调 |
-| **表面与内容分离** | 宿主渲染一切 chrome，扩展只声明"放哪、何时出现、点了跑什么"；扩展自主 UI 只存在于 webview 容器内 | 永久红线：插件永不渲染自己 webview 之外的东西 |
-| **声明式 + 容错解析** | `contributes` 的未知键被忽略（向前兼容），扩展可以领先宿主发布 | manifest 改为两层容错（§5.1），这是解锁一切演进的元决策 |
-| **懒激活** | 声明 ≠ 运行，`activationEvents` 按需启动 | DBX 的 sidecar 模型天然支持：贡献点是纯数据，不 spawn sidecar；首次激活才拉起 |
+| `connection-provider` | 保留 | 连接表单、Secret、连接生命周期和专用 actions |
+| `workbench` | 保持内容定义 | 不增加固定 `surface` 字段 |
+| `filesystem-provider` | 保留 | 通用文件管理器协议 |
+| `context-menu` | 首版保留 | 仍调用 `contextMenu/<id>`；未来满足无损迁移条件后再弃用 |
+| `result-view` | 保留 | 结果快照入口 |
+| `command` | 新增 | 通用、静态、宿主可展示的动作定义 |
+| `menus` | 新增 | 把 command 摆放到宿主位置 |
 
----
+### 3.2 后续候选类型（不属于 v1 发布面）
 
-## 3. UI 贡献点：5 → 11（+2 可选）
-
-### 3.1 现有 5 类的处置
-
-| 现有 | 处置 | 说明 |
-| --- | --- | --- |
-| `connection-provider` | 保留 | 域特有（连接生命周期/表单/capabilities），VS Code 无对应物，是 DBX 的领域优势 |
-| `workbench` | 保留 + 扩展 | 加可选 `surface: "tab" \| "panel"`（封闭枚举，见 §6.1）；panel 形态复用通用容器（§7.4） |
-| `filesystem-provider` | 保留 | 域特有（SFTP 挂载） |
-| `context-menu` | **泛化为 `menus`** | 现类型绑死连接上下文；泛化为"位置词表 + when 子句 + command 引用"（§3.3） |
-| `result-view` | 保留 | SQL 结果渲染器，随 command 体系一并激活 |
-
-### 3.2 新增 6 类（+2 可选）
-
-| # | 贡献点 | VS Code 对应物 | 解决什么 | 批次 |
-| --- | --- | --- | --- | --- |
-| 6 | `command` | `contributes.commands` | **原子**：`{ id, title(七语), icon, when, dispatch }`。v1 语义固定为"打开 workbench 带 context"；v2 增加派发型（转发 sidecar 执行，见 §6.2 安全闸门） | A |
-| 7 | `menus` | `contributes.menus` | command 的摆放位置词表（§3.4），每项 `{ command, when }` | A |
-| 8 | `toolbar-item` | 近似 Activity Bar 入口 | 全局工具栏图标 = command 摆放，用户在 设置→外观 逐项开关（完整设计见 §7.3） | A |
-| 9 | `status-bar-item` | `StatusBarItem` | 常驻小指示：`{ text/icon/tooltip/command/when }`（连接状态、录制中、终端活动） | B |
-| 10 | `sidebar-view`（+ 通用 view-container） | `viewsContainers` + `views` | 通用侧栏树视图：Kafka topic 树、LDAP 目录、SFTP 书签从各自 workweb 拆出，标准化为宿主容器 + 插件 webview（桥协议零新增） | B |
-| 11 | `object-viewer` | `customEditors` | 按"资源类型"打开插件渲染器：Redis key 可视化、Kafka message、JSON 列预览 | B |
-| 可选 | `viewsWelcome` | `viewsWelcome` | 插件视图空态文案 | C |
-| 可选 | `badge` | ActivityBar badge | 视图容器角标计数（传输中/待审批） | C |
-| — | `keybinding` | `contributes.keybindings` | **折叠进 command**（声明默认键位，用户在设置改），不独立成类型 | A |
-
-**类型新增判据（比数量更重要）**：只有**渲染契约不同**才允许新增贡献类型；只是**数据不同**一律扩展现有类型的可选字段。判据钉死后，"11 类"是当前推导结果而非目标（VS Code 40+ 类型的维护负担正是没守住这条判据的代价）。A/B 批实施时按判据复审：`status-bar-item` 与 `toolbar-item` 渲染契约差异最小，应先试合并为 command + 摆放。
-
-### 3.3 `menus` 位置词表（v1）
-
-`commandPalette` / `connectionContext`（现 context-menu 的泛化）/ `objectExplorer` / `dataGrid` / `editorTitle` / `tabContext`。
-
-⚠️ 位置名是**永久契约**（§6.1）：将被写进成千上万份 manifest，新增安全、改名/删除破坏。发布前按宿主**现存全部表面**盘点一遍（连接侧栏/对象树/数据网格/SQL 编辑器/tab 栏/终端面板），宁可一次定全。
-
-### 3.4 `when` 子句
-
-- v1 语法钉死为 `==`、`!=`、`&&` 三种——**无正则、无 `in`、无自定义函数**；任何语法扩展 = `host_api` major。
-- 上下文键最小集：`connection.state`（connected/disconnected/none）、`object.type`（table/db/topic/…）、`surface`（tab/panel）、`readOnly`。
-- 宿主渲染时求值；词表扩充走宿主版本，不开放插件自定义表达式（避免 DSL 失控）。
-
----
-
-## 4. 交互原语：2 → 6（宿主代渲染）
-
-| # | 原语 | VS Code 对应 | 形态 |
-| --- | --- | --- | --- |
-| 1 | **command 派发** | commands.executeCommand | 命令面板 / menus / toolbar / 键位全部落到同一派发；v1 打开 workbench，v2 派发插件后端 |
-| 2 | **notification + actions** | showInformationMessage | 桥 `notify(pluginId, { level, text, actions[], when })`，点击回传 action id |
-| 3 | **quick-pick** | showQuickPick | 桥 `quickPick(pluginId, { items[], placeholder })` → 选中项回传 |
-| 4 | **input** | showInputBox | 单行文本起步；表单复用 connection-provider 既有 fields 渲染器 |
-| 5 | **activate / open-with** | openWorkbench / customEditor.open | 已有 openWorkbench；补 object-viewer 的 openWith(resource) |
-| 6 | **event 订阅** | *Event<T>* | 已有 appearance/locale/context；补 `connection-state`（连接增删/断连）与 `active-object`（当前选中库/表/对象）——与 when 词表共享词汇 |
-
-模态原语（2/3/4）的完整契约见 §6.3。
-
----
-
-## 5. 关键架构决策
-
-### 5.1 manifest 两层容错（元决策）
-
-现状两层都会拒装（§1.1 第 2 行）。容错必须同时落在两层，缺一不可：
-
-- **类型层**：未知贡献 `type` → 跳过该条 + 插件中心黄标；
-- **值层**：已知类型内的未知字段、未知枚举值（如未来 `surface:"floating"` 落到只认 `"tab"|"panel"` 的老宿主）→ 同样跳过该条贡献并警告，**绝不整包拒装**。
-
-实现建议：反序列化到 `serde_json::Value` 逐条判定（先认 `type`，再按已知结构体 strict 解析，失败即降级记录），而非依赖 enum 级 `deny_unknown_fields` 的当前行为。这是解锁后续一切演进的开关——否则每加一个贡献点/枚举值都要宿主发版 + 全体插件抬 `engines`。
-
-### 5.2 其余决策
-
-1. **command 是唯一原子**：工具栏/菜单/面板/键位全部是 command 的摆放，禁止"某表面私有动作"的平行机制（`connection-provider.actions` 给一个迁移窗口：映射为 `connectionContext` 位置的 command）。
-2. **command 全限定命名空间**：宿主解析时强制 `${pluginId}.${commandId}`（插件声明短 id，宿主拼全）；宿主保留顶层命名空间 `workbench.*` / `app.*`——防插件伪造宿主命令混入命令面板（VS Code 早期真实踩过）。menus 位置名同理是宿主保留词表。
-3. **图标与 i18n 走既有公共件**：`resolvePluginIcon` + `PluginContributionLocalization`（§7.3 已验证可行）。
-4. **显隐治理**：宿主代渲染的每一项都必须进入 设置→外观 的开关网格与设置搜索，避免工具栏被插件塞爆时用户无防御。
-
----
-
-## 6. 兼容宪法（发布即冻结）
-
-> 本章回答：**哪些东西一旦发布就再也改不动**，以及必须**在发布前**钉死的规则。
-
-### 6.1 永久契约清单（只能加，不能改名/删除/改语义）
-
-| 冻结物 | 规约 |
+| 候选 | 发布前置条件 |
 | --- | --- |
-| 贡献类型名（`toolbar-item`…） | kebab-case；语义只可收窄描述不可改变行为；删除 = 破坏，弃用走 §6.4 |
-| menus 位置词表 | §3.3；发布前全表面盘点 |
-| command 全限定 ID | `${pluginId}.${id}`；id 建议蛇形；宿主保留 `workbench.*`/`app.*` |
-| when 上下文键 + 语法 | §3.4；语法超集必须解析报错而非宽容 |
-| 枚举值（`surface:"tab"\|"panel"` 等） | 封闭枚举，扩值走宿主版本 + §5.1 值层容错；插件不得依赖"未知值回退 tab"——跳过整条贡献才是契约 |
-| `context` 透传键 | 宿主注入键保留清单：`connectionId`/`workbenchId`/`connection`/`restored`/`workbenchState`；插件自定义键**应当**自带前缀（如 `ssh.*`），宿主合并时永不改写插件键 |
-| 桥 API（`window.dbxPlugin.*`、模态原语签名） | 与 manifest 同等是公共 API：major 内只加不改；`showQuickPick` 返回 `null` = 用户取消等语义写进类型定义 |
+| `status-bar-item` | 动态状态更新、激活、限流、清理协议完成 |
+| `view-container` / `view` | 视图生命周期、懒加载、选择与菜单事件协议完成 |
+| `object-viewer` | 资源类型注册、open-with 选择和数据上限完成 |
+| `viewsWelcome` / `badge` | 所属 view/container 契约先稳定 |
 
-### 6.2 command v2 派发是最大的单向门（安全前置）
-
-v1 的 command 是**纯数据**（打开 workbench + context），零执行面。v2 若允许派发到插件 sidecar，**所有已发布 command 一夜之间变成 RPC 入口**——安全等级跳变，事后不可逆。因此：
-
-- v1 命令声明带 `dispatch: "data" | "rpc"`（缺省 data）；只有显式 rpc 的命令可派发——旧清单自动免疫；
-- rpc 命令继承 sidecar 侧破坏性操作闸门（confirmDestructive/审计台账，SSH 插件已有先例），宿主至少提供统一"执行确认"可选弹层；
-- 命令面板/菜单对 rpc 命令标注来源插件（防钓鱼：`ssh.重启生产机` 不能长得像宿主自带）。
-
-### 6.3 模态原语契约（notify/quickPick/input）
-
-- **单飞**：每插件同时至多一个模态；新请求顶替旧请求（旧的按取消结算）；
-- **取消语义**：用户 Esc/关窗 → resolve `null`（不是 reject、不是挂死）；
-- **超时**：宿主侧默认 30s 超时结算为 `null`（防 sidecar 死后模态永悬）；
-- **排队**：跨插件的模态按到达顺序排队展示，不叠放；
-- web/docker 形态下必须**可用或明确禁用**（禁用时返回 `null` 并附原因，不能挂死）。
-
-### 6.4 弃用与迁移政策
-
-- 任一类型/位置/枚举值弃用：宿主**保留兼容翻译 N+2 个 minor 版本**（如旧 `context-menu` 声明 → 宿主内部翻译为 `menus` 摆放），期间插件中心对使用方黄标；
-- 每类迁移必须先证明**语义无损**（旧 context-menu 的连接绑定 ⊆ 新位置词表），有损则不迁移、保留原类型共存；
-- `connection-provider.actions` → commands 同政策，给存量插件一个版本的迁移窗口。
-
-### 6.5 一致性测试（把宪法变成 CI 门）
-
-1. **golden manifests**：每类贡献一份合法样例 + 期望宿主行为（渲染位置/开关项/设置搜索命中）；
-2. **容错矩阵**：未知类型、已知类型未知字段、未知枚举值 → 均为"跳过+警告"，整包安装成功；
-3. **升级矩阵**：老 manifest × 新宿主（逐版本样例回放）、新 manifest × 模拟老宿主（验证 `engines` 门槛文案而非崩溃）；
-4. **行为回归**：模态单飞/超时、command 全限定拼接、when 语法拒绝超集（解析器必须报错而非宽容）。
-
-### 6.6 形态降级矩阵（非桌面宿主）
-
-每个宿主代渲染表面在 web/docker 形态的行为必须显式定义（显示/隐藏/降级）：toolbar/sidebar/status-bar 在 web 形态的存废、panel dock 在无窗环境的替代（回到 tab）、模态原语同 §6.3。降级行为写进各表面实现 PR 的验收项。
+`toolbar-item` 不作为独立贡献类型：工具栏项是 `menus.location = "appToolbar"`。
+`keybinding` 首版也不作为独立贡献类型；默认键位在宿主键位体系完成冲突治理后再作为 command 的摆放方式增加。
 
 ---
 
-## 7. 首个消费者：本地终端的宿主需求
+## 4. `command` 规范
 
-本地终端（插件侧已完成，见 `FEATURE_PARITY.zh-CN.md` 本地终端条目）暴露的缺口是本体系的第一个实例。分层方案：P0 零宿主改动 → P1 侧栏入口 → P2 底部悬浮面板。
-
-### 7.1 P0：无连接直通（✅ 插件侧已落地，commit 1824c04）
-
-- `context.localTerminal` 直通：宿主以 `{ localTerminal: true }` 打开本 workbench（插件中心无连接打开 / 桥调用）时，跳过 SSH 连接流程直接进入本地终端；无连接时 identity 显示"本地终端"。
-- 自查自开：工作台内经 `host.openWorkbench(io.dbx.ssh.workbench, { localTerminal: true, workbenchId: uuid }, { forceNew: true })` 一键开独立本地终端 tab；无此桥的旧宿主隐藏入口。
-- 关闭 tab → 宿主 `workbench/close` → 插件回收本地会话。
-- mock 夹具 `?local=1` 覆盖直通路径；浏览器已验证。
-
-### 7.2 P1：侧栏全局工作台区（宿主 ~1 天）
-
-AppSidebar 底部新增"插件工作台"区：读取前端插件 registry 中的 workbench 贡献，逐条渲染图标+名，点击 = `openPluginWorkbench(pluginId, contributionId)`（无 context）。
-
-- 数据面零新协议（registry 已有全部信息）；i18n 七语；设置项"在侧栏显示插件工作台"（默认开）；
-- 通用设施（对所有插件生效），不为本插件开特例。
-
-### 7.3 M1.5：工具栏插件入口（宿主 2~3 天 + 插件 0.5 天）
-
-把插件入口挂进**既有**的主工具栏显隐体系（设置 → 外观 → 工具栏开关网格），对用户零新概念。
-
-**manifest（v1 = toolbar-item 贡献）**
+### 4.1 v1 唯一动作：`open-workbench`
 
 ```json
 {
-  "type": "toolbar-item",
-  "id": "local-terminal",
-  "label": "本地终端",
-  "label_i18n": { "en": "Local terminal", "...": "..." },
-  "icon": "assets/toolbar-local-terminal.svg",
-  "workbench": "io.dbx.ssh.workbench",
-  "context": { "localTerminal": true }
+  "type": "command",
+  "id": "open-local-terminal",
+  "label": "Local terminal",
+  "description": "Open a local terminal.",
+  "icon": "assets/local-terminal.svg",
+  "action": {
+    "type": "open-workbench",
+    "workbench": "io.dbx.ssh.workbench",
+    "presentation": "tab",
+    "reuse": "singleton",
+    "instance_key": "local-terminal",
+    "restore": "none",
+    "context": {
+      "plugin": { "mode": "local-terminal" }
+    }
+  }
 }
 ```
 
-- v1 行为固定为 `打开 workbench`：`workbench` 必须引用**同插件**已声明的 workbench 贡献，`context` 原样透传（与 §7.1 直通闭环）；v2 预留 event 型（镜像 `contextMenu/<id>` 模式派发 sidecar）。
-- label 七语复用 `PluginContributionLocalization`；icon 为插件包内资产，宿主经 `resolvePluginIcon` 解析。
+字段规则：
 
-**宿主 desktop 侧**
+- `id` 在插件内唯一；宿主内部规范化为 `${pluginId}.${id}`。
+- `label`、`description`、`icon` 复用现有贡献点国际化和资产规则。
+- `action.type` v1 只能是 `open-workbench`。
+- `workbench` 必须引用同插件已经声明的 workbench。
+- `presentation`：A1 只接受 `tab`；§8.3 BottomDock 上线后新增 `panel` 枚举值，使用它的插件必须提升最低宿主版本。缺省 `tab`。
+- `reuse`：
+  - `singleton`：复用相同 command 实例；
+  - `new`：每次由宿主创建新实例。
+- `instance_key` 仅用于 `singleton`，宿主以
+  `pluginId + commandId + presentation + instance_key` 形成复用键；插件不得直接提供 `workbenchId`。
+- `restore`：A1 只接受 `none`；Runtime 里程碑再增加 `placeholder`、`state`、`reattach`，完整语义见 §7.6。缺省 `none`。
+- `context` 必须是 JSON 数据；插件载荷放在 `context.plugin`，不得写宿主保留字段。
+- 宿主必须在最终 context 中注入权威的 `workbenchId`、`restored`、`surface`，并在适用时注入 `connectionId`。
 
-1. `settingsStore`：不动内置 `ToolbarItems`，新增独立动态记录 `pluginToolbarItems: Record<"plugin:<pluginId>/<itemId>", boolean>`——首次出现默认 `true`；加载时清理已卸载插件的陈旧键。
-2. 设置 → 外观：开关网格在内置项后动态追加插件条目（开关 + 插件图标 + 七语 label）；设置搜索同步追加动态定义（`createToolbarVisibilitySettingsSearchDefinitions` 已接受 items 参数，天然可扩展——缺席搜索是该文件头注释的红线）。
-3. `AppToolbar`：内置项之后按 registry 追加动态项；`items.icon` 扩为 `Component | 图片URL` 联合并适配渲染；点击 = `openPluginWorkbench(pluginId, workbench, { context }, { forceNew: false })`（复用既有 tab，重复点击不重载）；溢出收 More 菜单对动态项自动生效（纯 DOM 测量）。
+command 可以声明 `enablement`，其结构与 §5.3 的条件对象一致。宿主必须只基于当前 context 快照求值，不得为了绘制菜单同步调用 Sidecar。
 
-**已否决备选**：`ToolbarItems` 加索引签名混入插件键（持久化形状 churn）；复用 `ContextMenu` 贡献（语义不符）；v1 即做 event 派发型（openWorkbench 已覆盖诉求）。
+### 4.2 v1 不包含 RPC command
 
-### 7.4 P2：底部悬浮终端（宿主 3~5 天 + 插件 1 天）
+不得用 `dispatch: "rpc"` 之类的预留值制造“已声明但当前不可执行”的状态。
+未来若增加 Sidecar command，使用新的判别动作，例如：
 
-**核心决策**：宿主内置通用底部面板容器 + workbench 贡献加可选 `surface` 字段（`"tab"` 缺省 / `"panel"`）。不新增 manifest 贡献类型 → installer/安装链零改动；容器是通用设施（日志/监控面板未来可复用），符合"宿主做容器、插件做内容"分层；`surface` 依赖 §5.1 值层容错发布。
+```json
+{ "action": { "type": "invoke-sidecar", "method": "..." } }
+```
 
-**宿主侧（BottomDock.vue）**
+该动作必须随新的 Host API/Manifest 版本发布，并同时定义权限、确认、审计、超时、取消和来源标识。旧的 `open-workbench` command 永远不得被重新解释成 RPC。
 
-1. 主窗口底部覆盖层（Quake 式悬浮；v2 可加"挤压主区" dock 模式）；
-2. 高度可拖（复用 `panelResizeState`），可整栏收起；
-3. 固定触发钮：窗口右下角终端图标 + 活动指示点（有输出/命令运行时呼吸）；
-4. 热键 `Ctrl/⌘+J`（VS Code 同款）呼出/收起；收起后焦点归还主区；实施前与宿主键位表核对；
-5. 内容复用 `PluginWorkbenchHost.vue`（webview 宿主组件原样嵌入，桥协议零新增——桥是 per-webview 的）；
-6. 状态持久化（开/关、高度、上次 contributionId）入 settingsStore。
+### 4.3 与领域动作的边界
 
-**会话语义**：panel webview 与 tab webview 是两个实例（两个 workbenchId、两个独立本地会话）；隐藏 = keep-alive（会话保活，正是悬浮终端的价值）；应用退出或显式卸载 → `workbench/close`。设置项"闲置 N 分钟自动收起并卸载"（卸载即终止会话，UI 明示）。
-
-**插件侧**：`context.surface === "panel"` 时精简 UI（隐藏 SFTP 侧栏按钮、弹窗改精简排版）；其余能力（shell 选择器、注入、最近命令、命令标记、退出覆盖层）原样可用。
+- `connection-provider.actions` 保持现状：继续接收未保存表单、Secret 安全视图并允许返回 `fieldValues`。
+- `context-menu` 保持现状：继续携带非敏感连接摘要并调用 `contextMenu/<id>`。
+- 只有新 command 能完全覆盖旧动作的输入、输出和安全语义时，才允许启动弃用流程。
 
 ---
 
-## 8. 里程碑与工作量
+## 5. `menus` 规范
 
-| 里程碑 | 内容 | 归属 | 状态 |
+### 5.1 v1 位置词表
+
+- `commandPalette`：命令面板；
+- `appToolbar`：主工具栏；
+- `appSidebar`：侧栏插件入口区。
+
+连接右键、对象树、数据网格、编辑器标题和 tab 右键等上下文位置，待 command 上下文注入规则完成后再逐项增加。位置名一旦发布只能新增，不能改名或改变语义。
+
+### 5.2 示例
+
+```json
+{
+  "type": "menus",
+  "id": "global-entrypoints",
+  "items": [
+    {
+      "location": "commandPalette",
+      "command": "open-local-terminal",
+      "group": "primary",
+      "order": 100
+    },
+    {
+      "location": "appToolbar",
+      "command": "open-local-terminal",
+      "default_visible": false,
+      "group": "navigation",
+      "order": 100
+    },
+    {
+      "location": "appSidebar",
+      "command": "open-local-terminal",
+      "default_visible": true,
+      "group": "primary",
+      "order": 100
+    }
+  ]
+}
+```
+
+规则：
+
+- `command` 引用本插件 command 的短 ID；跨插件引用禁止。
+- `appToolbar`/`appSidebar` 是持久 chrome，必须进入设置显隐和设置搜索；`commandPalette` 不生成单独的外观开关。
+- 插件工具栏项缺省隐藏；每个插件最多一个 `default_visible: true` 的工具栏项。
+- `group` 只能使用宿主发布的稳定词表：v1 为 `navigation`、`primary`、`secondary`、`destructive`。
+- `order` 是 group 内的整数排序键；相同值按全限定 command ID 稳定排序。插件不得声明任意全局 group，也不得使用 before/after 指向另一个插件。
+- 宿主必须对 command 数量、menu item 数量、label/description/context 长度和图标资源设置上限；具体值在 Schema PR 中冻结并进入 conformance 测试。
+- 所有宿主渲染的插件入口必须显示插件来源或可访问的来源提示，避免伪装成宿主内置命令。
+- 国际化只使用现有顶层 `localizations.<locale>.contributions.<id>`，不得新增 `label_i18n` 平行机制。
+
+### 5.3 `when` 条件
+
+v1 不引入字符串表达式语言，使用可由 JSON Schema 校验的结构化条件：
+
+```json
+{
+  "when": {
+    "all": [
+      { "key": "connection.state", "operator": "equals", "value": "connected" },
+      { "key": "object.type", "operator": "oneOf", "value": ["table", "view"] },
+      { "key": "readOnly", "operator": "notEquals", "value": true }
+    ]
+  }
+}
+```
+
+- v1 operator：`equals`、`notEquals`、`oneOf`；`all` 内隐式 AND。
+- v1 宿主 key：`connection.state`、`object.type`、`surface`、`readOnly`。
+- `when`/`enablement` 缺省为 true；条件中引用不存在的 key 时，该 predicate 对所有 operator 均求值为 false。
+- key 和 operator 为宿主保留词表；A1 遇到未知值时整个 Manifest 校验失败。
+- 新 operator/key 是增量契约，但使用它的插件必须声明相应的最低宿主版本。
+
+### 5.4 可见与可执行
+
+- `menus.items[].when` 控制当前 placement 是否可见；同一个 command 在不同位置可以使用不同的 `when`。
+- `command.enablement` 控制 command 是否可执行；所有 placement 共用同一 enablement。
+- placement 可见但 command 不可执行时，支持 disabled item 的表面必须显示禁用态；不支持禁用态的表面可以隐藏，但行为必须进入表面降级矩阵。
+- command 真正执行前必须重新校验 enablement，不能只相信上一次渲染结果。
+- 需要网络、磁盘或 Sidecar 状态才能判断的条件不能进入同步 enablement；执行后由业务层返回可理解的拒绝原因。
+
+---
+
+## 6. Manifest 解析、版本协商与降级
+
+### 6.1 不能追溯修复旧宿主
+
+旧宿主仍然会拒绝它不认识的新字段和贡献类型。首次引入本规范必须遵循：
+
+1. 宿主先发布支持新 envelope/贡献类型的版本；
+2. 插件随后提升 `engines.dbx` 或 `engines.host_api` 下限；
+3. 新宿主从此以后才能对未来 Manifest v2 的可选 feature fragment 执行安全降级。
+
+不得声称“插件可以天然领先所有旧宿主发布”。
+
+### 6.2 解析顺序
+
+新宿主必须按以下顺序处理 Manifest：
+
+1. 从原始 JSON 读取最小 envelope：`manifest_version`、`id`、`version`、`publisher`、`engines`；
+2. 先执行版本门槛检查，版本不足时返回明确的“不兼容宿主版本”，不得落成泛化 JSON 解析错误；
+3. 再逐条解析 contributions；
+4. 执行 ID 唯一性、引用图、权限和资源路径校验。
+
+### 6.3 A1 不引入逐条 optional
+
+首个 `command + menus` PR 继续使用严格 Manifest：未知类型、未知字段、未知枚举、格式错误和悬空引用均拒绝安装。插件使用新贡献点时必须提升最低宿主版本。
+
+这样做的理由是：逐条跳过会破坏 command、menus、workbench 之间的引用图，也会把字段拼写错误伪装成正常降级。A1 的兼容边界必须简单到 reviewer 可以穷举。
+
+### 6.4 后续 feature fragment（Manifest v2 候选）
+
+跨 Desktop/Web、不同宿主能力的可选功能应以完整 feature 为降级单元，而不是在每条 contribution 上增加 `optional`：
+
+```json
+{
+  "manifest_version": 2,
+  "features": [
+    {
+      "id": "bottom-panel",
+      "optional": true,
+      "requires": {
+        "host_capabilities": ["ui.panel"]
+      },
+      "contributions": [
+        { "type": "command", "id": "open-local-panel", "label": "Local terminal panel", "action": { "type": "open-workbench", "workbench": "io.dbx.ssh.workbench", "presentation": "panel", "reuse": "singleton", "instance_key": "local-terminal-panel", "restore": "none" } },
+        { "type": "menus", "id": "panel-entry", "items": [{ "location": "appToolbar", "command": "open-local-panel", "group": "navigation", "order": 100, "default_visible": false }] }
+      ]
+    }
+  ]
+}
+```
+
+- feature 内部单独执行严格 Schema、ID 和引用图校验。
+- capability 不满足且 feature optional 时，整体跳过并展示一次可理解警告。
+- capability 满足但 feature 自身格式错误时仍拒装，不能降级掩盖作者错误。
+- 核心 contributions 不得引用 optional feature 内部 ID；feature 可以引用核心贡献。
+- 该设计增加 Manifest 顶层字段，应通过 Manifest v2 或同等明确的格式版本发布，不进入 A1 PR。
+
+### 6.5 Conformance 门禁
+
+宿主 CI 必须覆盖：
+
+1. envelope 先于 contributions 的版本判断；
+2. A1 未知类型、字段、枚举和悬空引用全部拒装；
+3. 已知贡献拼写错误拒装；
+4. Manifest v2 feature fragment 另建矩阵，不与 A1 测试混杂；
+5. 老 Manifest × 新宿主回放；
+6. 新 Manifest × 版本不足宿主的清晰错误；
+7. command/menu 数量与载荷上限；
+8. 国际化、图标、设置显隐和来源标识。
+
+---
+
+## 7. Host API 与运行时交互
+
+### 7.1 现有 API 不改语义
+
+`window.dbxPlugin.notify(method, params)` 继续表示“向本插件 Sidecar 发送无响应通知”。
+新的宿主 UI 原语不得复用 `notify` 名称，也不得要求插件传入 `pluginId`。
+
+### 7.2 后续宿主模态 API 命名
+
+如后续确有需求，使用宿主自动绑定身份的命名空间：
+
+```ts
+window.dbxPlugin.ui.showMessage(options)
+window.dbxPlugin.ui.showQuickPick(options)
+window.dbxPlugin.ui.showInput(options)
+```
+
+发布前必须定义：
+
+- 每插件单飞、跨插件排队；
+- Esc/关闭返回 `null`；
+- 默认超时和显式上限；
+- 文本、选项、action 数量和总载荷上限；
+- 插件来源标识、防钓鱼展示；
+- web/docker 的明确降级；
+- webview 销毁、插件卸载和 Sidecar 退出时的取消行为。
+
+这些 API 只允许活动的沙箱 UI 调用。若未来需要“没有 webview 时由 Sidecar 主动通知”，必须另行设计 Sidecar→Host 能力、权限和激活模型，不能借用 UI bridge。
+
+### 7.3 动态宿主 UI 延后
+
+状态栏文字、badge、panel 活动点等需要运行时更新。发布这些贡献点之前必须先定义：
+
+- 谁负责激活 Sidecar/webview；
+- 状态更新 API 和最大更新频率；
+- 宿主重启、webview 销毁和插件卸载时的清理；
+- 后台插件的资源预算；
+- 静态占位与动态状态不可用时的降级。
+
+在该协议完成前，BottomDock v1 不显示“有输出/命令运行中”动态呼吸点。
+
+### 7.4 运行时作用域
+
+| Scope | 宿主身份 | 典型资源 | 结束条件 |
 | --- | --- | --- | --- |
-| M0 | P0：context.localTerminal 直通 + 自查自开 | 插件 | ✅ 已落地（1824c04） |
-| 前置 | manifest 两层容错（§5.1）+ conformance 套件骨架 | 宿主 ~1 天 | 建议最先 |
-| A 批 | command + menus（context-menu 泛化）+ toolbar-item + keybinding 折叠 | 宿主 2~3 天 + 插件 0.5 天 | 待排期 |
-| M1 | P1：侧栏全局工作台区 | 宿主 1 天 | 待排期 |
-| M1.5 | 工具栏插件入口（§7.3） | 宿主 2~3 天 + 插件 0.5 天 | 待排期 |
-| B 批 | status-bar-item / sidebar-view / object-viewer | 宿主，按插件需求拉 | 待定 |
-| C 批 | viewsWelcome / badge | 宿主顺手 | 待定 |
-| P2 | surface 字段 + BottomDock（§7.4） | 宿主 3~5 天 + 插件 1 天 | 待排期 |
-| M3 | Windows 实测（ConPTY、热键、拖拽）随宿主发布 | 双方 | 1 天 |
+| plugin | `pluginId` | Sidecar 进程、全局缓存 | 禁用、更新、卸载、宿主退出 |
+| connection | `connectionId` | SSH/数据库连接、隧道引用 | disconnect、删除连接、插件卸载 |
+| workbench | `workbenchId` | webview、PTY、订阅、临时状态 | tab/panel 关闭、插件卸载 |
+| invocation | `invocationId` | 单次 command/RPC、取消句柄 | 完成、取消、超时 |
 
-发布顺序约束：P2 的 `surface` 枚举依赖值层容错先行（或宿主先行发版 + 插件抬 `engines`，二选一，倾向前者）。
+- 子 scope 不得比父 scope 活得更久；关闭顺序为 invocation → workbench/connection → plugin。
+- 宿主生成所有 scope ID，插件只能把它们作为不透明引用使用。
+- 任何长任务必须绑定 invocation 或更长生命周期的显式 scope，不能成为无主后台任务。
+- `workbench/close` 只关闭 workbench scope，不能代替整个插件的 deactivate/unload 协议。
+
+### 7.5 插件 context key
+
+后续允许插件发布有限的动态 context key，以支持纯宿主求值的 menus/enablement：
+
+```ts
+await window.dbxPlugin.contextKeys.set("localSessionRunning", true)
+await window.dbxPlugin.contextKeys.delete("localSessionRunning")
+```
+
+宿主内部完整键为 `plugin.<pluginId>.<key>`。约束：
+
+- 值仅允许 `null`、boolean、有限 number、短 string 或小型标量数组；
+- 禁止 Secret、连接配置、任意对象和大型集合；
+- 每插件键数量、单值大小和更新频率必须设上限；
+- webview/Sidecar/scope 销毁时清除所属键；
+- 插件不能设置、覆盖或伪造宿主 context key；
+- A1 只支持宿主 key，插件 context key API 独立评审后上线。
+
+### 7.6 恢复模型
+
+`open-workbench` action 的 `restore` 明确内容实例的恢复等级：
+
+| 模式 | 宿主恢复 | 插件责任 |
+| --- | --- | --- |
+| `none` | 不把该实例加入下次会话恢复 | 无恢复回调；用户需要重新执行 command |
+| `placeholder` | 恢复 tab/panel 外壳与来源元数据 | 显示未运行态，等待用户重新打开 |
+| `state` | 恢复有界 JSON `workbenchState` | 从状态重建 UI，不自动重放命令或副作用 |
+| `reattach` | 恢复状态并提供旧 scope 引用 | 验证 Sidecar 中仍存在资源后重连，失败回退 placeholder |
+
+- 恢复不是再次执行 command。
+- `workbenchState` 必须版本化、有大小上限、不得包含 Secret。
+- A1 只发布 `none`；`placeholder`、`state`、`reattach` 随 Runtime 里程碑增加。
+- 插件必须显式支持非 `none` 模式；宿主不能从当前 UI 猜测。
+- 隐藏与恢复不同：隐藏可以 keep-alive；宿主进程重启后的恢复必须走本节协议。
+
+### 7.7 动态卸载
+
+宿主更新、禁用或卸载插件时应执行：
+
+1. 停止接受新的 command invocation；
+2. 向 Sidecar 发送有界超时的 `plugin/prepareUnload`；
+3. 插件返回活动 scope 摘要和可选阻断原因，不得返回 Secret；
+4. 宿主按最深 scope 优先取消 invocation、关闭 workbench/connection；
+5. 发送 `plugin/deactivate`，关闭桥、清除 context key、菜单状态和动态 UI；
+6. 超时后终止 Sidecar 及其子进程组，并记录诊断；
+7. 若无法安全卸载，宿主向用户说明需要重启，而不是假装成功。
+
+`prepareUnload` 只能争取优雅清理时间，不能无限阻止用户卸载；最长等待时间由宿主控制。
 
 ---
 
-## 9. 风险登记册
+## 8. 首个消费者：SSH 插件本地终端
 
-| # | 风险 | 缓解 |
+### 8.1 当前状态：P0 部分完成
+
+commit `1824c04` 已完成“从现有 SSH workbench 自查自开一个本地终端 tab”，但还不能把插件中心普通打开视为完整入口：插件中心不会自动提供插件私有的本地模式 context。
+
+当前实现仍有三项迁移任务：
+
+1. 将 `{ localTerminal: true }` 迁移为 `{ plugin: { mode: "local-terminal" } }`；
+2. 不再由插件传入 `workbenchId`，实例 ID 由宿主生成；
+3. `restored: true` 时不得自动创建新 shell，应恢复 tab 外壳并显示退出/重开状态，等待用户显式启动。
+
+因此验收状态应写为：
+
+- [x] 已打开的 SSH workbench 可以显式新建本地终端 tab；
+- [ ] 插件中心/全局入口通过 command context 打开本地终端；
+- [ ] 无连接 tab 的恢复矩阵完成，恢复不会自动执行本机 shell。
+
+### 8.2 P1：使用 command + menus 提供全局入口
+
+SSH 插件声明一个 `open-local-terminal` command，并分别摆放到：
+
+- `commandPalette`；
+- `appSidebar`（默认显示）；
+- `appToolbar`（默认隐藏，由用户在设置中打开）。
+
+不得扫描并暴露“所有 workbench”来猜测哪些入口适合全局打开：部分 workbench 必须依赖连接或特定 context。全局可发现性必须由插件显式声明。
+
+### 8.3 P2：BottomDock
+
+BottomDock 是宿主通用容器，不是终端专用实现。
+
+- 本地终端 command 以 `presentation: "panel"` 打开同一个 workbench 内容；workbench 自身不声明固定 surface。
+- tab 与 panel 的复用键必须包含 `presentation`，两者可以同时存在。
+- `workbenchId` 由宿主分别生成；panel 隐藏仅隐藏 UI，不销毁 webview。
+- 宿主在 context 中注入权威 `surface: "panel"`；插件据此使用紧凑布局。
+- panel 关闭或插件卸载时发送 `workbench/close`；进程异常退出时 Sidecar 仍必须保证 PTY 子进程组被回收。
+- v1 不自动按空闲时间卸载正在运行的终端，避免误杀长任务；自动卸载策略留待宿主能可靠判断运行状态后再设计。
+- `Ctrl/⌘+J` 必须先进入宿主统一快捷键冲突治理，不硬编码覆盖用户键位。
+
+### 8.4 恢复语义
+
+- A2 的本地终端 command 使用 `restore: "none"`：宿主重启后不恢复该终端实例，也不重新执行 command。
+- Runtime 里程碑可增加 `placeholder`，恢复外壳后显示退出态和“重新打开”按钮。
+- 本地 shell 不跨宿主进程恢复；只有确认 Sidecar 内仍存在同一宿主生成的 scope 时才可使用 `reattach`。
+- 任何非 `none` 恢复路径都必须先处理 `restored`，再决定 UI 状态，绝不能自动启动 shell。
+
+---
+
+## 9. 里程碑
+
+| 里程碑 | 内容 | 归属 |
 | --- | --- | --- |
-| R1 | 无连接 tab 的崩溃恢复语义未定义（boot 恢复测试只覆盖带 connectionId 的 tab） | 宿主在 P0 落地时确认无连接 tab 不被 boot 恢复丢弃或误重连；期望行为 = 恢复 tab 元数据，webview 显示既有 restartDisconnected/本地会话退出态（插件已处理该态） |
-| R2 | manifest 兼容：新贡献类型/枚举值在老宿主的行为 | §5.1 两层容错（首选）；否则宿主先行发版 + 插件抬 `engines`（integrator 定版本号） |
-| R3 | panel 常驻内存（每 webview 数十 MB） | §7.4 闲置自动收起并卸载设置 |
-| R4 | 热键 `Ctrl/⌘+J` 冲突 | 实施前与宿主键位表核对；命令面板快捷键（Ctrl/⌘+K 或 +P）同查 |
-| R5 | 评审归属 | 宿主改动走宿主仓流程；本文即需求输入 |
-| R6 | toolbar 图标渲染适配（`items.icon` 联合类型） | 改动集中一个渲染分支 |
-| R7 | 动态开关缺席设置搜索 | settingsSearch 红线，§7.3 已并入设计 |
-| R8 | toolbar-item label 本地化回退链 | 实施时验证 `PluginContributionLocalization` 覆盖；最简回退 manifest 内联 `label_i18n` |
-| R-menus | context-menu → menus 迁移破坏存量 | §6.4：N+2 兼容翻译 + 语义无损才迁 |
-| R-sidebar | sidebar-view 树交互需要最小 webview 桥协议（懒加载/右键） | 比 status-bar 复杂，排期单独评估 |
-| R-compat | 宿主不采纳容错解析 | 每个新贡献点叠加"宿主发版 + 插件抬门槛"联动成本 |
-| R-v2rpc | command v2 派发把存量命令变成 RPC 入口 | §6.2：v1 首发 `dispatch` 判别字段 + 审批/审计闸门前置 |
+| 前置 | envelope 版本门槛、严格解析与 conformance 骨架 | 宿主 |
+| A1 | `command(open-workbench)` + `menus(commandPalette/appToolbar/appSidebar)` | 宿主 |
+| A2 | SSH 插件迁移本地终端 context、声明 command/menus、修复恢复语义 | 插件 |
+| P2 | command `presentation: panel` + BottomDock + 实例复用/关闭生命周期 | 宿主 + 插件 |
+| Runtime | scope、contextKeys、restore、prepareUnload/deactivate | 宿主 + SDK + Sidecar |
+| Manifest v2 | capability-gated feature fragments | 独立提案 |
+| 后续 | RPC command、宿主模态、动态状态栏、view-container/view、object-viewer | 独立提案 |
+| 验证 | macOS/Windows/Web 降级矩阵与真实宿主回归 | 双方 |
+
+首次发布顺序固定为“宿主先行、插件抬最低版本、插件后发”。
 
 ---
 
 ## 10. 验收清单
 
-**P0（已达成）**
-- [x] 无连接打开工作台 → 直接进入本地终端；关闭 tab → 本地会话被回收（`workbench/close`）；mock `?local=1` 覆盖。
+### Manifest 与兼容
 
-**容错与 conformance（前置）**
-- [ ] 未知类型 / 已知类型未知字段 / 未知枚举值 → 跳过+黄标，整包安装成功（三层用例入 CI）。
-- [ ] golden manifests + 升降级回放矩阵进宿主 CI 门禁。
+- [ ] 版本不足在解析 contributions 前得到明确错误。
+- [ ] A1 未知贡献、字段、枚举与悬空引用全部拒装。
+- [ ] 已知贡献字段拼写错误拒装，不被静默忽略。
+- [ ] 现有 5 类贡献在新宿主行为不变。
+- [ ] feature fragment 不进入 A1 Schema；Manifest v2 另行评审。
 
-**A 批 / M1 / M1.5**
-- [ ] 命令面板列出插件 command（全限定 ID、来源标注）；`when` 语法超集解析报错。
-- [ ] 侧栏可见所有独立 workbench 贡献；点击打开；设置项可关。
-- [ ] SSH 插件安装后：外观设置出现"本地终端"开关（带插件图标，默认开，设置搜索可搜到）；工具栏图标点击 → 无连接本地终端 tab；再次点击复用既有 tab 不重载；开关关闭后图标（含 More 菜单）消失，重启保持；卸载后无陈旧键。
-- [ ] 老宿主 + 新插件（含新贡献）：跳过+黄标或按 `engines` 门槛拒绝，不崩。
+### command 与 menus
 
-**P2**
-- [ ] 任意页面 `Ctrl/⌘+J` 呼出/收起；面板内本地终端全功能（shell 选择/注入/标记/最近命令）；收起后会话保活（输出仍累积，重新展开可见）；拖拽高度持久化；应用退出后面板会话终止。
+- [ ] command 只能引用同插件 workbench，宿主内部使用全限定 ID。
+- [ ] `singleton`/`new` 和 `instance_key` 行为有自动化测试。
+- [ ] commandPalette、appToolbar、appSidebar 均展示插件来源。
+- [ ] appToolbar 缺省隐藏；每插件最多一个默认显示项。
+- [ ] `group/order` 稳定排序，不允许插件跨命名空间锚定。
+- [ ] `menus.when` 与 `command.enablement` 独立测试，执行前重新校验 enablement。
+- [ ] 外观设置与设置搜索只管理持久 chrome 摆放。
+- [ ] 国际化沿用顶层 `localizations`，无 `label_i18n` 平行字段。
 
-**回归**
-- [ ] 原 SSH workbench tab 行为不变；老插件（无新贡献）在新宿主行为不变。
+### context 与生命周期
+
+- [ ] 插件载荷只进入 `context.plugin`。
+- [ ] 宿主覆盖保留字段，插件无法伪造 `workbenchId`、`surface`、`restored` 或 `connectionId`。
+- [ ] tab/panel 复用键包含 presentation；同一 workbench 可同时存在两种实例。
+- [ ] 恢复 tab/panel 不重新执行 command，不自动启动本地 shell。
+- [ ] 关闭、卸载与异常退出均不会遗留 PTY 子进程。
+- [ ] plugin/connection/workbench/invocation scope 的父子关系和关闭顺序有自动化测试。
+- [ ] A1 `restore: none` 不产生恢复实例；后续 `placeholder/state/reattach` 分别有成功与失败回退测试。
+- [ ] 动态卸载清除 context key、菜单状态、webview、Sidecar 和子进程。
+
+### 非桌面形态
+
+- [ ] Web/Docker 对 appToolbar、appSidebar 和 panel 的显示/隐藏/回退行为明确。
+- [ ] panel 不可用时，`presentation: panel` 按规范回退到 tab 或返回明确的不支持错误；不得静默丢失入口。
+
+---
+
+## 11. 发布即冻结的契约
+
+以下内容一经发布只能增加，不能改名或改变既有语义：
+
+- 贡献类型名 `command`、`menus`；
+- command action 判别值 `open-workbench`；
+- menus 位置 `commandPalette`、`appToolbar`、`appSidebar`；
+- `reuse`、`presentation` 和实例复用规则；
+- `context.plugin` 与宿主保留字段的所有权；
+- A1 严格解析与 host-first 发布规则；
+- `menus.when` 与 `command.enablement` 的不同语义；
+- menu `group/order` 的稳定排序规则；
+- runtime scope、restore 和 unload 的生命周期语义；
+- Host API 现有 `notify` 语义；
+- 国际化继续使用顶层 `localizations`。
+
+任何 RPC command、动态宿主状态或 Sidecar 主动 UI 能力都必须通过新判别值、新权限和对应版本发布，不得重新解释上述字段。
