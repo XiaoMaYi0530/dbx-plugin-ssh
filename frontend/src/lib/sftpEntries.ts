@@ -39,8 +39,32 @@ export type SftpColumn = "size" | "modified" | "permissions" | "owner" | "group"
 
 const KNOWN_COLUMNS: readonly SftpColumn[] = ["size", "modified", "permissions", "owner", "group"];
 
-/** 持久化状态没有可用列偏好时的默认列。 */
-export const DEFAULT_VISIBLE_COLUMNS: SftpColumn[] = ["size", "modified"];
+/** 持久化状态没有可用列偏好时的默认列（全开 5 列）。 */
+export const DEFAULT_VISIBLE_COLUMNS: SftpColumn[] = ["size", "modified", "owner", "group", "permissions"];
+
+/** 各列默认宽度（px）；name 列自动伸缩不占固定值。 */
+export const DEFAULT_COLUMN_WIDTHS: Record<SftpColumn, number> = {
+  size: 80,
+  modified: 130,
+  owner: 100,
+  group: 100,
+  permissions: 90,
+};
+
+/** 每列最小宽度（px）：修改时间 72（短日期可读），其余 68。 */
+export const COLUMN_MIN_WIDTHS: Record<SftpColumn, number> = {
+  size: 68,
+  modified: 72,
+  owner: 68,
+  group: 68,
+  permissions: 68,
+};
+export const COLUMN_WIDTH_MAX = 400;
+
+/** 名称列最小宽度（px）：中文文件名不折叠/省略的下限。 */
+export const NAME_COLUMN_MIN = 90;
+/** 名称列最大宽度（px）。 */
+export const NAME_COLUMN_MAX = 600;
 
 export function sanitizeVisibleColumns(value: unknown): SftpColumn[] {
   if (!Array.isArray(value)) return [...DEFAULT_VISIBLE_COLUMNS];

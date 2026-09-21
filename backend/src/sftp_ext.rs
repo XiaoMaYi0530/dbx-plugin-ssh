@@ -14,7 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::model::normalize_remote_path;
-use crate::ssh::{apply_preserved_permissions, SshRuntime};
+use crate::ssh::{apply_preserved_permissions, lookup_owner_group_names, SshRuntime};
 
 /// Largest payload [`write_file`] accepts in one call; bigger files must go
 /// through the streaming upload slot (`sftp/upload/start`).
@@ -40,20 +40,26 @@ pub async fn stat(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<
         FileType::Symlink => "symlink",
         FileType::Other => "other",
     };
+    // SFTP 协议默认只返回 uid/gid 数字，user/group 字段为 None。
+    // 如果 russh-sftp 没拿到名字，远程跑 `stat -c '%U %G'` 查。
+    let (owner_name, group_name) = match (metadata.user.clone(), metadata.group.clone()) {
+        (Some(u), Some(g)) if !u.is_empty() && !g.is_empty() => (Some(u), Some(g)),
+        _ => lookup_owner_group_names(runtime, session_id, &path).await,
+    };
+    let owner_display = owner_name.clone().or_else(|| metadata.uid.map(|u| u.to_string()));
+    let group_display = group_name.clone().or_else(|| metadata.gid.map(|g| g.to_string()));
     Ok(json!({
         "path": path,
         "kind": kind,
         "size": metadata.size,
         "modifiedAt": metadata.mtime.map(u64::from),
         "mode": metadata.permissions.map(format_mode),
-        "owner": metadata
-            .user
-            .clone()
-            .or_else(|| metadata.uid.map(|uid| uid.to_string())),
-        "group": metadata
-            .group
-            .clone()
-            .or_else(|| metadata.gid.map(|gid| gid.to_string())),
+        "owner": owner_display,
+        "group": group_display,
+        "ownerName": owner_name,
+        "ownerUid": metadata.uid,
+        "groupName": group_name,
+        "groupGid": metadata.gid,
     }))
 }
 

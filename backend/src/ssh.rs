@@ -6793,6 +6793,37 @@ async fn enrich_owner_names(
     }
 }
 
+/// 远程 `stat -c '%U %G' path` 查单个文件的 owner/group 名字。
+/// SFTP 协议默认只返回 uid/gid 数字，russh-sftp 的 `Metadata.user/group`
+/// 在服务器未开 `username@hostname` 扩展时为 None。此函数作为 stat 的
+/// fallback，失败/超时返回 (None, None)，调用方用数字兜底。
+pub(crate) async fn lookup_owner_group_names(
+    runtime: &SshRuntime,
+    session_id: &str,
+    path: &str,
+) -> (Option<String>, Option<String>) {
+    let session = match runtime.session(session_id).await {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let cmd = format!("stat -c '%U %G' -- {}", exec::shell_quote(path));
+    let output = match exec::exec_plain(
+        &session.handle,
+        &cmd,
+        Duration::from_secs(OWNER_LOOKUP_TIMEOUT_SECS),
+        &[],
+    )
+    .await
+    {
+        Ok(outcome) => outcome.output,
+        Err(_) => return (None, None),
+    };
+    let mut parts = output.trim().split_whitespace();
+    let owner = parts.next().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let group = parts.next().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    (owner, group)
+}
+
 /// Parses `ls -l` output into `name -> (owner, group)`. Owner/group sit in
 /// fields 3/4 of every layout; the name start depends on whether the date
 /// collapsed into one epoch field (GNU `--time-style=+%s`, name from field 6)
