@@ -56,6 +56,7 @@ import {
   Siren,
   Square,
   SquarePlus,
+  ListPlus,
   SquareTerminal,
   Star,
   Terminal as TerminalIcon,
@@ -993,6 +994,9 @@ const isLocalMode = computed(() => localSession.value !== null);
 // SSH 专属动作与展示分支按它门控，与会话有无解耦。
 const localShellRestored = ref(false);
 const localUiMode = computed(() => isLocalMode.value || localShellRestored.value);
+// 底部 Dock 面板形态（surface=panel，宿主 §8.3）：隐藏工作台身份区，让面板
+// 聚焦终端本身；多开/换 shell 经面板「+」菜单（桥 openWorkbench 再开面板）。
+const panelSurface = computed(() => hostContext.value.surface === "panel");
 // —— 本地终端偏好（sidecar preferences.json 持久化；iframe 沙箱无 localStorage）——
 // shell 空串 = 跟随自动探测；integration 缺省开。
 const localShellPref = ref("");
@@ -2856,6 +2860,31 @@ async function openLocalMenu() {
   } finally {
     localShellsLoading.value = false;
   }
+}
+
+// Dock 面板「+」：按 shell 类型经桥 openWorkbench 再开一个面板条目
+// （宿主决定 surface 归属：panel webview 内 → 新面板条目；tab 内 → 新 tab）。
+const localShellSurfaceOpen = ref(false);
+async function openLocalShellSurfaceMenu() {
+  localShellSurfaceOpen.value = true;
+  if (localShellsLoading.value || localShells.value.length) return;
+  localShellsLoading.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ shells: typeof localShells.value }>("local/shells/list", {}, { timeoutMs: 10_000 });
+    localShells.value = result.shells || [];
+  } catch {
+    // 旧 sidecar 无发现方法：菜单退化为自动探测项。
+  } finally {
+    localShellsLoading.value = false;
+  }
+}
+function openLocalShellSurface(program?: string) {
+  localShellSurfaceOpen.value = false;
+  void window.dbxPlugin.openWorkbench?.(
+    "io.dbx.ssh.workbench",
+    { plugin: { mode: "local-terminal", ...(program ? { shell: program } : {}) } },
+    { forceNew: true },
+  );
 }
 
 async function setLocalShellPref(program: string) {
@@ -7218,6 +7247,7 @@ function closeToolbarPopovers() {
   bookmarkSaveOpen.value = false;
   batchTargetsOpen.value = false;
   localMenuOpen.value = false;
+  localShellSurfaceOpen.value = false;
 }
 
 function closeMenus() {
@@ -7742,7 +7772,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="workbench">
+  <main class="workbench" :class="{ 'panel-surface': panelSurface }">
     <header class="toolbar" :style="toolbarStyle">
       <!-- 连接信息入口：Info 图标按钮紧跟标识区（状态徽章右侧），弹层左对齐锚定 -->
       <div class="identity-side">
@@ -7819,6 +7849,24 @@ onBeforeUnmount(() => {
                   :title="t('localTerminal.openInNewTab')"
                   @click="openLocalTerminalTab"
                 ><SquarePlus /></button>
+                <Popover :open="localShellSurfaceOpen" @update:open="(open) => (localShellSurfaceOpen = open)">
+                  <PopoverAnchor as-child>
+                    <button
+                      v-if="canOpenLocalTab"
+                      class="local-tab-button"
+                      :title="t('localTerminal.openShellSurface')"
+                      @click="openLocalShellSurfaceMenu"
+                    ><ListPlus /></button>
+                  </PopoverAnchor>
+                  <PopoverContent class="popover" align="end" :side-offset="5">
+                    <button class="shell-surface-item" @click="openLocalShellSurface()">
+                      <TerminalIcon class="h-3.5 w-3.5" />{{ t("localTerminal.autoShell") }}
+                    </button>
+                    <button v-for="entry in localShells" :key="entry.program" class="shell-surface-item" @click="openLocalShellSurface(entry.program)">
+                      <TerminalIcon class="h-3.5 w-3.5" />{{ entry.name }}<span class="mono local-shell-program">{{ entry.program }}</span>
+                    </button>
+                  </PopoverContent>
+                </Popover>
                 <button class="primary-button" :disabled="localState === 'starting'" @click="localMenuOpen = false; localShellRestored || isLocalMode ? restartLocalTerminal() : requestLocalTerminal()">
                   {{ localUiMode ? t("localTerminal.restart") : t("localTerminal.open") }}
                 </button>
