@@ -93,7 +93,7 @@ AppSidebar 底部新增"插件工作台"区：读取前端插件 registry 中**�
 
 ### 5. 验收清单
 
-- [ ] P0：无连接打开工作台 → 直接进入本地终端；关闭 tab → 本地会话被回收（`workbench/close`）。
+- [x] P0（插件侧已落地，M0）：`context.localTerminal` 直通——无连接打开工作台 → 直接进入本地终端（跳过 SSH 连接引导，identity 显示"本地终端"）；工作台内"自查自开"按钮经 `host.openWorkbench(…, { localTerminal: true, workbenchId }, { forceNew: true })` 一键开独立本地终端 tab；关闭 tab → 本地会话被回收（`workbench/close`）。mock 夹具 `?local=1` 覆盖直通路径。
 - [ ] P1：侧栏可见所有独立 workbench 贡献；点击打开；设置项可关。
 - [ ] P2：任意页面 `Ctrl/⌘+J` 呼出/收起；面板内本地终端全功能可用（shell 选择/注入/标记/最近命令）；收起后会话保活（收起期间输出仍在累积，重新展开可见）；拖拽高度持久化；应用退出后面板会话终止。
 - [ ] 回归：原 SSH workbench tab 行为不变；老宿主 + 新插件包（无 surface 字段时）行为不变。
