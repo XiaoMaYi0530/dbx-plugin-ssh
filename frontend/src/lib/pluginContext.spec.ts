@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readPluginMode, resolveWorkbenchId } from "./pluginContext";
+import { readPluginMode, readPluginShell, resolveWorkbenchId } from "./pluginContext";
 
 // PR-A4 context.plugin 命名空间的读取助手。用例锁定两件事：A4 目标形状的
 // 类型安全读取（含对旧 { localTerminal: true } 直通形状的硬切换拒绝），与
@@ -26,6 +26,14 @@ describe("pluginContext (PR-A4 context.plugin namespace)", () => {
     expect(readPluginMode({})).toBe("");
     expect(readPluginMode(undefined)).toBe("");
     expect(readPluginMode(null)).toBe("");
+  });
+
+  it("readPluginShell reads the dock-selected shell type from the payload", () => {
+    expect(readPluginShell({ plugin: { mode: "local-terminal", shell: "/bin/fish" } })).toBe("/bin/fish");
+    expect(readPluginShell({ plugin: { mode: "local-terminal" } })).toBe("");
+    expect(readPluginShell({ plugin: { mode: "local-terminal", shell: "   " } })).toBe("");
+    expect(readPluginShell({ plugin: { shell: 42 } })).toBe("");
+    expect(readPluginShell(undefined)).toBe("");
   });
 
   it("resolveWorkbenchId prefers the host-injected id", () => {

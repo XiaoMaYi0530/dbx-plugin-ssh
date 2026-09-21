@@ -23,3 +23,14 @@ export function readPluginMode(context: Record<string, unknown> | undefined | nu
 export function resolveWorkbenchId(context: Record<string, unknown> | undefined | null, fallback: string): string {
   return normalizeConnectionText(context?.workbenchId) || fallback;
 }
+
+/**
+ * 读取 `context.plugin.shell`——底部 Dock「+」新建本地终端时按所选 shell
+ * 类型启动（如 zsh/fish）；未声明或缺省时回落调用方的 shell 偏好。
+ */
+export function readPluginShell(context: Record<string, unknown> | undefined | null): string {
+  const plugin = context?.plugin;
+  if (!plugin || typeof plugin !== "object" || Array.isArray(plugin)) return "";
+  const shell = (plugin as Record<string, unknown>).shell;
+  return typeof shell === "string" ? shell.trim() : "";
+}

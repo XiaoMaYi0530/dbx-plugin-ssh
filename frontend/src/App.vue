@@ -125,7 +125,7 @@ import { browseCommandHistory, commandInputAction, isPersistableCommand, pushCom
 import { filterQuickCommands, normalizeQuickCommands, QUICK_COMMANDS_LIMIT, quickCommandText, type QuickCommand } from "./lib/quickCommands";
 import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
-import { readPluginMode, resolveWorkbenchId } from "./lib/pluginContext";
+import { readPluginMode, readPluginShell, resolveWorkbenchId } from "./lib/pluginContext";
 import { clampFontSize } from "./lib/terminalZoom";
 import { commandMarkerTooltip, formatCommandDuration, Osc633CommandParser, runningCommandElapsedMs, type Osc633StreamUpdates } from "./lib/terminalCommandMarkers";
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress, type BatchProgressState } from "./lib/sftpBatchProgress";
@@ -2740,7 +2740,7 @@ function markLocalExited(code: number | null) {
   stopCommandMarkerTick();
 }
 
-async function startLocalTerminal() {
+async function startLocalTerminal(shellOverride?: string) {
   if (localState.value === "starting" || isLocalMode.value) return;
   localState.value = "starting";
   try {
@@ -2748,8 +2748,8 @@ async function startLocalTerminal() {
       workbenchId: workbenchId.value,
       cols: terminal?.cols || 120,
       rows: terminal?.rows || 32,
-      // 用户在 shell 选择器里记住的 shell；空串 = 跟随自动探测。
-      ...(localShellPref.value ? { shell: localShellPref.value } : {}),
+      // shell 优先级：Dock 显式指定 > 用户偏好 > 跟随自动探测。
+      ...(shellOverride?.trim() ? { shell: shellOverride.trim() } : localShellPref.value ? { shell: localShellPref.value } : {}),
       ...(localShellIntegrationPref.value ? {} : { shellIntegration: false }),
       // 重开继承上次 cwd（目录可能已被删，sidecar 会回落家目录）。
       ...(localLastCwd.value ? { cwd: localLastCwd.value } : {}),
@@ -7607,7 +7607,8 @@ async function initialize() {
       localShellRestored.value = true;
       return;
     }
-    await startLocalTerminal();
+    // Dock「+」按所选 shell 类型新建（context.plugin.shell），未指定走偏好。
+    await startLocalTerminal(readPluginShell(hostContext.value) || undefined);
     return;
   }
   if (!connectionId.value || !workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
