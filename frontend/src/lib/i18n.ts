@@ -108,6 +108,17 @@ const messages = {
     terminalZoom: {
       fontSize: "Terminal font size {size}px",
     },
+    terminalFont: {
+      title: "Terminal font",
+      family: "Font family",
+      followHost: "Follow host",
+      custom: "Custom…",
+      customPlaceholder: "CSS font stack, e.g. 'Fira Code', monospace",
+      size: "Font size",
+      reset: "Restore default",
+      applied: "Terminal font updated · {size}px",
+      resetDone: "Terminal font now follows the host settings",
+    },
     terminalCommand: {
       running: "Running: {command}",
       finished: "exit {code} · {duration}",
@@ -447,6 +458,17 @@ const messages = {
     terminalZoom: {
       fontSize: "Tamaño de fuente del terminal {size}px",
     },
+    terminalFont: {
+      title: "Fuente del terminal",
+      family: "Familia de fuente",
+      followHost: "Seguir al host",
+      custom: "Personalizada…",
+      customPlaceholder: "Pila CSS de fuentes, p. ej. 'Fira Code', monospace",
+      size: "Tamaño de fuente",
+      reset: "Restaurar predeterminado",
+      applied: "Fuente del terminal actualizada · {size}px",
+      resetDone: "La fuente del terminal vuelve a seguir la configuración del host",
+    },
     terminalCommand: {
       running: "Ejecutando: {command}",
       finished: "exit {code} · {duration}",
@@ -778,6 +800,17 @@ const messages = {
     },
     terminalZoom: {
       fontSize: "Dimensione del font del terminale {size}px",
+    },
+    terminalFont: {
+      title: "Carattere del terminale",
+      family: "Famiglia di caratteri",
+      followHost: "Segui l'host",
+      custom: "Personalizzato…",
+      customPlaceholder: "Famiglia CSS, es. 'Fira Code', monospace",
+      size: "Dimensione del carattere",
+      reset: "Ripristina predefinito",
+      applied: "Carattere del terminale aggiornato · {size}px",
+      resetDone: "Il carattere del terminale segue di nuovo le impostazioni dell'host",
     },
     terminalCommand: {
       running: "Esecuzione: {command}",
@@ -1111,6 +1144,17 @@ const messages = {
     terminalZoom: {
       fontSize: "ターミナルのフォントサイズ {size}px",
     },
+    terminalFont: {
+      title: "ターミナルフォント",
+      family: "フォントファミリー",
+      followHost: "ホストに従う",
+      custom: "カスタム…",
+      customPlaceholder: "CSS のフォントスタック（例: 'Fira Code', monospace）",
+      size: "フォントサイズ",
+      reset: "デフォルトに戻す",
+      applied: "ターミナルフォントを更新しました · {size}px",
+      resetDone: "ターミナルフォントはホスト設定に従います",
+    },
     terminalCommand: {
       running: "実行中: {command}",
       finished: "終了コード {code} · 所要 {duration}",
@@ -1443,6 +1487,17 @@ const messages = {
     terminalZoom: {
       fontSize: "Tamanho da fonte do terminal {size}px",
     },
+    terminalFont: {
+      title: "Fonte do terminal",
+      family: "Família da fonte",
+      followHost: "Seguir o host",
+      custom: "Personalizada…",
+      customPlaceholder: "Pilha CSS de fontes, ex. 'Fira Code', monospace",
+      size: "Tamanho da fonte",
+      reset: "Restaurar padrão",
+      applied: "Fonte do terminal atualizada · {size}px",
+      resetDone: "A fonte do terminal volta a seguir as configurações do host",
+    },
     terminalCommand: {
       running: "Executando: {command}",
       finished: "exit {code} · {duration}",
@@ -1774,6 +1829,17 @@ const messages = {
     },
     terminalZoom: {
       fontSize: "终端字号 {size}px",
+    },
+    terminalFont: {
+      title: "终端字体",
+      family: "字体族",
+      followHost: "跟随宿主",
+      custom: "自定义…",
+      customPlaceholder: "CSS 字体串，如 'Fira Code', monospace",
+      size: "字号",
+      reset: "恢复默认",
+      applied: "终端字体已更新 · {size}px",
+      resetDone: "终端字体已恢复跟随宿主",
     },
     terminalCommand: {
       running: "运行中：{command}",
@@ -2113,6 +2179,17 @@ const messages = {
     },
     terminalZoom: {
       fontSize: "終端字號 {size}px",
+    },
+    terminalFont: {
+      title: "終端字型",
+      family: "字型族",
+      followHost: "跟隨宿主",
+      custom: "自訂…",
+      customPlaceholder: "CSS 字型串，如 'Fira Code', monospace",
+      size: "字號",
+      reset: "還原預設",
+      applied: "終端字型已更新 · {size}px",
+      resetDone: "終端字型已還原為跟隨宿主",
     },
     terminalCommand: {
       running: "執行中：{command}",

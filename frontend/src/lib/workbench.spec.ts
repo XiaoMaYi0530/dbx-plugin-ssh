@@ -737,7 +737,10 @@ describe("App.vue popover/modal wiring structural guard", () => {
     for (const ref of ["quickMenuOpen", "connectionInfoOpen", "agentModeOpen", "highlightMenuOpen", "bookmarkSaveOpen", "columnsOpen", "transferPanelOpen", "batchTargetsOpen", "pathHistoryOpen"]) {
       expect(popoverRefs, `popover 提取丢失 ${ref}`).toContain(ref);
     }
-    for (const ref of ["settingsOpen", "alertTriageOpen", "hostKeyPrompt", "folderPickerTarget"]) {
+    // settingsDialog 抽出独立组件后，settingsOpen/profilesOpen 的 Dialog 模板
+    // 不在 App.vue 里，modal 清单只剩 App 内联弹窗；两个 open ref 仍在
+    // modalOpenStates（Esc 链）里覆盖。
+    for (const ref of ["alertTriageOpen", "hostKeyPrompt", "folderPickerTarget"]) {
       expect(modalRefs, `modal 提取丢失 ${ref}`).toContain(ref);
     }
   });
