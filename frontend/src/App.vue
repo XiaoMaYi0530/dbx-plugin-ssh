@@ -7554,7 +7554,7 @@ async function initialize() {
   });
   await nextTick();
   createTerminal();
-  // P0 无连接本地终端直通（HOST_TERMINAL_SURFACE.zh-CN.md §2 P0.1）：宿主以
+  // P0 无连接本地终端直通（HOST_PLUGIN_UI_SPEC.zh-CN.md §7.1）：宿主以
   // context.localTerminal=true 打开本 workbench（插件中心无连接打开 / 工具栏
   // 入口 / 自查自开桥）时，跳过 SSH 连接流程直接进入本地终端。宿主零改动。
   if (hostContext.value.localTerminal === true) {

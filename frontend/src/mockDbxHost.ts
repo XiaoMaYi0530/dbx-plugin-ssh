@@ -36,7 +36,7 @@ const localeListeners = new Set<(locale: string) => void>();
 const light = fixtureParams.get("theme") === "light";
 
 // ?local=1 模拟宿主以 context.localTerminal 打开的无连接本地终端 tab
-// （HOST_TERMINAL_SURFACE §2 P0.1 直通路径）：无 connectionId/connection。
+// （HOST_PLUGIN_UI_SPEC §7.1 直通路径）：无 connectionId/connection。
 const localOnlyContext = fixtureParams.get("local") === "1";
 
 const context = localOnlyContext
