@@ -7596,6 +7596,9 @@ async function initialize() {
   if (readPluginMode(hostContext.value) === "local-terminal") {
     if (!workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
     await hydratePrefs();
+    // 底部 Dock / webview 重建重开：先接回 sidecar 里仍绑定本 workbenchId 的
+    // 存活 shell（重开不泄漏新 PTY，spec §10 关闭无 PTY 遗留）。
+    if (await reattachLocalSession()) return;
     // A4 恢复语义（spec §7.6/§8.4）：恢复不是再次执行 command——restored tab
     // 不自动起 shell，只亮退出外壳，等用户点"重新打开"显式启动。
     if (restored.value) {

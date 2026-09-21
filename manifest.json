@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.ssh",
   "name": "SSH Terminal",
-  "version": "0.4.80",
+  "version": "0.4.81",
   "publisher": "jinpy",
   "description": "A secure SSH terminal for interactive sessions, SFTP file transfer, remote commands, and guarded server operations.",
   "source": "https://github.com/jinpy666/dbx-plugin-ssh",
@@ -624,7 +624,7 @@
       "action": {
         "type": "open-workbench",
         "workbench": "io.dbx.ssh.workbench",
-        "presentation": "tab",
+        "presentation": "panel",
         "reuse": "singleton",
         "instance_key": "local-terminal",
         "restore": "none",
@@ -649,13 +649,6 @@
           "location": "appToolbar",
           "command": "open-local-terminal",
           "group": "navigation",
-          "order": 100,
-          "default_visible": false
-        },
-        {
-          "location": "appSidebar",
-          "command": "open-local-terminal",
-          "group": "primary",
           "order": 100,
           "default_visible": true
         }
