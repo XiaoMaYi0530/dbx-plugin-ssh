@@ -755,8 +755,14 @@ impl LocalTerminalRuntime {
         }));
         if let Some(list) = shells.get("shells").and_then(|value| value.as_array()) {
             for shell in list {
-                let program = shell.get("program").and_then(|value| value.as_str()).unwrap_or_default();
-                let name = shell.get("name").and_then(|value| value.as_str()).unwrap_or(program);
+                let program = shell
+                    .get("program")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let name = shell
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(program);
                 if program.is_empty() {
                     continue;
                 }
