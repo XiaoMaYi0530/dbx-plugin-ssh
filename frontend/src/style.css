@@ -378,6 +378,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .file-header button:nth-child(n + 2) { justify-content: flex-end; }
 .file-header span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-rows { min-height: 0; flex: 1; overflow: auto; }
+/* 文件列表是全局"隐藏滚动条"规则（*::-webkit-scrollbar{display:none}）的例外：
+   6 列超宽时需要常驻横向滚动条，否则用户不知道后面还有列。 */
+.file-rows { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--foreground) 25%, transparent) transparent; }
+.file-rows::-webkit-scrollbar { display: block; height: 10px; width: 10px; }
+.file-rows::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--foreground) 25%, transparent); border-radius: 5px; }
+.file-rows::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--foreground) 40%, transparent); }
+.file-rows::-webkit-scrollbar-track { background: transparent; }
 .file-row { width: 100%; height: 30px; border: 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent); border-radius: 0; background: transparent; text-align: left; color: var(--foreground); font-size: 12px; cursor: default; }
 .file-row:hover { background: color-mix(in srgb, var(--accent) 65%, transparent); }
 .file-row.selected, .file-row.selected:hover { background: var(--accent); color: var(--accent-foreground); }

@@ -58,8 +58,10 @@ async fn sudo_exec(
 // stat
 // ---------------------------------------------------------------------------
 
-const GNU_STAT_FORMAT: &str = "%F|%i|%s|%Y|%a|%U|%G";
-const BSD_STAT_FORMAT: &str = "%HT|%i|%z|%m|%p|%Su|%Sg";
+/// GNU coreutils stat: type|inode|size|mtime|perm|user|uid|group|gid
+const GNU_STAT_FORMAT: &str = "%F|%i|%s|%Y|%a|%U|%u|%G|%g";
+/// BSD/macOS stat:  type|inode|size|mtime|perm|user|uid|group|gid
+const BSD_STAT_FORMAT: &str = "%HT|%i|%z|%m|%Lp|%Su|%u|%Sg|%g";
 
 /// Fields shared by both stat dialects, already normalized for JSON output.
 struct StatInfo {
@@ -69,6 +71,8 @@ struct StatInfo {
     mode: String,
     owner: String,
     group: String,
+    owner_uid: Option<u64>,
+    group_gid: Option<u64>,
 }
 
 /// Maps a `stat` file-type description (GNU `%F` or BSD `%HT`) to the kind
@@ -92,10 +96,10 @@ fn format_mode_bits(bits: u32) -> String {
     format!("{:04o}", bits & 0o7777)
 }
 
-/// Parses `stat -c '%F|%i|%s|%Y|%a|%U|%G'` output (GNU coreutils).
+/// Parses `stat -c '%F|%i|%s|%Y|%a|%U|%u|%G|%g'` output (GNU coreutils).
 fn parse_gnu_stat_line(line: &str) -> Option<StatInfo> {
     let fields = line.trim().split('|').collect::<Vec<_>>();
-    if fields.len() < 7 {
+    if fields.len() < 9 {
         return None;
     }
     let mode = u32::from_str_radix(fields[4].trim(), 8).ok()?;
@@ -105,16 +109,17 @@ fn parse_gnu_stat_line(line: &str) -> Option<StatInfo> {
         modified_at: fields[3].trim().parse().unwrap_or(0),
         mode: format_mode_bits(mode),
         owner: fields[5].trim().to_string(),
-        group: fields[6].trim().to_string(),
+        owner_uid: fields[6].trim().parse().ok(),
+        group: fields[7].trim().to_string(),
+        group_gid: fields[8].trim().parse().ok(),
     })
 }
 
-/// Parses `stat -f '%HT|%i|%z|%m|%p|%Su|%Sg'` output (BSD/macOS stat).
-/// BSD `%p` is the decimal `st_mode` including file-type bits, so the
-/// permission mask is applied before formatting.
+/// Parses BSD stat output — `stat -f '%HT|%i|%z|%m|%Lp|%Su|%u|%Sg|%g'`.
+/// BSD %Lp is decimal st_mode including file-type bits; mask to 0o7777.
 fn parse_bsd_stat_line(line: &str) -> Option<StatInfo> {
     let fields = line.trim().split('|').collect::<Vec<_>>();
-    if fields.len() < 7 {
+    if fields.len() < 9 {
         return None;
     }
     let mode = fields[4].trim().parse::<u32>().ok()?;
@@ -124,7 +129,9 @@ fn parse_bsd_stat_line(line: &str) -> Option<StatInfo> {
         modified_at: fields[3].trim().parse().unwrap_or(0),
         mode: format_mode_bits(mode),
         owner: fields[5].trim().to_string(),
-        group: fields[6].trim().to_string(),
+        owner_uid: fields[6].trim().parse().ok(),
+        group: fields[7].trim().to_string(),
+        group_gid: fields[8].trim().parse().ok(),
     })
 }
 
@@ -152,6 +159,12 @@ pub async fn stat(runtime: &SshRuntime, session_id: &str, path: &str) -> Result<
         "mode": info.mode,
         "owner": info.owner,
         "group": info.group,
+        // GNU/BSD stat 总是会输出 %u / %g，所以数字字段必然有值。
+        // owner / group 这里就是用户名/组名字符串，name 和 display 相同。
+        "ownerName": info.owner,
+        "ownerUid": info.owner_uid,
+        "groupName": info.group,
+        "groupGid": info.group_gid,
     }))
 }
 
@@ -656,54 +669,69 @@ mod tests {
 
     #[test]
     fn parses_gnu_stat_lines() {
-        let info = parse_gnu_stat_line("regular file|12345|1024|1720000000|644|root|root").unwrap();
+        // GNU stat -c '%F|%i|%s|%Y|%a|%U|%u|%G|%g' — 9 字段
+        let info =
+            parse_gnu_stat_line("regular file|12345|1024|1720000000|644|root|0|root|0").unwrap();
         assert_eq!(info.kind, "file");
         assert_eq!(info.size, 1024);
         assert_eq!(info.modified_at, 1720000000);
         assert_eq!(info.mode, "0644");
         assert_eq!(info.owner, "root");
         assert_eq!(info.group, "root");
+        assert_eq!(info.owner_uid, Some(0));
+        assert_eq!(info.group_gid, Some(0));
 
-        // GNU prints "regular empty file" for zero-length regular files and
-        // keeps special bits in %a.
+        // 普通用户 alice (uid=1000, gid=1000) 的 SUID 可执行文件
         let empty =
-            parse_gnu_stat_line("regular empty file|99|0|1720000002|4755|alice|wheel").unwrap();
+            parse_gnu_stat_line("regular empty file|99|0|1720000002|4755|alice|1000|wheel|1000")
+                .unwrap();
         assert_eq!(empty.kind, "file");
         assert_eq!(empty.mode, "4755");
+        assert_eq!(empty.owner_uid, Some(1000));
+        assert_eq!(empty.group_gid, Some(1000));
 
-        let dir = parse_gnu_stat_line("directory|2|4096|1720000001|755|root|root").unwrap();
+        let dir = parse_gnu_stat_line("directory|2|4096|1720000001|755|root|0|root|0").unwrap();
         assert_eq!(dir.kind, "directory");
         assert_eq!(dir.mode, "0755");
 
-        let link = parse_gnu_stat_line("symbolic link|98|11|1720000003|777|root|root").unwrap();
+        let link = parse_gnu_stat_line("symbolic link|98|11|1720000003|777|root|0|root|0").unwrap();
         assert_eq!(link.kind, "symlink");
 
         let device =
-            parse_gnu_stat_line("character special file|97|0|1720000004|666|root|root").unwrap();
+            parse_gnu_stat_line("character special file|97|0|1720000004|666|root|0|root|0")
+                .unwrap();
         assert_eq!(device.kind, "other");
 
         assert!(parse_gnu_stat_line("garbage").is_none());
-        assert!(parse_gnu_stat_line("regular file|1|2|3|999|root|root").is_none());
+        // 字段数不够（少 2 个 uid/gid）
+        assert!(parse_gnu_stat_line("regular file|1|2|3|644|root|root").is_none());
+        // mode 非法
+        assert!(parse_gnu_stat_line("regular file|1|2|3|999|root|0|root|0").is_none());
     }
 
     #[test]
     fn parses_bsd_stat_lines() {
-        // BSD %p is the full st_mode: 0o40755 -> 0755, 0o100644 -> 0644,
-        // 0o120777 -> 0777.
-        let dir = parse_bsd_stat_line("Directory|2|4096|1720000000|16877|root|wheel").unwrap();
+        // BSD stat -f '%HT|%i|%z|%m|%Lp|%Su|%u|%Sg|%g' — 9 字段
+        let dir = parse_bsd_stat_line("Directory|2|4096|1720000000|16877|root|0|wheel|0").unwrap();
         assert_eq!(dir.kind, "directory");
-        assert_eq!(dir.mode, "0755");
+        assert_eq!(dir.mode, "0755"); // 16877 & 0o7777 = 0o755
         assert_eq!(dir.size, 4096);
         assert_eq!(dir.owner, "root");
+        assert_eq!(dir.owner_uid, Some(0));
+        assert_eq!(dir.group_gid, Some(0));
 
-        let file = parse_bsd_stat_line("File|99|1024|1720000001|33188|alice|staff").unwrap();
+        let file =
+            parse_bsd_stat_line("File|99|1024|1720000001|33188|alice|1000|staff|500").unwrap();
         assert_eq!(file.kind, "file");
-        assert_eq!(file.mode, "0644");
+        assert_eq!(file.mode, "0644"); // 33188 & 0o7777 = 0o644
         assert_eq!(file.group, "staff");
+        assert_eq!(file.owner_uid, Some(1000));
+        assert_eq!(file.group_gid, Some(500));
 
-        let link = parse_bsd_stat_line("Symbolic Link|98|11|1720000002|41471|root|wheel").unwrap();
+        let link =
+            parse_bsd_stat_line("Symbolic Link|98|11|1720000002|41471|root|0|wheel|0").unwrap();
         assert_eq!(link.kind, "symlink");
-        assert_eq!(link.mode, "0777");
+        assert_eq!(link.mode, "0777"); // 41471 & 0o7777 = 0o7777
     }
 
     #[test]
