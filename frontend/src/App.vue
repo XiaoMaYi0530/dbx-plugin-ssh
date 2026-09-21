@@ -988,14 +988,14 @@ const localPendingFrames = new Map<number, { stream: number; data: Uint8Array }>
 let localReplayInFlight = false;
 let localReplayNoProgress = 0;
 const isLocalMode = computed(() => localSession.value !== null);
-// A4 恢复外壳（spec §7.6/§8.4）：restored 本地 tab 不自动起 shell，用退出
-// 覆盖层作外壳态等待用户显式启动；shell 真正起来后（startLocalTerminal 成功）
-// 即清除。localUiMode = "本地终端 UI 态"（有会话运行或恢复外壳），工具栏的
-// SSH 专属动作与展示分支按它门控，与会话有无解耦。
+// A4 restored shell (spec §7.6/§8.4): a restored local tab never auto-starts a shell; the exit
+// overlay as the shell state waiting for an explicit start; cleared once a shell actually comes up (startLocalTerminal succeeds)
+// cleared. localUiMode = "local-terminal UI state" (running session or restored shell); SSH-only toolbar actions gate on it,
+// SSH-only toolbar actions and display branches gate on it, decoupled from session existence.
 const localShellRestored = ref(false);
 const localUiMode = computed(() => isLocalMode.value || localShellRestored.value);
-// 底部 Dock 面板形态（surface=panel，宿主 §8.3）：隐藏工作台身份区，让面板
-// 聚焦终端本身；多开/换 shell 经面板「+」菜单（桥 openWorkbench 再开面板）。
+// Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
+// and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
 const panelSurface = computed(() => hostContext.value.surface === "panel");
 // —— 本地终端偏好（sidecar preferences.json 持久化；iframe 沙箱无 localStorage）——
 // shell 空串 = 跟随自动探测；integration 缺省开。
@@ -1046,9 +1046,9 @@ const locale = ref("zh-CN");
 const t = (key: string, values: Record<string, string | number> = {}) => workbenchMessage(locale.value, key, values);
 const connectionId = computed(() => normalizeConnectionText(hostContext.value.connectionId));
 // Host API 1.1 provides a stable workbenchId in the host context; on 1.0 a
-// locally generated id keeps session scoping per workbench instance. A4 起
-// 插件不再自传 workbenchId（宿主权威，spec §11）——1.0 宿主缺失注入时仍由
-// 此 fallback 兜底（用例见 lib/pluginContext.spec.ts）。
+// locally generated id keeps session scoping per workbench instance. Since A4
+// The plugin no longer passes its own workbenchId (host-authoritative, spec §11) — when a 1.0 host omits the injection,
+// this fallback covers it (see lib/pluginContext.spec.ts).
 const fallbackWorkbenchId = crypto.randomUUID();
 const workbenchId = computed(() => resolveWorkbenchId(hostContext.value, fallbackWorkbenchId));
 const restored = computed(() => hostContext.value.restored === true);
@@ -1146,7 +1146,7 @@ const commandMarkerDetails = computed(() => commandMarkerTooltip(
   },
 ));
 const connectionIdentity = computed(() => {
-  // 无连接本地终端 tab（含恢复外壳）：没有连接身份可显示。
+  // Connectionless local-terminal tab (including the restored shell): there is no connection identity to show.
   if (localUiMode.value && !connectionId.value) return t("localTerminal.active");
   const host = connection.value.host || connection.value.name || connectionId.value || "–";
   const identity = connection.value.username ? `${connection.value.username}@${host}` : host;
@@ -2752,7 +2752,7 @@ async function startLocalTerminal(shellOverride?: string) {
       workbenchId: workbenchId.value,
       cols: terminal?.cols || 120,
       rows: terminal?.rows || 32,
-      // shell 优先级：Dock 显式指定 > 用户偏好 > 跟随自动探测。
+      // Shell precedence: explicit dock choice > user preference > auto-detection.
       ...(shellOverride?.trim() ? { shell: shellOverride.trim() } : localShellPref.value ? { shell: localShellPref.value } : {}),
       ...(localShellIntegrationPref.value ? {} : { shellIntegration: false }),
       // 重开继承上次 cwd（目录可能已被删，sidecar 会回落家目录）。
@@ -2764,7 +2764,7 @@ async function startLocalTerminal(shellOverride?: string) {
     }
     localSession.value = { sessionId: info.sessionId, shell: info.shell };
     localState.value = "running";
-    // 恢复外壳到此结束：会话已显式重启。
+    // The restored shell ends here: the session was explicitly restarted.
     localShellRestored.value = false;
     localExitCode.value = null;
     localLastSequence.value = 0;
@@ -2792,8 +2792,8 @@ async function closeLocalTerminal() {
   terminal?.focus();
 }
 
-// 恢复外壳的"关闭"：还没有会话可关——与 SSH restored tab 同款落断开兜底态
-// （不重放连接，spec §7.6），退出覆盖层随之退场。
+// "Close" on a restored shell: there is no session to close — fall into the same disconnected state as an SSH restored tab
+// (no connection replay, spec §7.6) and the exit overlay steps aside.
 function dismissRestoredLocalShell() {
   localShellRestored.value = false;
   localState.value = "exited";
@@ -2801,8 +2801,8 @@ function dismissRestoredLocalShell() {
   terminalError.value = t("restartDisconnected");
 }
 
-// 工具栏本地终端钮：运行中→关闭；恢复外壳→直接重开（无会话可关，跳过
-// SSH 确认流）；SSH 态→走既有确认流。
+// Toolbar local-terminal button: running -> close; restored shell -> reopen directly (nothing to close, skipping
+// SSH confirm flow); an SSH state walks the existing confirm flow.
 function toggleLocalTerminal() {
   if (localShellRestored.value) {
     void restartLocalTerminal();
@@ -2862,11 +2862,11 @@ async function openLocalMenu() {
   }
 }
 
-// Dock 面板「+」：按 shell 类型经桥 openWorkbench 再开一个面板条目
-// （宿主决定 surface 归属：panel webview 内 → 新面板条目；tab 内 → 新 tab）。
+// Dock panel "+": opens another dock entry with the selected shell type via the bridge openWorkbench
+// (the host owns the surface: inside a panel webview -> a new dock entry; inside a tab -> a new tab).
 const localShellSurfaceOpen = ref(false);
-// host.listConnections（PR-A4 通用扩展点）：只读无密的插件自有连接清单，
-// 供面板内连接切换；旧宿主无此方法时降级隐藏连接区。
+// host.listConnections (PR-A4 generic extension point): a read-only, secret-free list of the plugin's own connections,
+// for in-panel connection switching; hosts without it degrade to a hidden connection section.
 const dockConnections = ref<Array<{ id: string; name: string; providerId: string; connectionType?: string; readOnly?: boolean }>>([]);
 async function openLocalShellSurfaceMenu() {
   localShellSurfaceOpen.value = true;
@@ -2876,7 +2876,7 @@ async function openLocalShellSurfaceMenu() {
     const result = await window.dbxPlugin.invoke<{ shells: typeof localShells.value }>("local/shells/list", {}, { timeoutMs: 10_000 });
     localShells.value = result.shells || [];
   } catch {
-    // 旧 sidecar 无发现方法：菜单退化为自动探测项。
+    // Legacy sidecars without discovery: the menu degrades to the auto-detect entry.
   } finally {
     localShellsLoading.value = false;
   }
@@ -2884,7 +2884,7 @@ async function openLocalShellSurfaceMenu() {
     const listed = await window.dbxPlugin.request<{ connections?: typeof dockConnections.value }>("host.listConnections");
     dockConnections.value = listed?.connections ?? [];
   } catch {
-    // 旧宿主无 listConnections 扩展点：连接切换区隐藏。
+    // Legacy hosts without the listConnections extension point: the connection section stays hidden.
     dockConnections.value = [];
   }
 }
@@ -2928,10 +2928,10 @@ async function setLocalShellIntegrationPref(enabled: boolean) {
   }
 }
 
-// P0.2 自查自开：经宿主 openWorkbench 桥开一个独立的无连接本地终端 tab。
-// A4 目标契约（spec §4/§11）：插件载荷只进 context.plugin，实例身份
-// （workbenchId）由宿主生成——旧宿主不注入时由 workbenchId fallback 兜底。
-// 旧宿主无此桥时菜单项不出现。
+// P0.2 self-open: opens a separate connectionless local-terminal tab through the host openWorkbench bridge.
+// A4 target contract (spec §4/§11): the plugin payload lives only in context.plugin and the instance identity
+// (workbenchId) is generated by the host — when a legacy host omits it, the workbenchId fallback covers it.
+// The menu item is hidden on hosts without this bridge.
 const canOpenLocalTab = computed(() => Boolean(window.dbxPlugin?.openWorkbench));
 
 async function openLocalTerminalTab() {
@@ -7643,24 +7643,24 @@ async function initialize() {
   });
   await nextTick();
   createTerminal();
-  // P0 无连接本地终端直通（HOST_PLUGIN_UI_SPEC.zh-CN.md §4/§7.1）：宿主以
-  // command context（plugin.mode="local-terminal"）打开本 workbench（command
-  // 面板 / 工具栏入口 / 自查自开桥）时，跳过 SSH 连接流程直接进入本地终端。
+  // P0 connectionless local-terminal passthrough (HOST_PLUGIN_UI_SPEC §4/§7.1): when the host opens this workbench with
+  // the workbench is opened with the command context (plugin.mode="local-terminal") (command
+  // panel / toolbar entry / self-open bridge), the SSH connection flow is skipped and the local terminal opens directly.
   if (readPluginMode(hostContext.value) === "local-terminal") {
     if (!workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
     await hydratePrefs();
-    // 底部 Dock / webview 重建重开：先接回 sidecar 里仍绑定本 workbenchId 的
-    // 存活 shell（重开不泄漏新 PTY，spec §10 关闭无 PTY 遗留）。
+    // Bottom dock / webview rebuild reopen: first reattach the live shell still bound to this workbenchId in the
+    // live shell (reopening never leaks a new PTY; spec §10 leaves no PTY behind on close).
     if (await reattachLocalSession()) return;
-    // A4 恢复语义（spec §7.6/§8.4）：恢复不是再次执行 command——restored tab
-    // 不自动起 shell，只亮退出外壳，等用户点"重新打开"显式启动。
+    // A4 restore semantics (spec §7.6/§8.4): restoring is not re-running the command — a restored tab
+    // no automatic shell — just the exit shell until the user explicitly hits "Reopen".
     if (restored.value) {
       localSession.value = null;
       localState.value = "exited";
       localShellRestored.value = true;
       return;
     }
-    // Dock「+」按所选 shell 类型新建（context.plugin.shell），未指定走偏好。
+    // Dock "+" creates with the selected shell type (context.plugin.shell); when unset the preference applies.
     await startLocalTerminal(readPluginShell(hostContext.value) || undefined);
     return;
   }

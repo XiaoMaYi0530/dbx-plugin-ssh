@@ -82,12 +82,12 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
    hidden 负责长主机名截断，弹层不会被裁）。 */
 .identity-side { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; gap: 4px; }
 
-/* Dock 面板形态（surface=panel）：隐藏连接身份区，聚焦终端本体。 */
+/* Dock panel surface (surface=panel): hide the connection identity block and focus the terminal. */
 .workbench.panel-surface .identity-side {
   display: none;
 }
 
-/* 面板「+」shell 菜单条目。 */
+/* Panel "+" shell menu entries. */
 .shell-surface-item {
   display: flex;
   width: 100%;

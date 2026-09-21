@@ -1,23 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { readPluginMode, readPluginShell, resolveWorkbenchId } from "./pluginContext";
 
-// PR-A4 context.plugin 命名空间的读取助手。用例锁定两件事：A4 目标形状的
-// 类型安全读取（含对旧 { localTerminal: true } 直通形状的硬切换拒绝），与
-// 宿主权威 workbenchId 的旧宿主（Host API 1.0 不注入）fallback 兼容
-// （实施计划 R-旧宿主兼容：fallback 必须保留并有用例）。
+// Read helpers for the PR-A4 context.plugin namespace. The cases lock two things: type-safe reads of the A4 target shape
+// type-safe reads (including the hard-switch rejection of the legacy { localTerminal: true } passthrough shape) and
+// workbenchId from legacy hosts (Host API 1.0 does not inject it) falls back for compatibility
+// (impl-plan R-legacy-host-compat: the fallback must be kept and covered by a test).
 describe("pluginContext (PR-A4 context.plugin namespace)", () => {
   it("readPluginMode reads context.plugin.mode from the A4 shape", () => {
     expect(readPluginMode({ plugin: { mode: "local-terminal" } })).toBe("local-terminal");
-    // 预留扩展位（P2 panel surface 等后续模式名原样透出，由调用方比较）。
+    // Reserved extension slot (later mode names such as the P2 panel surface pass through verbatim for the caller to compare).
     expect(readPluginMode({ plugin: { mode: "panel" } })).toBe("panel");
     expect(readPluginMode({ plugin: { mode: "local-terminal", extra: 1 } })).toBe("local-terminal");
   });
 
   it("readPluginMode rejects the legacy top-level shape and malformed payloads (hard switch)", () => {
-    // 旧 { localTerminal: true } 直通形状不再触发本地模式。
+    // The legacy { localTerminal: true } passthrough shape no longer triggers local-terminal mode.
     expect(readPluginMode({ localTerminal: true })).toBe("");
     expect(readPluginMode({ localTerminal: true, plugin: { mode: "local-terminal" } })).toBe("local-terminal");
-    // 载荷必须是普通对象，mode 必须是字符串。
+    // the payload must be a plain object and mode must be a string.
     expect(readPluginMode({ plugin: null })).toBe("");
     expect(readPluginMode({ plugin: "local-terminal" })).toBe("");
     expect(readPluginMode({ plugin: [{ mode: "local-terminal" }] })).toBe("");
@@ -45,7 +45,7 @@ describe("pluginContext (PR-A4 context.plugin namespace)", () => {
     expect(resolveWorkbenchId({}, "fallback")).toBe("fallback");
     expect(resolveWorkbenchId(undefined, "fallback")).toBe("fallback");
     expect(resolveWorkbenchId(null, "fallback")).toBe("fallback");
-    // 空白与序列化空值视同缺失（与 normalizeConnectionText 的展示语义一致）。
+    // Blank and serialized null-ish values count as missing (same semantics as normalizeConnectionText).
     expect(resolveWorkbenchId({ workbenchId: "   " }, "fallback")).toBe("fallback");
     expect(resolveWorkbenchId({ workbenchId: "null" }, "fallback")).toBe("fallback");
     expect(resolveWorkbenchId({ workbenchId: 42 }, "fallback")).toBe("fallback");

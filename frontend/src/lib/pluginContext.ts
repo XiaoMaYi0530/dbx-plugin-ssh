@@ -1,13 +1,13 @@
-// PR-A4 context.plugin 命名空间（HOST_PLUGIN_UI_SPEC §4/§7.5/§11）：插件载荷
-// 只进 context.plugin；workbenchId/restored/surface/connectionId 是宿主保留
-// 字段，由宿主在最终 context 注入，插件不得伪造。本地终端直通以
-// `plugin.mode === "local-terminal"` 判定——旧的顶层 `{ localTerminal: true }`
-// 形状随宿主 A1 契约移除（读写两端同仓硬切换，不做双读兼容）。纯函数。
+// PR-A4 context.plugin namespace (HOST_PLUGIN_UI_SPEC §4/§7.5/§11): the plugin payload
+// Plugin payload goes only into context.plugin; workbenchId/restored/surface/connectionId are host-reserved
+// fields are injected by the host into the final context and must never be forged by the plugin. Local-terminal
+// `plugin.mode === "local-terminal"` — the legacy top-level `{ localTerminal: true }`
+// shape was removed with the host A1 contract (hard switch on both read and write sides in-repo, no dual-read compat). Pure functions.
 import { normalizeConnectionText } from "./connectionInfo";
 
 /**
- * 读取 `context.plugin.mode`；载荷缺失/非对象/数组/模式非字符串一律返回
- * 空串，调用方以具体模式名比较（`readPluginMode(ctx) === "local-terminal"`）。
+ * Reads `context.plugin.mode`; missing/non-object/array payloads or a non-string mode return
+ * empty string; callers compare against a concrete mode name (`readPluginMode(ctx) === "local-terminal"`).
  */
 export function readPluginMode(context: Record<string, unknown> | undefined | null): string {
   const plugin = context?.plugin;
@@ -17,16 +17,16 @@ export function readPluginMode(context: Record<string, unknown> | undefined | nu
 }
 
 /**
- * 宿主权威 workbenchId：Host API 1.1+ 由宿主注入；旧宿主（1.0，不注入该
- * 字段）回落调用方本地生成的 id，保持会话按 workbench 实例隔离。
+ * Host-authoritative workbenchId: injected by Host API 1.1+; legacy hosts (1.0, which do not inject the
+ * field) fall back to the caller's locally generated id, keeping sessions scoped per workbench instance.
  */
 export function resolveWorkbenchId(context: Record<string, unknown> | undefined | null, fallback: string): string {
   return normalizeConnectionText(context?.workbenchId) || fallback;
 }
 
 /**
- * 读取 `context.plugin.shell`——底部 Dock「+」新建本地终端时按所选 shell
- * 类型启动（如 zsh/fish）；未声明或缺省时回落调用方的 shell 偏好。
+ * Reads `context.plugin.shell` — when the bottom dock "+" creates a local terminal it starts the
+ * selected type (e.g. zsh/fish); when absent or default it falls back to the caller's shell preference.
  */
 export function readPluginShell(context: Record<string, unknown> | undefined | null): string {
   const plugin = context?.plugin;
