@@ -921,8 +921,6 @@ let unsubscribeAppearance: (() => void) | undefined;
 let unsubscribeTheme: (() => void) | undefined;
 let unsubscribeLocale: (() => void) | undefined;
 let unsubscribeContext: (() => void) | undefined;
-let unsubscribeFileDrag: (() => void) | undefined;
-let unsubscribeFileDrop: (() => void) | undefined;
 let persistTimer = 0;
 let resizeTimer = 0;
 let reconnectTimer = 0;
@@ -4711,6 +4709,7 @@ function registerHostFileTransferBridge() {
 }
 
 async function handleHostFileDrop(files: Array<{ handleId: string; name: string; size: number; contentType: string }>) {
+  dragActive.value = false;
   const plan = planHostFileDrop({
     files: files.length,
     connected: connected.value,
@@ -7319,11 +7318,6 @@ async function initialize() {
   });
   unsubscribeEvent = api.onEvent(handleEvent);
   unsubscribeBinary = api.onBinary(handleBinary);
-  unsubscribeFileDrag = api.fileTransfer?.onDragState((active) => (dragActive.value = active));
-  unsubscribeFileDrop = api.fileTransfer?.onDrop((files) => {
-    dragActive.value = false;
-    void uploadHandleFiles(files).then(() => loadDirectory()).catch(showError);
-  });
   await nextTick();
   createTerminal();
   if (!connectionId.value || !workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
@@ -7433,8 +7427,6 @@ onBeforeUnmount(() => {
   unsubscribeTheme?.();
   unsubscribeLocale?.();
   unsubscribeContext?.();
-  unsubscribeFileDrag?.();
-  unsubscribeFileDrop?.();
   resizeObserver?.disconnect();
   disposeInput?.dispose();
   disposeSelectionCopy?.dispose();
