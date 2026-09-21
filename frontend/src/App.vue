@@ -2,8 +2,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { ImageAddon } from "@xterm/addon-image";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
   Archive,
@@ -82,6 +84,7 @@ import {
   type TrzszProgressState,
 } from "./lib/terminalTrzsz";
 import { Osc7DirectoryParser } from "./lib/terminalDirectoryTracking";
+import { handleOsc52ClipboardWrite, handleTerminalColorQuery } from "./lib/terminalOsc";
 import {
   resolveTerminalKeyAction,
   resolveTerminalRightClickAction,
@@ -907,6 +910,12 @@ const batchProgress = ref<BatchProgressState | null>(null);
 let terminal: Terminal | undefined;
 let fitAddon: FitAddon | undefined;
 let searchAddon: SearchAddon | undefined;
+// OSC 10/11 颜色查询应答 handler（registerOscHandler 的 disposable）：主题切换
+// 时重挂，终端销毁时统一释放；OSC 52 只在 createTerminal 挂一次。
+let oscColorQueryDisposables: { dispose(): void }[] = [];
+let osc52Disposable: { dispose(): void } | undefined;
+// 主题色解析失败时颜色查询的兜底应答（深色系常规值，仅在宿主下发非法颜色时触达）。
+const OSC_COLOR_FALLBACK = { foreground: "#c9d1d9", background: "#0d1117" };
 let terminalPasteHandler: ((event: ClipboardEvent) => void) | undefined;
 let terminalWheelHandler: ((event: WheelEvent) => void) | undefined;
 // 点击定位光标（iTerm2 风格）：按下位置记忆 + 松开时判定“原地点击”。
@@ -1352,6 +1361,9 @@ function applyAppearance(next: DbxPluginAppearanceInput) {
   followHostFonts(resolved);
   if (terminal) {
     terminal.options.theme = terminalTheme();
+    // 10/11 应答闭包捕获注册时的颜色值：主题切换后重挂，查询才能返回新主题色
+    //（对标 electerm 的 registerTerminalColorQueryHandlers 语义）。
+    registerOscColorQueryHandlers();
     // 宿主下发的字体大小即缩放基准；外观切换后回到基准值，
     // 但用户 A+/A- 调过的字号（localStorage）优先于宿主基准。
     const persistedFontSize = loadPersistedTerminalFontSize();
@@ -1359,6 +1371,26 @@ function applyAppearance(next: DbxPluginAppearanceInput) {
     terminal.options.fontSize = terminalFontSize.value;
     scheduleFit();
   }
+}
+
+// vim/tmux/neovim 等启动时用 OSC 10/11 查询终端前景/背景色定调色板；xterm 内核
+// 不应答，这里按当前主题补答（对标 electerm）。颜色"设置"分支交回内核处理。
+function registerOscColorQueryHandlers() {
+  for (const disposable of oscColorQueryDisposables) {
+    if (disposable.dispose) disposable.dispose();
+  }
+  oscColorQueryDisposables = [];
+  if (!terminal) return;
+  const term = terminal;
+  const colors = appearance.value.colors;
+  oscColorQueryDisposables.push(
+    term.parser.registerOscHandler(10, (data) =>
+      handleTerminalColorQuery(term, 10, colors.foreground, OSC_COLOR_FALLBACK.foreground, data),
+    ),
+    term.parser.registerOscHandler(11, (data) =>
+      handleTerminalColorQuery(term, 11, colors.background, OSC_COLOR_FALLBACK.background, data),
+    ),
+  );
 }
 
 // 字体始终跟随宿主：不写内联字体变量——内联样式会压过 themeSync 桥样式表里的
@@ -1416,6 +1448,20 @@ function createTerminal() {
   terminal.loadAddon(searchAddon);
   terminal.loadAddon(new WebLinksAddon());
   terminal.open(terminalHost.value);
+  // 对标 electerm 的终端体验增强（须在 open 之后挂载）：
+  // - Unicode 11 宽度表：emoji/新版 CJK 符号按两列计宽，旧宽度表会错位对齐；
+  // - 内联图像（sixel + iTerm2 OSC 1337）：imgcat/chafa/htop 图表可渲染，
+  //   像素上限与 electerm 同款 32MiB。
+  // 连字 addon（@xterm/addon-ligatures）暂不引入：其 opentype.js 依赖走 Node
+  // 内置模块，Electron（electerm）可用，本插件的沙箱 iframe 模块求值即崩，
+  // 上游尚无浏览器安全构建。
+  terminal.loadAddon(new Unicode11Addon());
+  terminal.unicode.activeVersion = "11";
+  terminal.loadAddon(new ImageAddon({ pixelLimit: 33_554_432 }));
+  registerOscColorQueryHandlers();
+  osc52Disposable = terminal.parser.registerOscHandler(52, (data) =>
+    handleOsc52ClipboardWrite(data, (text) => writeClipboardText(text, clipboardDeps())),
+  );
   terminal.attachCustomKeyEventHandler(handleTerminalKey);
   searchAddon.onDidChangeResults(({ resultCount, resultIndex }) => {
     if (!searchOpen.value) return;
@@ -6142,6 +6188,9 @@ async function openReplay(item: RecordingSummary) {
         fontSize: appearance.value.terminal.fontSize,
       });
       replayTerminal.open(replayHost.value);
+      // 与主终端同用 Unicode 11 宽度表：emoji/宽字符行在回放里保持相同折行。
+      replayTerminal.loadAddon(new Unicode11Addon());
+      replayTerminal.unicode.activeVersion = "11";
     }
   } catch (cause) {
     showError(cause);
@@ -6240,11 +6289,12 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
     // 挂 WebGL renderer。两个此前就存在的坑在此一并修掉：screenElement 下第
     // 一块 canvas 是链接下划线的 2d renderLayer（透明，querySelector 会抓错），
     // 真画布按「能取到 webgl2 上下文」选中（getContext 幂等无副作用）；
-    // preserveDrawingBuffer 是 WebglAddon 的构造参数（默认 false，关闭时合成
-    // 后回读全零像素），导出终端显式开启——主终端不取像素，维持默认。GPU 被
+    // preserveDrawingBuffer 是 WebglAddon 的构造参数（0.20 beta 起改为 options
+    // 对象；默认 false，关闭时合成后回读全零像素），导出终端显式开启——主终端
+    // 不取像素，维持默认。GPU 被
     // 禁/context 耗尽挂不上 renderer（DOM 渲染无 canvas）时，走 !screen 分支
     // 给出 replayExportFailed 明确错误，而不是永远空帧。
-    attachWebglRenderer(term, () => new WebglAddon(true));
+    attachWebglRenderer(term, () => new WebglAddon({ preserveDrawingBuffer: true }));
     const screen =
       (Array.from(host.querySelectorAll("canvas")) as HTMLCanvasElement[])
         .find((c) => c.getContext("webgl2")) ?? null;
@@ -7358,6 +7408,10 @@ onBeforeUnmount(() => {
   unsubscribeFileDrag?.();
   unsubscribeFileDrop?.();
   resizeObserver?.disconnect();
+  for (const disposable of oscColorQueryDisposables) disposable.dispose();
+  oscColorQueryDisposables = [];
+  osc52Disposable?.dispose();
+  osc52Disposable = undefined;
   disposeInput?.dispose();
   disposeSelectionCopy?.dispose();
   terminalWriteThrottle.dispose();
