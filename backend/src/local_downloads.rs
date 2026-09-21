@@ -239,11 +239,11 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
         // default folder — the OS Documents directory (issue #18). Build the
         // raw argument so the quoting wraps only the path, the canonical
         // `explorer /select,"<path>"` form.
-        return std::process::Command::new("explorer")
+        std::process::Command::new("explorer")
             .raw_arg(explorer_select_arg(path))
             .spawn()
             .map(|_| ())
-            .map_err(|error| format!("Failed to launch Explorer: {error}"));
+            .map_err(|error| format!("Failed to launch Explorer: {error}"))
     }
     #[cfg(not(windows))]
     {

@@ -77,9 +77,9 @@ describe("sanitizeSftpEntries", () => {
 
 describe("sanitizeVisibleColumns", () => {
   it("falls back to the default columns for non-array payloads", () => {
-    expect(sanitizeVisibleColumns(undefined)).toEqual(["size", "modified"]);
-    expect(sanitizeVisibleColumns(null)).toEqual(["size", "modified"]);
-    expect(sanitizeVisibleColumns("size")).toEqual(["size", "modified"]);
+    expect(sanitizeVisibleColumns(undefined)).toEqual(["size", "modified", "owner", "group", "permissions"]);
+    expect(sanitizeVisibleColumns(null)).toEqual(["size", "modified", "owner", "group", "permissions"]);
+    expect(sanitizeVisibleColumns("size")).toEqual(["size", "modified", "owner", "group", "permissions"]);
   });
 
   it("keeps only known columns and drops junk entries", () => {
@@ -94,8 +94,8 @@ describe("sanitizeVisibleColumns", () => {
   });
 
   it("falls back to defaults when nothing usable remains", () => {
-    expect(sanitizeVisibleColumns([])).toEqual(["size", "modified"]);
-    expect(sanitizeVisibleColumns([42, null])).toEqual(["size", "modified"]);
+    expect(sanitizeVisibleColumns([])).toEqual(["size", "modified", "owner", "group", "permissions"]);
+    expect(sanitizeVisibleColumns([42, null])).toEqual(["size", "modified", "owner", "group", "permissions"]);
   });
 
   it("accepts the new owner/group columns from persisted state", () => {
