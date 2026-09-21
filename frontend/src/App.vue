@@ -177,6 +177,7 @@ import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from ".
 import { bridgeBinaryBytes } from "../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
 import { workbenchMessage } from "./lib/i18n";
+import { randomUUID } from "./lib/uuid";
 import TextPreview from "./components/TextPreview.vue";
 import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
 import ConnectingCard from "./components/ConnectingCard.vue";
@@ -692,9 +693,7 @@ const batchHistoryIndex = ref(-1);
 const batchHistoryBackup = ref("");
 // 跨工作台同步源标识：sidecar 把本端状态广播给所有 webview，各端按 source
 // 过滤回声；sidecar 缺该方法（旧版二进制）时静默降级，只影响同步。
-const batchBarSourceId = typeof crypto.randomUUID === "function"
-  ? crypto.randomUUID()
-  : `bar-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const batchBarSourceId = randomUUID();
 let batchBroadcastTimer: number | undefined;
 // 连接信息面板（只读摘要 + echo 往返延迟）。
 const connectionInfoOpen = ref(false);
@@ -990,7 +989,7 @@ const t = (key: string, values: Record<string, string | number> = {}) => workben
 const connectionId = computed(() => normalizeConnectionText(hostContext.value.connectionId));
 // Host API 1.1 provides a stable workbenchId in the host context; on 1.0 a
 // locally generated id keeps session scoping per workbench instance.
-const fallbackWorkbenchId = crypto.randomUUID();
+const fallbackWorkbenchId = randomUUID();
 const workbenchId = computed(() => normalizeConnectionText(hostContext.value.workbenchId) || fallbackWorkbenchId);
 const restored = computed(() => hostContext.value.restored === true);
 const connection = computed<ConnectionSummary>(() => {
@@ -2649,7 +2648,7 @@ async function reconnectNow() {
 function openNewSessionTab() {
   const api = window.dbxPlugin;
   if (!api.openWorkbench || !connectionId.value) return;
-  const context: Record<string, unknown> = { ...hostContext.value, connectionId: connectionId.value, workbenchId: crypto.randomUUID() };
+  const context: Record<string, unknown> = { ...hostContext.value, connectionId: connectionId.value, workbenchId: randomUUID() };
   const persisted = context.workbenchState;
   if (persisted && typeof persisted === "object") {
     const { sessionId: _sessionId, terminalSequence: _terminalSequence, ...rest } = persisted as Record<string, unknown>;
@@ -5358,7 +5357,7 @@ async function runCommand() {
   commandRunning.value = true;
   commandError.value = "";
   commandResult.value = undefined;
-  const execId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `exec-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const execId = randomUUID();
   commandExecId.value = execId;
   try {
     commandResult.value = await window.dbxPlugin.invoke<ExecResult>("ssh/exec", {
