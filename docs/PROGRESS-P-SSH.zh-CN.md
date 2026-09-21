@@ -3267,3 +3267,33 @@ amd64 与 arm64 均有报告。
 kafka 现网动态包按预期拦——修复后 CI 重建即静态）。CI 模拟容器
 （rust:1-bookworm + 同款 wrapper + 官方 CLI 0.1.3 打包）产出 linux dbxp
 端到端复验。桌面 macOS/Windows 产物不受影响，无需重发。
+
+## 宿主 OS 级拖放上传接线收口 + 双注册修复（2026-09-22）
+
+**背景**：桌面宿主在 webview 层捕获 OS 拖放（HTML5 drop 事件到不了沙箱
+iframe），fileTransfer 桥（宿主 1.1 optional）的 `onDrop`/`onDragState`
+事件已在上游宿主合入。插件侧 1cb3e48/1bc3dfe 已接
+`registerHostFileTransferBridge`：`planHostFileDrop` 按面板状态分流——
+SFTP 面板打开→当前目录直传；solo 终端→复用 `terminalDropPrompt` 落点
+询问（接受 handle metas）；只读/无文件/传输中→忽略；旧宿主桥没有拖拽
+监听时 optional-chaining 降级，不再炸 initialize。
+
+**修复**：`initialize()` 内残留的第二套 `api.fileTransfer?.onDragState/
+onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）未随新接线
+移除——同一 fileTransfer 桥上双处理器并存，真机一次拖放会触发两次上传
+（旧处理器无视面板状态直传当前目录、绕过落点询问）；且 `mockDbxHost`
+的 `onDrop` 为 no-op，fixture 与单测都无法暴露，只有真机会撞上。移除旧
+注册及其 `unsubscribeFileDrag`/`unsubscribeFileDrop` 变量与卸载清理；
+`dragActive` 复位并入 `handleHostFileDrop`（对齐 HTML5 `onDrop` 惯例）。
+现 onDragState/onDrop 全仓仅 `registerHostFileTransferBridge` 一处注册。
+
+**验证**：`vue-tsc` 0 错；`vitest run` 60 文件 510 用例全绿；`pnpm build`
+过（ui/index.html 重产，含拖放接线与 #33/#71 诊断样式）；`cargo fmt
+--check` / `clippy -D warnings` / `cargo test` 533 全绿（含工作区未提交
+的 #33/#71 埋点）。
+
+**剩余风险**：真机拖放验收未跑（上游事件已合入，待 DBX 宿主实测：分屏
+直传 / solo 落点询问 / 只读忽略 / 多文件与大文件 / 悬停 overlay 两种
+面板模式）；`ui/index.html` 为 integrator 所有，留待打包时随工作区一并
+处理；宿主对同一 handleId 被并发 read 的语义未验证（修复后插件侧已回
+单消费者，风险仅存于修复前的安装版本）。

@@ -8,6 +8,9 @@ const fixtureParams = new URLSearchParams(location.search);
 // 的终端断言读 DOM 文本，WebGL 渲染下文本只存在于 GPU canvas，必须锁定
 // DOM 渲染器路径（WebGL 自身的成功/回退由 terminalWebgl 单测覆盖）。
 if (fixtureParams.get("render") === "dom") {
+  // 快速输入诊断（#33/#71）：默认强制 DOM 渲染器。要复刻真实工作台的
+  // WebGL 渲染路径时，把下行改为 setItem("ssh-terminal-webgl", "1")
+  //（注意：Safari 的 vite fixture 下 WebGL 终端渲染为空白，仅 Chromium 可用）。
   try { localStorage.setItem("ssh-terminal-webgl", "0"); } catch { /* noop */ }
 }
 // ?rw=1 模拟可写连接（默认只读），供拖放上传等写路径 UI 验证。
@@ -827,6 +830,12 @@ window.dbxPlugin = {
     const bytes = typeof data === "string" ? Uint8Array.from(atob(data), (value) => value.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
     const inputSequence = Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, false));
     for (const listener of eventListeners) listener({ method: "ssh/terminal/inputAck", params: { sequence: inputSequence } });
+    // 快速输入诊断（#33/#71）：回显键入内容，闭合 fixture 内的输入→显示环，
+    // 让 WKWebView/Chromium 的按键投递差异可以在无宿主环境下复现。
+    if (bytes.byteLength > 8) {
+      const echoed = new TextDecoder().decode(bytes.subarray(8));
+      setTimeout(() => emitTerminal(echoed), 12);
+    }
   },
   onEvent: (listener) => { eventListeners.add(listener); return () => eventListeners.delete(listener); },
   onBinary: (listener) => { binaryListeners.add(listener); return () => binaryListeners.delete(listener); },

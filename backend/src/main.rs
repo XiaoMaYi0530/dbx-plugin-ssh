@@ -33,6 +33,7 @@ mod vault;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -1057,6 +1058,7 @@ impl PluginHandler for Plugin {
         emitter: &PluginEmitter,
     ) -> Result<(), PluginError> {
         if let Some(session_id) = channel.strip_prefix("ssh/terminal/in/") {
+            TERMINAL_INPUT_FRAMES_RECEIVED.fetch_add(1, Ordering::Relaxed);
             if data.len() < 8 {
                 return Err(to_plugin_error(
                     "SSH terminal input is missing its sequence".to_string(),
@@ -1316,16 +1318,83 @@ fn main() -> std::io::Result<()> {
     if std::env::args().any(|arg| arg == "--mcp") {
         return mcp::run_mcp_stdio(plugin_data_dir());
     }
+    log_sidecar_exit("serve-start".to_string());
+    spawn_terminal_input_counter();
     let plugin = Plugin::new().map_err(std::io::Error::other)?;
     let metadata = PluginMetadata::new("io.dbx.ssh", env!("CARGO_PKG_VERSION"))
         .with_capability("connections")
         .with_capability("events")
         .with_capability("binary")
         .with_capability("filesystem");
-    PluginServer::new(metadata, plugin)
+    let result = PluginServer::new(metadata, plugin)
         .transport(PluginTransport::Framed)
         .worker_threads(4)
-        .serve()
+        .serve();
+    // serve() only returns when stdin reaches EOF (host closed the pipe) or a
+    // read fails; everything else — SIGTERM/SIGKILL, a crash — ends the
+    // process without any trace. #33/#71 debugging showed mid-session sidecar
+    // exits that leave zero output in the host log, so the exit cause is
+    // appended here to tell "host closed stdin" (line present) apart from
+    // "host signalled the process" (no line).
+    log_sidecar_exit(match &result {
+        Ok(()) => "serve-ok stdin-eof".to_string(),
+        Err(error) => format!("serve-err {error}"),
+    });
+    result
+}
+
+/// Best-effort append to `<data-dir>/sidecar-exit.log`; never fails startup
+/// or shutdown when the data dir is unusable.
+fn log_sidecar_exit(stage: String) {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let path = plugin_data_dir().join("sidecar-exit.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{} pid={} {}", timestamp, std::process::id(), stage);
+}
+
+/// Terminal input frames received from the host bridge (#33/#71 rapid-input
+/// loss diagnosis): the count dumped to `<data-dir>/terminal-input-count.log`
+/// every few seconds is the sidecar-side ground truth. Compared against what
+/// the user actually typed it tells input loss before the sidecar (webview or
+/// host bridge dropped frames) apart from loss after it (display side).
+static TERMINAL_INPUT_FRAMES_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
+fn spawn_terminal_input_counter() {
+    std::thread::spawn(|| {
+        let mut last_dumped = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let total = TERMINAL_INPUT_FRAMES_RECEIVED.load(Ordering::Relaxed);
+            if total == last_dumped {
+                continue;
+            }
+            last_dumped = total;
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0);
+            let path = plugin_data_dir().join("terminal-input-count.log");
+            let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            else {
+                continue;
+            };
+            use std::io::Write;
+            let _ = writeln!(file, "{timestamp} pid={} total={total}", std::process::id());
+        }
+    });
 }
 
 #[cfg(test)]
