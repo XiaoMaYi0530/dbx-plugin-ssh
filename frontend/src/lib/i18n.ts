@@ -4224,6 +4224,8 @@ const acceleratorMonitorMessages: Record<string, Record<string, string>> = {
 };
 for (const locale of Object.keys(acceleratorMonitorMessages)) {
   supplemental[locale] = { ...(supplemental[locale] ?? {}), ...acceleratorMonitorMessages[locale] };
+}
+
 // 命令输入建议（P1-1，suggestions.*）与上传并发/重复策略（P1-5，transferCfg.*）。
 const suggestionTransferMessages: Record<string, Record<string, string>> = {
   en: {
