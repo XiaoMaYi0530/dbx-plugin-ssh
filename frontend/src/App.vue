@@ -140,6 +140,7 @@ import { advanceBatchProgress, batchProgressPercent, createBatchProgress, type B
 import { describeWorkbenchSessionStatus, type WorkbenchSessionStatus } from "./lib/sessionStatus";
 import { sanitizeCommandOutput } from "./lib/terminalOutputText";
 import { normalizeTerminalInputBytes } from "./lib/terminalInput";
+import { installMacWebkitInputFallback } from "./lib/terminalWebkitInput";
 import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
 import { mergeTransferProgress, transferCancelReason, type TransferPhase } from "./lib/transferProgress";
@@ -188,7 +189,7 @@ import { resolveRemotePath, splitRemotePathSegments } from "./lib/remotePathInpu
 import { shouldCommitRename } from "./lib/sftpRename";
 import { folderDownloadOutcome, type FolderDownloadFinish } from "./lib/sftpFolderDownload";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
-import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRendererLike } from "./lib/terminalWebgl";
+import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRecoveryOptions, type WebglRendererLike } from "./lib/terminalWebgl";
 import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from "./lib/terminalClickCursor";
 import { bridgeBinaryBytes } from "../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
@@ -759,6 +760,16 @@ const downloadPrefsAdapter = {
 // 终端临时挂载（取像素依赖 canvas），导出完随终端 dispose 释放 context。
 const webglEnabled = ref(loadWebglEnabled());
 const webglRenderer = ref<WebglRendererLike | null>(null);
+// GPU 重置/驱动切换后有限次重建 renderer（Tabby 同款策略）：成功经
+// onRecovered 回填引用，偏好已关闭则放弃重建，预算耗尽静默留在 DOM 渲染。
+function webglRecoveryOptions(): WebglRecoveryOptions<WebglRendererLike> {
+  return {
+    onRecovered: (addon) => {
+      webglRenderer.value = addon;
+    },
+    enabled: () => webglEnabled.value,
+  };
+}
 // True while attachSession sits inside its bounded backoff loop; turns the
 // status pill and overlay into the dedicated "reconnecting" phase.
 const reconnectPending = ref(false);
@@ -849,6 +860,7 @@ let dropUploadResolver: ((choice: "cancel" | "cwd" | { dir: string }) => void) |
 let zoomNoticeTimer = 0;
 let resizeObserver: ResizeObserver | undefined;
 let disposeInput: { dispose(): void } | undefined;
+let disposeWebkitInputFallback: (() => void) | undefined;
 let disposeSelectionCopy: { dispose(): void } | undefined;
 let unsubscribeEvent: (() => void) | undefined;
 let unsubscribeBinary: (() => void) | undefined;
@@ -1412,7 +1424,7 @@ function createTerminal() {
     searchResultIndex.value = resultCount > 0 && resultIndex >= 0 ? resultIndex + 1 : 0;
     searchMatchState.value = resultCount > 0 ? "match" : "no-match";
   });
-  disposeInput = terminal.onData((data) => {
+  const routeTerminalData = (data: string) => {
     if (!session.value) return;
     // 文件传输占用路由：trzsz 持有流时，传输中的输入进 filter（Ctrl+C 停传输、
     // 其余吞掉），等待协商期直接吞掉（防止杂散键入干扰 trz 握手）；zmodem 持有
@@ -1425,7 +1437,13 @@ function createTerminal() {
     if (route === "blocked") return;
     trackPendingInput(data);
     sendTerminalBytes(new TextEncoder().encode(data));
-  });
+  };
+  disposeInput = terminal.onData(routeTerminalData);
+  // xterm.js 6.1 still drops rapid direct commits on macOS WKWebView when an
+  // IME reports printable keys as keyCode=229 (#5887/#6045/#6144 upstream).
+  // The adapter runs before xterm's hidden textarea listeners and routes only
+  // single-byte text outside real composition through the same PTY path.
+  disposeWebkitInputFallback = installMacWebkitInputFallback({ terminal, onData: routeTerminalData });
   // 选中复制（可在设置里关闭）：选择一变化即静默写入剪贴板，不弹提示。
   disposeSelectionCopy = terminal.onSelectionChange(() => {
     if (!termSelectCopy.value || !terminal?.hasSelection()) return;
@@ -1444,7 +1462,7 @@ function createTerminal() {
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value);
   if (webglEnabled.value) {
-    webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon());
+    webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon(), webglRecoveryOptions());
   }
   if (highlightEnabled.value) attachHighlightRender();
   scheduleFit();
@@ -1455,7 +1473,7 @@ function setWebglEnabled(next: boolean) {
   webglEnabled.value = next;
   persistWebglEnabled(next);
   if (!terminal) return;
-  webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon());
+  webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon(), webglRecoveryOptions());
 }
 
 // Apple 平台用 Cmd+A 直选全选，其余平台 Ctrl+Shift+A（isTerminalSelectAllShortcut）。
@@ -4686,11 +4704,10 @@ async function chooseUpload() {
     await loadDirectory();
     if (selection.files.length) showNotice(t("uploaded", { count: selection.files.length }));
   } catch (cause) {
-    // 宿主文件桥读盘失败（如 unknown plugin file handle，issue #83/#79）时不再
-    // 直接终止：回退到 webview 原生文件选择（File API），上传仍可继续。
+    // 宿主文件桥失败（pick 或读盘，如 unknown plugin file handle，issue #83/#79）
+    // 时不再直接终止：回退到 webview 原生文件选择（File API），上传仍可继续。
     if (isHostBridgeReadFailure(cause)) {
-      showNotice(t("uploadBridgeFallback"));
-      uploadInput.value?.click();
+      fallbackToNativeUploadPicker();
       return;
     }
     showError(cause);
@@ -4723,6 +4740,13 @@ function isHostBridgeReadFailure(cause: unknown): boolean {
   if (!(cause instanceof Error)) return false;
   const code = (cause as Error & { code?: unknown }).code;
   return code === "upload-read-failed" || /file handle/i.test(cause.message);
+}
+
+// 桥接不可用时的兜底（对标 dbx-plugin-files PR #47）：提示后自动打开 webview
+// 原生文件选择器（File API，不依赖宿主句柄），上传仍可完成。
+function fallbackToNativeUploadPicker() {
+  showNotice(t("uploadBridgeFallback"));
+  uploadInput.value?.click();
 }
 
 async function uploadLocalFiles(files: readonly File[], targetDir?: string) {
@@ -6985,7 +7009,14 @@ async function initialize() {
   unsubscribeFileDrag = api.fileTransfer?.onDragState((active) => (dragActive.value = active));
   unsubscribeFileDrop = api.fileTransfer?.onDrop((files) => {
     dragActive.value = false;
-    void uploadHandleFiles(files).then(() => loadDirectory()).catch(showError);
+    // 拖入文件同样走宿主桥读盘（issue #83/#79）：桥故障时与工具栏上传一致回退
+    // 原生选择器重挑，而不是只报错走死。
+    void uploadHandleFiles(files)
+      .then(() => loadDirectory())
+      .catch((cause) => {
+        if (isHostBridgeReadFailure(cause)) fallbackToNativeUploadPicker();
+        else showError(cause);
+      });
   });
   await nextTick();
   createTerminal();
@@ -7101,6 +7132,8 @@ onBeforeUnmount(() => {
   osc52Disposable?.dispose();
   osc52Disposable = undefined;
   disposeInput?.dispose();
+  disposeWebkitInputFallback?.();
+  disposeWebkitInputFallback = undefined;
   disposeSelectionCopy?.dispose();
   terminalWriteThrottle.dispose();
   detachHighlightRender();
@@ -8761,6 +8794,5 @@ onBeforeUnmount(() => {
 /* 拖拽过程中全局光标 */
 body.resizing-col { cursor: col-resize !important; user-select: none; }
 </style>
-
 
 

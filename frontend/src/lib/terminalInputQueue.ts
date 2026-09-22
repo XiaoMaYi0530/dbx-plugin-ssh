@@ -34,10 +34,12 @@ export function createTerminalInputQueue(options: TerminalInputQueueOptions): Te
     writeU64(payload, 0, sequence);
     payload.set(data, 8);
 
-    // Keep the transport ordered because the sidecar worker pool may process
-    // concurrent binary frames on different workers. Do not wait for the
-    // broadcast inputAck; sendBinary's completion is the bridge acceptance
-    // boundary and the backend applies its own bounded backpressure.
+    // Serialize sends so wire order is preserved end to end: the sidecar SDK
+    // keeps same-channel frames in arrival order (one lane per channel), so
+    // arrival order is all that must hold, and full serialization does not
+    // depend on the host bridge being FIFO. Do not wait for the broadcast
+    // inputAck; sendBinary's completion is the bridge acceptance boundary and
+    // the backend applies its own bounded backpressure.
     tail = tail
       .then(async () => {
         // Input queued before a session reset must not leak into the next
