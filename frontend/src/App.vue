@@ -162,6 +162,24 @@ import {
   HIGHLIGHT_RULES_LIMIT,
   type HighlightRuleView,
 } from "./lib/keywordHighlight";
+// 动作链接（P1-2，默认关闭）+ 行号/时间戳 gutter（P1-3，默认关闭）。
+import { createActionLinkProvider } from "./lib/actionLinksAddon";
+import {
+  matchActionLinks,
+  sanitizeActionLinksSettings,
+  type ActionLinkMatch,
+  type ActionLinkMatcherToggles,
+  type ActionLinksSettings,
+} from "./lib/actionLinksMatcher";
+import {
+  computeGutterRows,
+  getRenderCellHeight,
+  sanitizeGutterSettings,
+  trimTimestampMap,
+  GUTTER_TIMESTAMP_RETENTION_ROWS,
+  type GutterRow,
+  type GutterSettings,
+} from "./lib/terminalGutter";
 import { pushSample, sparklinePath, METRICS_SAMPLE_CAPACITY } from "./lib/metricsSparkline";
 import { transferPausable, matchResumableUpload, canResumeUpload, type ResumableUploadTask } from "./lib/transferResume";
 import { isLiveTransferStatus, sortTransferTasks } from "./lib/transferOrder";
@@ -232,6 +250,7 @@ import { workbenchMessage } from "./lib/i18n";
 import { randomUUID } from "./lib/uuid";
 import TextPreview from "./components/TextPreview.vue";
 import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
+import TerminalGutter from "./components/TerminalGutter.vue";
 import ConnectingCard from "./components/ConnectingCard.vue";
 import FolderPickerDialog from "./components/FolderPickerDialog.vue";
 import SideNavPanel, { type SftpSideQuickPath } from "./components/SideNavPanel.vue";
@@ -1029,9 +1048,11 @@ const selectedShellInjectable = computed<boolean | undefined>(() => {
 
 // Large-output rendering throttle: coalesce consecutive PTY frames into one
 // merged xterm write per animation frame (capped, order preserving). The sink
-// reads `terminal` lazily so it also works across terminal recreation.
+// reads `terminal` lazily so it also works across terminal recreation. The
+// write completion callback is the gutter timestamp capture point (P1-3): it
+// stamps the logical rows each merged batch actually produced.
 const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle({
-  sink: (data) => terminal?.write(data),
+  sink: (data) => terminal?.write(data, stampGutterWrittenRows),
 });
 // #33/#71 快速输入丢字母的分层计数：keys(onData 实际路由到 PTY 的按键)、
 // sends(提交给宿主桥的帧)、acks(sidecar 确认收到的帧)、errors(桥拒绝)、
@@ -1782,6 +1803,8 @@ function createTerminal() {
     webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon(), webglRecoveryOptions());
   }
   if (highlightEnabled.value) attachHighlightRender();
+  if (actionLinksEnabled.value) attachActionLinks();
+  if (isGutterActive()) attachGutterListeners();
   scheduleFit();
 }
 
@@ -3392,6 +3415,7 @@ async function requestHostReopenConnection() {
 
 async function reconnect() {
   terminal?.clear();
+  resetGutterTimestamps();
   await closeSession(false);
   await requestHostReopenConnection();
   await openSession();
@@ -4049,6 +4073,360 @@ watch(compiledHighlightRules, () => {
 });
 
 // ---------------------------------------------------------------------------
+// 动作链接 + 行号/时间戳 gutter（IMPL_PLAN Task P1-2 / P1-3，均默认关闭）。
+// 偏好权威态在此，经 sidecar preferences.json（backend/src/preferences.rs 的
+// 固定 allowlist，local/preferences/get|set）持久化；设置页控件在
+// SettingsDialog「终端」分类，经 update:* 增量上抛。
+// ---------------------------------------------------------------------------
+
+async function persistTerminalFeaturePrefs(patch: Record<string, unknown>) {
+  try {
+    await window.dbxPlugin.invoke("local/preferences/set", patch);
+  } catch {
+    // 旧 sidecar 无这些键位：与 localShell 等同款，当前会话内存态兜底。
+  }
+}
+
+// ---- 动作链接（P1-2）----
+const actionLinksSettings = ref<ActionLinksSettings>(sanitizeActionLinksSettings(undefined));
+const actionLinksEnabled = computed(() => actionLinksSettings.value.enabled);
+// 与关键词高亮同帧率上限 / 同量级装饰总数护栏。
+const ACTION_LINK_SCAN_MIN_INTERVAL_MS = 33;
+const ACTION_LINK_DECORATION_LIMIT = 400;
+let actionLinkProviderDisposable: { dispose(): void } | undefined;
+let actionLinkRenderDisposable: { dispose(): void } | undefined;
+let actionLinkScanScheduled = false;
+let actionLinkLastScanAt = 0;
+let actionLinkPendingRange: { start: number; end: number } | undefined;
+// 每行一组（marker + 虚线 decorations + 登记文本）；去留条件复用关键词高亮的
+// shouldRebuildHighlightRow——"本帧重绘且文本未变则整组保留"是防自激回路的
+// 关键（xterm 在装饰注册/销毁后会再触发整幅重绘）。
+const actionLinkDecorationsByRow = new Map<number, { text: string; dispose(): void }>();
+let actionLinkDecorationCount = 0;
+// 悬停 / Alt+点击的命令预览浮签（terminal-pane 内绝对定位，pointer-events 关）。
+const actionLinkHint = ref<{ x: number; y: number; text: string } | null>(null);
+
+function clearActionLinkDecorations() {
+  for (const entry of actionLinkDecorationsByRow.values()) entry.dispose();
+  actionLinkDecorationsByRow.clear();
+  actionLinkDecorationCount = 0;
+}
+
+function attachActionLinks() {
+  if (!terminal || actionLinkProviderDisposable || !actionLinksEnabled.value) return;
+  actionLinkProviderDisposable = terminal.registerLinkProvider(
+    createActionLinkProvider(terminal, {
+      matchers: actionLinksSettings.value.matchers,
+      callbacks: {
+        onActivate: handleActionLinkActivate,
+        onHover: showActionLinkHintAt,
+        onLeave: hideActionLinkHint,
+      },
+    }),
+  );
+  actionLinkRenderDisposable = terminal.onRender(({ start, end }) => scheduleActionLinkScan(start, end));
+  scheduleActionLinkScan(0, terminal.rows - 1);
+}
+
+function detachActionLinks() {
+  actionLinkProviderDisposable?.dispose();
+  actionLinkProviderDisposable = undefined;
+  actionLinkRenderDisposable?.dispose();
+  actionLinkRenderDisposable = undefined;
+  clearActionLinkDecorations();
+  hideActionLinkHint();
+}
+
+// 点击 = 把建议命令送进现有 PTY 输入通路（不含换行：shell 输入行停在原地，
+// 用户可补改后再回车执行）。Alt+点击 = 仅预览命令文本，不向 PTY 写入。
+function handleActionLinkActivate(match: ActionLinkMatch, event: MouseEvent) {
+  if (event.altKey) {
+    showActionLinkHintAt(match, event);
+    return;
+  }
+  const sessionId = localSession.value?.sessionId ?? session.value?.sessionId;
+  if (!sessionId) return;
+  sendTerminalBytes(new TextEncoder().encode(match.command));
+  terminal?.focus();
+}
+
+function showActionLinkHintAt(match: ActionLinkMatch, event: MouseEvent) {
+  const host = terminalHost.value;
+  if (!host) return;
+  const bounds = host.getBoundingClientRect();
+  actionLinkHint.value = {
+    x: Math.min(Math.max(event.clientX - bounds.left + 10, 4), Math.max(4, bounds.width - 280)),
+    y: Math.max(4, event.clientY - bounds.top - 34),
+    text: match.command,
+  };
+}
+
+function hideActionLinkHint() {
+  actionLinkHint.value = null;
+}
+
+function scheduleActionLinkScan(start: number, end: number) {
+  if (!terminal || !actionLinksEnabled.value) return;
+  actionLinkPendingRange = actionLinkPendingRange
+    ? { start: Math.min(actionLinkPendingRange.start, start), end: Math.max(actionLinkPendingRange.end, end) }
+    : { start, end };
+  if (actionLinkScanScheduled) return;
+  actionLinkScanScheduled = true;
+  const wait = Math.max(0, ACTION_LINK_SCAN_MIN_INTERVAL_MS - (performance.now() - actionLinkLastScanAt));
+  window.setTimeout(runActionLinkScan, wait);
+}
+
+function runActionLinkScan() {
+  actionLinkScanScheduled = false;
+  actionLinkLastScanAt = performance.now();
+  const range = actionLinkPendingRange;
+  actionLinkPendingRange = undefined;
+  if (!range || !terminal || !actionLinksEnabled.value) return;
+  scanActionLinkRange(range.start, range.end);
+}
+
+function scanActionLinkRange(start: number, end: number) {
+  const term = terminal;
+  if (!term) return;
+  const buffer = term.buffer.active;
+  // onRender 的视口相对行号 → 缓冲绝对行号 + 视口判定，与关键词高亮同款换算。
+  const dirty = toAbsoluteRowRange(start, end, buffer.viewportY, buffer.length);
+  const vpFrom = Math.max(0, Math.min(buffer.viewportY, buffer.length - 1));
+  const vpTo = Math.min(buffer.length - 1, vpFrom + term.rows - 1);
+  for (const [row, entry] of actionLinkDecorationsByRow) {
+    // 防自激：仅"滚出视口"或"本帧重绘且文本确实变化"才拆组重建。
+    const dirtyRow = row >= dirty.from && row <= dirty.to;
+    const currentText = dirtyRow ? buffer.getLine(row)?.translateToString(true) ?? "" : entry.text;
+    if (!shouldRebuildHighlightRow({ row, viewportFrom: vpFrom, viewportTo: vpTo, dirty: dirtyRow, previousText: entry.text, currentText })) continue;
+    entry.dispose();
+    actionLinkDecorationsByRow.delete(row);
+  }
+  const matchers = actionLinksSettings.value.matchers;
+  const keywordRules = compiledHighlightRules.value;
+  const base = buffer.baseY + buffer.cursorY;
+  for (let row = vpFrom; row <= vpTo; row++) {
+    if (actionLinkDecorationsByRow.has(row)) continue;
+    if (actionLinkDecorationCount >= ACTION_LINK_DECORATION_LIMIT) return;
+    const lineText = buffer.getLine(row)?.translateToString(true) ?? "";
+    if (!lineText) continue;
+    const matches = matchActionLinks(lineText, matchers);
+    if (!matches.length) continue;
+    // 让位：与用户关键词高亮同段命中的范围跳过（高亮是用户显式配置的规则）。
+    const keywordSpans = keywordRules.length ? matchesInLine(lineText, keywordRules) : [];
+    const visible = keywordSpans.length
+      ? matches.filter((match) => !keywordSpans.some((span) => match.start < span.end && match.end > span.start))
+      : matches;
+    if (!visible.length) continue;
+    const marker = term.registerMarker(row - base);
+    if (!marker) continue;
+    const disposables: Array<{ dispose(): void }> = [marker];
+    const entry = {
+      text: lineText,
+      decorations: 0,
+      dispose() {
+        for (const disposable of disposables.splice(0)) disposable.dispose();
+        actionLinkDecorationCount -= entry.decorations;
+        entry.decorations = 0;
+      },
+    };
+    for (const match of visible) {
+      if (actionLinkDecorationCount >= ACTION_LINK_DECORATION_LIMIT) break;
+      const decoration = term.registerDecoration({ marker, x: match.start, width: match.end - match.start });
+      if (!decoration) continue;
+      // 虚线下划线画在装饰元素下缘（装饰层在文字层上方，无填充不遮字形）。
+      decoration.onRender((element) => {
+        element.style.borderBottom = "1px dashed var(--primary)";
+      });
+      disposables.push(decoration);
+      entry.decorations++;
+      actionLinkDecorationCount++;
+    }
+    actionLinkDecorationsByRow.set(row, entry);
+  }
+}
+
+// 设置变化（总开关或三类匹配器）：即时生效——provider 构造时快照 matchers，
+// 任何变化都重建；关闭时零挂钩子（摘 provider + 清 decoration）。
+watch(actionLinksSettings, (next) => {
+  if (!terminal) return;
+  if (next.enabled) {
+    actionLinkProviderDisposable?.dispose();
+    actionLinkProviderDisposable = undefined;
+    clearActionLinkDecorations();
+    attachActionLinks();
+  } else {
+    detachActionLinks();
+  }
+}, { deep: true });
+
+// ---- 行号 / 时间戳 gutter（P1-3）----
+const gutterSettings = ref<GutterSettings>(sanitizeGutterSettings(undefined));
+const gutterRows = ref<GutterRow[]>([]);
+const gutterCellHeight = ref<number | null>(null);
+// 大输出写入期挂起重算（terminalWriteThrottle 积压 > 256KiB 即跳帧，落定后由
+// 下一次 onRender/onScroll 事件跟上），避免 gutter 追帧放大 strained 场景开销。
+const GUTTER_SUSPEND_PENDING_BYTES = 256 * 1024;
+let gutterRafId = 0;
+let gutterScreenOffsetTop = 0;
+// 逻辑行首绝对行号 → 写入时刻。裁剪保留视口顶端前 3000 行。
+const gutterTimestamps = new Map<number, number>();
+let gutterLastStampedRow = -1;
+let gutterRenderDisposable: { dispose(): void } | undefined;
+let gutterScrollDisposable: { dispose(): void } | undefined;
+let gutterResizeDisposable: { dispose(): void } | undefined;
+let gutterEnterDisposable: { dispose(): void } | undefined;
+
+const gutterPaneVisible = computed(() => gutterSettings.value.showLineNumbers || gutterSettings.value.showTimestamps);
+// gutter 只占终端左 padding 环带：两种开关组合给固定宽度（行号 5 位 + 余量）。
+const gutterWidth = computed(() => {
+  if (!gutterPaneVisible.value) return 0;
+  if (gutterSettings.value.showLineNumbers && gutterSettings.value.showTimestamps) return 132;
+  return gutterSettings.value.showLineNumbers ? 56 : 88;
+});
+// 渲染尺寸读不到（渲染器未就绪/WebGL 恢复中）时整体隐藏降级，不报错。
+const gutterVisible = computed(() => gutterPaneVisible.value && gutterCellHeight.value !== null && gutterRows.value.length > 0);
+const gutterPaneStyle = computed(() => ({ "--dbx-gutter-width": `${gutterWidth.value}px` }));
+
+function isGutterActive() {
+  return gutterPaneVisible.value;
+}
+
+function attachGutterListeners() {
+  if (!terminal || gutterRenderDisposable || !isGutterActive()) return;
+  gutterRenderDisposable = terminal.onRender(() => scheduleGutterRecompute());
+  gutterScrollDisposable = terminal.onScroll(() => scheduleGutterRecompute());
+  gutterResizeDisposable = terminal.onResize(() => scheduleGutterRecompute());
+  // 回车重盖光标逻辑行：独立 onData 挂子（routeTerminalData 输入路由不动）。
+  gutterEnterDisposable = terminal.onData((data) => {
+    if (!gutterSettings.value.showTimestamps) return;
+    if (!data.includes("\r") && !data.includes("\n")) return;
+    if (!terminal) return;
+    const buffer = terminal.buffer.active;
+    stampLogicalLineContaining(buffer.baseY + buffer.cursorY, Date.now());
+    scheduleGutterRecompute();
+  });
+  scheduleGutterRecompute();
+}
+
+function detachGutterListeners() {
+  gutterRenderDisposable?.dispose();
+  gutterRenderDisposable = undefined;
+  gutterScrollDisposable?.dispose();
+  gutterScrollDisposable = undefined;
+  gutterResizeDisposable?.dispose();
+  gutterResizeDisposable = undefined;
+  gutterEnterDisposable?.dispose();
+  gutterEnterDisposable = undefined;
+  if (gutterRafId) {
+    cancelAnimationFrame(gutterRafId);
+    gutterRafId = 0;
+  }
+  gutterRows.value = [];
+  gutterCellHeight.value = null;
+}
+
+function scheduleGutterRecompute() {
+  if (!isGutterActive()) return;
+  if (gutterRafId) return;
+  gutterRafId = window.requestAnimationFrame(runGutterRecompute);
+}
+
+function runGutterRecompute() {
+  gutterRafId = 0;
+  const term = terminal;
+  if (!term || !isGutterActive()) return;
+  if (terminalWriteThrottle.pendingBytes > GUTTER_SUSPEND_PENDING_BYTES) return;
+  gutterCellHeight.value = getRenderCellHeight(term);
+  const buffer = term.buffer.active;
+  // 首视口行的像素起点 = xterm 元素的 padding-top（gutter 文本与画布行对齐）。
+  const paddingTop = term.element ? Number.parseFloat(window.getComputedStyle(term.element).paddingTop) : Number.NaN;
+  gutterScreenOffsetTop = Number.isFinite(paddingTop) ? paddingTop : 0;
+  gutterRows.value = computeGutterRows({
+    cellHeight: gutterCellHeight.value,
+    screenOffsetTop: gutterScreenOffsetTop,
+    scrollTop: buffer.viewportY,
+    buffer: { type: buffer.type, length: buffer.length, getLine: (y) => buffer.getLine(y) },
+    rows: term.rows,
+    timestamps: gutterTimestamps,
+    showLineNumbers: gutterSettings.value.showLineNumbers,
+    showTimestamps: gutterSettings.value.showTimestamps,
+    timestampFormat: gutterSettings.value.timestampFormat,
+  });
+  trimTimestampMap(gutterTimestamps, Math.max(0, buffer.viewportY - GUTTER_TIMESTAMP_RETENTION_ROWS));
+}
+
+// 时间戳采集挂点：写入节流 sink 的 terminal.write 完成回调（xterm 解析完这批
+// 合并字节后触发）。对新写入的逻辑行首盖 Date.now()；原地重写（进度条）只重盖
+// 底行；buffer 变短（clear/重连）时整表重置。
+function stampGutterWrittenRows() {
+  if (!gutterSettings.value.showTimestamps) return;
+  if (!terminal) return;
+  const buffer = terminal.buffer.active;
+  if (buffer.type === "alternate") return;
+  const last = buffer.length - 1;
+  if (last < 0) return;
+  if (last < gutterLastStampedRow) resetGutterTimestamps();
+  const now = Date.now();
+  const from = Math.max(0, gutterLastStampedRow);
+  for (let row = from; row <= last; row++) {
+    if (buffer.getLine(row)?.isWrapped) continue;
+    gutterTimestamps.set(row, now);
+  }
+  gutterLastStampedRow = last;
+}
+
+// 回车重盖：光标所在逻辑行（含 wrapped 向上回溯）整体盖为回车时刻。
+function stampLogicalLineContaining(absoluteRow: number, atMs: number) {
+  if (!terminal) return;
+  const buffer = terminal.buffer.active;
+  if (buffer.type === "alternate") return;
+  let row = Math.max(0, Math.min(absoluteRow, buffer.length - 1));
+  let scanned = 0;
+  while (row > 0 && scanned < 2048 && buffer.getLine(row)?.isWrapped) {
+    row -= 1;
+    scanned += 1;
+  }
+  gutterTimestamps.set(row, atMs);
+}
+
+function resetGutterTimestamps() {
+  gutterTimestamps.clear();
+  gutterLastStampedRow = -1;
+}
+
+// gutter 设置变化：挂/摘挂子 + 宽度变化后重算终端列宽（xterm 左 padding 随
+// --dbx-gutter-width 变化，FitAddon 需要重新 fit）。
+watch(gutterSettings, () => {
+  if (terminal && isGutterActive()) attachGutterListeners();
+  else detachGutterListeners();
+  scheduleGutterRecompute();
+  scheduleFit();
+}, { deep: true });
+
+// 设置页增量上抛：归一化 → sidecar 持久化（watcher 即时挂/摘）。
+function updateActionLinksSettings(patch: { enabled?: boolean; matchers?: Partial<ActionLinkMatcherToggles> }) {
+  const next = sanitizeActionLinksSettings({
+    enabled: patch.enabled ?? actionLinksSettings.value.enabled,
+    matchers: { ...actionLinksSettings.value.matchers, ...(patch.matchers ?? {}) },
+  });
+  actionLinksSettings.value = next;
+  void persistTerminalFeaturePrefs({
+    action_links_enabled: next.enabled,
+    action_links_matchers: { ipv4: next.matchers.ipv4, host_port: next.matchers.hostPort, archive: next.matchers.archive },
+  });
+}
+
+function updateGutterSettings(patch: { showLineNumbers?: boolean; showTimestamps?: boolean; timestampFormat?: string }) {
+  const next = sanitizeGutterSettings({ ...gutterSettings.value, ...patch });
+  gutterSettings.value = next;
+  void persistTerminalFeaturePrefs({
+    terminal_show_line_numbers: next.showLineNumbers,
+    terminal_show_timestamps: next.showTimestamps,
+    terminal_timestamp_format: next.timestampFormat,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // metrics sparkline + 发行版徽标（IMPL_PLAN_NETCATTY_PARITY §3-B2）
 // ---------------------------------------------------------------------------
 
@@ -4495,12 +4873,23 @@ async function hydratePrefsOnce() {
     // 同上：等待 sidecar 权威值。
   }
   try {
-    const prefs = await window.dbxPlugin.invoke<{ downloadDir?: unknown; downloadUseDefaultDir?: unknown; downloadConflictPolicy?: unknown; localShell?: unknown; localShellIntegration?: unknown }>("local/preferences/get", {});
+    const prefs = await window.dbxPlugin.invoke<{ downloadDir?: unknown; downloadUseDefaultDir?: unknown; downloadConflictPolicy?: unknown; localShell?: unknown; localShellIntegration?: unknown; action_links_enabled?: unknown; action_links_matchers?: unknown; terminal_show_line_numbers?: unknown; terminal_show_timestamps?: unknown; terminal_timestamp_format?: unknown }>("local/preferences/get", {});
     if (typeof prefs.downloadDir === "string") downloadDirState.value = prefs.downloadDir.trim();
     if (typeof prefs.downloadUseDefaultDir === "boolean") downloadUseDefaultState.value = prefs.downloadUseDefaultDir;
     if (prefs.downloadConflictPolicy !== undefined) downloadConflictState.value = sanitizeConflictPolicy(prefs.downloadConflictPolicy);
     if (typeof prefs.localShell === "string") localShellPref.value = prefs.localShell;
     if (typeof prefs.localShellIntegration === "boolean") localShellIntegrationPref.value = prefs.localShellIntegration;
+    // 动作链接 / gutter：键位缺省时保持内存默认（功能关闭），不无谓覆写。
+    if (prefs.action_links_enabled !== undefined || prefs.action_links_matchers !== undefined) {
+      actionLinksSettings.value = sanitizeActionLinksSettings({ enabled: prefs.action_links_enabled, matchers: prefs.action_links_matchers });
+    }
+    if (prefs.terminal_show_line_numbers !== undefined || prefs.terminal_show_timestamps !== undefined || prefs.terminal_timestamp_format !== undefined) {
+      gutterSettings.value = sanitizeGutterSettings({
+        showLineNumbers: prefs.terminal_show_line_numbers,
+        showTimestamps: prefs.terminal_show_timestamps,
+        timestampFormat: prefs.terminal_timestamp_format,
+      });
+    }
     cachePrefs();
   } catch {
     // 旧 sidecar：保留 localStorage 种子或默认。
@@ -6214,6 +6603,7 @@ function selectAllTerminal() {
 
 function clearTerminal() {
   terminal?.clear();
+  resetGutterTimestamps();
   terminalMenuOpen.value = false;
   terminal?.focus();
 }
@@ -8049,6 +8439,8 @@ onBeforeUnmount(() => {
   terminalBellFlash.value = false;
   terminalWriteThrottle.dispose();
   detachHighlightRender();
+  detachActionLinks();
+  detachGutterListeners();
   terminal?.dispose();
   for (const waiter of uploadAckWaiters.values()) {
     window.clearTimeout(waiter.timer);
@@ -8416,8 +8808,14 @@ onBeforeUnmount(() => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+        <!-- P1-3 行号/时间戳 gutter：绝对定位覆盖左缘 padding 环带（z-index 1，
+             低于浮层 z-index 2），xterm 左 padding 随 --dbx-gutter-width 加宽，
+             不遮文本；drop-overlay/搜索面板/诊断浮层定位不受影响。 -->
+        <TerminalGutter v-if="gutterVisible" :rows="gutterRows" :width="gutterWidth" />
         <div ref="terminalHost" class="terminal-host" :class="{ 'bell-flash': terminalBellFlash }" @mousedown.middle="handleTerminalMiddleClick" />
+        <!-- P1-2 动作链接命令预览浮签：悬停 / Alt+点击时显示建议命令文本。 -->
+        <div v-if="actionLinkHint" class="action-link-hint mono" :style="{ left: `${actionLinkHint.x}px`, top: `${actionLinkHint.y}px` }">{{ actionLinkHint.text }}</div>
         <!-- #33/#71 快速输入丢失诊断浮层：Ctrl/Cmd+Shift+D 切换。keys=onData
              路由到 PTY 的按键、sends=提交宿主桥的帧、acks=sidecar 确认的帧、
              errors=桥拒绝、swallowed=传输路由吞键。三者对不上即锁定丢失层。 -->
@@ -9317,6 +9715,8 @@ onBeforeUnmount(() => {
       :terminal-behavior="terminalBehavior"
       :terminal-hotkeys="terminalHotkeys"
       :apple-platform="applePlatform"
+      :action-links="actionLinksSettings"
+      :gutter="gutterSettings"
       :appearance="terminalAppearanceState"
       :custom-themes="terminalAppearance.customThemes"
       :active-theme-id="activeAppearanceThemeId"
@@ -9330,6 +9730,8 @@ onBeforeUnmount(() => {
       @update:webgl="setWebglEnabled"
       @update-behavior="updateTerminalBehavior"
       @update-hotkeys="updateTerminalHotkeys"
+      @update:action-links="updateActionLinksSettings"
+      @update:gutter="updateGutterSettings"
       @apply-font="(payload) => applyTerminalFontSettings(payload.family, payload.size)"
       @update-appearance="updateTerminalAppearance"
       @apply-theme="applyTerminalAppearanceTheme"
@@ -9834,6 +10236,32 @@ onBeforeUnmount(() => {
 }
 /* 拖拽过程中全局光标 */
 body.resizing-col { cursor: col-resize !important; user-select: none; }
+
+/* —— P1-3 行号/时间戳 gutter 的布局联动 ——
+   gutter 组件自身样式在 TerminalGutter.vue；这里只做两件事：
+   1) gutter 可见时把 xterm 左 padding 加宽 --dbx-gutter-width（FitAddon 读
+      element padding 算列数，列宽随之自动收窄，文本不会滑进 gutter 环带）；
+   2) 命令预览浮签（悬停 / Alt+点击动作链接时出现），z-index 高于终端宿主
+      （z 0）与 gutter（z 1），低于浮层梯队（z 2+）。 */
+.terminal-pane.gutter-visible .terminal-host :deep(.xterm) {
+  padding-left: calc(var(--dbx-gutter-width, 0px) + var(--ssh-terminal-padding-left, 10px));
+}
+.action-link-hint {
+  position: absolute;
+  z-index: 3;
+  max-width: 300px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: var(--popover);
+  color: var(--foreground);
+  font-size: 11px;
+  white-space: pre;
+  text-overflow: ellipsis;
+  box-shadow: var(--shadow-sm, 0 1px 3px rgb(0 0 0 / 0.25));
+  pointer-events: none;
+}
 </style>
 
 
