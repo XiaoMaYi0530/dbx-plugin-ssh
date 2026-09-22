@@ -624,7 +624,7 @@
       "action": {
         "type": "open-workbench",
         "workbench": "io.dbx.ssh.workbench",
-        "presentation": "tab",
+        "presentation": "panel",
         "reuse": "singleton",
         "instance_key": "local-terminal",
         "restore": "none",
@@ -632,7 +632,9 @@
           "plugin": {
             "mode": "local-terminal"
           }
-        }
+        },
+        "options_action": "local/terminal/launch-options",
+        "connection_targets": true
       }
     },
     {
@@ -649,13 +651,6 @@
           "location": "appToolbar",
           "command": "open-local-terminal",
           "group": "navigation",
-          "order": 100,
-          "default_visible": false
-        },
-        {
-          "location": "appSidebar",
-          "command": "open-local-terminal",
-          "group": "primary",
           "order": 100,
           "default_visible": true
         }

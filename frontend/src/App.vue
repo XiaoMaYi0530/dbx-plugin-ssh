@@ -61,6 +61,7 @@ import {
   Siren,
   Square,
   SquarePlus,
+  ListPlus,
   SquareTerminal,
   Star,
   Terminal as TerminalIcon,
@@ -131,7 +132,7 @@ import { browseCommandHistory, commandInputAction, isPersistableCommand, pushCom
 import { filterQuickCommands, normalizeQuickCommands, QUICK_COMMANDS_LIMIT, quickCommandText, type QuickCommand } from "./lib/quickCommands";
 import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
-import { readPluginMode, resolveWorkbenchId } from "./lib/pluginContext";
+import { readPluginMode, readPluginShell, resolveWorkbenchId } from "./lib/pluginContext";
 import { clampFontSize } from "./lib/terminalZoom";
 import { loadTerminalFontOverride, persistTerminalFontFamily, persistTerminalFontSize, resolveTerminalFont, type TerminalFontOverride } from "./lib/terminalFont";
 import { MIB, settingsErrorOf } from "./lib/settingsModel";
@@ -994,12 +995,15 @@ const localPendingFrames = new Map<number, { stream: number; data: Uint8Array }>
 let localReplayInFlight = false;
 let localReplayNoProgress = 0;
 const isLocalMode = computed(() => localSession.value !== null);
-// A4 恢复外壳（spec §7.6/§8.4）：restored 本地 tab 不自动起 shell，用退出
-// 覆盖层作外壳态等待用户显式启动；shell 真正起来后（startLocalTerminal 成功）
-// 即清除。localUiMode = "本地终端 UI 态"（有会话运行或恢复外壳），工具栏的
-// SSH 专属动作与展示分支按它门控，与会话有无解耦。
+// A4 restored shell (spec §7.6/§8.4): a restored local tab never auto-starts a shell; the exit
+// overlay as the shell state waiting for an explicit start; cleared once a shell actually comes up (startLocalTerminal succeeds)
+// cleared. localUiMode = "local-terminal UI state" (running session or restored shell); SSH-only toolbar actions gate on it,
+// SSH-only toolbar actions and display branches gate on it, decoupled from session existence.
 const localShellRestored = ref(false);
 const localUiMode = computed(() => isLocalMode.value || localShellRestored.value);
+// Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
+// and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
+const panelSurface = computed(() => hostContext.value.surface === "panel");
 // —— 本地终端偏好（sidecar preferences.json 持久化；iframe 沙箱无 localStorage）——
 // shell 空串 = 跟随自动探测；integration 缺省开。
 const localShellPref = ref("");
@@ -1065,9 +1069,9 @@ const locale = ref("zh-CN");
 const t = (key: string, values: Record<string, string | number> = {}) => workbenchMessage(locale.value, key, values);
 const connectionId = computed(() => normalizeConnectionText(hostContext.value.connectionId));
 // Host API 1.1 provides a stable workbenchId in the host context; on 1.0 a
-// locally generated id keeps session scoping per workbench instance. A4 起
-// 插件不再自传 workbenchId（宿主权威，spec §11）——1.0 宿主缺失注入时仍由
-// 此 fallback 兜底（用例见 lib/pluginContext.spec.ts）。
+// locally generated id keeps session scoping per workbench instance. Since A4
+// The plugin no longer passes its own workbenchId (host-authoritative, spec §11) — when a 1.0 host omits the injection,
+// this fallback covers it (see lib/pluginContext.spec.ts).
 const fallbackWorkbenchId = crypto.randomUUID();
 const workbenchId = computed(() => resolveWorkbenchId(hostContext.value, fallbackWorkbenchId));
 const restored = computed(() => hostContext.value.restored === true);
@@ -1159,7 +1163,7 @@ const commandMarkerDetails = computed(() => commandMarkerTooltip(
   },
 ));
 const connectionIdentity = computed(() => {
-  // 无连接本地终端 tab（含恢复外壳）：没有连接身份可显示。
+  // Connectionless local-terminal tab (including the restored shell): there is no connection identity to show.
   if (localUiMode.value && !connectionId.value) return t("localTerminal.active");
   const host = connection.value.host || connection.value.name || connectionId.value || "–";
   const identity = connection.value.username ? `${connection.value.username}@${host}` : host;
@@ -3124,7 +3128,7 @@ function markLocalExited(code: number | null) {
   stopCommandMarkerTick();
 }
 
-async function startLocalTerminal() {
+async function startLocalTerminal(shellOverride?: string) {
   if (localState.value === "starting" || isLocalMode.value) return;
   localState.value = "starting";
   try {
@@ -3132,8 +3136,8 @@ async function startLocalTerminal() {
       workbenchId: workbenchId.value,
       cols: terminal?.cols || 120,
       rows: terminal?.rows || 32,
-      // 用户在 shell 选择器里记住的 shell；空串 = 跟随自动探测。
-      ...(localShellPref.value ? { shell: localShellPref.value } : {}),
+      // Shell precedence: explicit dock choice > user preference > auto-detection.
+      ...(shellOverride?.trim() ? { shell: shellOverride.trim() } : localShellPref.value ? { shell: localShellPref.value } : {}),
       ...(localShellIntegrationPref.value ? {} : { shellIntegration: false }),
       // 重开继承上次 cwd（目录可能已被删，sidecar 会回落家目录）。
       ...(localLastCwd.value ? { cwd: localLastCwd.value } : {}),
@@ -3144,7 +3148,7 @@ async function startLocalTerminal() {
     }
     localSession.value = { sessionId: info.sessionId, shell: info.shell };
     localState.value = "running";
-    // 恢复外壳到此结束：会话已显式重启。
+    // The restored shell ends here: the session was explicitly restarted.
     localShellRestored.value = false;
     localExitCode.value = null;
     localLastSequence.value = 0;
@@ -3172,8 +3176,25 @@ async function closeLocalTerminal() {
   terminal?.focus();
 }
 
-// 恢复外壳的"关闭"：还没有会话可关——与 SSH restored tab 同款落断开兜底态
-// （不重放连接，spec §7.6），退出覆盖层随之退场。
+// HOST_PLUGIN_UI_SPEC §8.3/§7.4 workbench/close 两段式关闭：宿主拆除 panel/tab webview
+// 前先通知本 workbench 释放自己的 sidecar scope（PTY 会话），避免孤儿 PTY 活到 sidecar
+// 退出。特 性探测：旧宿主不发 workbench/close，也无此 API。置 disposed 拦住在途的
+// 异步启动流程（startLocalTerminal 会据此回收刚开的会话）。
+if (window.dbxPlugin.workbench?.onClose) {
+  window.dbxPlugin.workbench.onClose(async () => {
+    disposed = true;
+    const ownedSessions = [
+      ["local/session/close", localSession.value?.sessionId],
+      ["ssh/session/close", session.value?.sessionId],
+    ].filter((pair): pair is [string, string] => typeof pair[1] === "string" && !!pair[1]);
+    await Promise.allSettled(ownedSessions.map(([method, sessionId]) => window.dbxPlugin.notify(method, { sessionId })));
+    localSession.value = null;
+    session.value = undefined;
+  });
+}
+
+// "Close" on a restored shell: there is no session to close — fall into the same disconnected state as an SSH restored tab
+// (no connection replay, spec §7.6) and the exit overlay steps aside.
 function dismissRestoredLocalShell() {
   localShellRestored.value = false;
   localState.value = "exited";
@@ -3181,8 +3202,8 @@ function dismissRestoredLocalShell() {
   terminalError.value = t("restartDisconnected");
 }
 
-// 工具栏本地终端钮：运行中→关闭；恢复外壳→直接重开（无会话可关，跳过
-// SSH 确认流）；SSH 态→走既有确认流。
+// Toolbar local-terminal button: running -> close; restored shell -> reopen directly (nothing to close, skipping
+// SSH confirm flow); an SSH state walks the existing confirm flow.
 function toggleLocalTerminal() {
   if (localShellRestored.value) {
     void restartLocalTerminal();
@@ -3242,6 +3263,54 @@ async function openLocalMenu() {
   }
 }
 
+// Dock panel "+": opens another dock entry with the selected shell type via the bridge openWorkbench
+// (the host owns the surface: inside a panel webview -> a new dock entry; inside a tab -> a new tab).
+const localShellSurfaceOpen = ref(false);
+// host.listConnections (PR-A4 generic extension point): a read-only, secret-free list of the plugin's own connections,
+// for in-panel connection switching; hosts without it degrade to a hidden connection section.
+const dockConnections = ref<Array<{ id: string; name: string; providerId: string; connectionType?: string; readOnly?: boolean }>>([]);
+async function openLocalShellSurfaceMenu() {
+  localShellSurfaceOpen.value = true;
+  if (localShellsLoading.value || localShells.value.length) return;
+  localShellsLoading.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ shells: typeof localShells.value }>("local/shells/list", {}, { timeoutMs: 10_000 });
+    localShells.value = result.shells || [];
+  } catch {
+    // Legacy sidecars without discovery: the menu degrades to the auto-detect entry.
+  } finally {
+    localShellsLoading.value = false;
+  }
+  try {
+    const listed = await window.dbxPlugin.request<{ connections?: typeof dockConnections.value }>("host.listConnections");
+    dockConnections.value = listed?.connections ?? [];
+  } catch {
+    // Legacy hosts without the listConnections extension point: the connection section stays hidden.
+    dockConnections.value = [];
+  }
+}
+function openConnectionSurface(connection: (typeof dockConnections.value)[number]) {
+  localShellSurfaceOpen.value = false;
+  void window.dbxPlugin.openWorkbench?.(
+    "io.dbx.ssh.workbench",
+    {
+      connectionId: connection.id,
+      providerId: connection.providerId,
+      connectionType: connection.connectionType,
+      connection: { id: connection.id, name: connection.name, readOnly: connection.readOnly === true },
+    },
+    { forceNew: true },
+  );
+}
+function openLocalShellSurface(program?: string) {
+  localShellSurfaceOpen.value = false;
+  void window.dbxPlugin.openWorkbench?.(
+    "io.dbx.ssh.workbench",
+    { plugin: { mode: "local-terminal", ...(program ? { shell: program } : {}) } },
+    { forceNew: true },
+  );
+}
+
 async function setLocalShellPref(program: string) {
   localShellPref.value = program;
   try {
@@ -3260,10 +3329,10 @@ async function setLocalShellIntegrationPref(enabled: boolean) {
   }
 }
 
-// P0.2 自查自开：经宿主 openWorkbench 桥开一个独立的无连接本地终端 tab。
-// A4 目标契约（spec §4/§11）：插件载荷只进 context.plugin，实例身份
-// （workbenchId）由宿主生成——旧宿主不注入时由 workbenchId fallback 兜底。
-// 旧宿主无此桥时菜单项不出现。
+// P0.2 self-open: opens a separate connectionless local-terminal tab through the host openWorkbench bridge.
+// A4 target contract (spec §4/§11): the plugin payload lives only in context.plugin and the instance identity
+// (workbenchId) is generated by the host — when a legacy host omits it, the workbenchId fallback covers it.
+// The menu item is hidden on hosts without this bridge.
 const canOpenLocalTab = computed(() => Boolean(window.dbxPlugin?.openWorkbench));
 
 async function openLocalTerminalTab() {
@@ -7467,6 +7536,7 @@ function closeToolbarPopovers() {
   bookmarkSaveOpen.value = false;
   batchTargetsOpen.value = false;
   localMenuOpen.value = false;
+  localShellSurfaceOpen.value = false;
 }
 
 function closeMenus() {
@@ -7830,21 +7900,25 @@ async function initialize() {
   });
   await nextTick();
   createTerminal();
-  // P0 无连接本地终端直通（HOST_PLUGIN_UI_SPEC.zh-CN.md §4/§7.1）：宿主以
-  // command context（plugin.mode="local-terminal"）打开本 workbench（command
-  // 面板 / 工具栏入口 / 自查自开桥）时，跳过 SSH 连接流程直接进入本地终端。
+  // P0 connectionless local-terminal passthrough (HOST_PLUGIN_UI_SPEC §4/§7.1): when the host opens this workbench with
+  // the workbench is opened with the command context (plugin.mode="local-terminal") (command
+  // panel / toolbar entry / self-open bridge), the SSH connection flow is skipped and the local terminal opens directly.
   if (readPluginMode(hostContext.value) === "local-terminal") {
     if (!workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
     await hydratePrefs();
-    // A4 恢复语义（spec §7.6/§8.4）：恢复不是再次执行 command——restored tab
-    // 不自动起 shell，只亮退出外壳，等用户点"重新打开"显式启动。
+    // Bottom dock / webview rebuild reopen: first reattach the live shell still bound to this workbenchId in the
+    // live shell (reopening never leaks a new PTY; spec §10 leaves no PTY behind on close).
+    if (await reattachLocalSession()) return;
+    // A4 restore semantics (spec §7.6/§8.4): restoring is not re-running the command — a restored tab
+    // no automatic shell — just the exit shell until the user explicitly hits "Reopen".
     if (restored.value) {
       localSession.value = null;
       localState.value = "exited";
       localShellRestored.value = true;
       return;
     }
-    await startLocalTerminal();
+    // Dock "+" creates with the selected shell type (context.plugin.shell); when unset the preference applies.
+    await startLocalTerminal(readPluginShell(hostContext.value) || undefined);
     return;
   }
   if (!connectionId.value || !workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
@@ -7986,7 +8060,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="workbench">
+  <main class="workbench" :class="{ 'panel-surface': panelSurface }">
     <header class="toolbar" :style="toolbarStyle">
       <!-- 连接信息入口：Info 图标按钮紧跟标识区（状态徽章右侧），弹层左对齐锚定 -->
       <div class="identity-side">
@@ -8020,10 +8094,12 @@ onBeforeUnmount(() => {
       </div>
       <div class="toolbar-actions">
         <button class="icon-button icon-neutral" :title="paneOrder === 'terminal-left' ? t('moveSftpLeft') : t('moveTerminalLeft')" @click="togglePaneOrder"><ArrowLeftRight /></button>
-        <button class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" :disabled="localUiMode" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
+        <!-- Local terminal UI hides SSH-only actions outright (not disabled): the local
+             shell has no SSH session to act on. -->
+        <button v-if="!localUiMode" class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
-        <button class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
         <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
              已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。 -->
         <button class="icon-button icon-violet" :class="{ 'is-active': localUiMode }" :title="localUiMode && !localShellRestored ? t('localTerminal.close') : t('localTerminal.open')" @click="toggleLocalTerminal"><TerminalIcon /></button>
@@ -8063,6 +8139,30 @@ onBeforeUnmount(() => {
                   :title="t('localTerminal.openInNewTab')"
                   @click="openLocalTerminalTab"
                 ><SquarePlus /></button>
+                <Popover :open="localShellSurfaceOpen" @update:open="(open) => (localShellSurfaceOpen = open)">
+                  <PopoverAnchor as-child>
+                    <button
+                      v-if="canOpenLocalTab"
+                      class="local-tab-button"
+                      :title="t('localTerminal.openShellSurface')"
+                      @click="openLocalShellSurfaceMenu"
+                    ><ListPlus /></button>
+                  </PopoverAnchor>
+                  <PopoverContent class="popover" align="end" :side-offset="5">
+                    <button class="shell-surface-item" @click="openLocalShellSurface()">
+                      <TerminalIcon class="h-3.5 w-3.5" />{{ t("localTerminal.autoShell") }}
+                    </button>
+                    <button v-for="entry in localShells" :key="entry.program" class="shell-surface-item" @click="openLocalShellSurface(entry.program)">
+                      <TerminalIcon class="h-3.5 w-3.5" />{{ entry.name }}<span class="mono local-shell-program">{{ entry.program }}</span>
+                    </button>
+                    <template v-if="dockConnections.length">
+                      <p class="shell-surface-header">{{ t("localTerminal.connectionTerminals") }}</p>
+                      <button v-for="connection in dockConnections" :key="`conn-${connection.id}`" class="shell-surface-item" @click="openConnectionSurface(connection)">
+                        <TerminalIcon class="h-3.5 w-3.5" />{{ connection.name }}
+                      </button>
+                    </template>
+                  </PopoverContent>
+                </Popover>
                 <button class="primary-button" :disabled="localState === 'starting'" @click="localMenuOpen = false; localShellRestored || isLocalMode ? restartLocalTerminal() : requestLocalTerminal()">
                   {{ localUiMode ? t("localTerminal.restart") : t("localTerminal.open") }}
                 </button>
@@ -8070,21 +8170,21 @@ onBeforeUnmount(() => {
             </PopoverContent>
           </Popover>
         </div>
-        <button class="icon-button icon-emerald" :title="t('reconnect')" :disabled="localUiMode || (terminalState === 'connecting' && !reconnectPending)" @click="reconnectNow"><PlugZap /></button>
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting' && !reconnectPending" @click="reconnectNow"><PlugZap /></button>
         <!-- 一键 sudo -v：向当前 PTY 写入命令刷新 sudo 凭据缓存；quick sudo 自动应答
              是否启用由连接设置决定（设置弹窗），工作台不再提供开关。 -->
-        <button class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
-        <button class="icon-button icon-emerald" :title="t('profilesTitle')" :disabled="localUiMode" @click="openProfilesManager"><KeyRound /></button>
-        <button class="icon-button icon-cyan" :title="t('alertTriage.title')" :disabled="localUiMode" @click="openAlertTriage"><Siren /></button>
-        <button class="icon-button icon-cyan" :title="t('forwards.title')" :disabled="!session" @click="forwardsOpen = true"><Network /></button>
-        <label class="follow-directory-control" :title="t('followTerminal')">
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
+        <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
+        <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('forwards.title')" :disabled="!session" @click="forwardsOpen = true"><Network /></button>
+        <label v-if="!localUiMode" class="follow-directory-control" :title="t('followTerminal')">
           <Switch size="sm" :model-value="followDirectory" :disabled="!connected" @update:model-value="setDirectoryTracking" />
           <span>{{ t("followTerminal") }}</span>
         </label>
         <span class="toolbar-separator" aria-hidden="true" />
-        <button class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
-        <button class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
-        <div>
+        <button v-if="!localUiMode" class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
+        <button v-if="!localUiMode" class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
+        <div v-if="!localUiMode">
           <Popover :open="quickMenuOpen" @update:open="(open) => { if (!open) quickMenuOpen = false; }">
             <PopoverAnchor as-child>
               <button class="icon-button icon-amber" :title="t('quickCommands')" :disabled="!connected" @click.stop="toggleQuickMenu"><Zap /></button>

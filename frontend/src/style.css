@@ -81,6 +81,41 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
 /* 标识区 + Info 按钮的左组容器：弹层锚点在外层（identity 自身 overflow
    hidden 负责长主机名截断，弹层不会被裁）。 */
 .identity-side { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; gap: 4px; }
+
+/* Dock panel surface (surface=panel): hide the entire workbench toolbar — the
+   panel presents only the terminal. The host dock chrome provides its own
+   close/collapse/maximize controls, so no toolbar widgets are needed. */
+.workbench.panel-surface .toolbar {
+  display: none;
+}
+
+/* Panel "+" shell menu entries. */
+.shell-surface-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  text-align: left;
+}
+.shell-surface-item:hover {
+  background: color-mix(in srgb, currentColor 8%, transparent);
+}
+.shell-surface-header {
+  padding: 4px 8px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+.shell-surface-item .local-shell-program {
+  margin-left: auto;
+  opacity: 0.6;
+  font-size: 10px;
+}
 .identity { min-width: 0; overflow: hidden; gap: 6px; }
 /* 空间不足时 Info 按钮也可折叠（先缩主机名，再缩它到 0），不再硬顶
    右侧按钮组造成叠印。 */

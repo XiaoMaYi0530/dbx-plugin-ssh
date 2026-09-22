@@ -280,6 +280,8 @@ impl Plugin {
             "local/session/list" => Ok(self.runtime.block_on(self.local.list())),
             // 本地终端 shell 发现：工作台选择器用（多平台 shell 设置）。
             "local/shells/list" => Ok(self.local.shells()),
+            // PR-A4 generic launch-options contract: picker entries for the dock "+".
+            "local/terminal/launch-options" => Ok(self.local.launch_options()),
             "workbench/close" => {
                 let workbench_id = required_string(&params, "workbenchId")?;
                 self.runtime
