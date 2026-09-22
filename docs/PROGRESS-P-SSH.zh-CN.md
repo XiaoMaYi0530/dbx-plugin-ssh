@@ -3361,3 +3361,13 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 > `handleHostFileDrop`：`canAcceptFileDrop` 门禁 → `planHostFileDrop` 落点
 > 分流（含 targetDir）→ 桥故障回退原生选择器；`registerHostFileTransferBridge`
 > 注册器已随之移除，上节「仅一处注册」的表述以本注记为准。
+
+## M1 nyaterm-parity 波次（2026-09-23）
+
+对齐 docs/IMPL_PLAN_NYATERM_PARITY.zh-CN.md（v2）P1 五任务、DEV_PLAN W1 三 agent 并行拓扑落地：
+
+- **并行执行**：`parity-gpu`（9a/9b GPU+NPU）、`parity-actions-gutter`（8b+8c）、`parity-suggest-transfer`（8a+10b）三 worktree 并行 TDD；热点治理按计划生效（App.vue 接线点错峰，merge 仅 3 文件冲突且全为两侧追加型）。
+- **集成修复**：i18n.ts 追加块丢 for 循环闭合、preferences.rs keep-both 结构损伤——最终以「C 版为底 + B 版片段函数级插入」重建（cargo 595 全绿）；GPU 卡片窄卡显存折行/`NPUCANN` 徽标粘连/CANN 徽标右对齐三处 UI 打磨。
+- **mock 夹具**：mockDbxHost 的 `ssh/metrics` 补 `gpu`/`npu` sections（双 A100 + 910B4/310P3 + 计算进程），供监控卡片视觉验证。
+- **验证**：cargo 595 / vitest 792 / vue-tsc 0 / build 过；e2e 七场景截图（连接、设置区、双列 gutter、建议浮层、Downloads 传输设置、GPU/NPU 卡片、动作链接下划线）经 visual-judge 终审 7/7 pass；详见 TEST_MATRIX「M1」节。
+- **遗留**：GPU/NPU 真机冒烟（需有卡主机）、Windows ConPTY gutter、DBX 桌面宿主手测（M1 里程碑 PR 前人工）。
