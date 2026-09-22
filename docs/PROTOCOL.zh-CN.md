@@ -508,6 +508,25 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - `sftp/transfer/status`：参数 `taskId`。返回单个任务的同构状态对象；任务不存在时先查历史，仍无则报错。
 - `sftp/transfer/history`：参数 `sessionId?`（可选过滤）、`limit?`（默认 50，上限 200）。返回 `{ tasks: [...] }`——持久化传输历史（`transfer-history.json`，环形上限 200 条，跨 sidecar 重启保留）与内存 live 任务按 `taskId` 去重合并、新→旧排序，元素结构 `{ taskId, sessionId, connectionId, direction, fileName, size, transferred, status, startedAt, finishedAt, error? }`（时间戳 Unix 毫秒；`status` 同上并含 `failed`）。无活动连接也可查询；仅状态跃迁落盘，逐块进度不落盘；跨进程（embedded 与 stdio `--mcp`）last-writer-wins；重启后遗留 `running` 呈现为 `failed`（不回写文件）。不进 MCP 工具面。
 
+## 主机密钥确认通道(requestUserInput)
+
+首次连接(或主机密钥变更)时,sidecar 的确认请求按以下顺序选通道:
+
+1. **宿主弹窗(优先)**:宿主在 `plugin/initialize` 广告 `host.hostApiVersion >= 1.1.0`
+   且 `host.features` 含 `host.requestUserInput`(点分形式)时,sidecar 直接调用
+   `host/requestUserInput`(字符串 id `plugin-N`,`echo: true`,`options:
+   accept/remember`,`timeoutSecs: 300`)。弹窗期间宿主暂停 `connection/test` /
+   `connection/connect` 的请求截止时间,连接表单里即可完成信任。
+2. **工作台事件(降级)**:宿主不支持(-32601)或无可用弹窗面(-32001 且非 SDK
+   本地超时)时,仍发既有事件 `connection/challenge`,由工作台 UI 应答
+   (`connection/challenge/resolve`),语义与字段不变。
+3. **fail closed**:用户 cancel/timeout、宿主对请求不应答(SDK 本地 330s 超时,
+   `-32001` + "did not answer")、或其他错误——一律拒绝握手,不降级、不猜测。
+   MCP 模式的 `auto_trust`(TOFU)行为不变。
+
+已知限制:Host API 1.0 宿主 + 工作台未打开(连接表单路径)仍无应答者,`connection/test`
+约 9s 后返回可读超时文案(0.4.78+ 缓解),文案在挑战已发出时附指引。
+
 ## 主机密钥
 
 `DBX_PLUGIN_DATA_DIR/known_hosts` 保存插件确认过的主机密钥，同时只读系统 `known_hosts`。未知主机通过 `ssh/host-key/prompt` 事件交给工作台确认；已知主机密钥变化直接拒绝，不能用一次确认覆盖。
