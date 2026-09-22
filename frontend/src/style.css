@@ -869,7 +869,3 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .forward-field-pair { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 6px; }
 .forward-form-error { margin: 0; font-size: 11px; color: var(--destructive); }
 .forward-form footer { display: flex; justify-content: flex-end; }
-/* 监听字段单行布局：主机输入 + 网卡下拉并排，不叠两层。 */
-.forward-host-cell { display: flex; flex-direction: row; align-items: center; gap: 4px; min-width: 0; }
-.forward-host-cell > input { flex: 1 1 auto; min-width: 0; }
-.forward-host-picker { flex: 0 0 108px; min-width: 0; font-size: 10px; }

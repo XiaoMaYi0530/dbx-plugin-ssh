@@ -19,7 +19,6 @@ import {
   type HostInterface,
   type PortForward,
 } from "../lib/portForward";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 interface Props {
@@ -48,8 +47,8 @@ const forwardForm = reactive<ForwardFormDraft>({
 /** 已翻译的表单错误（校验码或冲突预检文案），空串即无错误。 */
 const forwardFormMessage = ref("");
 const interfaces = ref<HostInterface[]>([]);
-/** 选取后强制下拉重挂载回占位态：所选地址已回填输入框，值不重复展示。 */
-const pickerReset = ref(0);
+/** datalist id：绑定监听输入框与网卡候选列表。 */
+const hostOptionListId = "forward-listen-host-options";
 
 async function refreshForwards() {
   if (!props.connectionId) return;
@@ -77,11 +76,6 @@ async function refreshInterfaces() {
 
 function applyForwardFormError(code: ForwardFormError) {
   forwardFormMessage.value = code ? t(`forwards.error.${code}`) : "";
-}
-
-function pickListenHost(addr: unknown) {
-  if (typeof addr === "string") forwardForm.listenHost = addr;
-  pickerReset.value += 1;
 }
 
 async function submitForward() {
@@ -193,20 +187,19 @@ watch(
             <label class="forward-field">
               <span>{{ t("forwards.listen") }}</span>
               <span class="forward-field-pair">
-                <span class="forward-host-cell">
-                  <input v-model="forwardForm.listenHost" :placeholder="t('forwards.listenHostPlaceholder')" />
-                  <Select :key="pickerReset" v-if="interfaces.length" :model-value="undefined" @update:model-value="pickListenHost">
-                    <SelectTrigger size="xs" class="forward-host-picker" :title="t('forwards.detectTip')">
-                      <SelectValue :placeholder="t('forwards.detectTip')" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="0.0.0.0">{{ t("forwards.allInterfaces") }}</SelectItem>
-                      <SelectItem v-for="iface in interfaces" :key="iface.addr" :value="iface.addr">
-                        {{ iface.addr }} · {{ iface.isLoopback ? t("forwards.loopback") : iface.name }}
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
-                </span>
+                <input
+                  v-model="forwardForm.listenHost"
+                  :placeholder="t('forwards.listenHostPlaceholder')"
+                  :list="hostOptionListId"
+                />
+                <!-- ip+网卡名同框：datalist 候选 value=可绑定 IP，网卡名作说明
+                     文案；手输与点选同一输入框，探测失败自动退化为纯手输。 -->
+                <datalist :id="hostOptionListId">
+                  <option value="0.0.0.0">{{ t("forwards.allInterfaces") }}</option>
+                  <option v-for="iface in interfaces" :key="iface.addr" :value="iface.addr">
+                    {{ iface.isLoopback ? t("forwards.loopback") : iface.name }}
+                  </option>
+                </datalist>
                 <input v-model="forwardForm.listenPort" inputmode="numeric" :placeholder="t('forwards.portPlaceholder')" />
               </span>
             </label>
