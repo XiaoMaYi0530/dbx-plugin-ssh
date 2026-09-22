@@ -362,13 +362,10 @@ impl PromptBroker {
         }
     }
 
-    // Task 3 (`connection/test` timeout guidance in main.rs) consumes these.
-    #[allow(dead_code)]
     pub(crate) fn clear_challenge_raised(&self) {
         self.challenge_raised.store(false, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn challenge_was_raised(&self) -> bool {
         self.challenge_raised.load(Ordering::Relaxed)
     }
@@ -805,12 +802,26 @@ fn test_dial_budget_secs(connect_timeout_secs: u64, explicit: bool) -> u64 {
 
 /// Actionable `connection/test` timeout: the cryptic host RPC-timeout
 /// message gave no remedy; this names the effective budget (flagged as the
-/// host default when the field was absent) plus the user-side fix.
-fn test_timeout_message(host: &str, port: u16, budget_secs: u64, host_default: bool) -> String {
+/// host default when the field was absent) plus the user-side fix. When a
+/// host-key confirmation was raised during the probe, say so instead of
+/// pointing the user at the timeout setting.
+fn test_timeout_message(
+    host: &str,
+    port: u16,
+    budget_secs: u64,
+    host_default: bool,
+    challenge_raised: bool,
+) -> String {
     let source = if host_default { " (host default)" } else { "" };
-    format!(
+    let mut message = format!(
         "SSH connection to {host}:{port} timed out after {budget_secs} seconds{source}. Increase 'SSH timeout' under Advanced options and retry."
-    )
+    );
+    if challenge_raised {
+        message.push_str(
+            " A host-key confirmation was raised but went unanswered; connect once from the SSH workbench to trust this host, or update DBX to 0.6.17+ so the confirmation can appear here.",
+        );
+    }
+    message
 }
 
 /// Key-exchange-only probe handler (tiny-rdm's CheckHostKey equivalent):
@@ -1836,6 +1847,7 @@ impl SshRuntime {
         operation_id: &str,
         emitter: PluginEmitter,
     ) -> Result<(), String> {
+        self.prompts.clear_challenge_raised();
         // 宿主对 connection/test 有 RPC 截止（有效连接超时），截止一到直接
         // 杀掉请求、用户只看到费解的宿主超时文案——sidecar 必须在截止前
         // 作答，因此拨号预算按宿主截止对齐并留 1s 余量。
@@ -1853,6 +1865,7 @@ impl SshRuntime {
                         connection.runtime_port,
                         budget_secs,
                         !connection.connect_timeout_explicit,
+                        self.prompts.challenge_was_raised(),
                     ));
                 }
             };
@@ -7585,12 +7598,12 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
 
     #[test]
     fn test_timeout_message_names_budget_source_and_remedy() {
-        let explicit = test_timeout_message("dbx-ssh-test", 22, 29, false);
+        let explicit = test_timeout_message("dbx-ssh-test", 22, 29, false, false);
         assert_eq!(
             explicit,
             "SSH connection to dbx-ssh-test:22 timed out after 29 seconds. Increase 'SSH timeout' under Advanced options and retry."
         );
-        let fallback = test_timeout_message("dbx-ssh-test", 22, 9, true);
+        let fallback = test_timeout_message("dbx-ssh-test", 22, 9, true, false);
         assert!(
             fallback.contains("timed out after 9 seconds (host default)"),
             "{fallback}"
@@ -7599,6 +7612,17 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
             fallback.contains("Increase 'SSH timeout' under Advanced options"),
             "{fallback}"
         );
+    }
+
+    #[test]
+    fn test_timeout_message_names_pending_host_key_confirmation() {
+        let base = test_timeout_message("h", 22, 9, true, false);
+        assert!(base.contains("timed out after 9 seconds (host default)"));
+        assert!(base.contains("Increase 'SSH timeout'"));
+
+        let with_challenge = test_timeout_message("h", 22, 9, false, true);
+        assert!(with_challenge.contains("host-key confirmation"));
+        assert!(!with_challenge.contains("(host default)"));
     }
 
     #[test]
@@ -9887,6 +9911,17 @@ matrix-ed25519";
             broker.clear_challenge_raised();
             let _ = challenge_via(&broker, &emitter).await;
             assert!(broker.challenge_was_raised());
+            broker.clear_challenge_raised();
+            assert!(!broker.challenge_was_raised());
+        }
+
+        #[test]
+        fn challenge_flag_clears_between_probes() {
+            let gateway = Arc::new(ScriptedGateway::without_feature());
+            let broker = PromptBroker::with_gateway(gateway);
+            broker
+                .challenge_raised
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             broker.clear_challenge_raised();
             assert!(!broker.challenge_was_raised());
         }
