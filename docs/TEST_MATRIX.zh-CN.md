@@ -49,3 +49,12 @@ i18n 七语全量对齐断言、终端标记条运行中时长 tick、sudo 保�
 （smoke_sudo_otp_test.py 10 用例）。
 依赖宿主/CI（单列）：宿主管线集成回归（test.sh 全量 + plugin_tools_bridge）、DBX Web/Docker
 浏览器兜底 e2e、长稳与大文件 100 MiB/1 GiB、五平台包矩阵、多会话语义与端口转发归属决策。
+
+
+## M1（nyaterm-parity W1，2026-09-23）
+
+单测：cargo **595/595**（基线 575 + 20：metrics_gpu 13 / preferences 7）、vitest **792/792**（基线 698 + 94：matcher 24 / gutter 18 / suggestions+guard+queue 42 / gpu 视图与组件 10）、vue-tsc 0 错、`pnpm build` 过（ui/ 已重生成）；`validate_repo.py`、`connection-forms/verify.mjs` 全过。
+
+e2e（headless Chrome，`mock.html?fresh=1&slow=2`，Playwright + 系统 Chrome）：连接流程 → 设置 Terminal 分类（Action links / Line numbers & timestamps 区渲染、开关→Save 持久化）→ 终端行号+时间戳双列 gutter 对齐 → 命令条造历史后输入 "ec" 建议浮层（匹配高亮 + History 来源标签）→ Downloads 分类（重复策略单选 + 并发输入）→ Server metrics GPU/NPU 卡片（双 A100 P0/P8 + 910B4/310P3 + CANN 徽标 + 空进程态 + 警戒色）→ 动作链接 host:port 下划线（与 IP 关键词高亮共存）。截图经 visual-judge 终审 **7/7 pass**（备注项：Downloads 路径说明行位置、窄卡显存 title 兜底截断，均非阻断）。
+
+仍保持未验收（依赖真机/CI）：NVIDIA/Ascend 真机采集冒烟（无卡主机，TEST_MATRIX 待补跑记录）、Windows ConPTY 下 gutter 渲染、DBX 桌面宿主端到端手测（M1 里程碑 PR 合入前人工执行）。

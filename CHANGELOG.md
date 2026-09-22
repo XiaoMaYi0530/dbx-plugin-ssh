@@ -4,6 +4,25 @@
 
 This file records user-facing changes for DBX SSH Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
+## [Unreleased]
+
+### 新增 / Added
+
+- **终端命令建议浮层**（对标 NyaTerm）：终端内输入时按模糊评分浮出历史/快捷命令建议（↑↓ 选择、Tab 填充、Enter 执行、Esc 关闭）；采集挂接 shell integration 命令标记与命令条执行路径，沿用密钥样过滤，Expect/OTP 注入文本不入库；alternate buffer/pager/抑制程序集（htop/less/man/journalctl/tail -f 等）五门抑制；设置键 `history_suggestions_enabled`（默认开）与长度上下限。
+  **Terminal command suggestions:** fuzzy-scored history/quick-command overlay in the terminal (↑↓ select, Tab fill, Enter run, Esc dismiss); collection hooks shell-integration command markers and the command bar, reuses the secret-like filter, and never records Expect/OTP injected text; suppressed in alternate buffers, pagers and a suppressive-program set; new `history_suggestions_enabled` and length-limit preferences.
+
+- **动作链接**（默认关闭，对标 NyaTerm）：识别终端输出中的 IPv4、`host:port` 与压缩包文件名并加下划线，点击把建议命令（`ping`/`nc -vz`/`unzip` 等）填入输入行而不执行；三类匹配器独立开关；与既有 IP/关键词高亮让位共存。
+  **Action links (off by default):** underline IPv4, host:port and archive names in terminal output; clicking fills the suggested command (`ping`/`nc -vz`/`unzip`…) into the input line without running it; three matcher toggles; yields to the existing keyword/IP highlights.
+
+- **行号/时间戳 gutter**（默认关闭，对标 NyaTerm）：终端左缘行号列与行首写时间戳列（回车重盖当前行），格式串可配（`[HH:mm:ss]` 默认，token 化）；wrapped 行只标首行，alternate buffer 隐藏，读不到渲染尺寸时整体降级隐藏。
+  **Line-number / timestamp gutter (off by default):** left gutter with line numbers and first-write timestamps (Enter restamps the current line), configurable token-based format; wrapped lines mark their first row only, hidden in the alternate buffer, degrades gracefully.
+
+- **GPU / Ascend NPU 监控**（对标 NyaTerm）：`ssh_metrics` 新增 `gpu`/`npu` sections——NVIDIA 经 `nvidia-smi`（利用率/显存/温度/功耗/风扇/pstate + 计算进程按 uuid 归卡），Ascend 经 `npu-smi info`（AI Core/HBM/健康度/功耗 + CANN 版本从安装元数据读取）；MCP `ssh_metrics` 自动受益；监控面板新增卡片区（警戒色阈值、空进程态、不可用弱化提示）。
+  **GPU / Ascend NPU monitoring:** `ssh_metrics` gains `gpu`/`npu` sections — NVIDIA via nvidia-smi (utilization/memory/temp/power/fan/pstate plus compute processes keyed by uuid), Ascend via npu-smi info (AI Core/HBM/health/power with the CANN version read from install metadata); the MCP tool benefits automatically and the metrics panel renders per-device cards with warning colours and graceful unavailable states.
+
+- **传输并发与重复目标策略**：上传并发可配置（`transfer_concurrency`，1–10 默认 3，暂停占位/取消释放槽位）；远端同名文件按 `transfer_duplicate_policy` 处理——自动改名（默认，`name(1)..name(999)` 经新 `sftp/rename-unique`）/覆盖/逐个询问（支持应用到全部）。
+  **Transfer concurrency and duplicate policy:** configurable upload concurrency (`transfer_concurrency`, 1–10, default 3; paused transfers keep their slot, cancelled release it); remote name clashes follow `transfer_duplicate_policy` — auto-rename (default, via the new `sftp/rename-unique`), overwrite, or per-batch ask with apply-to-all.
+
 ## [0.6.0] — 2026-09-22
 
 0.6.0 正式版，收束 0.6.0-beta.1–4 的全部变更。
