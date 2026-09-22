@@ -4686,6 +4686,13 @@ async function chooseUpload() {
     await loadDirectory();
     if (selection.files.length) showNotice(t("uploaded", { count: selection.files.length }));
   } catch (cause) {
+    // 宿主文件桥读盘失败（如 unknown plugin file handle，issue #83/#79）时不再
+    // 直接终止：回退到 webview 原生文件选择（File API），上传仍可继续。
+    if (isHostBridgeReadFailure(cause)) {
+      showNotice(t("uploadBridgeFallback"));
+      uploadInput.value?.click();
+      return;
+    }
     showError(cause);
   }
 }
@@ -4698,10 +4705,24 @@ async function uploadHandleFiles(files: Array<{ handleId: string; name: string; 
           const result = await window.dbxPlugin.fileTransfer!.read(file.handleId, offset, length);
           return window.dbxPlugin.decodeBase64(result.dataBase64);
         });
+      } catch (cause) {
+        // 桥接读盘错误转成可理解的提示；uploadSource 已补 upload-read-failed 代码，
+        // 终端拖入路径（同函数）的 showError 也会显示这条友好文案。
+        if (isHostBridgeReadFailure(cause)) {
+          const code = (cause as Error & { code?: unknown }).code;
+          throw Object.assign(new Error(t("uploadBridgeReadFailed", { name: file.name })), { code, cause });
+        }
+        throw cause;
       } finally {
         await window.dbxPlugin.fileTransfer!.cancel(file.handleId).catch(() => undefined);
       }
   });
+}
+
+function isHostBridgeReadFailure(cause: unknown): boolean {
+  if (!(cause instanceof Error)) return false;
+  const code = (cause as Error & { code?: unknown }).code;
+  return code === "upload-read-failed" || /file handle/i.test(cause.message);
 }
 
 async function uploadLocalFiles(files: readonly File[], targetDir?: string) {
