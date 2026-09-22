@@ -189,7 +189,7 @@ import { resolveRemotePath, splitRemotePathSegments } from "./lib/remotePathInpu
 import { shouldCommitRename } from "./lib/sftpRename";
 import { folderDownloadOutcome, type FolderDownloadFinish } from "./lib/sftpFolderDownload";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
-import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRendererLike } from "./lib/terminalWebgl";
+import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRecoveryOptions, type WebglRendererLike } from "./lib/terminalWebgl";
 import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from "./lib/terminalClickCursor";
 import { bridgeBinaryBytes } from "../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
@@ -760,6 +760,16 @@ const downloadPrefsAdapter = {
 // 终端临时挂载（取像素依赖 canvas），导出完随终端 dispose 释放 context。
 const webglEnabled = ref(loadWebglEnabled());
 const webglRenderer = ref<WebglRendererLike | null>(null);
+// GPU 重置/驱动切换后有限次重建 renderer（Tabby 同款策略）：成功经
+// onRecovered 回填引用，偏好已关闭则放弃重建，预算耗尽静默留在 DOM 渲染。
+function webglRecoveryOptions(): WebglRecoveryOptions<WebglRendererLike> {
+  return {
+    onRecovered: (addon) => {
+      webglRenderer.value = addon;
+    },
+    enabled: () => webglEnabled.value,
+  };
+}
 // True while attachSession sits inside its bounded backoff loop; turns the
 // status pill and overlay into the dedicated "reconnecting" phase.
 const reconnectPending = ref(false);
@@ -1452,7 +1462,7 @@ function createTerminal() {
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value);
   if (webglEnabled.value) {
-    webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon());
+    webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon(), webglRecoveryOptions());
   }
   if (highlightEnabled.value) attachHighlightRender();
   scheduleFit();
@@ -1463,7 +1473,7 @@ function setWebglEnabled(next: boolean) {
   webglEnabled.value = next;
   persistWebglEnabled(next);
   if (!terminal) return;
-  webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon());
+  webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon(), webglRecoveryOptions());
 }
 
 // Apple 平台用 Cmd+A 直选全选，其余平台 Ctrl+Shift+A（isTerminalSelectAllShortcut）。
