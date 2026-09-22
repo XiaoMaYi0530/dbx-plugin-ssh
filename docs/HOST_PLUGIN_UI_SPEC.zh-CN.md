@@ -513,6 +513,24 @@ BottomDock 是宿主通用容器，不是终端专用实现。
 - [ ] Web/Docker 对 appToolbar、appSidebar 和 panel 的显示/隐藏/回退行为明确。
 - [ ] panel 不可用时，`presentation: panel` 按规范回退到 tab 或返回明确的不支持错误；不得静默丢失入口。
 
+### PR-A4 插件侧本地验证映射
+
+SSH 插件把本地终端迁移到 `command` + `menus`（PR-A4，实施计划见
+`docs/HOST_UI_A4_IMPL_PLAN.zh-CN.md`）。下表把评审指南 §7 中与 A4 相关的检查项
+映射到插件侧验证方式：能在本仓本地验证的标注命令/用例名，需要宿主配合的标注
+“待宿主联调”，由串行收尾的 V 轨道在宿主 A1-A3 落地后收口。本节只建结构与当前
+确定项，不代勾 W1/W2 未完成项（§8.1 状态勾选留待对应轨道完成后更新）。
+
+| 评审指南 §7 检查项 | A4 视角 | 验证方式 |
+| --- | --- | --- |
+| 插件载荷只进入 `context.plugin`，宿主保留字段最后写入并覆盖冲突（安全与隔离） | 直通 context 从 `{ localTerminal: true }` 迁到 `{ plugin: { mode: "local-terminal" } }`；mock 侧模拟宿主权威 `workbenchId` | 本地可验（W1 合并后生效）：`node scripts/smoke_ui_mock.mjs` A4 锚点 `?local=1` 直通；`pnpm --dir frontend test`（`mockDbxHost.spec.ts` context 形状往返 + openWorkbench 身份权威用例） |
+| 插件无法伪造 `workbenchId`、`surface`、`restored`、`connectionId`（command / 安全与隔离） | 自开桥不再传 `workbenchId`，由宿主注入（旧宿主走 fallback） | 本地可验（W1 合并后生效）：`pnpm --dir frontend test` 自开桥参数用例；真实宿主注入行为 **待宿主联调** |
+| 恢复不重新执行 command、不自动启动本地 shell（生命周期与恢复） | `?local=1&restored=1` 夹具：0 次 `local/terminal/start`，退出外壳（已退出 + 重新打开/关闭）可见 | 本地可验（W1 合并后生效）：`node scripts/smoke_ui_mock.mjs` A4 锚点 restored 零调用断言；`pnpm --dir frontend test` restored 不自动起 shell 用例 |
+| A1 `restore: none` 不创建恢复实例、不重新执行 command（生命周期与恢复） | 本地终端 command 声明 `restore: none`（W2 manifest 分支 `codex/ssh/a4-manifest`） | 声明内容静态审查见 W2 分支；宿主恢复行为 **待宿主联调**（V 轨道合同矩阵） |
+| 关闭、卸载与异常退出均不会遗留 PTY 子进程（context 与生命周期） | sidecar `local/session/close` 回收子 shell | 本地可验：`python3 scripts/smoke_local_terminal.py`（用例 5：close 后子进程退出并收到 exited 事件）；宿主 webview 关闭链路 **待宿主联调** |
+| commandPalette / appToolbar / appSidebar 摆放与来源提示（menus 与 UX） | W2 manifest 声明三摆放 + `assets/local-terminal.svg` 受控图标 | 声明内容静态审查见 W2 分支；入口渲染与来源提示 **待宿主联调**（宿主 A3） |
+| 直通进入本地终端：本地徽标、无 SSH 连接卡片、恰好一次自动启动（A4 直通回归） | `?local=1` 直通路径在 context 迁移后行为不变 | 本地可验（W1 合并后生效）：`node scripts/smoke_ui_mock.mjs` A4 锚点 `?local=1`（徽标 + 无 SSH 卡片 + start 计数=1） |
+
 ---
 
 ## 11. 发布即冻结的契约
