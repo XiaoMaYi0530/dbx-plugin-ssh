@@ -38,12 +38,21 @@ const localeListeners = new Set<(locale: string) => void>();
 // 与 DBX globals.css 的 :root（pearl 浅色）和 .dark 规范块保持一致。
 const light = fixtureParams.get("theme") === "light";
 
-// ?local=1 模拟宿主以 context.localTerminal 打开的无连接本地终端 tab
-// （HOST_PLUGIN_UI_SPEC §7.1 直通路径）：无 connectionId/connection。
+// ?local=1 模拟宿主以 command context（plugin.mode="local-terminal"）打开的
+// 无连接本地终端 tab（HOST_PLUGIN_UI_SPEC §4/§7.1 直通路径）：无
+// connectionId/connection。workbenchId/restored/surface 由宿主（mock）注入。
 const localOnlyContext = fixtureParams.get("local") === "1";
+// ?local=1&restored=1 模拟宿主恢复的本地终端 tab：恢复语义（spec §7.6/§8.4）
+// 要求恢复不重放——不自动起 shell，只亮退出外壳等用户显式启动。
+const restoredFixture = fixtureParams.get("restored") === "1";
 
 const context = localOnlyContext
-  ? { localTerminal: true, workbenchId: "visual-workbench" }
+  ? {
+      plugin: { mode: "local-terminal" },
+      workbenchId: "visual-workbench",
+      restored: restoredFixture,
+      surface: "tab",
+    }
   : {
   connectionId: "visual-connection",
   workbenchId: "visual-workbench",
@@ -923,10 +932,23 @@ window.dbxPlugin = {
   invoke,
   notify: async () => undefined,
   // 新建会话按钮的桥调用：mock 只记录参数（控制台可见），不真的开 tab。
+  // 镜像规范 §11 的宿主权威性：插件载荷保留在 context.plugin，插件传入的
+  // 保留字段（workbenchId/restored/surface）一律丢弃，身份由 mock（宿主）
+  // 生成注入——为宿主 A1 行为提供先行测试面。
   openWorkbench: async (contributionId, childContext) => {
     console.info("[mock] openWorkbench", contributionId, childContext);
+    const payload = (childContext && typeof childContext === "object" && !Array.isArray(childContext) ? childContext : {}) as Record<string, unknown>;
+    delete payload.workbenchId;
+    delete payload.restored;
+    delete payload.surface;
+    const hostContext = {
+      ...payload,
+      workbenchId: `mock-workbench-${++mockOpenWorkbenchSeq}`,
+      restored: false,
+      surface: "tab",
+    };
     (window as unknown as { __dbxMockOpenWorkbench?: unknown[] }).__dbxMockOpenWorkbench ??= [];
-    (window as unknown as { __dbxMockOpenWorkbench: unknown[] }).__dbxMockOpenWorkbench.push({ contributionId, context: childContext });
+    (window as unknown as { __dbxMockOpenWorkbench: unknown[] }).__dbxMockOpenWorkbench.push({ contributionId, context: hostContext });
   },
   sendBinary: async (channel, data) => {
     if (channel.startsWith("sftp/upload/")) {
@@ -988,6 +1010,8 @@ window.dbxPlugin = {
 // mock 专有调试入口（真实桥无此字段）：切换 locale 并推送 onLocaleChange
 // 监听，供 mock.html 控制台 / 单测走查 i18n 切换链（瞬态 notice 不随切语
 // 重译的 R5-P2-2 维持豁免，不在本夹具模拟范围）。
+// openWorkbench 注入的 mock 宿主实例序号（宿主权威身份模拟，spec §11）。
+let mockOpenWorkbenchSeq = 0;
 (window as unknown as { __dbxMockSetLocale?: (next: string) => void }).__dbxMockSetLocale = (next: string) => {
   currentLocale = next || "en";
   for (const listener of localeListeners) listener(currentLocale);

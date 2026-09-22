@@ -254,4 +254,61 @@ describe("mockDbxHost fixture", () => {
     const stat = (await plugin.invoke("sftp/stat", { path: "/home/demo/deploy.sh" })) as { size: number };
     expect(stat.size).toBe(30);
   });
+
+  // PR-A4：mock 夹具按目标契约供形——context.plugin 命名空间（spec §4/§11）。
+  // ？local=1 直通形状迁移后不得再出现顶层 localTerminal 键。
+  it("?local=1 serves the A4 plugin-mode context without the legacy localTerminal key", async () => {
+    const plugin = await loadMock("?local=1");
+    expect(plugin.context).toEqual({
+      plugin: { mode: "local-terminal" },
+      workbenchId: "visual-workbench",
+      restored: false,
+      surface: "tab",
+    });
+    expect((plugin.context as Record<string, unknown>).localTerminal).toBeUndefined();
+  });
+
+  // PR-A4 恢复语义（spec §7.6/§8.4）：restored 夹具把恢复事实暴露给 App 的
+  // 直通分支（恢复不重放——不自动起 shell 由 App.vue restored 分支保证，浏览器
+  // 侧由 scripts/smoke_ui_mock.mjs 的 A4 锚点锁零 local/terminal/start 调用）。
+  it("?local=1&restored=1 exposes the restored fixture for the no-replay shell state", async () => {
+    const plugin = await loadMock("?local=1&restored=1");
+    expect(plugin.context).toMatchObject({
+      plugin: { mode: "local-terminal" },
+      restored: true,
+      surface: "tab",
+    });
+    // 夹具本体是被动的：加载即调用 local/terminal/start 的一定是 App 侧 bug，
+    // 这里锁定 mock 自己在加载路径上零桥调用。
+    const starts: string[] = [];
+    const raw = plugin.invoke.bind(plugin);
+    plugin.invoke = ((method: string, ...rest: unknown[]) => {
+      if (method === "local/terminal/start") starts.push(method);
+      return (raw as (method: string, ...rest: unknown[]) => Promise<unknown>)(method, ...rest);
+    }) as typeof plugin.invoke;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(starts).toEqual([]);
+  });
+
+  // PR-A4 宿主权威（spec §11）：mock 的 openWorkbench 镜像宿主 A1 行为——
+  // 插件传入的保留字段（workbenchId/restored/surface）丢弃，身份由宿主生成。
+  it("openWorkbench discards plugin-forged reserved fields and injects host identity", async () => {
+    const plugin = await loadMock("");
+    await plugin.openWorkbench!("io.dbx.ssh.workbench", {
+      plugin: { mode: "local-terminal" },
+      workbenchId: "plugin-forged-id",
+      restored: true,
+      surface: "panel",
+    });
+    const calls = (window as unknown as { __dbxMockOpenWorkbench?: Array<{ contributionId: string; context: Record<string, unknown> }> }).__dbxMockOpenWorkbench ?? [];
+    expect(calls).toHaveLength(1);
+    expect(calls[0].contributionId).toBe("io.dbx.ssh.workbench");
+    const ctx = calls[0].context;
+    // 插件载荷原样保留；保留字段被宿主身份覆盖。
+    expect(ctx.plugin).toEqual({ mode: "local-terminal" });
+    expect(ctx.workbenchId).not.toBe("plugin-forged-id");
+    expect(String(ctx.workbenchId)).toMatch(/^mock-workbench-/);
+    expect(ctx.restored).toBe(false);
+    expect(ctx.surface).toBe("tab");
+  });
 });
