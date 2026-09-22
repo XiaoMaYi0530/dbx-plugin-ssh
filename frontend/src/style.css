@@ -842,7 +842,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 
 /* 端口映射管理弹窗（PortForwardDialog）：映射行 = 类型徽标 + 路由 + 状态 +
    计数 + 停止；下方为添加表单（方向单选 + 监听/目标地址对）。 */
-.forwards-modal { width: min(560px, calc(100vw - 40px)); }
+.forwards-modal { width: min(760px, calc(100vw - 40px)); }
 .forwards-body { display: flex; flex-direction: column; gap: 14px; min-height: 200px; }
 .forwards-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow: auto; }
 .forward-row { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
@@ -869,3 +869,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .forward-field-pair { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 6px; }
 .forward-form-error { margin: 0; font-size: 11px; color: var(--destructive); }
 .forward-form footer { display: flex; justify-content: flex-end; }
+/* 监听字段单行布局：主机输入 + 网卡下拉并排，不叠两层。 */
+.forward-host-cell { display: flex; flex-direction: row; align-items: center; gap: 4px; min-width: 0; }
+.forward-host-cell > input { flex: 1 1 auto; min-width: 0; }
+.forward-host-picker { flex: 0 0 108px; min-width: 0; font-size: 10px; }

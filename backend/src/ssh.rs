@@ -2083,6 +2083,38 @@ impl SshRuntime {
         let session = self.session(session_id).await?;
         let (kind, listen_host, listen_port, target_host, target_port) =
             forward::parse_spec(params)?;
+        // Conflict pre-check ahead of bind/tcpip-forward, so a duplicate gets
+        // a naming error instead of a raw "address already in use" (local) or
+        // a server-side refusal (remote). Local endpoints collide on the one
+        // client machine — every connection; remote endpoints collide per
+        // server — same connection only.
+        if listen_port != 0 {
+            let conflicting = self.forwards.rows().into_iter().find(|row| {
+                row.kind == kind
+                    && (kind == forward::ForwardKind::Local
+                        || row.connection_id == session.connection_id)
+                    && forward::listen_endpoints_conflict(
+                        &listen_host,
+                        listen_port,
+                        &row.listen_host,
+                        row.listen_port,
+                    )
+            });
+            if let Some(row) = conflicting {
+                let endpoint = format!("{listen_host}:{listen_port}");
+                let existing = forward::describe(
+                    row.kind,
+                    &row.listen_host,
+                    row.listen_port,
+                    &row.target_host,
+                    row.target_port,
+                );
+                return Err(format!(
+                    "Listen endpoint {endpoint} is already forwarded by mapping {} ({existing})",
+                    row.id
+                ));
+            }
+        }
         let entry = Arc::new(forward::ForwardEntry {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),

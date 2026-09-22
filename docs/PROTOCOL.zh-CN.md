@@ -18,6 +18,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/host-key/resolve` | 处理工作台内的主机密钥确认 |
 | `ssh/exec` | 在会话连接上执行远程命令，可选 Quick Sudo 提权 |
 | `ssh/exec/cancel` | 中止进行中的远程命令（按 `execId`） |
+| `ssh/forward/interfaces` | 本机网卡地址探测（供端口映射面板的监听地址选择器）：无参 → `{interfaces: [{name, addr, isLoopback}]}`，回环优先、v4 先于 v6、按 IP 去重；探测失败返回空数组（选择器隐藏，手输不受影响）。`if-addrs`（getifaddrs）实现，无会话依赖 |
 | `ssh/forward/list`、`ssh/forward/start`、`ssh/forward/stop` | 用户级端口映射（ssh(1) -L/-R，见「端口映射」节）：`list` 按 `{connectionId?}`/`{sessionId?}` 过滤返回 `{forwards: [row]}`；`start` `{sessionId, kind: "local"\|"remote", listenHost?, listenPort, targetHost, targetPort}`（`listenHost` 缺省 127.0.0.1；`listenPort: 0` 由本机/服务端挑选，`boundPort` 回报实际端口）→ `{forward: row}`；`stop` `{id}` → `{success, forward}`，未知 id 报错。row 字段 camelCase：`id/sessionId/connectionId/kind/listenHost/listenPort/boundPort/targetHost/targetPort/state("starting"\|"active"\|"stopped"\|"error")/error?/connectionsTotal/connectionsActive/bytesUp/bytesDown`。状态迁移发 `ssh/forward/state`（notify）`{id, sessionId, connectionId, state, error?}` |
 | `ssh/agent/resolve` | 处理 AI 终端同步执行的命令审批（按 `challengeId`，一次性；approve 可携 `command` 编辑后原文与 `remember: true` 记住标记，见「审批记忆」节） |
 | `ssh/alert/triage` | 告警分诊：异构告警 JSON/纯文本 → 结构化 + 分类 + 只读诊断命令清单（无需连接，从不执行；见「告警分诊」节） |
@@ -189,6 +190,7 @@ suggestions: [{command, purposeKey}]}`（字段钳制：title/message ≤2 KiB�
 
 - **local（-L）**：sidecar 在客户端机器 `listen_host:listen_port` 起 TCP 监听；每条入站连接开一条 `direct-tcpip` 通道，由服务端拨 `target_host:target_port`。双向转发走 `copy_bidirectional`，按连接累计 `bytesUp/bytesDown`。
 - **remote（-R）**：sidecar 先向服务端发 `tcpip-forward` 全局请求（拒绝即 start 报错，`AllowTcpForwarding no` 的服务器在此处失败）；`listenPort: 0` 时由服务端挑选端口并以 `boundPort` 回报。服务端侧入站连接以 `forwarded-tcpip` 通道送达，sidecar 的客户端 handler 按连接维度的转发表（`(listen_host, bound_port) → target`，含归一化与通配端口回退匹配）在**客户端机器**拨目标地址并双向转发。停止时发 `cancel-tcpip-forward` 并摘除表项。
+- **输入校验与冲突预检**：listen/target 主机接受 IPv4、IPv6（`[...]` 括号剥除）与主机名标签；嵌入式端口/scheme（`host:8080`、`http://…`）、`999.1.1.1` 这类伪 IP、本地映射的 `*` 通配均拒绝（空 listenHost 缺省回环）。`start` 在 bind/`tcpip-forward` 之前做监听端点冲突预检：同方向、同显式端口（0 = 自动挑选永不冲突）、主机相同或任一侧通配（`*`/`0.0.0.0`/`::`/空）即报 `Listen endpoint … is already forwarded by mapping …`；local 作用于全部连接（同一台客户机），remote 作用于同连接（同一台服务器）。工作台面板同规则预检并在表单内联提示。
 - `stop` 语义：后台任务全部 abort（含已建立的转发连接），registry 立即摘除；对同一 id 重复 stop 报 `not found` 错误。已建立的映射在会话存活期间持续转发；映射生命周期 = 会话生命周期。
 - 事件 `ssh/forward/state` 为状态广播（starting/active/error/stopped），工作台面板（`PortForwardDialog.vue`，自订阅该事件）据此就地刷新；list 为准、事件为加速。
 

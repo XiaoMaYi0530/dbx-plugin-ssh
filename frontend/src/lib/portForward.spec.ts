@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   applyForwardState,
+  findForwardConflict,
   formatForwardBytes,
   formatForwardRoute,
   forwardStartParams,
   parseForwards,
+  parseInterfaces,
   validateForwardForm,
   type ForwardFormDraft,
   type PortForward,
@@ -82,20 +84,73 @@ describe("validateForwardForm", () => {
     ...overrides,
   });
 
-  it("accepts a complete form and server-picked ports", () => {
+  it("accepts complete forms, loopback default and server-picked ports", () => {
     expect(validateForwardForm(draft({}))).toBeNull();
-    expect(validateForwardForm(draft({ listenPort: "0", targetPort: "65535" }))).toBeNull();
+    expect(validateForwardForm(draft({ listenHost: "", listenPort: "0", targetPort: "65535" }))).toBeNull();
   });
 
-  it("rejects a missing target host", () => {
+  it("accepts IPv4, IPv6 (bracketed) and hostname targets", () => {
+    expect(validateForwardForm(draft({ targetHost: "192.168.1.10" }))).toBeNull();
+    expect(validateForwardForm(draft({ targetHost: "[FE80::1]" }))).toBeNull();
+    expect(validateForwardForm(draft({ targetHost: "::1" }))).toBeNull();
+    expect(validateForwardForm(draft({ listenHost: "10.0.0.5:8080" }))).toBe("listenHost");
+    expect(validateForwardForm(draft({ targetHost: "http://db" }))).toBe("targetHost");
+    expect(validateForwardForm(draft({ targetHost: "999.1.1.1" }))).toBe("targetHost");
+    expect(validateForwardForm(draft({ targetHost: "bad host" }))).toBe("targetHost");
+  });
+
+  it("allows the wildcard listen host only for remote mappings", () => {
+    expect(validateForwardForm(draft({ kind: "remote", listenHost: "*" }))).toBeNull();
+    expect(validateForwardForm(draft({ kind: "local", listenHost: "*" }))).toBe("listenHost");
+  });
+
+  it("rejects a missing target host and bad ports", () => {
     expect(validateForwardForm(draft({ targetHost: "  " }))).toBe("targetHost");
-  });
-
-  it("rejects non-integer and out-of-range ports", () => {
     expect(validateForwardForm(draft({ listenPort: "" }))).toBe("port");
     expect(validateForwardForm(draft({ listenPort: "abc" }))).toBe("port");
     expect(validateForwardForm(draft({ targetPort: "-1" }))).toBe("port");
     expect(validateForwardForm(draft({ targetPort: "65536" }))).toBe("port");
+  });
+});
+
+describe("findForwardConflict", () => {
+  const rows = [
+    row({}),
+    row({ id: "fwd-2", kind: "remote", listenPort: 31234, boundPort: 31234 }),
+  ];
+
+  it("flags the same endpoint and wildcard overlap", () => {
+    expect(findForwardConflict(rows, { kind: "local", listenHost: "127.0.0.1", listenPort: "8080" })?.id).toBe("fwd-1");
+    expect(findForwardConflict(rows, { kind: "local", listenHost: "0.0.0.0", listenPort: "8080" })?.id).toBe("fwd-1");
+    expect(findForwardConflict(rows, { kind: "local", listenHost: "127.0.0.1", listenPort: "8081" })).toBeNull();
+    // Different direction: the same port lives on different machines.
+    expect(findForwardConflict(rows, { kind: "remote", listenHost: "127.0.0.1", listenPort: "8080" })).toBeNull();
+  });
+
+  it("ignores auto-picked ports and defaults the empty host to loopback", () => {
+    expect(findForwardConflict(rows, { kind: "local", listenHost: "127.0.0.1", listenPort: "0" })).toBeNull();
+    expect(findForwardConflict(rows, { kind: "local", listenHost: "", listenPort: "8080" })?.id).toBe("fwd-1");
+  });
+});
+
+describe("parseInterfaces", () => {
+  it("parses rows and drops addressless entries", () => {
+    const interfaces = parseInterfaces({
+      interfaces: [
+        { name: "lo0", addr: "127.0.0.1", isLoopback: true },
+        { name: "en0", addr: "", isLoopback: false },
+        null,
+        { addr: "192.168.1.24", isLoopback: false },
+      ],
+    });
+    expect(interfaces).toHaveLength(2);
+    expect(interfaces[0]).toMatchObject({ name: "lo0", addr: "127.0.0.1", isLoopback: true });
+    expect(interfaces[1]).toMatchObject({ name: "", addr: "192.168.1.24", isLoopback: false });
+  });
+
+  it("returns an empty list for junk payloads", () => {
+    expect(parseInterfaces(null)).toEqual([]);
+    expect(parseInterfaces({})).toEqual([]);
   });
 });
 

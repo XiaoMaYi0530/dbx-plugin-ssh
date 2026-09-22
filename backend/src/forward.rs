@@ -172,11 +172,14 @@ pub(crate) fn describe(
     format!("{listen_host}:{listen_port} {arrow} {target_host}:{target_port}")
 }
 
-/// Validates and normalizes one mapping request. Hosts default like ssh(1):
-/// an empty listen host is the loopback interface, never the wildcard.
-/// Listen port 0 asks the OS (local) or the server (remote) to pick a port;
-/// the actually bound value is reported through `boundPort`. Pure so tests
-/// exercise every rejection without touching the network.
+/// Validates and normalizes one mapping request. Hosts accept IPv4, IPv6
+/// (bracketed or bare) and plain hostnames; the listen host defaults like
+/// ssh(1) — empty is the loopback interface, never the wildcard — and `*`
+/// (bind-everywhere) is only meaningful server-side, so a local mapping
+/// rejects it instead of failing later at bind time. Listen port 0 asks the
+/// OS (local) or the server (remote) to pick a port; the actually bound
+/// value is reported through `boundPort`. Pure so tests exercise every
+/// rejection without touching the network.
 pub(crate) fn parse_spec(
     params: &Value,
 ) -> Result<(ForwardKind, String, u16, String, u16), String> {
@@ -187,6 +190,12 @@ pub(crate) fn parse_spec(
             .and_then(Value::as_str)
             .unwrap_or(""),
     )?;
+    if kind == ForwardKind::Local && listen_host == "*" {
+        return Err(
+            "listenHost \"*\" is a server-side wildcard; local mappings bind a concrete host (use 0.0.0.0 for all interfaces)"
+                .to_string(),
+        );
+    }
     let listen_port = parse_port(params.get("listenPort"), "listenPort")?;
     // Unlike the listen host, a missing target has no sensible default —
     // reject before normalize_host silently substitutes the loopback.
@@ -203,17 +212,83 @@ pub(crate) fn parse_spec(
     Ok((kind, listen_host, listen_port, target_host, target_port))
 }
 
-/// Loopback defaults and permissive-but-sane host syntax. Returns the
-/// normalized host (lowercased, trimmed, loopback default applied).
+/// Host syntax gate: IPv4 / IPv6 (URL-style `[...]` brackets stripped) /
+/// hostname labels / the `*` listen wildcard. Empty stays the caller's
+/// contract (loopback default applied here). Everything that embeds a port
+/// or scheme (`host:8080`, `http://…`, `user@host`) is rejected so a typo
+/// never silently becomes a hostname lookup of garbage.
 pub(crate) fn normalize_host(raw: &str) -> Result<String, String> {
-    let host = raw.trim();
-    if host.is_empty() {
+    let invalid = |reason: &str| format!("Invalid host {raw:?}: {reason}");
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return Ok("127.0.0.1".to_string());
     }
-    if host.len() > 253 || host.chars().any(|c| c.is_whitespace()) {
-        return Err(format!("Invalid host: {raw:?}"));
+    if trimmed.len() > 253 || trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(invalid("must be a hostname or IP without whitespace"));
     }
-    Ok(host.to_lowercase())
+    // `[::1]` / `[fe80::1]`: brackets are a URL convention — strip them and
+    // reject `[::1]:8080` (the port belongs in its own field).
+    let host = if trimmed.starts_with('[') {
+        let Some(end) = trimmed.find(']') else {
+            return Err(invalid("unclosed bracket"));
+        };
+        if end != trimmed.len() - 1 {
+            return Err(invalid(
+                "bracketed IPv6 must not be followed by more text (put the port in its own field)",
+            ));
+        }
+        &trimmed[1..end]
+    } else {
+        trimmed
+    };
+    let lower = host.to_lowercase();
+    if lower == "*" {
+        return Ok(lower);
+    }
+    // Bare IPs (v4 and v6, including scoped zones like fe80::1%en0) win over
+    // hostname rules; std's parser is the authority.
+    if lower.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(lower);
+    }
+    if lower.contains([':', '/', '@']) {
+        return Err(invalid("expected an IPv4/IPv6 address or a hostname"));
+    }
+    // All-numeric dotted strings that failed the IPv4 parse above are typos
+    // like `999.1.1.1`, not hostnames — reject instead of a DNS surprise.
+    if !lower.is_empty() && lower.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return Err(invalid("looks like an IPv4 address but is not a valid one"));
+    }
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    if !lower.split('.').all(label_ok) {
+        return Err(invalid(
+            "hostname labels accept letters, digits and inner hyphens only",
+        ));
+    }
+    Ok(lower)
+}
+
+/// True when two listen endpoints of the same direction collide on the same
+/// machine (local) or server (remote): equal ports and equal hosts, or
+/// either side a wildcard (`*` / `0.0.0.0` / `::` / empty). Port 0 lets the
+/// OS or the server pick, so it never pre-conflicts. Pure; both sides are
+/// expected pre-normalized.
+pub(crate) fn listen_endpoints_conflict(
+    a_host: &str,
+    a_port: u16,
+    b_host: &str,
+    b_port: u16,
+) -> bool {
+    if a_port == 0 || a_port != b_port {
+        return false;
+    }
+    let wildcard = |host: &str| matches!(host, "*" | "0.0.0.0" | "::" | "");
+    wildcard(a_host) || wildcard(b_host) || a_host == b_host
 }
 
 /// 1..=65535 for explicit ports; 0 is only meaningful for a remote listen
@@ -500,6 +575,53 @@ pub(crate) fn abort_tasks(entry: &ForwardEntry) {
     }
 }
 
+/// Client-machine interface addresses for the forward dialog's listen-host
+/// picker (`ssh/forward/interfaces`): one row per distinct bindable IP with
+/// its interface name and loopback flag. Ordered loopback → IPv4 → IPv6 →
+/// name so the picker reads stably; deduped because one IP can appear on
+/// several interfaces. Takes normalized `(interface, ip, is_loopback)` rows
+/// so tests pin the ordering without constructing host-specific structs.
+/// An empty probe result degrades to an empty list — the picker hides and
+/// manual input keeps working.
+pub(crate) fn interface_rows(probe: Vec<(String, std::net::IpAddr, bool)>) -> Value {
+    let mut rows = probe;
+    // Loopback first, then IPv4, then IPv6; !is_loopback so true sorts first.
+    rows.sort_by(|a, b| {
+        (!a.2, a.1.is_ipv6(), &a.0, a.1.to_string()).cmp(&(
+            !b.2,
+            b.1.is_ipv6(),
+            &b.0,
+            b.1.to_string(),
+        ))
+    });
+    rows.dedup_by(|a, b| a.1 == b.1);
+    let interfaces: Vec<Value> = rows
+        .into_iter()
+        .map(|(name, ip, is_loopback)| {
+            json!({
+                "name": name,
+                "addr": ip.to_string(),
+                "isLoopback": is_loopback,
+            })
+        })
+        .collect();
+    json!({ "interfaces": interfaces })
+}
+
+/// Live probe wrapper for the RPC arm; the pure sorting lives in
+/// [`interface_rows`].
+pub(crate) fn local_interface_rows() -> Value {
+    let probe: Vec<_> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|iface| {
+            let ip = iface.ip();
+            (iface.name, ip, ip.is_loopback())
+        })
+        .collect();
+    interface_rows(probe)
+}
+
 /// Registry of live mappings, one per sidecar process (not per session) so
 /// `ssh/forward/list` can answer for a whole connection or a single session.
 #[derive(Default)]
@@ -599,6 +721,117 @@ mod tests {
         assert_eq!(normalize_host("  DB-01 ").unwrap(), "db-01");
         assert_eq!(normalize_host("").unwrap(), "127.0.0.1");
         assert!(normalize_host("bad host").is_err());
+    }
+
+    #[test]
+    fn accepts_ipv4_ipv6_bracketed_and_hostnames() {
+        // IPv4 (case/whitespace normalized).
+        assert_eq!(normalize_host("192.168.1.10").unwrap(), "192.168.1.10");
+        // IPv6 bare and URL-bracketed; brackets are stripped for the bind.
+        assert_eq!(normalize_host("::1").unwrap(), "::1");
+        assert_eq!(normalize_host("[FE80::1]").unwrap(), "fe80::1");
+        // Plain hostname and loopback name.
+        assert_eq!(normalize_host("db.Internal").unwrap(), "db.internal");
+        assert_eq!(normalize_host("localhost").unwrap(), "localhost");
+        // The listen wildcard stays verbatim (remote-side bind everywhere).
+        assert_eq!(normalize_host("*").unwrap(), "*");
+    }
+
+    #[test]
+    fn rejects_scheme_port_and_malformed_hosts() {
+        // Embedded port / scheme / userinfo never become garbage lookups.
+        assert!(normalize_host("10.0.0.5:8080").is_err());
+        assert!(normalize_host("http://10.0.0.5").is_err());
+        assert!(normalize_host("user@db").is_err());
+        // Broken bracket forms.
+        assert!(normalize_host("[::1").is_err());
+        assert!(normalize_host("[::1]:8080").is_err());
+        // Malformed hostnames and IPs.
+        assert!(normalize_host("-lead.ing").is_err());
+        assert!(normalize_host("end-.ing").is_err());
+        assert!(normalize_host("..").is_err());
+        assert!(normalize_host("999.1.1.1").is_err());
+        assert!(normalize_host("fe80::1%en0").is_err()); // zone scope: bind via the interface name instead
+    }
+
+    #[test]
+    fn local_kind_rejects_wildcard_star() {
+        let error = spec(json!({
+            "kind": "local", "listenHost": "*", "listenPort": 80,
+            "targetHost": "h", "targetPort": 1
+        }))
+        .unwrap_err();
+        assert!(error.contains("wildcard"), "unexpected: {error}");
+        // Remote keeps the sshd "bind everywhere" spelling.
+        let parsed = spec(json!({
+            "kind": "remote", "listenHost": "*", "listenPort": 80,
+            "targetHost": "h", "targetPort": 1
+        }))
+        .unwrap();
+        assert_eq!(parsed.1, "*");
+    }
+
+    #[test]
+    fn listen_conflicts_need_same_port_and_overlapping_host() {
+        use crate::forward as fwd;
+        // Same host, same port.
+        assert!(fwd::listen_endpoints_conflict(
+            "127.0.0.1",
+            8080,
+            "127.0.0.1",
+            8080
+        ));
+        // Wildcard overlaps any host on the same port.
+        assert!(fwd::listen_endpoints_conflict(
+            "0.0.0.0",
+            8080,
+            "192.168.1.5",
+            8080
+        ));
+        assert!(fwd::listen_endpoints_conflict("::1", 8080, "*", 8080));
+        // Different port or auto-pick never conflicts.
+        assert!(!fwd::listen_endpoints_conflict(
+            "127.0.0.1",
+            8080,
+            "127.0.0.1",
+            8081
+        ));
+        assert!(!fwd::listen_endpoints_conflict(
+            "127.0.0.1",
+            0,
+            "127.0.0.1",
+            8080
+        ));
+        // Different concrete hosts coexist.
+        assert!(!fwd::listen_endpoints_conflict(
+            "127.0.0.1",
+            8080,
+            "192.168.1.5",
+            8080
+        ));
+    }
+
+    #[test]
+    fn interface_rows_order_loopback_v4_v6_and_dedupe() {
+        use std::net::IpAddr;
+        let ip = |v: &str| v.parse::<IpAddr>().unwrap();
+        let rows = interface_rows(vec![
+            ("en0".to_string(), ip("192.168.1.10"), false),
+            ("utun3".to_string(), ip("::1"), true),
+            ("lo0".to_string(), ip("127.0.0.1"), true),
+            ("en1".to_string(), ip("192.168.1.10"), false), // duplicate IP across ifaces
+        ]);
+        let list = rows["interfaces"].as_array().unwrap();
+        let addrs: Vec<&str> = list
+            .iter()
+            .map(|row| row["addr"].as_str().unwrap())
+            .collect();
+        // Both loopbacks lead (v4 before v6 inside the group), then the rest.
+        assert_eq!(addrs, vec!["127.0.0.1", "::1", "192.168.1.10"]);
+        assert!(list[0]["isLoopback"].as_bool().unwrap());
+        assert_eq!(list[0]["name"].as_str().unwrap(), "lo0");
+        assert!(list[1]["isLoopback"].as_bool().unwrap());
+        assert!(!list[2]["isLoopback"].as_bool().unwrap());
     }
 
     #[test]

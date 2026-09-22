@@ -91,6 +91,9 @@ def start_forward(client: SidecarClient, session_id: str, kind: str, listen_port
         }, timeout=30)
     except Exception as error:  # noqa: BLE001 - classify then re-raise
         text = str(error)
+        # The conflict pre-check is a real contract, never an environmental skip.
+        if "already forwarded" in text:
+            raise
         if "forwarding" in text.lower() or "administratively" in text.lower() or "listen" in text.lower():
             raise SkipSignal(f"server refused {kind} forward: {text}") from error
         raise
@@ -269,10 +272,53 @@ def main() -> None:
                 raise AssertionError(f"session close left a forward behind: {rows!r}")
             print(f"    session close cleaned forward {forward['id']}")
 
+        def case_conflict_detection():
+            """A duplicate listen endpoint fails with the naming pre-check."""
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            free_port = probe.getsockname()[1]
+            probe.close()
+            first = start_forward(client, session_id, "local", free_port, "127.0.0.1", args.port)
+            stopped_ids.append(first["id"])
+            try:
+                start_forward(client, session_id, "local", free_port, "127.0.0.1", 22)
+            except SkipSignal:
+                raise
+            except Exception as error:  # noqa: BLE001 - the expected conflict
+                if "already forwarded" not in str(error):
+                    raise AssertionError(f"duplicate rejected with unexpected error: {error}") from error
+            else:
+                raise AssertionError("duplicate listen endpoint must be rejected")
+            # Wildcard overlaps the concrete binding too.
+            try:
+                start_forward(client, session_id, "local", free_port, "0.0.0.0", 22)
+            except SkipSignal:
+                raise
+            except Exception as error:  # noqa: BLE001 - the expected conflict
+                if "already forwarded" not in str(error):
+                    raise AssertionError(f"wildcard duplicate error unexpected: {error}") from error
+            else:
+                raise AssertionError("wildcard overlap must be rejected")
+            print(f"    duplicate + wildcard overlap on 127.0.0.1:{free_port} rejected")
+
+        def case_interface_probe():
+            """ssh/forward/interfaces reports loopback addresses of this host."""
+            result = req("ssh/forward/interfaces")
+            rows = result.get("interfaces") or []
+            addrs = {str(row.get("addr")) for row in rows}
+            if not rows:
+                print("    no interfaces reported (degraded picker) — accepted")
+                return
+            if "127.0.0.1" not in addrs and "::1" not in addrs:
+                raise AssertionError(f"probe missing loopback address: {sorted(addrs)}")
+            print(f"    probe returned {len(rows)} addresses (loopback present)")
+
         cases = [
             ("local -L roundtrip through the tunnel", case_local_forward_roundtrip, None),
             ("remote -R roundtrip via busybox nc", case_remote_forward_roundtrip, None),
             ("stop semantics + unknown-id error", case_stop_and_unknown_id, None),
+            ("conflict pre-check (duplicate + wildcard)", case_conflict_detection, None),
+            ("interface probe exposes loopback", case_interface_probe, None),
             ("session close clears the registry", case_session_close_cleans_up, None),
         ]
         for title, case, needs in cases:

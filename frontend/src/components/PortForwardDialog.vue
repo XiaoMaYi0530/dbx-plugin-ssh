@@ -7,15 +7,19 @@ import { Loader2, Plus, Square, X } from "@lucide/vue";
 import { workbenchMessage } from "../lib/i18n";
 import {
   applyForwardState,
+  findForwardConflict,
   formatForwardBytes,
   formatForwardRoute,
   forwardStartParams,
   parseForwards,
+  parseInterfaces,
   validateForwardForm,
   type ForwardFormDraft,
   type ForwardFormError,
+  type HostInterface,
   type PortForward,
 } from "../lib/portForward";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 interface Props {
@@ -41,7 +45,11 @@ const forwardForm = reactive<ForwardFormDraft>({
   targetHost: "",
   targetPort: "",
 });
-const forwardFormError = ref<ForwardFormError>(null);
+/** 已翻译的表单错误（校验码或冲突预检文案），空串即无错误。 */
+const forwardFormMessage = ref("");
+const interfaces = ref<HostInterface[]>([]);
+/** 选取后强制下拉重挂载回占位态：所选地址已回填输入框，值不重复展示。 */
+const pickerReset = ref(0);
 
 async function refreshForwards() {
   if (!props.connectionId) return;
@@ -57,10 +65,40 @@ async function refreshForwards() {
   }
 }
 
+/** 网卡地址探测（含回环）：失败静默降级为仅手输，选择器隐藏。 */
+async function refreshInterfaces() {
+  try {
+    interfaces.value = parseInterfaces(await window.dbxPlugin.invoke("ssh/forward/interfaces"));
+  } catch (cause) {
+    console.warn("[port-forward] interface probe failed", cause);
+    interfaces.value = [];
+  }
+}
+
+function applyForwardFormError(code: ForwardFormError) {
+  forwardFormMessage.value = code ? t(`forwards.error.${code}`) : "";
+}
+
+function pickListenHost(addr: unknown) {
+  if (typeof addr === "string") forwardForm.listenHost = addr;
+  pickerReset.value += 1;
+}
+
 async function submitForward() {
   const error = validateForwardForm(forwardForm);
-  forwardFormError.value = error;
-  if (error || !props.sessionId) return;
+  if (error) {
+    applyForwardFormError(error);
+    return;
+  }
+  const conflict = findForwardConflict(forwards.value, forwardForm);
+  if (conflict) {
+    forwardFormMessage.value = t("forwards.error.conflict", {
+      route: `${forwardForm.listenHost.trim() || "127.0.0.1"}:${forwardForm.listenPort.trim()}`,
+      existing: formatForwardRoute(conflict),
+    });
+    return;
+  }
+  if (!props.sessionId) return;
   try {
     const payload = await window.dbxPlugin.invoke(
       "ssh/forward/start",
@@ -70,9 +108,9 @@ async function submitForward() {
     if (started.length) {
       forwards.value = [...forwards.value.filter((row) => row.id !== started[0].id), ...started];
     }
-    forwardFormError.value = null;
+    forwardFormMessage.value = "";
   } catch (cause) {
-    forwardFormError.value = null;
+    forwardFormMessage.value = "";
     emit("error", cause);
   }
 }
@@ -113,8 +151,9 @@ watch(
   () => props.open,
   (open) => {
     if (open) {
-      forwardFormError.value = null;
+      forwardFormMessage.value = "";
       void refreshForwards();
+      void refreshInterfaces();
     }
   },
 );
@@ -154,7 +193,20 @@ watch(
             <label class="forward-field">
               <span>{{ t("forwards.listen") }}</span>
               <span class="forward-field-pair">
-                <input v-model="forwardForm.listenHost" :placeholder="t('forwards.listenHostPlaceholder')" />
+                <span class="forward-host-cell">
+                  <input v-model="forwardForm.listenHost" :placeholder="t('forwards.listenHostPlaceholder')" />
+                  <Select :key="pickerReset" v-if="interfaces.length" :model-value="undefined" @update:model-value="pickListenHost">
+                    <SelectTrigger size="xs" class="forward-host-picker" :title="t('forwards.detectTip')">
+                      <SelectValue :placeholder="t('forwards.detectTip')" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="0.0.0.0">{{ t("forwards.allInterfaces") }}</SelectItem>
+                      <SelectItem v-for="iface in interfaces" :key="iface.addr" :value="iface.addr">
+                        {{ iface.addr }} · {{ iface.isLoopback ? t("forwards.loopback") : iface.name }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </span>
                 <input v-model="forwardForm.listenPort" inputmode="numeric" :placeholder="t('forwards.portPlaceholder')" />
               </span>
             </label>
@@ -166,7 +218,7 @@ watch(
               </span>
             </label>
           </div>
-          <p v-if="forwardFormError" class="forward-form-error">{{ t(`forwards.error.${forwardFormError}`) }}</p>
+          <p v-if="forwardFormMessage" class="forward-form-error">{{ forwardFormMessage }}</p>
           <footer>
             <button type="submit" class="primary-button" :disabled="!props.sessionId"><Plus />{{ t("forwards.add") }}</button>
           </footer>

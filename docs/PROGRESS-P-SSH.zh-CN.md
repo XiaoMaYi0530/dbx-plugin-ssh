@@ -3305,3 +3305,21 @@ kafka 现网动态包按预期拦——修复后 CI 重建即静态）。CI 模�
 **剩余风险**：真机（DBX 桌面宿主）面板验收未跑；remote 转发的服务端
 forwarded-tcpip 回报地址形态依赖 OpenSSH 行为（已做归一化 + 端口回退，非
 OpenSSH 服务端未验证）；`-D`/映射持久化（跨会话记忆表单）明确 deferred。
+
+### 输入校验、冲突预检与网卡地址探测（2026-09-22 补强）
+
+- **主机语法**：sidecar `normalize_host` 升级为 IPv4/IPv6（`[...]` 括号剥
+  除）/主机名标签三态校验（std IpAddr 解析为权威），拒绝嵌入式端口/
+  scheme/伪 IP（`999.1.1.1`）；local 映射拒绝 `*` 通配（bind 不了）。前
+  端 `isValidHost` 同规则 JS 版（v6 借 URL 解析器校验），表单内联提示。
+- **冲突预检**：`listen_endpoints_conflict`（同方向 + 同显式端口 + 主机相
+  同或任一侧通配）在 bind/`tcpip-forward` 前拦截——local 查全局注册表
+  （同一台客户机）、remote 查同连接（同一台服务器）；工作台同规则客户端
+  预检并内联提示 `监听端点 {route} 已有映射（{existing}）`。
+- **网卡探测**：新增依赖 `if-addrs 0.15`（getifaddrs 纯 FFI 封装，无传递
+  依赖——用户明确要求网卡 IP 选择），sidecar `ssh/forward/interfaces` 返
+  回 `{name, addr, isLoopback}`（回环优先→v4→v6，按 IP 去重），面板监听
+  地址旁下拉可选（含 0.0.0.0「所有接口」项），探测失败静默降级为手输。
+- **验证**：sidecar 单测 13 例、vitest 524 例全绿；容器 smoke 新增冲突
+  （重复 + 通配）与探测（回环存在）用例全过；浏览器 fixture 验收非法主
+  机提示/冲突提示/网卡选取回填三交互。

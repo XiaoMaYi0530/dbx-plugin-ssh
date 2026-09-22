@@ -360,6 +360,16 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   else if (method === "sftp/list" || method === "sudo/listDir") result = { entries: mockList(String((params as Record<string, unknown>)?.path || "/")) };
   else if (method === "sftp/home") result = { path: "/home/demo" };
   else if (method === "ssh/forward/list") result = { forwards: mockForwards };
+  else if (method === "ssh/forward/interfaces") {
+    result = {
+      interfaces: [
+        { name: "lo0", addr: "127.0.0.1", isLoopback: true },
+        { name: "lo0", addr: "::1", isLoopback: true },
+        { name: "en0", addr: "192.168.1.24", isLoopback: false },
+        { name: "utun4", addr: "fd7a:115c:a1e0::3", isLoopback: false },
+      ],
+    };
+  }
   else if (method === "ssh/forward/start") {
     const input = params as Record<string, unknown>;
     const listenPort = Number(input.listenPort || 0);

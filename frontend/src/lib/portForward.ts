@@ -42,7 +42,14 @@ export interface ForwardFormDraft {
 }
 
 /** 表单校验错误码 → i18n `forwards.error.*`；null 表示通过。 */
-export type ForwardFormError = "targetHost" | "port" | null;
+export type ForwardFormError = "listenHost" | "targetHost" | "port" | null;
+
+/** `ssh/forward/interfaces` 行：本机可绑定地址 + 接口名 + 回环标记。 */
+export interface HostInterface {
+  name: string;
+  addr: string;
+  isLoopback: boolean;
+}
 
 function asForwardRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
@@ -114,16 +121,122 @@ export function applyForwardState(
 
 /**
  * 表单校验（与 sidecar `parse_spec` 同语义的客户端预检）：
- * - targetHost 必填（listenHost 缺省回落 127.0.0.1，由 sidecar 再兜底）；
+ * - listen/target 主机必须是 IPv4、IPv6（可带 `[]`）或主机名标签；
+ * - listenHost 缺省回落 127.0.0.1（`*` 仅远程映射可用）；
  * - 两个端口必须是 0..=65535 整数；0 表示让 OS/服务端挑选。
  */
 export function validateForwardForm(draft: ForwardFormDraft): ForwardFormError {
-  if (!draft.targetHost.trim()) return "targetHost";
+  if (!isValidHost(draft.listenHost.trim(), { allowEmpty: true, allowWildcard: draft.kind === "remote" })) {
+    return "listenHost";
+  }
+  if (!isValidHost(draft.targetHost.trim(), { allowEmpty: false, allowWildcard: false })) {
+    return "targetHost";
+  }
   for (const port of [draft.listenPort, draft.targetPort]) {
     const value = Number(port.trim());
     if (!port.trim() || !Number.isInteger(value) || value < 0 || value > 65535) return "port";
   }
   return null;
+}
+
+const WILDCARD_HOSTS = new Set(["*", "0.0.0.0", "::", ""]);
+
+/** 主机语法门（与 sidecar `normalize_host` 同规则的 JS 版）：IPv4 / IPv6 /
+ * 主机名 / 回环名；`*` 通配仅远程监听可用；嵌入式端口与 scheme 拒绝。 */
+export function isValidHost(
+  raw: string,
+  options: { allowEmpty: boolean; allowWildcard: boolean },
+): boolean {
+  let host = raw.trim().toLowerCase();
+  if (!host) return options.allowEmpty;
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    if (end === -1 || end !== host.length - 1) return false;
+    host = host.slice(1, end);
+  }
+  if (host === "*") return options.allowWildcard;
+  if (isIPv4(host) || isIPv6(host)) return true;
+  if (host === "localhost") return true;
+  if (/[:/@]/.test(host) || host.length > 253) return false;
+  // 全数字点分但不是合法 IPv4（如 999.1.1.1）：是笔误，不是主机名。
+  if (/^[\d.]+$/.test(host)) return false;
+  return host.split(".").every(
+    (label) =>
+      label.length > 0 &&
+      label.length <= 63 &&
+      /^[a-z0-9-]+$/.test(label) &&
+      !label.startsWith("-") &&
+      !label.endsWith("-"),
+  );
+}
+
+function isIPv4(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+function isIPv6(host: string): boolean {
+  if (!host.includes(":") || !/^[0-9a-f:.]+$/.test(host)) return false;
+  // 借 URL 解析器校验 IPv6 字面量（host 字段不含端口，直接包进 []）。
+  try {
+    new URL(`http://[${host}]`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 冲突预检（与 sidecar 同规则）：同方向、同端口（0 = 自动挑选永不冲突）、
+ * 主机相同或任一侧通配（`*`/`0.0.0.0`/`::`/空）即冲突。返回冲突行。
+ */
+export function findForwardConflict(
+  rows: PortForward[],
+  draft: Pick<ForwardFormDraft, "kind" | "listenHost" | "listenPort">,
+): PortForward | null {
+  const port = Number(draft.listenPort.trim());
+  if (!Number.isInteger(port) || port <= 0) return null;
+  const host = normalizePickHost(draft.listenHost.trim());
+  return (
+    rows.find(
+      (row) =>
+        row.kind === draft.kind &&
+        row.listenPort === port &&
+        (WILDCARD_HOSTS.has(host) ||
+          WILDCARD_HOSTS.has(normalizePickHost(row.listenHost)) ||
+          host === normalizePickHost(row.listenHost)),
+    ) ?? null
+  );
+}
+
+function normalizePickHost(host: string): string {
+  let value = host.trim().toLowerCase();
+  if (value.startsWith("[") && value.endsWith("]")) value = value.slice(1, -1);
+  if (!value) value = "127.0.0.1";
+  return value;
+}
+
+/**
+ * `ssh/forward/interfaces` 载荷 → 网卡地址行；坏行丢弃。探测失败（空载荷）
+ * 返回空数组，选择器隐藏、手输不受影响。
+ */
+export function parseInterfaces(payload: unknown): HostInterface[] {
+  const record = asForwardRecord(payload);
+  const rows = record && Array.isArray(record.interfaces) ? record.interfaces : [];
+  const parsed: HostInterface[] = [];
+  for (const row of rows) {
+    const source = asForwardRecord(row);
+    if (!source) continue;
+    const addr = typeof source.addr === "string" ? source.addr.trim() : "";
+    if (!addr) continue;
+    parsed.push({
+      name: typeof source.name === "string" ? source.name : "",
+      addr,
+      isLoopback: source.isLoopback === true,
+    });
+  }
+  return parsed;
 }
 
 /** 校验通过后的 RPC 参数（端口转数字；listenHost 空串交给 sidecar 默认）。 */

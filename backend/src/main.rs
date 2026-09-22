@@ -151,6 +151,7 @@ impl Plugin {
                 Ok(json!({ "success": true }))
             }
             "ssh/forward/list" => Ok(self.ssh.forward_list(&params)),
+            "ssh/forward/interfaces" => Ok(forward::local_interface_rows()),
             "ssh/forward/start" => self
                 .runtime
                 .block_on(self.ssh.forward_start(&params, emitter.clone())),
