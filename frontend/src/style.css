@@ -570,8 +570,16 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 /* 批量发送命令条（Electerm quick-command bar 风格）：常驻贴终端底部，回车即发送。
    命令条约 35px 高，宿主让位 42px 留出 7px 间隙；浮层偏移同步上移。 */
 .terminal-pane.batch-bar-open .terminal-host { inset: 0 0 42px 0; }
+/* 命令标记状态条可见时同样为 host 让位（FitAddon 经 ResizeObserver 自动
+   重排行数）——标记条从浮层改为贴底状态条，避免盖住最后一行提示符/命令
+   （真实反馈：光标停在底行时被 pill 挡住）。与批量条叠放时组合让位。 */
+.terminal-pane.marker-visible .terminal-host { inset: 0 0 24px 0; }
+.terminal-pane.batch-bar-open.marker-visible .terminal-host { inset: 0 0 66px 0; }
 .terminal-pane.batch-bar-open .terminal-command-marker,
 .terminal-pane.batch-bar-open .zmodem-status { bottom: 50px; }
+/* 命令标记状态条可见时，传输横幅上移避免叠压（SSH 终端同样装了 633 标记） */
+.terminal-pane.marker-visible .zmodem-status { bottom: 28px; }
+.terminal-pane.batch-bar-open.marker-visible .zmodem-status { bottom: 70px; }
 .batch-bar { position: absolute; z-index: 5; right: 0; bottom: 0; left: 0; display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding: 4px 8px; background: var(--background); }
 .batch-bar-targets { display: inline-flex; flex: 0 1 auto; min-width: 0; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; white-space: nowrap; }
 .batch-bar-targets:hover { background: color-mix(in srgb, var(--muted) 55%, transparent); }
@@ -785,6 +793,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .local-shell-popover .local-shell-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; font-size: 9px; color: var(--muted-foreground); }
 .local-shell-popover .local-shell-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
 .local-rerun-command { display: inline-block; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.local-shell-footer .local-tab-button { display: inline-flex; align-items: center; justify-content: center; min-height: 28px; min-width: 32px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--background); margin-right: auto; }
+.local-shell-footer .local-tab-button:hover { background: var(--accent); }
+.local-shell-footer .local-tab-button svg { width: 14px; height: 14px; }
 
 /* BEL 视觉铃：程序输出 \x07 时终端面板边框短促脉冲（alert() 的终端惯例替代） */
 .terminal-pane.bell-flash { animation: terminal-bell-pulse 0.4s ease-out; }
@@ -796,7 +807,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 /* OSC 633 command marker strip at the bottom-left of the terminal pane; hidden
    unless the remote shell integration emits 633 frames. The zmodem banner
    (z-index 3) takes precedence when both would overlap. */
-.terminal-command-marker { position: absolute; z-index: 2; left: 8px; bottom: 8px; display: inline-flex; align-items: center; gap: 6px; max-width: calc(100% - 16px); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; background: color-mix(in srgb, var(--background) 90%, transparent); color: var(--muted-foreground); font-size: 10px; pointer-events: auto; cursor: default; }
+.terminal-command-marker { position: absolute; z-index: 2; left: 0; right: 0; bottom: 0; display: inline-flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding: 3px 10px 4px; background: var(--ssh-terminal-background); color: var(--muted-foreground); font-size: 10px; pointer-events: auto; cursor: default; min-width: 0; }
 .terminal-command-marker svg { width: 12px; height: 12px; flex: 0 0 12px; }
 
 /* #33/#71 快速输入丢失诊断浮层（Ctrl/Cmd+Shift+D 切换，双击关闭）：

@@ -38,7 +38,13 @@ const localeListeners = new Set<(locale: string) => void>();
 // 与 DBX globals.css 的 :root（pearl 浅色）和 .dark 规范块保持一致。
 const light = fixtureParams.get("theme") === "light";
 
-const context = {
+// ?local=1 模拟宿主以 context.localTerminal 打开的无连接本地终端 tab
+// （HOST_PLUGIN_UI_SPEC §7.1 直通路径）：无 connectionId/connection。
+const localOnlyContext = fixtureParams.get("local") === "1";
+
+const context = localOnlyContext
+  ? { localTerminal: true, workbenchId: "visual-workbench" }
+  : {
   connectionId: "visual-connection",
   workbenchId: "visual-workbench",
   restored: false,

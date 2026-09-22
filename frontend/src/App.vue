@@ -1150,6 +1150,8 @@ const commandMarkerDetails = computed(() => commandMarkerTooltip(
   },
 ));
 const connectionIdentity = computed(() => {
+  // 无连接本地终端 tab：没有连接身份可显示。
+  if (isLocalMode.value && !connectionId.value) return t("localTerminal.active");
   const host = connection.value.host || connection.value.name || connectionId.value || "–";
   const identity = connection.value.username ? `${connection.value.username}@${host}` : host;
   const port = connection.value.port && connection.value.port !== 22 ? `:${connection.value.port}` : "";
@@ -3224,6 +3226,20 @@ async function setLocalShellIntegrationPref(enabled: boolean) {
   }
 }
 
+// P0.2 自查自开：经宿主 openWorkbench 桥开一个独立的无连接本地终端 tab
+// （context.localTerminal 直通闭环）。旧宿主无此桥时菜单项不出现。
+const canOpenLocalTab = computed(() => Boolean(window.dbxPlugin?.openWorkbench));
+
+async function openLocalTerminalTab() {
+  const api = window.dbxPlugin;
+  if (!api.openWorkbench) return;
+  await api.openWorkbench(
+    "io.dbx.ssh.workbench",
+    { localTerminal: true, workbenchId: crypto.randomUUID() },
+    { forceNew: true },
+  );
+}
+
 // webview 重建后接回 sidecar 里仍活着的本地 shell（workbench/close 才回收）。
 async function reattachLocalSession(): Promise<boolean> {
   try {
@@ -4298,7 +4314,7 @@ function loadSftpPaneDefaultOpen(): boolean {
 // preferences.json——工作台 iframe 是 sandbox="allow-scripts"（opaque
 // origin），localStorage 直接抛 SecurityError；localStorage 仅作 web
 // 浏览器直连场景的同步缓存。
-let prefsHydrated = false;
+let prefsHydrated: Promise<void> | null = null;
 
 function loadDownloadDir(): string {
   return downloadDirState.value;
@@ -4354,9 +4370,14 @@ async function syncPrefs() {
   }
 }
 
-async function hydratePrefs() {
-  if (prefsHydrated) return;
-  prefsHydrated = true;
+function hydratePrefs(): Promise<void> {
+  // Promise 记忆而非布尔：并发调用（onMounted 与本地终端直通分支）共享同一
+  // 次加载，直通分支 await 它时偏好保证已就绪。
+  prefsHydrated ??= hydratePrefsOnce();
+  return prefsHydrated;
+}
+
+async function hydratePrefsOnce() {
   try {
     downloadDirState.value = window.localStorage.getItem(DOWNLOAD_DIR_KEY)?.trim() || "";
     downloadUseDefaultState.value = window.localStorage.getItem(DOWNLOAD_USE_DEFAULT_KEY) !== "0";
@@ -7773,6 +7794,15 @@ async function initialize() {
   });
   await nextTick();
   createTerminal();
+  // P0 无连接本地终端直通（HOST_PLUGIN_UI_SPEC.zh-CN.md §7.1）：宿主以
+  // context.localTerminal=true 打开本 workbench（插件中心无连接打开 / 工具栏
+  // 入口 / 自查自开桥）时，跳过 SSH 连接流程直接进入本地终端。宿主零改动。
+  if (hostContext.value.localTerminal === true) {
+    if (!workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
+    await hydratePrefs();
+    await startLocalTerminal();
+    return;
+  }
   if (!connectionId.value || !workbenchId.value) throw new Error(t("errors.hostBridgeMissing"));
   const state = initialState();
   if (restored.value) {
@@ -7983,6 +8013,12 @@ onBeforeUnmount(() => {
               <footer class="local-shell-footer">
                 <!-- 本地模式中按钮保持可用：restart 语义（关当前 → 按新偏好重开）。
                      仅 starting 期间禁用防双击。 -->
+                <button
+                  v-if="canOpenLocalTab"
+                  class="local-tab-button"
+                  :title="t('localTerminal.openInNewTab')"
+                  @click="openLocalTerminalTab"
+                ><SquarePlus /></button>
                 <button class="primary-button" :disabled="localState === 'starting'" @click="localMenuOpen = false; isLocalMode ? restartLocalTerminal() : requestLocalTerminal()">
                   {{ isLocalMode ? t("localTerminal.restart") : t("localTerminal.open") }}
                 </button>
@@ -8234,7 +8270,7 @@ onBeforeUnmount(() => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
         <div ref="terminalHost" class="terminal-host" :class="{ 'bell-flash': terminalBellFlash }" @mousedown.middle="handleTerminalMiddleClick" />
         <!-- #33/#71 快速输入丢失诊断浮层：Ctrl/Cmd+Shift+D 切换。keys=onData
              路由到 PTY 的按键、sends=提交宿主桥的帧、acks=sidecar 确认的帧、
