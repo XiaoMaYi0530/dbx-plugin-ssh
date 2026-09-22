@@ -313,6 +313,11 @@ function scheduleDisconnect() {
 const request: DbxPluginApi["request"] = async <T = unknown>(method: string) =>
   (method === "host.getContext" ? context : null) as T;
 
+// 端口映射面板的 fixture 态：内存数组 + 递增 id，start/stop 与真实 sidecar
+// 语义一致（0 端口由 mock 随机挑一个、start 后广播 active 状态事件）。
+const mockForwards: Array<Record<string, unknown>> = [];
+let mockForwardSeq = 1;
+
 const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, params?: unknown) => {
   let result: unknown;
   if (method === "ssh/session/open") {
@@ -354,6 +359,41 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   }
   else if (method === "sftp/list" || method === "sudo/listDir") result = { entries: mockList(String((params as Record<string, unknown>)?.path || "/")) };
   else if (method === "sftp/home") result = { path: "/home/demo" };
+  else if (method === "ssh/forward/list") result = { forwards: mockForwards };
+  else if (method === "ssh/forward/start") {
+    const input = params as Record<string, unknown>;
+    const listenPort = Number(input.listenPort || 0);
+    const boundPort = listenPort > 0 ? listenPort : 30000 + Math.floor(Math.random() * 20000);
+    const forward = {
+      id: `mock-forward-${mockForwardSeq++}`,
+      sessionId: String(input.sessionId || "visual-session"),
+      connectionId: context.connectionId,
+      kind: input.kind === "remote" ? "remote" : "local",
+      listenHost: String(input.listenHost || "127.0.0.1"),
+      listenPort,
+      boundPort,
+      targetHost: String(input.targetHost || ""),
+      targetPort: Number(input.targetPort || 0),
+      state: "active",
+      error: null,
+      connectionsTotal: 0,
+      connectionsActive: 0,
+      bytesUp: 0,
+      bytesDown: 0,
+    };
+    mockForwards.push(forward);
+    setTimeout(() => {
+      for (const listener of eventListeners) listener({ method: "ssh/forward/state", params: { id: forward.id, sessionId: forward.sessionId, connectionId: forward.connectionId, state: "active", error: null } });
+    }, 20);
+    result = { forward };
+  }
+  else if (method === "ssh/forward/stop") {
+    const id = String((params as Record<string, unknown>)?.id || "");
+    const index = mockForwards.findIndex((forward) => forward.id === id);
+    if (index < 0) throw new Error("Port mapping was not found or already stopped");
+    mockForwards.splice(index, 1);
+    result = { success: true };
+  }
   else if (method === "sftp/createDirectory" || method === "sudo/mkdir") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockDir(String((params as Record<string, unknown>)?.path || "/").split("/").pop() || "folder"));
   else if (method === "sftp/touch") result = mockWriteEntry(String((params as Record<string, unknown>)?.path || ""), mockFile(String((params as Record<string, unknown>)?.path || "").split("/").pop() || "file.txt", 0));
   else if (method === "sftp/archive") {
