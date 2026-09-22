@@ -194,7 +194,12 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    内容其高亮块（如 Last login 的 IP）会浮到卡片遮罩之上。 */
 .terminal-host { position: absolute; z-index: 0; inset: 0; background: var(--ssh-terminal-background); }
 .terminal-host .xterm { height: 100%; padding: 5px 0 8px 10px; background: var(--ssh-terminal-background); }
-.terminal-host .xterm-viewport {
+/* 选择器必须压过 xterm 6.1-beta 的 `.xterm:not(.allow-transparency)
+   .xterm-viewport{background-color:#000}`（特异性 0,3,0）——6.0.0 时该规则
+   是 `.xterm .xterm-viewport`（0,2,0），靠导入顺序即可覆盖；升 beta 后特异性
+   变高，低特异性写法静默失效、padding 环带复现黑边。这里提到 .xterm .xterm-viewport
+   （同为 0,3,0），本文件在 xterm.css 之后导入，同特异性后者生效。 */
+.terminal-host .xterm .xterm-viewport {
   scrollbar-width: none !important;
   /* xterm 6：主题背景色改内联到 .xterm-scrollable-element（内容盒，避开了
      .xterm 的 padding），viewport 不再内联着色、保留库默认 #000，其矩形
