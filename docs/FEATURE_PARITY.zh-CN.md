@@ -415,3 +415,75 @@ headless Chrome + playwright-core 走系统 Chrome channel、依赖缺失即 SKI
 注意：`dbx-plugin` 装在 nvm 全局 bin（`~/.nvm/versions/node/<ver>/bin/dbx-plugin`，实测 0.1.9），
 **不在默认 PATH 上**；`scripts/smoke_ui_mock.mjs` 依赖 `pnpm` 在 PATH 上，跑之前需按上面的
 PATH 导出，否则 `spawn pnpm ENOENT`。
+
+## i18n 键引用护栏与 `d983f8fc` 回归修复（2026-09-22，同分支第三轮）
+
+### 起因
+
+上一轮从七语中退役了 `terminalSelectCopy.section` 与 `terminalBehavior.copyOnSelect`（并入 Clipboard 板块）。
+而 `workbenchMessage` 在查不到键时**会把 key 原样返回**，所以任何残留引用都会把原始的
+点号键直接渲染到界面上。既有断言（`workbench.spec.ts:171`）只比对**七个语言之间**的键集合是否一致——
+**一个在七语中同时缺失的键，这条断言天然抓不到**。因此先补护栏，再用它验证退役是否干净。
+
+### 新增护栏：`frontend/src/lib/i18nKeyReferences.spec.ts`
+
+用 `import.meta.glob("../**/*.{vue,ts}", { query: "?raw", eager: true })` 内联源码（不需要文件系统访问，
+默认 node 环境即可运行），扫描两类引用并断言其全部存在于 `en` 表：
+
+| 扫描面 | 形态 | 实测规模 |
+| --- | --- | --- |
+| 翻译调用首参 | `t("a.b")` / `props.t("a.b")` / `translate(...)` / `workbenchMessage(...)` | 903 处 |
+| 动作表间接引用 | `labelKey: "a.b"` | 19 处 |
+| **唯一引用合计** | | **617 条**，覆盖 130 个源文件 |
+
+五个断言：① 扫描面非空（含**分类型下限**）；② 所有引用均可解析；③ 任意语言下都不会把键名当文案返回；
+④ 上一轮退役的两个键不得复活；⑤ 新命名空间 `terminalBehavior.*` / `terminalHotkeys.*` 必须被扫到。
+
+**为什么第①条要分类型下限**：初版把键统一取 `match[2]`，而属性式正则的第二个捕获组是**引号字符**，
+于是 19 处 `labelKey` 引用被静默跳过，总数看起来依旧健康。这个自身缺陷只有在修正分组索引后才暴露出来。
+
+**为什么属性扫描用白名单而非 `*Key` 通配**：`*Key` 会连 `shiftKey` / `ctrlKey` / `altKey` / `metaKey`（DOM 修饰键）、
+`purposeKey`（后端 playbook 契约键，由 `lib/alertTriage.ts` 映射为 `alertTriage.purpose.<key>`）、
+`hostKey`、`authMethodPrivateKey`（SSH 领域概念）以及恰好以 key 结尾的 `hotkey` 一并命中，产生 4 条误报。
+
+### 发现：19 个「被引用、但七语中都不存在」的键
+
+护栏首次运行即报出 19 条未解析引用。逐项核对确认**并非扫描器误报**（对应值全部取自运行时表）：
+
+| 来源 | 键 | 用户可见后果 |
+| --- | --- | --- |
+| `App.vue` 模板直渲 | `metricsSwap` | 会话指标面板显示字面量 `metricsSwap`，而非「交换空间」 |
+| `App.vue` 模板直渲 | `terminalDropPrompt.title` / `summary` / `toCurrent` / `toCustom` / `pathPlaceholder` | 拖拽上传确认框的标题、说明、两个目标选项与路径占位符全部显示原始键 |
+| `SettingsDialog.vue` 模板 | `mcpSettings.permissionModeAutonomous` / `permissionModeConfirm` | MCP 自动执行权限模式下拉项显示原始键 |
+| `App.vue` / `lib/sftpErrors.ts` 错误路径 | `errors.sessionChanged`、`errors.uploadAckTimeout`、`errors.downloadChunkLength`、`errors.downloadEmptyChunk`、`errors.downloadChunkTimeout`、`errors.probeOutput`、`errors.hostBridgeMissing`、`errors.workbenchDetached`、`errors.permissionDenied`、`errors.remoteNotFound`、`terminalCopyUnavailable` | 错误提示把原始键当文案抛出 |
+
+### 根因：`d983f8fc` 的 i18n 回退
+
+`git log -S` 显示这些键在 `i18n.ts` 上各只有两次变更：首次引入与 `d983f8fc`
+（"feat: add trigger-driven SSH authentication providers"）。该提交对本文件的改动为
+**+28 / -112 行**，把 `terminalDropPrompt` 整块、`metricsSwap`、`permissionMode*` 等键一并删除，
+而 `App.vue` / `SettingsDialog.vue` / `sftpErrors.ts` 的调用点保留至今
+（调用点本身引入于更早的 `9b212eaa`）。即：**一次顺带的 i18n 重写让 19 处文案丢失，且没有任何断言能发现。**
+
+### 修复：逐字恢复，纯新增
+
+新增 `restoredMessages` 表并合并进 `supplemental`，沿用本文件既有写法
+（`terminalFontMovedMessages`、`uploadBridgeMessages` 同为该模式，且已有 `"errors.localFileShortRead"`
+这类扁平点号键先例）。`workbenchMessage` 的解析顺序是「嵌套 → `en` 嵌套 → `supplemental` → 原样返回 key」，
+因此**扁平点号键与嵌套键完全等价**，无需还原原嵌套结构，改动面收敛为每语言一个插入点。
+
+- **19 键 × 7 语言 = 133 条**，取值逐字取自 `d983f8fc^:frontend/src/lib/i18n.ts`
+  （脚本提取 + JSON 往返规范化转义），**不是重新翻译**。
+- `git diff` 为 **+157 / -0**，未修改任何既有行。
+- `errors.terminalInputAckTimeout` 同样被该提交删除，但**全仓库零引用**（含 `backend/`），故不恢复。
+
+### 验收口径（本轮）
+
+- 基线：同一分支的 `f1c764c`。
+- 七语键数由 750 恢复至 **769**；`workbench.spec.ts` 的七语集合与占位符对齐断言继续通过。
+- 新增单测 5 例；全量 vitest **70 文件 / 680 用例全绿**；`vue-tsc --noEmit` 通过；
+  `scripts/validate_repo.py` 与 `scripts/connection-forms/verify.mjs` 均 PASS
+  （后者本身就校验「七语言标签/选项」）。
+- 无新增 smoke 用例：本轮未新增用户可见能力，只恢复文案；既有
+  `scripts/smoke_ui_settings.mjs`（45 项断言）与 `scripts/smoke_ui_mock.mjs` 未受影响。
+- 未新增运行时依赖；未提交 `ui/`（integrator 所有权）。
