@@ -932,6 +932,10 @@ let terminalBellFlashTimer = 0;
 let bellAudioContext: AudioContext | undefined;
 let unsubscribeEvent: (() => void) | undefined;
 let unsubscribeBinary: (() => void) | undefined;
+// 宿主 fileTransfer 桥拖放事件（宿主 1.1 optional）注销句柄：OS 级拖入上传
+// 与终端/SFTP 面板共享同一道门禁，见 handleHostFileDrop。
+let unsubscribeFileDrag: (() => void) | undefined;
+let unsubscribeFileDrop: (() => void) | undefined;
 let unsubscribeAppearance: (() => void) | undefined;
 let unsubscribeTheme: (() => void) | undefined;
 let unsubscribeLocale: (() => void) | undefined;
@@ -7994,8 +7998,6 @@ onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", hideTooltip, true);
   document.removeEventListener("wheel", hideTooltip, true);
   hostFontObserver.disconnect();
-  hostFileTransferOffDragState?.();
-  hostFileTransferOffDrop?.();
   hideTooltip();
   window.clearTimeout(persistTimer);
   window.clearInterval(recordCountdownTimer);
