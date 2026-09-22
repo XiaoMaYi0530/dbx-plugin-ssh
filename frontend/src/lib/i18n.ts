@@ -2627,6 +2627,35 @@ for (const locale of Object.keys(uploadBridgeMessages)) {
   supplemental[locale] = { ...(supplemental[locale] ?? {}), ...uploadBridgeMessages[locale] };
 }
 
+// 拖拽上传门禁的拒绝提示（终端/SFTP 面板/宿主级拖入三条链路共用）：未连接、
+// 只读会话或传输协议占用终端时，拒绝要有反馈而不是静默吞掉。
+const dropGateMessages: Record<string, Record<string, string>> = {
+  "zh-CN": {
+    dropRefused: "已忽略拖入的文件：会话未连接、为只读或正在传输中",
+  },
+  "zh-TW": {
+    dropRefused: "已忽略拖入的檔案：工作階段未連線、為唯讀或正在傳輸中",
+  },
+  en: {
+    dropRefused: "Dropped files ignored: the session is not connected, is read-only, or a transfer is in progress",
+  },
+  es: {
+    dropRefused: "Archivos soltados ignorados: la sesión no está conectada, es de solo lectura o hay una transferencia en curso",
+  },
+  it: {
+    dropRefused: "File rilasciati ignorati: la sessione non è connessa, è in sola lettura o è in corso un trasferimento",
+  },
+  ja: {
+    dropRefused: "ドロップされたファイルを無視しました：セッションが未接続、読み取り専用、または転送中です",
+  },
+  "pt-BR": {
+    dropRefused: "Arquivos soltados ignorados: a sessão não está conectada, é somente leitura ou há uma transferência em andamento",
+  },
+};
+for (const locale of Object.keys(dropGateMessages)) {
+  supplemental[locale] = { ...(supplemental[locale] ?? {}), ...dropGateMessages[locale] };
+}
+
 /** Dev/test helper: flattens a nested message table into dotted `a.b` keys. */
 function flattenMessageTable(table: unknown, prefix = "", out: Record<string, string> = {}): Record<string, string> {
   if (!table || typeof table !== "object") return out;
