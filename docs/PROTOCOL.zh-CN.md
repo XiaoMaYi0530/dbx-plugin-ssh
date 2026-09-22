@@ -18,6 +18,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/host-key/resolve` | 处理工作台内的主机密钥确认 |
 | `ssh/exec` | 在会话连接上执行远程命令，可选 Quick Sudo 提权 |
 | `ssh/exec/cancel` | 中止进行中的远程命令（按 `execId`） |
+| `ssh/forward/list`、`ssh/forward/start`、`ssh/forward/stop` | 用户级端口映射（ssh(1) -L/-R，见「端口映射」节）：`list` 按 `{connectionId?}`/`{sessionId?}` 过滤返回 `{forwards: [row]}`；`start` `{sessionId, kind: "local"\|"remote", listenHost?, listenPort, targetHost, targetPort}`（`listenHost` 缺省 127.0.0.1；`listenPort: 0` 由本机/服务端挑选，`boundPort` 回报实际端口）→ `{forward: row}`；`stop` `{id}` → `{success, forward}`，未知 id 报错。row 字段 camelCase：`id/sessionId/connectionId/kind/listenHost/listenPort/boundPort/targetHost/targetPort/state("starting"\|"active"\|"stopped"\|"error")/error?/connectionsTotal/connectionsActive/bytesUp/bytesDown`。状态迁移发 `ssh/forward/state`（notify）`{id, sessionId, connectionId, state, error?}` |
 | `ssh/agent/resolve` | 处理 AI 终端同步执行的命令审批（按 `challengeId`，一次性；approve 可携 `command` 编辑后原文与 `remember: true` 记住标记，见「审批记忆」节） |
 | `ssh/alert/triage` | 告警分诊：异构告警 JSON/纯文本 → 结构化 + 分类 + 只读诊断命令清单（无需连接，从不执行；见「告警分诊」节） |
 | `ssh/audit/list` | 执行审计台账只读回放：`{limit?, beforeTs?}` → `{entries, truncated}`（见「执行审计」节） |
@@ -181,6 +182,15 @@ suggestions: [{command, purposeKey}]}`（字段钳制：title/message ≤2 KiB�
 - `external_config.jump_hosts`（最多 3 跳）定义跳板链：每跳包含 `host`、`port`（缺省 22）、`username`、`authentication`（`password` / `private-key` / `private-key-password` / `agent`）及对应凭据字段，可选 `totp_secret` / 提示词 / `auth_flow_mode`。配置跳板后整条链替换 runtime 隧道，末跳直连目标 `host:port`；每跳主机密钥独立校验，登录期 keyboard-interactive 2FA 同样生效。会话关闭时按序断开整条链。
 - 协议层 keepalive：russh 按 `keepalive_interval_secs`（连接表单字段，缺省 30 秒，0 关闭）周期发送带应答的 keepalive 全局请求（等效 OpenSSH `ServerAliveInterval`），连续 3 次无应答即判定连接死亡，终端转入断开态、由工作台重连；跳板链每跳同参。
 - 终端活动保活（`terminal_keepalive_secs`，连接表单字段，默认 0 关闭）：按配置间隔向交互终端 PTY 注入"空格+退格"（净零输入——空命令行不入 shell history，全屏程序内仅光标往返），用于对抗按键盘活动判空闲的服务器侧策略（`TMOUT`、堡垒机审计），协议层探测对此无效。解析侧钳制 5–3600 秒（`model.rs` `clamp_terminal_keepalive`）；仅作用于终端会话（MCP exec 通道不注入），会话关闭即随读写循环退出。`ssh/sessions/list` 以 `terminalKeepaliveSecs` 上报生效值。
+
+## 端口映射（-L / -R）
+
+用户级端口映射（对标 ssh(1) `-L`/`-R` 与 Xshell「隧道」面板；`-D` 动态转发刻意不做——宿主 dbx-core 已为数据库代拨内置动态隧道，见对标清单）。挂在当前连接的**工作台会话**上，会话关闭（`ssh/session/close`、连接断开）即整组清理：本地监听 abort、远端 `cancel-tcpip-forward` 撤销（句柄已死则跳过），注册表行随事件 `ssh/forward/state {state:"stopped"}` 下发后移除。映射为运行时状态，不落盘、不跨会话恢复。
+
+- **local（-L）**：sidecar 在客户端机器 `listen_host:listen_port` 起 TCP 监听；每条入站连接开一条 `direct-tcpip` 通道，由服务端拨 `target_host:target_port`。双向转发走 `copy_bidirectional`，按连接累计 `bytesUp/bytesDown`。
+- **remote（-R）**：sidecar 先向服务端发 `tcpip-forward` 全局请求（拒绝即 start 报错，`AllowTcpForwarding no` 的服务器在此处失败）；`listenPort: 0` 时由服务端挑选端口并以 `boundPort` 回报。服务端侧入站连接以 `forwarded-tcpip` 通道送达，sidecar 的客户端 handler 按连接维度的转发表（`(listen_host, bound_port) → target`，含归一化与通配端口回退匹配）在**客户端机器**拨目标地址并双向转发。停止时发 `cancel-tcpip-forward` 并摘除表项。
+- `stop` 语义：后台任务全部 abort（含已建立的转发连接），registry 立即摘除；对同一 id 重复 stop 报 `not found` 错误。已建立的映射在会话存活期间持续转发；映射生命周期 = 会话生命周期。
+- 事件 `ssh/forward/state` 为状态广播（starting/active/error/stopped），工作台面板（`PortForwardDialog.vue`，自订阅该事件）据此就地刷新；list 为准、事件为加速。
 
 ## 会话环境与会话命令（SetEnv / RemoteCommand）
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -28,6 +29,7 @@ use crate::audit_log;
 use crate::exec::{
     self, AuthFlowMode, ExecOutcome, Hints, SudoAuth, PLAIN_EXEC_TIMEOUT, SUDO_EXEC_TIMEOUT,
 };
+use crate::forward;
 use crate::highlight_rules;
 use crate::host_key::{HostKeyState, HostKeyVerifier};
 use crate::local_downloads;
@@ -433,6 +435,11 @@ pub struct SshClient {
     operation_id: String,
     dial_deadline: Arc<DialDeadline>,
     connect_timeout: Duration,
+    /// Remote (-R) port mappings of this connection: `(listen_host,
+    /// bound_port) -> local dial target`. Populated by `ssh/forward/start`
+    /// and consulted by the forwarded-tcpip handler below; per-connection so
+    /// two servers can forward the same port independently.
+    remote_forwards: Arc<RemoteForwardTable>,
 }
 
 impl client::Handler for SshClient {
@@ -530,6 +537,50 @@ impl client::Handler for SshClient {
                 Err(russh::Error::from(error))
             }
         }
+    }
+
+    /// Incoming `forwarded-tcpip` channel: the server accepted a connection
+    /// on a port this side registered with `tcpip-forward` (remote -R
+    /// mapping). The local dial target is looked up in this connection's
+    /// remote-forward table; the relay runs detached so the handler returns
+    /// immediately and the SSH reader is never blocked by user traffic.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let _ = originator_address;
+        let _ = originator_port;
+        let _ = session;
+        let target =
+            forward::lookup_remote_target(&self.remote_forwards, connected_address, connected_port);
+        let Some(target) = target else {
+            eprintln!(
+                "[ssh-forward] forwarded-tcpip {connected_address}:{connected_port} has no registered mapping; rejecting"
+            );
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        reply.accept().await;
+        // Dial from the client machine; on failure the channel is dropped,
+        // which the server surfaces as a closed connection to its client.
+        match TcpStream::connect((target.host.as_str(), target.port)).await {
+            Ok(tcp) => {
+                tokio::spawn(forward::relay_remote(target.entry, channel, tcp));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[ssh-forward] local dial {}:{} failed: {error}",
+                    target.host, target.port
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -789,6 +840,11 @@ impl ReplayBuffer {
             .unwrap_or(self.sequence.saturating_add(1))
     }
 }
+
+/// Remote (-R) port mapping table for one connection, keyed by
+/// `(listen_host, bound_port)` and consulted by the SSH client handler when
+/// the server hands over a `forwarded-tcpip` channel.
+pub type RemoteForwardTable = Mutex<HashMap<(String, u32), forward::RelayTarget>>;
 
 /// `workbench_id` is kept with the session so attach can only restore the
 /// session that belongs to the same workbench. A different workbench must open
@@ -1117,6 +1173,13 @@ pub struct SshRuntime {
     agent_challenges: Mutex<HashMap<String, PendingChallenge>>,
     /// Monotonic session creation counter (see `SessionEntry::created_seq`).
     session_seq: AtomicU64,
+    /// Live user-facing port mappings (Xshell-style 端口映射, -L/-R):
+    /// forward id -> mapping row. Runtime-scoped on purpose; rows die with
+    /// their session so a closed SSH session cannot leave phantom ports.
+    forwards: forward::ForwardRegistry,
+    /// Per-connection `(listen_host, bound_port) -> dial target` tables the
+    /// forwarded-tcpip handler consults (see `SshClient::remote_forwards`).
+    remote_tables: Mutex<HashMap<String, Arc<RemoteForwardTable>>>,
     /// Trust-on-first-use for unknown host keys (MCP stdio mode).
     auto_trust: bool,
     pub prompts: PromptBroker,
@@ -1152,6 +1215,8 @@ impl SshRuntime {
             sudo_keepalive: Arc::new(Mutex::new(HashMap::new())),
             metrics_cache: Mutex::new(HashMap::new()),
             exec_tasks: Mutex::new(HashMap::new()),
+            forwards: forward::ForwardRegistry::default(),
+            remote_tables: Mutex::new(HashMap::new()),
             agent_modes: Mutex::new(agent_terminal::load_modes(&data_dir)),
             agent_challenges: Mutex::new(HashMap::new()),
             auto_trust: false,
@@ -1786,6 +1851,10 @@ impl SshRuntime {
         let verifier = Arc::new(HostKeyVerifier::new(self.known_hosts_path.clone()));
         let timeout = Duration::from_secs(connection.connect_timeout_secs);
         let dial_deadline = DialDeadline::start(timeout);
+        // The forwarded-tcpip handler needs the mapping table at dial time;
+        // remote forwards registered later on this connection insert into the
+        // same Arc, and the table dies with the connection's last session.
+        let remote_forwards = self.remote_table_for(&connection.id);
         let handler = SshClient {
             verifier,
             prompts: self.prompts.clone(),
@@ -1797,6 +1866,7 @@ impl SshRuntime {
             operation_id: operation_id.to_string(),
             dial_deadline: dial_deadline.clone(),
             connect_timeout: timeout,
+            remote_forwards,
         };
         let timeout_message = || {
             format!(
@@ -1967,7 +2037,179 @@ impl SshRuntime {
         Ok((Arc::new(handle), jumps.into_iter().map(Arc::new).collect()))
     }
 
+    /// Per-connection remote-forward table, created on first use. The dial
+    /// path hands the same Arc to the SSH client handler; remote forward
+    /// start inserts the rows the handler later matches against.
+    fn remote_table_for(&self, connection_id: &str) -> Arc<RemoteForwardTable> {
+        let mut tables = self
+            .remote_tables
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        tables
+            .entry(connection_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
+    }
+
+    /// `ssh/forward/list`: live mappings, optionally scoped to one connection
+    /// or session. Read-only — liveness counters update as relays come and go.
+    pub fn forward_list(&self, params: &Value) -> Value {
+        let connection_id = params.get("connectionId").and_then(Value::as_str);
+        let session_id = params.get("sessionId").and_then(Value::as_str);
+        let mut rows: Vec<Value> = self
+            .forwards
+            .rows()
+            .iter()
+            .filter(|entry| connection_id.is_none_or(|id| entry.connection_id == id))
+            .filter(|entry| session_id.is_none_or(|id| entry.session_id == id))
+            .map(|entry| entry.payload())
+            .collect();
+        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        json!({ "forwards": rows })
+    }
+
+    /// `ssh/forward/start`: validate, register, then arm the direction —
+    /// local binds the port before the mapping is reported active, remote
+    /// asks the server to listen first (a refusal removes the mapping again).
+    pub async fn forward_start(
+        &self,
+        params: &Value,
+        emitter: PluginEmitter,
+    ) -> Result<Value, String> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or("sessionId is required")?;
+        let session = self.session(session_id).await?;
+        let (kind, listen_host, listen_port, target_host, target_port) =
+            forward::parse_spec(params)?;
+        let entry = Arc::new(forward::ForwardEntry {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            connection_id: session.connection_id.clone(),
+            kind,
+            listen_host,
+            listen_port,
+            target_host,
+            target_port,
+            bound_port: AtomicU32::new(0),
+            state: Mutex::new(forward::ForwardState::Starting),
+            error: Mutex::new(None),
+            connections_total: AtomicU64::new(0),
+            connections_active: AtomicI64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
+            listener_task: Mutex::new(None),
+            relays: Mutex::new(Vec::new()),
+            emitter: Some(emitter),
+            stopping: AtomicBool::new(false),
+        });
+        self.forwards.insert(entry.clone());
+        match kind {
+            forward::ForwardKind::Local => {
+                if let Err(error) =
+                    forward::spawn_local_listener(entry.clone(), session.handle.clone()).await
+                {
+                    self.forwards.remove(&entry.id);
+                    return Err(error);
+                }
+            }
+            forward::ForwardKind::Remote => {
+                let bound = session
+                    .handle
+                    .tcpip_forward(&entry.listen_host, u32::from(entry.listen_port))
+                    .await;
+                let bound = match bound {
+                    Ok(port) => port,
+                    Err(error) => {
+                        self.forwards.remove(&entry.id);
+                        return Err(format!(
+                            "Server refused to listen on {}:{}: {error}",
+                            entry.listen_host, entry.listen_port
+                        ));
+                    }
+                };
+                let bound = u16::try_from(bound).unwrap_or(entry.listen_port.max(1));
+                entry.bound_port.store(u32::from(bound), Ordering::Relaxed);
+                let table = self.remote_table_for(&session.connection_id);
+                forward::register_remote_target(
+                    &table,
+                    &entry.listen_host,
+                    bound,
+                    &entry.target_host,
+                    entry.target_port,
+                    entry.clone(),
+                );
+            }
+        }
+        forward::set_state(&entry, forward::ForwardState::Active, None);
+        Ok(json!({ "forward": entry.payload() }))
+    }
+
+    /// `ssh/forward/stop`: tear the mapping down and report the final row.
+    pub async fn forward_stop(&self, id: &str) -> Result<Value, String> {
+        let entry = self
+            .forwards
+            .get(id)
+            .ok_or("Port mapping was not found or already stopped")?;
+        self.teardown_forward(&entry).await;
+        Ok(json!({ "success": true, "forward": entry.payload() }))
+    }
+
+    /// Tears one mapping down: background tasks aborted, remote listener
+    /// cancelled on the session's SSH handle (best effort — a dead session
+    /// cannot cancel anything and does not need to), table row removed, and
+    /// the registry drops the entry so a stopped id cannot be restarted into.
+    async fn teardown_forward(&self, entry: &Arc<forward::ForwardEntry>) {
+        forward::abort_tasks(entry);
+        if entry.kind == forward::ForwardKind::Remote {
+            let session = self.sessions.read().await.get(&entry.session_id).cloned();
+            if let Some(session) = session {
+                let port = entry.bound_port.load(Ordering::Relaxed);
+                let port = if port == 0 {
+                    u32::from(entry.listen_port)
+                } else {
+                    port
+                };
+                let _ = session
+                    .handle
+                    .cancel_tcpip_forward(&entry.listen_host, port)
+                    .await;
+            }
+            if let Some(table) = self
+                .remote_tables
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&entry.connection_id)
+            {
+                table
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .retain(|_, target| target.entry.id != entry.id);
+            }
+        }
+        self.forwards.remove(&entry.id);
+        forward::set_state(entry, forward::ForwardState::Stopped, None);
+    }
+
+    /// Session teardown: every mapping of the session dies with it. Called
+    /// from `close_session` while the session's SSH handle is still
+    /// resolvable, so remote listeners are cancelled on the way out.
+    pub async fn stop_session_forwards(&self, session_id: &str) {
+        for entry in self
+            .forwards
+            .rows()
+            .iter()
+            .filter(|row| row.session_id == session_id)
+        {
+            self.teardown_forward(entry).await;
+        }
+    }
+
     pub async fn close_session(&self, session_id: &str) -> Result<(), String> {
+        // Teardown runs while the session is still registered so remote
+        // listener cancellation can ride the (still open) SSH handle.
+        self.stop_session_forwards(session_id).await;
         let session = self
             .sessions
             .write()
@@ -1997,6 +2239,12 @@ impl SshRuntime {
             .any(|session| session.connection_id == connection_id);
         if !connection_has_sessions {
             self.stop_sudo_keepalive(&connection_id).await;
+            // No session left on the connection: the per-connection
+            // forwarded-tcpip table can never match again.
+            self.remote_tables
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&connection_id);
         }
         Ok(())
     }
