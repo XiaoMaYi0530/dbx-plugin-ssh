@@ -75,6 +75,41 @@ pub async fn exists(runtime: &SshRuntime, session_id: &str, path: &str) -> Resul
     Ok(exists)
 }
 
+/// Upper bound for `name(1)..name(999)` collision probing in
+/// [`rename_unique`]; also bounds how long the SFTP mutex is held.
+pub const UNIQUE_NAME_PROBE_LIMIT: u32 = 999;
+
+/// Longest accepted file name (chars) for the unique-name probe.
+const MAX_UNIQUE_NAME_CHARS: usize = 255;
+
+/// `sftp/rename-unique` — suggests a non-conflicting file name inside `dir`
+/// for an upload about to land there. `name` itself wins when free, otherwise
+/// `name(1)` .. `name(999)` are probed (the `(n)` is inserted before the last
+/// extension: `report.pdf` -> `report(1).pdf`). Returns `{name, conflict}`.
+pub async fn rename_unique(
+    runtime: &SshRuntime,
+    session_id: &str,
+    dir: &str,
+    name: &str,
+) -> Result<Value, String> {
+    let sftp = runtime.sftp(session_id).await?;
+    let dir = normalize_remote_path(dir)?;
+    let clean = clean_unique_name(name)?;
+    let session = sftp.lock().await;
+    let probe = |candidate: &str| {
+        let full = join_remote_name(&dir, candidate);
+        session.symlink_metadata(full)
+    };
+    for (index, candidate) in unique_name_candidates(&clean).into_iter().enumerate() {
+        if probe(&candidate).await.is_err() {
+            return Ok(json!({ "name": candidate, "conflict": index > 0 }));
+        }
+    }
+    Err(format!(
+        "No unique name derived from '{clean}' within {UNIQUE_NAME_PROBE_LIMIT} attempts"
+    ))
+}
+
 /// `sftp/touch` — creates an empty file when missing, otherwise refreshes
 /// mtime/atime. Servers that reject SETSTAT times make the refresh a no-op,
 /// mirroring tiny-rdm's create-only `Touch`.
@@ -343,6 +378,66 @@ async fn commit_temporary_file(
         let _ = sftp.lock().await.remove_file(backup.to_string()).await;
     }
     Ok(())
+}
+
+/// Validates and bounds a caller-provided file name for the unique-name
+/// probe: no path separators, no `.`/`..`, capped length.
+fn clean_unique_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("File name is required".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("File name must not contain path separators".to_string());
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err("File name must not be a relative path component".to_string());
+    }
+    Ok(trimmed.chars().take(MAX_UNIQUE_NAME_CHARS).collect())
+}
+
+/// The n-th collision candidate: `(n)` inserted before the last extension
+/// (`report.pdf` -> `report(1).pdf`); names without a usable extension get a
+/// suffix instead (`report` -> `report(1)`, `.bashrc` -> `.bashrc(1)`).
+fn unique_name_candidate(name: &str, n: u32) -> String {
+    match name.rfind('.') {
+        Some(index) if index > 0 => format!("{}({n}){}", &name[..index], &name[index..]),
+        _ => format!("{name}({n})"),
+    }
+}
+
+/// Full probe order for a name: the plain name first, then the bounded
+/// `name(1)..name(999)` collision candidates.
+fn unique_name_candidates(name: &str) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(UNIQUE_NAME_PROBE_LIMIT as usize + 1);
+    candidates.push(name.to_string());
+    for n in 1..=UNIQUE_NAME_PROBE_LIMIT {
+        candidates.push(unique_name_candidate(name, n));
+    }
+    candidates
+}
+
+/// Pure decision core of [`rename_unique`]: the first candidate the `exists`
+/// probe reports as free, paired with whether a `(n)` rename was needed.
+fn next_unique_name<F>(name: &str, mut exists: F) -> Option<(String, bool)>
+where
+    F: FnMut(&str) -> bool,
+{
+    for (index, candidate) in unique_name_candidates(name).into_iter().enumerate() {
+        if !exists(&candidate) {
+            return Some((candidate, index > 0));
+        }
+    }
+    None
+}
+
+/// Joins a normalized directory with a bare file name (`/` root included).
+fn join_remote_name(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
 }
 
 /// Trims, drops blanks and normalizes every source path; errors when nothing
@@ -642,6 +737,62 @@ mod tests {
             check_exec_success(&json!({ "exitCode": 2, "output": "tar: eof\n" }), "archive")
                 .unwrap_err();
         assert!(error.starts_with("archive exited with status 2: tar: eof"));
+    }
+
+    #[test]
+    fn clean_unique_name_rejects_paths_and_bounds_length() {
+        assert_eq!(clean_unique_name("  report.pdf ").unwrap(), "report.pdf");
+        assert!(clean_unique_name("").is_err());
+        assert!(clean_unique_name("a/b.pdf").is_err());
+        assert!(clean_unique_name("a\\b.pdf").is_err());
+        assert!(clean_unique_name(".").is_err());
+        assert!(clean_unique_name("..").is_err());
+        let long = "x".repeat(300);
+        assert_eq!(clean_unique_name(&long).unwrap().chars().count(), 255);
+    }
+
+    #[test]
+    fn unique_name_candidate_inserts_before_the_last_extension() {
+        assert_eq!(unique_name_candidate("report.pdf", 1), "report(1).pdf");
+        assert_eq!(
+            unique_name_candidate("archive.tar.gz", 12),
+            "archive.tar(12).gz"
+        );
+        assert_eq!(unique_name_candidate("report", 3), "report(3)");
+        // Hidden files keep their leading dot untouched.
+        assert_eq!(unique_name_candidate(".bashrc", 2), ".bashrc(2)");
+    }
+
+    #[test]
+    fn next_unique_name_picks_the_first_free_candidate() {
+        let free = |_: &str| false;
+        assert_eq!(
+            next_unique_name("report.pdf", free),
+            Some(("report.pdf".to_string(), false))
+        );
+        let taken = |candidate: &str| candidate == "report.pdf" || candidate == "report(1).pdf";
+        assert_eq!(
+            next_unique_name("report.pdf", taken),
+            Some(("report(2).pdf".to_string(), true))
+        );
+        // Exhausting the probe budget yields None (handler turns it into an error).
+        let everything = |_: &str| true;
+        assert_eq!(next_unique_name("report.pdf", everything), None);
+    }
+
+    #[test]
+    fn unique_name_candidates_start_with_the_plain_name() {
+        let candidates = unique_name_candidates("a.txt");
+        assert_eq!(candidates.first().unwrap(), "a.txt");
+        assert_eq!(candidates.get(1).unwrap(), "a(1).txt");
+        assert_eq!(candidates.len(), (UNIQUE_NAME_PROBE_LIMIT + 1) as usize);
+        assert_eq!(candidates.last().unwrap(), "a(999).txt");
+    }
+
+    #[test]
+    fn join_remote_name_handles_the_root() {
+        assert_eq!(join_remote_name("/", "a.txt"), "/a.txt");
+        assert_eq!(join_remote_name("/tmp/up", "a.txt"), "/tmp/up/a.txt");
     }
 }
 

@@ -130,6 +130,9 @@ import {
   type SftpBookmark,
 } from "./lib/sftpBookmarks";
 import { browseCommandHistory, commandInputAction, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
+import { searchCommands, commandSuggestionQueryAcceptable, type CommandSuggestion } from "./lib/commandSuggestions";
+import { canShowSuggestions, createSuggestionGuardState, type SuggestionGuardState } from "./lib/suggestionGuard";
+import { clampTransferConcurrency, runTransfers, sanitizeTransferDuplicatePolicy, type TransferDuplicatePolicy } from "./lib/transferQueue";
 import { filterQuickCommands, normalizeQuickCommands, QUICK_COMMANDS_LIMIT, quickCommandText, type QuickCommand } from "./lib/quickCommands";
 import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
@@ -252,6 +255,7 @@ import { randomUUID } from "./lib/uuid";
 import TextPreview from "./components/TextPreview.vue";
 import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
 import TerminalGutter from "./components/TerminalGutter.vue";
+import CommandSuggestions from "./components/CommandSuggestions.vue";
 import ConnectingCard from "./components/ConnectingCard.vue";
 import GpuNpuMonitor from "./components/GpuNpuMonitor.vue";
 import FolderPickerDialog from "./components/FolderPickerDialog.vue";
@@ -483,11 +487,25 @@ const DOWNLOAD_DIR_KEY = "ssh-download-directory";
 const DOWNLOAD_USE_DEFAULT_KEY = "ssh-download-use-default-dir";
 // 文件已存在时的处理策略：rename（自动重命名，默认）/ ask（询问我）/ overwrite（覆盖）。
 const DOWNLOAD_CONFLICT_KEY = "ssh-download-conflict-policy";
+// 上传并发（P1-5，1..10，默认 3）与重复目标策略（rename 默认）：sidecar
+// preferences 权威存储，localStorage 仅作同步缓存（语义同下载偏好）。
+const TRANSFER_CONCURRENCY_KEY = "ssh-transfer-concurrency";
+const TRANSFER_DUPLICATE_KEY = "ssh-transfer-duplicate-policy";
+// 命令输入建议（P1-1）：开关 + 查询长度上下限；同一偏好链路持久化。
+const SUGGESTIONS_ENABLED_KEY = "ssh-history-suggestions-enabled";
+const SUGGESTIONS_MIN_CHARS_KEY = "ssh-history-suggestion-min-chars";
+const SUGGESTIONS_MAX_CHARS_KEY = "ssh-history-suggestion-max-chars";
 // 下载偏好的内存权威态：setup 早期（downloadUseDefaultDraft 初始化）就会被读，
 // 必须声明在所有读取点之前（存储语义见下方 loadDownloadDir 一带的注释）。
 const downloadDirState = ref("");
 const downloadUseDefaultState = ref(true);
 const downloadConflictState = ref<DownloadConflictPolicy>("rename");
+// 上传并发/重复策略与命令建议的内存权威态（hydratePrefs 时被 sidecar 值覆盖）。
+const transferConcurrencyState = ref(3);
+const transferDuplicateState = ref<TransferDuplicatePolicy>("rename");
+const suggestionsEnabledState = ref(true);
+const suggestionMinCharsState = ref(2);
+const suggestionMaxCharsState = ref(64);
 
 function sanitizeConflictPolicy(value: unknown): DownloadConflictPolicy {
   return value === "ask" || value === "overwrite" ? value : "rename";
@@ -678,6 +696,18 @@ const quickSearch = ref("");
 const quickExpandedId = ref<string | null>(null);
 const quickEditorOpen = ref(false);
 const filteredQuickCommands = computed(() => filterQuickCommands(quickCommands.value, quickSearch.value));
+// 命令输入建议浮层（P1-1）运行时状态：条目/选中项/光标锚点与抑制门锁存。
+// 开关与长度上下限的权威值在上方 suggestions*State（sidecar 偏好）。
+const suggestionOpen = ref(false);
+const suggestionItems = ref<CommandSuggestion[]>([]);
+const suggestionActiveIndex = ref(0);
+const suggestionAnchor = ref<{ x: number; y: number } | null>(null);
+const suggestionQuery = ref("");
+// 抑制门锁存（跟随型程序命中后保持抑制，Ctrl+C/q 解除）：非响应式即可，
+// 只有 canShowSuggestions 的返回值会进渲染。
+let suggestionGuardState: SuggestionGuardState = createSuggestionGuardState();
+// 最近一次执行的命令行（onData 回车行 + OSC 633 E 帧），抑制门据此判定。
+const lastTerminalCommand = ref<string | null>(null);
 
 function openQuickEditor(item?: QuickCommand) {
   quickDraft.id = item?.id;
@@ -833,6 +863,21 @@ const downloadPrefsAdapter = {
   persistDir: persistDownloadDir,
   persistUseDefault: persistDownloadUseDefaultDir,
   persistConflict: persistDownloadConflictPolicy,
+};
+// 传输并发/重复策略与命令建议的读写适配器（权威态在本组件，同下载偏好）。
+const transferPrefsAdapter = {
+  loadConcurrency: loadTransferConcurrency,
+  loadDuplicatePolicy: loadTransferDuplicatePolicy,
+  persistConcurrency: persistTransferConcurrency,
+  persistDuplicatePolicy: persistTransferDuplicatePolicy,
+};
+const suggestionPrefsAdapter = {
+  loadEnabled: loadSuggestionsEnabled,
+  loadMinChars: loadSuggestionMinChars,
+  loadMaxChars: loadSuggestionMaxChars,
+  persistEnabled: persistSuggestionsEnabled,
+  persistMinChars: persistSuggestionMinChars,
+  persistMaxChars: persistSuggestionMaxChars,
 };
 // 终端 WebGL 渲染加速（对标 iShell GPU 加速）：localStorage 全局偏好，
 // 默认开；WebGL 不可用（headless/无 context）时静默回退 DOM 渲染。只有主
@@ -1775,7 +1820,12 @@ function createTerminal() {
       terminalDiag.swallowed += 1;
       return;
     }
+    // 命令建议（P1-1）：行快照先于 trackPendingInput 取（\r 会清空行缓冲），
+    // 之后按输入事件推进抑制门并刷新浮层。快速命令/粘贴/自动应答不走路由，
+    // 天然不会触发浮层，也不会进入采集。
+    const lineBeforeInput = pendingTerminalInput;
     trackPendingInput(data);
+    refreshSuggestionsAfterInput(data, lineBeforeInput);
     terminalDiag.keys += 1;
     sendTerminalBytes(new TextEncoder().encode(data));
   };
@@ -1838,6 +1888,8 @@ function handleTerminalKey(event: KeyboardEvent) {
     event.stopPropagation();
     return false;
   };
+  // 命令建议浮层开启时优先消费导航/填充键（Tab 回车不落远端 shell）。
+  if (suggestionOpen.value && handleSuggestionKey(event)) return consume();
   // 搜索框已打开时 Esc 先关面板，不参与快捷键匹配（关闭键不可改写）。
   {
     const mod = event.metaKey || event.ctrlKey;
@@ -2113,6 +2165,177 @@ function trackPendingInput(data: string) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 命令输入建议浮层（P1-1）：采集→抑制门→检索→定位→按键消费。
+// 采集只走两条真实来源：① 命令弹窗/命令条执行（已入 commandHistory）；
+// ② OSC 633 shell-integration E 帧（applyCommandMarker）。无 shell
+// integration 的 SSH 会话不做按键模拟式采集（真实降级）；Expect/OTP 自动
+// 应答由 sidecar 直接注入 PTY，与 onData 用户输入不同源，永不入历史。
+// ---------------------------------------------------------------------------
+
+function closeSuggestions() {
+  suggestionOpen.value = false;
+  suggestionItems.value = [];
+  suggestionActiveIndex.value = 0;
+}
+
+function suggestionSearchBounds() {
+  return {
+    minLength: Math.max(1, suggestionMinCharsState.value),
+    maxLength: Math.max(suggestionMinCharsState.value, suggestionMaxCharsState.value),
+  };
+}
+
+function runSuggestionSearch(query: string): CommandSuggestion[] {
+  const bounds = suggestionSearchBounds();
+  return searchCommands(query, { history: commandHistory.value, quickCommands: quickCommands.value }, { ...bounds, limit: 12 });
+}
+
+/** 单字符输入事件抽取：多字符粘贴 / 控制序列 / 回车返回 null。 */
+function suggestionTypingChar(data: string): string | null {
+  if (data.length !== 1) return null;
+  const char = data.charAt(0);
+  if (char < " " || char === "\u007f") return null;
+  return char;
+}
+
+/**
+ * onData 每次输入后调用：推进抑制门状态并按需刷新浮层。
+ * lineBefore 是本次输入前的行缓冲快照（\r 清空后仍能取到被执行的命令行）。
+ */
+function refreshSuggestionsAfterInput(data: string, lineBefore: string) {
+  const alternateActive = terminal?.buffer.active.type === "alternate";
+  const typingChar = suggestionTypingChar(data);
+
+  if (data.includes("\u0003")) {
+    // Ctrl+C：打断当前行与跟随程序，锁存解除，浮层关闭。
+    suggestionGuardState = canShowSuggestions({ alternateActive, lastCommand: null, typingChar: "\u0003" }, suggestionGuardState).state;
+    lastTerminalCommand.value = null;
+    closeSuggestions();
+    return;
+  }
+  if (data.includes("\r") || data.includes("\n")) {
+    const executed = lineBefore.trim();
+    if (executed) lastTerminalCommand.value = executed;
+    suggestionGuardState = canShowSuggestions({ alternateActive, lastCommand: lastTerminalCommand.value, typingChar: null }, suggestionGuardState).state;
+    closeSuggestions();
+    return;
+  }
+  if (data.includes("\u001b")) {
+    // 方向键/控制序列：不当作输入，浮层保持原状之外直接隐藏（无法追踪行内容）。
+    closeSuggestions();
+    return;
+  }
+
+  const guard = canShowSuggestions(
+    { alternateActive, lastCommand: lastTerminalCommand.value, typingChar, lineEmpty: lineBefore.length === 0 },
+    suggestionGuardState,
+  );
+  suggestionGuardState = guard.state;
+  if (!guard.show || !suggestionsEnabledState.value) {
+    closeSuggestions();
+    return;
+  }
+  const query = pendingTerminalInput;
+  const bounds = suggestionSearchBounds();
+  if (!commandSuggestionQueryAcceptable(query, bounds.minLength, bounds.maxLength)) {
+    closeSuggestions();
+    return;
+  }
+  const items = runSuggestionSearch(query);
+  if (!items.length) {
+    closeSuggestions();
+    return;
+  }
+  suggestionQuery.value = query;
+  suggestionItems.value = items;
+  suggestionActiveIndex.value = 0;
+  suggestionAnchor.value = readTerminalSuggestionAnchor();
+  suggestionOpen.value = true;
+}
+
+/**
+ * 光标像素锚点：xterm 私有渲染尺寸（css.cell 宽高）× 光标缓冲坐标。
+ * 读不到（渲染器未就绪/内部结构变化）返回 null，浮层降级贴终端底部。
+ */
+function readTerminalSuggestionAnchor(): { x: number; y: number } | null {
+  if (!terminal || !terminalHost.value) return null;
+  try {
+    const core = (terminal as unknown as { _core?: { _renderService?: { dimensions?: { css?: { cell?: { width?: number; height?: number } } } } } })._core;
+    const cell = core?._renderService?.dimensions?.css?.cell;
+    const cellWidth = cell?.width ?? 0;
+    const cellHeight = cell?.height ?? 0;
+    if (!(cellWidth > 0) || !(cellHeight > 0)) return null;
+    const buffer = terminal.buffer.active;
+    const visibleRow = buffer.cursorY - buffer.viewportY;
+    return { x: Math.round(buffer.cursorX * cellWidth), y: Math.round((visibleRow + 1) * cellHeight) };
+  } catch {
+    return null;
+  }
+}
+
+/** 浮层开启时的按键消费：↑↓ 选择、Tab 填充、Enter 执行、Esc 关闭。 */
+function handleSuggestionKey(event: KeyboardEvent): boolean {
+  if (event.type !== "keydown" || !suggestionOpen.value || !suggestionItems.value.length) return false;
+  const items = suggestionItems.value;
+  if (event.key === "ArrowDown") {
+    suggestionActiveIndex.value = (suggestionActiveIndex.value + 1) % items.length;
+    return true;
+  }
+  if (event.key === "ArrowUp") {
+    suggestionActiveIndex.value = (suggestionActiveIndex.value - 1 + items.length) % items.length;
+    return true;
+  }
+  if (event.key === "Tab") {
+    fillSuggestion(items[suggestionActiveIndex.value]);
+    return true;
+  }
+  if (event.key === "Enter") {
+    executeSuggestion(items[suggestionActiveIndex.value]);
+    return true;
+  }
+  if (event.key === "Escape") {
+    closeSuggestions();
+    return true;
+  }
+  return false;
+}
+
+/** 把当前输入行替换为建议命令（退格抹掉已敲字符后按键盘语义重新写入）。 */
+function replaceTerminalLineWith(nextLine: string, pressEnter: boolean) {
+  if (!terminal) return;
+  const erase = "\u007f".repeat(pendingTerminalInput.length);
+  const payload = erase + nextLine + (pressEnter ? "\r" : "");
+  pendingTerminalInput = pressEnter ? "" : nextLine;
+  if (pressEnter) {
+    lastTerminalCommand.value = nextLine;
+    commandHistory.value = pushCommandHistory(commandHistory.value, nextLine);
+    persistCommandHistory();
+  }
+  sendTerminalBytes(new TextEncoder().encode(payload));
+}
+
+function fillSuggestion(item: CommandSuggestion) {
+  replaceTerminalLineWith(item.command, false);
+  // 填充后按新行内容刷新候选（可能只剩自身），保持浮层继续可微调。
+  const items = runSuggestionSearch(item.command);
+  if (items.length) {
+    suggestionItems.value = items;
+    suggestionActiveIndex.value = Math.max(0, items.findIndex((entry) => entry.command === item.command));
+    suggestionQuery.value = item.command;
+    suggestionAnchor.value = readTerminalSuggestionAnchor();
+  } else {
+    closeSuggestions();
+  }
+  terminal?.focus();
+}
+
+function executeSuggestion(item: CommandSuggestion) {
+  replaceTerminalLineWith(item.command, true);
+  closeSuggestions();
+  terminal?.focus();
+}
+
 function sendTerminalBytes(data: Uint8Array) {
   const sessionId = localSession.value?.sessionId ?? session.value?.sessionId;
   if (!sessionId) return;
@@ -2164,6 +2387,10 @@ function resetCommandMarker() {
   commandMarker.durationMs = null;
   commandMarker.cwd = "";
   commandMarker.startedAt = null;
+  // 会话切换/断开：建议浮层与抑制门锁存一并复位（P1-1）。
+  closeSuggestions();
+  suggestionGuardState = createSuggestionGuardState();
+  lastTerminalCommand.value = null;
 }
 
 function applyCommandMarker(updates: Osc633StreamUpdates) {
@@ -2177,11 +2404,18 @@ function applyCommandMarker(updates: Osc633StreamUpdates) {
   // 最近命令收集：仅 E 帧写 updates.command，故以其存在为准——不能挂在
   // commandActive 上，E 与 D 常在同一段输出里（命令快进快出时合并后的终值
   // 是 false），挂在 phase 上会漏采（与 D/A 退出码覆写同源的合并陷阱）。
-  if (isLocalMode.value && updates.command !== undefined && updates.command.trim()) {
+  if (updates.command !== undefined && updates.command.trim()) {
     const command = updates.command.trim();
-    if (command !== localRecentCommands.value[0]) {
+    lastTerminalCommand.value = command;
+    // 命令历史采集（P1-1）：shell integration 会话（本地 + SSH）把 E 帧命令行
+    // 写入 commandHistory 环形；持久化沿用 SECRET_LIKE/长度过滤，命令执行中
+    // 顺带收起浮层。与 onData 回车行采集去重由 pushCommandHistory 保证。
+    commandHistory.value = pushCommandHistory(commandHistory.value, command);
+    persistCommandHistory();
+    if (isLocalMode.value && command !== localRecentCommands.value[0]) {
       localRecentCommands.value = [command, ...localRecentCommands.value.filter((c) => c !== command)].slice(0, 20);
     }
+    closeSuggestions();
   }
   if (updates.commandActive === true) {
     commandMarker.exitCode = null;
@@ -4836,6 +5070,53 @@ function persistDownloadConflictPolicy(value: DownloadConflictPolicy) {
   void syncPrefs();
 }
 
+// 上传并发 / 重复目标策略（P1-5）：设置弹窗经适配器读写，权威态在此。
+function loadTransferConcurrency(): number {
+  return transferConcurrencyState.value;
+}
+
+function persistTransferConcurrency(value: number) {
+  transferConcurrencyState.value = clampTransferConcurrency(value);
+  void syncPrefs();
+}
+
+function loadTransferDuplicatePolicy(): TransferDuplicatePolicy {
+  return transferDuplicateState.value;
+}
+
+function persistTransferDuplicatePolicy(value: TransferDuplicatePolicy) {
+  transferDuplicateState.value = sanitizeTransferDuplicatePolicy(value);
+  void syncPrefs();
+}
+
+// 命令输入建议（P1-1）：设置弹窗经适配器读写，权威态在此。
+function loadSuggestionsEnabled(): boolean {
+  return suggestionsEnabledState.value;
+}
+
+function persistSuggestionsEnabled(value: boolean) {
+  suggestionsEnabledState.value = value;
+  void syncPrefs();
+}
+
+function loadSuggestionMinChars(): number {
+  return suggestionMinCharsState.value;
+}
+
+function persistSuggestionMinChars(value: number) {
+  suggestionMinCharsState.value = clampSuggestionMinChars(value);
+  void syncPrefs();
+}
+
+function loadSuggestionMaxChars(): number {
+  return suggestionMaxCharsState.value;
+}
+
+function persistSuggestionMaxChars(value: number) {
+  suggestionMaxCharsState.value = clampSuggestionMaxChars(value);
+  void syncPrefs();
+}
+
 function cachePrefs() {
   try {
     if (downloadDirState.value) window.localStorage.setItem(DOWNLOAD_DIR_KEY, downloadDirState.value);
@@ -4845,6 +5126,16 @@ function cachePrefs() {
     else window.localStorage.removeItem(DOWNLOAD_USE_DEFAULT_KEY);
     if (downloadConflictState.value !== "rename") window.localStorage.setItem(DOWNLOAD_CONFLICT_KEY, downloadConflictState.value);
     else window.localStorage.removeItem(DOWNLOAD_CONFLICT_KEY);
+    if (transferConcurrencyState.value !== 3) window.localStorage.setItem(TRANSFER_CONCURRENCY_KEY, String(transferConcurrencyState.value));
+    else window.localStorage.removeItem(TRANSFER_CONCURRENCY_KEY);
+    if (transferDuplicateState.value !== "rename") window.localStorage.setItem(TRANSFER_DUPLICATE_KEY, transferDuplicateState.value);
+    else window.localStorage.removeItem(TRANSFER_DUPLICATE_KEY);
+    if (!suggestionsEnabledState.value) window.localStorage.setItem(SUGGESTIONS_ENABLED_KEY, "0");
+    else window.localStorage.removeItem(SUGGESTIONS_ENABLED_KEY);
+    if (suggestionMinCharsState.value !== 2) window.localStorage.setItem(SUGGESTIONS_MIN_CHARS_KEY, String(suggestionMinCharsState.value));
+    else window.localStorage.removeItem(SUGGESTIONS_MIN_CHARS_KEY);
+    if (suggestionMaxCharsState.value !== 64) window.localStorage.setItem(SUGGESTIONS_MAX_CHARS_KEY, String(suggestionMaxCharsState.value));
+    else window.localStorage.removeItem(SUGGESTIONS_MAX_CHARS_KEY);
   } catch {
     // opaque origin：缓存跳过，内存态仍支撑本次会话。
   }
@@ -4857,6 +5148,11 @@ async function syncPrefs() {
       downloadDir: downloadDirState.value,
       downloadUseDefaultDir: downloadUseDefaultState.value,
       downloadConflictPolicy: downloadConflictState.value,
+      transfer_concurrency: transferConcurrencyState.value,
+      transfer_duplicate_policy: transferDuplicateState.value,
+      history_suggestions_enabled: suggestionsEnabledState.value,
+      history_suggestion_min_chars: suggestionMinCharsState.value,
+      history_suggestion_max_chars: suggestionMaxCharsState.value,
     });
   } catch {
     // 旧 sidecar 无此方法：本次会话内存态兜底。
@@ -4875,11 +5171,32 @@ async function hydratePrefsOnce() {
     downloadDirState.value = window.localStorage.getItem(DOWNLOAD_DIR_KEY)?.trim() || "";
     downloadUseDefaultState.value = window.localStorage.getItem(DOWNLOAD_USE_DEFAULT_KEY) !== "0";
     downloadConflictState.value = sanitizeConflictPolicy(window.localStorage.getItem(DOWNLOAD_CONFLICT_KEY));
+    transferConcurrencyState.value = clampTransferConcurrency(window.localStorage.getItem(TRANSFER_CONCURRENCY_KEY) ?? undefined);
+    transferDuplicateState.value = sanitizeTransferDuplicatePolicy(window.localStorage.getItem(TRANSFER_DUPLICATE_KEY));
+    suggestionsEnabledState.value = window.localStorage.getItem(SUGGESTIONS_ENABLED_KEY) !== "0";
+    suggestionMinCharsState.value = clampSuggestionMinChars(window.localStorage.getItem(SUGGESTIONS_MIN_CHARS_KEY));
+    suggestionMaxCharsState.value = clampSuggestionMaxChars(window.localStorage.getItem(SUGGESTIONS_MAX_CHARS_KEY));
   } catch {
     // 同上：等待 sidecar 权威值。
   }
   try {
-    const prefs = await window.dbxPlugin.invoke<{ downloadDir?: unknown; downloadUseDefaultDir?: unknown; downloadConflictPolicy?: unknown; localShell?: unknown; localShellIntegration?: unknown; action_links_enabled?: unknown; action_links_matchers?: unknown; terminal_show_line_numbers?: unknown; terminal_show_timestamps?: unknown; terminal_timestamp_format?: unknown }>("local/preferences/get", {});
+    const prefs = await window.dbxPlugin.invoke<{
+      downloadDir?: unknown;
+      downloadUseDefaultDir?: unknown;
+      downloadConflictPolicy?: unknown;
+      localShell?: unknown;
+      localShellIntegration?: unknown;
+      action_links_enabled?: unknown;
+      action_links_matchers?: unknown;
+      terminal_show_line_numbers?: unknown;
+      terminal_show_timestamps?: unknown;
+      terminal_timestamp_format?: unknown;
+      transfer_concurrency?: unknown;
+      transfer_duplicate_policy?: unknown;
+      history_suggestions_enabled?: unknown;
+      history_suggestion_min_chars?: unknown;
+      history_suggestion_max_chars?: unknown;
+    }>("local/preferences/get", {});
     if (typeof prefs.downloadDir === "string") downloadDirState.value = prefs.downloadDir.trim();
     if (typeof prefs.downloadUseDefaultDir === "boolean") downloadUseDefaultState.value = prefs.downloadUseDefaultDir;
     if (prefs.downloadConflictPolicy !== undefined) downloadConflictState.value = sanitizeConflictPolicy(prefs.downloadConflictPolicy);
@@ -4896,10 +5213,28 @@ async function hydratePrefsOnce() {
         timestampFormat: prefs.terminal_timestamp_format,
       });
     }
+    if (prefs.transfer_concurrency !== undefined) transferConcurrencyState.value = clampTransferConcurrency(prefs.transfer_concurrency);
+    if (prefs.transfer_duplicate_policy !== undefined) transferDuplicateState.value = sanitizeTransferDuplicatePolicy(prefs.transfer_duplicate_policy);
+    if (prefs.history_suggestions_enabled !== undefined) suggestionsEnabledState.value = prefs.history_suggestions_enabled === true;
+    if (prefs.history_suggestion_min_chars !== undefined) suggestionMinCharsState.value = clampSuggestionMinChars(prefs.history_suggestion_min_chars);
+    if (prefs.history_suggestion_max_chars !== undefined) suggestionMaxCharsState.value = clampSuggestionMaxChars(prefs.history_suggestion_max_chars);
     cachePrefs();
   } catch {
     // 旧 sidecar：保留 localStorage 种子或默认。
   }
+}
+
+// 建议长度上下限钳制：min 1..=16（默认 2），max 8..=512（默认 64），且 max 不低于 min。
+function clampSuggestionMinChars(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return 2;
+  return Math.min(16, Math.max(1, Math.floor(parsed)));
+}
+
+function clampSuggestionMaxChars(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return 64;
+  return Math.min(512, Math.max(8, Math.floor(parsed)));
 }
 
 // 「使用默认地址」关闭时，下载/导出前弹出目录选择小窗。resolve 语义：
@@ -5904,7 +6239,10 @@ async function chooseUpload() {
 
 async function uploadHandleFiles(files: Array<{ handleId: string; name: string; size: number }>, targetDir?: string) {
   if (!window.dbxPlugin.fileTransfer || !files.length) return;
-  await runWithConcurrency(files, 3, async (file) => {
+  uploadDuplicateBatchDecision = undefined;
+  await runTransfers(files, loadTransferConcurrency(), {
+    id: (file) => file.handleId,
+    run: async (file) => {
       try {
         await uploadSource(file.name, file.size, async (offset, length) => {
           const result = await window.dbxPlugin.fileTransfer!.read(file.handleId, offset, length);
@@ -5921,6 +6259,7 @@ async function uploadHandleFiles(files: Array<{ handleId: string; name: string; 
       } finally {
         await window.dbxPlugin.fileTransfer!.cancel(file.handleId).catch(() => undefined);
       }
+    },
   });
 }
 
@@ -5976,7 +6315,13 @@ async function handleHostFileDrop(files: Array<{ handleId: string; name: string;
 
 async function uploadLocalFiles(files: readonly File[], targetDir?: string) {
   openTransferPanel();
-  await runWithConcurrency([...files], 3, (file) => uploadSource(file.name, file.size, async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()), undefined, targetDir));
+  uploadDuplicateBatchDecision = undefined;
+  // File 对象没有稳定 id：包一层带序号的 key 再交给调度器。
+  const entries = files.map((file, index) => ({ file, key: `local-${index}` }));
+  await runTransfers(entries, loadTransferConcurrency(), {
+    id: (entry) => entry.key,
+    run: (entry) => uploadSource(entry.file.name, entry.file.size, async (offset, length) => new Uint8Array(await entry.file.slice(offset, offset + length).arrayBuffer()), undefined, targetDir),
+  });
   await loadDirectory();
   if (files.length) showNotice(t("uploaded", { count: files.length }));
 }
@@ -5985,11 +6330,20 @@ async function uploadSource(name: string, size: number, readChunk: (offset: numb
   if (!session.value) return;
   // resume 携带原 taskId/remotePath：后端校验 spool meta 后从已传前缀续接。
   // targetDir 仅新上传生效（终端拖入的自定义目标目录）；缺省仍是 SFTP 当前目录。
+  const dir = targetDir ?? currentPath.value;
+  // 重复目标预检（P1-5）：仅新上传生效；rename 可能改写最终远端文件名，
+  // 后续 remotePath 与传输面板展示名都用解析后的名字。
+  let uploadName = name;
+  if (!resume) {
+    const resolved = await resolveUploadDuplicateName(name, dir);
+    if (!resolved.proceed) return;
+    uploadName = resolved.name;
+  }
   const info = await window.dbxPlugin.invoke<{ taskId: string; chunkSize: number; resumeOffset?: number }>("sftp/upload/start", resume
     ? { sessionId: session.value.sessionId, remotePath: resume.remotePath, size, resumeTaskId: resume.taskId }
-    : { sessionId: session.value.sessionId, remotePath: joinRemote(targetDir ?? currentPath.value, name), size });
+    : { sessionId: session.value.sessionId, remotePath: joinRemote(dir, uploadName), size });
   const startOffset = info.resumeOffset ?? 0;
-  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: name, size, transferred: startOffset, status: startOffset > 0 ? "running" : "queued", joinedAt: Date.now() };
+  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "upload", fileName: uploadName, size, transferred: startOffset, status: startOffset > 0 ? "running" : "queued", joinedAt: Date.now() };
   try {
     let offset = startOffset;
     while (offset < size) {
@@ -6398,14 +6752,66 @@ async function cancelTransfer(task: TransferTask) {
   await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: task.taskId, reason: "user" }).catch((cause) => showError(cause));
 }
 
-async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T) => Promise<void>) {
-  const queue = [...items];
-  await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, async () => {
-    while (queue.length) {
-      const item = queue.shift();
-      if (item !== undefined) await worker(item);
-    }
-  }));
+// —— 上传重复目标策略（P1-5）：上传前 sftp/exists 预检，按 transfer_duplicate_policy
+// 决定重命名 / 覆盖 / 询问。询问弹窗支持「应用到全部」（批次内生效）。——
+
+/** 批次级「应用到全部」决策：undefined = 尚未决定（逐个询问）。 */
+let uploadDuplicateBatchDecision: "overwrite" | "rename" | undefined;
+
+interface UploadDuplicatePrompt {
+  fileName: string;
+  path: string;
+  resolve: (choice: "overwrite" | "rename" | undefined) => void;
+}
+const uploadDuplicatePrompt = ref<UploadDuplicatePrompt | null>(null);
+const uploadDuplicateApplyAll = ref(false);
+
+function resolveUploadDuplicate(choice: "overwrite" | "rename" | undefined) {
+  if (choice !== undefined && uploadDuplicateApplyAll.value) uploadDuplicateBatchDecision = choice;
+  uploadDuplicatePrompt.value?.resolve(choice);
+  uploadDuplicatePrompt.value = null;
+  uploadDuplicateApplyAll.value = false;
+}
+
+function askUploadDuplicate(fileName: string, path: string): Promise<"overwrite" | "rename" | undefined> {
+  return new Promise((resolve) => {
+    uploadDuplicatePrompt.value = { fileName, path, resolve };
+  });
+}
+
+/**
+ * 解析上传的最终远端文件名：目标已存在时按策略返回 proceed=false（放弃）或
+ * 调整后的名字（rename 经后端 sftp/rename-unique 探测 name(1)..name(999)）。
+ * 预检/重命名失败不阻断上传，回落现有覆盖语义。
+ */
+async function resolveUploadDuplicateName(name: string, targetDir: string): Promise<{ name: string; proceed: boolean }> {
+  const sessionId = session.value?.sessionId;
+  if (!sessionId) return { name, proceed: true };
+  const targetPath = joinRemote(targetDir, name);
+  let exists = false;
+  try {
+    const probe = await window.dbxPlugin.invoke<{ exists: boolean }>("sftp/exists", { sessionId, path: targetPath });
+    exists = probe.exists === true;
+  } catch {
+    // 预检不可用时保持原语义直接下发。
+    return { name, proceed: true };
+  }
+  if (!exists) return { name, proceed: true };
+  const policy = transferDuplicateState.value;
+  if (policy === "overwrite") return { name, proceed: true };
+  if (policy === "ask" && uploadDuplicateBatchDecision === undefined) {
+    const choice = await askUploadDuplicate(name, targetPath);
+    if (!choice) return { name, proceed: false };
+    uploadDuplicateBatchDecision = choice;
+  }
+  if (policy === "ask" && uploadDuplicateBatchDecision === "overwrite") return { name, proceed: true };
+  // rename（或 ask 选了重命名）：后端探测不冲突新名；旧 sidecar 无该方法时回落原名覆盖。
+  try {
+    const result = await window.dbxPlugin.invoke<{ name: string }>("sftp/rename-unique", { sessionId, dir: targetDir, name });
+    return { name: result.name || name, proceed: true };
+  } catch {
+    return { name, proceed: true };
+  }
 }
 
 function onUploadInput(event: Event) {
@@ -8007,6 +8413,7 @@ const modalOpenStates = computed(() => [
   dropUploadPrompt.value,
   downloadPrompt.value !== null,
   downloadConflictPrompt.value !== null,
+  uploadDuplicatePrompt.value !== null,
   attrsTarget.value,
   deleteTarget.value,
   batchDeleteOpen.value,
@@ -8109,6 +8516,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
   }
   if (downloadConflictPrompt.value) {
     resolveDownloadConflict(undefined);
+    return;
+  }
+  if (uploadDuplicatePrompt.value) {
+    resolveUploadDuplicate(undefined);
     return;
   }
   if (attrsTarget.value) {
@@ -8828,6 +9239,17 @@ onBeforeUnmount(() => {
         <div v-if="terminalDiagVisible" class="terminal-diag-overlay" @dblclick="terminalDiagVisible = false">
           keys {{ terminalDiag.keys }} · sends {{ terminalDiag.sends }} · acks {{ terminalDiag.acks }} · errors {{ terminalDiag.errors }} · swallowed {{ terminalDiag.swallowed }}
         </div>
+        <!-- 命令模糊建议浮层（P1-1）：锚点为光标像素坐标，读不到时贴终端底部；
+             键盘（↑↓/Tab/Enter/Esc）由 handleTerminalKey 在浮层开启时优先消费。 -->
+        <CommandSuggestions
+          v-if="suggestionOpen && suggestionItems.length"
+          :items="suggestionItems"
+          :active-index="suggestionActiveIndex"
+          :anchor="suggestionAnchor"
+          :t="t"
+          @activate="(index) => (suggestionActiveIndex = index)"
+          @fill="fillSuggestion"
+        />
         <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint") }}</strong></div>
         <TerminalSearchPanel
           v-if="searchOpen"
@@ -9633,6 +10055,26 @@ onBeforeUnmount(() => {
       </DialogContent>
     </Dialog>
 
+    <!-- 上传重复目标「询问我」（P1-5）：重命名 / 覆盖 / 取消，支持应用到本批次 -->
+    <Dialog :open="!!uploadDuplicatePrompt" @update:open="(open) => { if (!open) resolveUploadDuplicate(undefined); }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="uploadDuplicatePrompt">
+        <header><DialogTitle>{{ t("transferCfg.duplicateTitle") }}</DialogTitle><button class="icon-button" :title="t('close')" @click="resolveUploadDuplicate(undefined)"><X /></button></header>
+        <p>{{ t("transferCfg.duplicateMessage", { name: uploadDuplicatePrompt.fileName }) }}</p>
+        <p class="muted mono">{{ uploadDuplicatePrompt.path }}</p>
+        <label class="settings-field settings-switch-row">
+          <input v-model="uploadDuplicateApplyAll" type="checkbox" />
+          <span>{{ t("transferCfg.applyAll") }}</span>
+        </label>
+        <footer>
+          <button @click="resolveUploadDuplicate(undefined)">{{ t("cancel") }}</button>
+          <button class="danger-button" @click="resolveUploadDuplicate('overwrite')">{{ t("transferCfg.policy.overwrite") }}</button>
+          <button class="primary-button" @click="resolveUploadDuplicate('rename')">{{ t("transferCfg.policy.rename") }}</button>
+        </footer>
+        </template>
+      </DialogContent>
+    </Dialog>
+
     <Dialog :open="!!recordingDeleteTarget" @update:open="(open) => { if (!open) recordingDeleteTarget = null; }">
       <DialogContent class="modal small-modal" @escape-key-down.prevent>
         <template v-if="recordingDeleteTarget">
@@ -9730,6 +10172,8 @@ onBeforeUnmount(() => {
       :host-theme="hostTerminalTheme()"
       :host-color-scheme="appearance.colorScheme"
       :download-prefs="downloadPrefsAdapter"
+      :transfer-prefs="transferPrefsAdapter"
+      :suggestion-prefs="suggestionPrefsAdapter"
       :t="t"
       @notice="showNotice"
       @error="showError"

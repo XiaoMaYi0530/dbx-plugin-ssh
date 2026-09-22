@@ -391,6 +391,13 @@ impl Plugin {
                     .block_on(sftp_ext::exists(&self.ssh, session_id, path))?;
                 Ok(json!({ "exists": exists }))
             }
+            "sftp/rename-unique" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let dir = required_string(&params, "dir")?;
+                let name = required_string(&params, "name")?;
+                self.runtime
+                    .block_on(sftp_ext::rename_unique(&self.ssh, session_id, dir, name))
+            }
             "sftp/touch" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let path = required_string(&params, "path")?;
