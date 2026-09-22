@@ -104,25 +104,60 @@ def main() -> None:
         # terminal input frames carry a u64 BE sequence prefix; output frames
         # are [sequence u64][payload] on ssh/terminal/out/<sessionId>
         import struct as _struct
-        # 45s: shared CI runners occasionally starve the first PTY output past
-        # the 20s this used to allow (prompt flakes, FAIL ~50% on busy days).
-        deadline = time.monotonic() + 45
-        prompt_seen = False
-        while time.monotonic() < deadline and not prompt_seen:
-            for frame in list(client.binary_frames):
-                channel, data = frame
-                client.binary_frames.remove(frame)
-                if channel.startswith("ssh/terminal/out/") and (b"$ " in data or b"# " in data):
-                    prompt_seen = True
-                    break
-            if not prompt_seen:
+
+        def wait_for_prompt(budget: float) -> bool:
+            """Pump output frames until a shell prompt shows up or budget runs out.
+
+            45s per attempt: shared CI runners occasionally starve the first PTY
+            output (prompt flakes, FAIL ~50% on busy days; since 2026-09-22 the
+            starvation can outlast a single 45s window on linux runners, so the
+            caller retries with a fresh session). Periodic diagnostics print the
+            frame counter so a CI failure carries evidence instead of silence.
+            """
+            started = time.monotonic()
+            deadline = started + budget
+            last_diag = started
+            seen_diag_frames = 0
+            while time.monotonic() < deadline:
+                saw_prompt = False
+                for frame in list(client.binary_frames):
+                    channel, data = frame
+                    client.binary_frames.remove(frame)
+                    seen_diag_frames += 1
+                    if channel.startswith("ssh/terminal/out/") and (b"$ " in data or b"# " in data):
+                        saw_prompt = True
+                        break
+                if saw_prompt:
+                    return True
+                now = time.monotonic()
+                if now - last_diag >= 10:
+                    print(f"    [diag] +{now - started:.0f}s waiting, output frames so far: {seen_diag_frames}")
+                    last_diag = now
                 client.timeout = max(0.5, deadline - time.monotonic())
                 try:
                     client._pump(None)
                 except SidecarError:
                     break
+            return False
+
+        prompt_seen = wait_for_prompt(45)
         if not prompt_seen:
-            fail("shell prompt did not appear within 20s")
+            # One bounded self-heal: a starved first PTY stream never recovers
+            # mid-session, but a fresh session on the same connection usually
+            # produces output immediately.
+            print("    [diag] no prompt after 45s, reopening the session once")
+            try:
+                client.request("ssh/session/close", {"sessionId": session_id}, timeout=15)
+            except SidecarError:
+                pass
+            session = client.request("ssh/session/open",
+                                     {"connectionId": connection_id, "workbenchId": workbench_id,
+                                      "cols": 120, "rows": 30},
+                                     timeout=60, on_event=auto_accept_challenge)
+            session_id = session.get("sessionId", workbench_id)
+            prompt_seen = wait_for_prompt(45)
+        if not prompt_seen:
+            fail(f"shell prompt did not appear within 2x45s (see [diag] lines above)")
         print("    shell prompt received")
         client.send_binary(f"ssh/terminal/in/{session_id}", _struct.pack(">Q", 1) + b"echo SMOKE_OK_MARKER\r")
         deadline = time.monotonic() + 15
