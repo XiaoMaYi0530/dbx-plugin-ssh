@@ -46,6 +46,8 @@ import {
   type TerminalRightClickMode,
 } from "../lib/terminalBehavior";
 import type { TerminalHotkeyBindings } from "../lib/terminalHotkeys";
+import { type ActionLinkMatcherToggles, type ActionLinksSettings } from "../lib/actionLinksMatcher";
+import { GUTTER_TIMESTAMP_DEFAULT_FORMAT, type GutterSettings } from "../lib/terminalGutter";
 
 const props = defineProps<{
   open: boolean;
@@ -66,6 +68,10 @@ const props = defineProps<{
   terminalHotkeys: TerminalHotkeyBindings;
   /** 是否 Apple 平台：决定快捷键修饰键的显示符号与默认键位口径。 */
   applePlatform: boolean;
+  /** 动作链接偏好（权威态在 App，sidecar preferences 持久化）：只读 + 上抛增量。 */
+  actionLinks: ActionLinksSettings;
+  /** 行号/时间戳 gutter 偏好（权威态在 App）：只读 + 上抛增量。 */
+  gutter: GutterSettings;
   /** 终端外观偏好（权威态在 App）：本组件只读 + 经 emits 上抛改动意图。 */
   appearance: TerminalAppearanceState;
   /** 用户保存的主题快照（内置预设由 lib 常量提供，不需经 props）。 */
@@ -100,6 +106,10 @@ const emit = defineEmits<{
   (e: "update-hotkeys", bindings: TerminalHotkeyBindings): void;
   (e: "apply-font", payload: { family: string | null; size: number }): void;
   (e: "update-appearance", patch: Partial<TerminalAppearanceSettings>): void;
+  /** 动作链接设置增量：App 侧归一化 + sidecar 持久化 + 即时挂/摘 link provider。 */
+  (e: "update:actionLinks", patch: { enabled?: boolean; matchers?: Partial<ActionLinkMatcherToggles> }): void;
+  /** gutter 设置增量：App 侧归一化 + sidecar 持久化 + 即时挂/摘。 */
+  (e: "update:gutter", patch: { showLineNumbers?: boolean; showTimestamps?: boolean; timestampFormat?: string }): void;
   (e: "apply-theme", theme: TerminalAppearanceProfile): void;
   (e: "save-theme", name: string): void;
   (e: "delete-theme", id: string): void;
@@ -457,6 +467,33 @@ function updateScrollback(raw: string) {
 function updateHotkeys(bindings: TerminalHotkeyBindings) {
   emit("update-hotkeys", bindings);
 }
+
+// 动作链接/gutter 与行为设置同款增量语义：本组件不持副本，重开弹窗无回显漂移。
+function updateActionLinks(patch: { enabled?: boolean; matchers?: Partial<ActionLinkMatcherToggles> }) {
+  emit("update:actionLinks", patch);
+}
+
+function updateGutter(patch: { showLineNumbers?: boolean; showTimestamps?: boolean; timestampFormat?: string }) {
+  emit("update:gutter", patch);
+}
+
+/** 单个匹配器开关：reka Switch 回传 boolean | string，收紧为布尔再上抛。 */
+function updateMatcher(key: keyof ActionLinkMatcherToggles, value: unknown) {
+  updateActionLinks({ matchers: { [key]: value === true } });
+}
+
+/** 时间戳格式输入：空串回退默认格式（输入中途清空不落空格式）。 */
+function updateGutterFormat(raw: string) {
+  const trimmed = raw.trim();
+  updateGutter({ timestampFormat: trimmed || GUTTER_TIMESTAMP_DEFAULT_FORMAT });
+}
+
+/** 三类匹配器开关按常量数组迭代（模板不支持 as const 字面量迭代）。 */
+const ACTION_LINK_MATCHER_ROWS: Array<{ key: keyof ActionLinkMatcherToggles; label: string }> = [
+  { key: "ipv4", label: "actionLinks.ipv4" },
+  { key: "hostPort", label: "actionLinks.hostPort" },
+  { key: "archive", label: "actionLinks.archive" },
+];
 
 /** 文本输入框取原始串（同 numberFieldValue，避免在模板里写 as 断言）。 */
 function textFieldValue(event: Event): string {
@@ -1344,6 +1381,36 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <span>{{ t(BELL_LABELS[mode]) }}</span>
             </label>
             <p class="muted settings-note">{{ t("terminalBehavior.bellHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("actionLinks.sectionTitle") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="actionLinks.enabled" @update:model-value="(v) => updateActionLinks({ enabled: v === true })" />
+              <span>{{ t("actionLinks.enabled") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("actionLinks.enabledHint") }}</p>
+            <template v-if="actionLinks.enabled">
+              <label v-for="matcher in ACTION_LINK_MATCHER_ROWS" :key="matcher.key" class="settings-field settings-switch-row">
+                <Switch size="sm" :model-value="actionLinks.matchers[matcher.key]" @update:model-value="(v) => updateMatcher(matcher.key, v)" />
+                <span>{{ t(matcher.label) }}</span>
+              </label>
+            </template>
+
+            <h3 class="settings-section-title">{{ t("gutter.sectionTitle") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="gutter.showLineNumbers" @update:model-value="(v) => updateGutter({ showLineNumbers: v === true })" />
+              <span>{{ t("gutter.showLineNumbers") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("gutter.showLineNumbersHint") }}</p>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="gutter.showTimestamps" @update:model-value="(v) => updateGutter({ showTimestamps: v === true })" />
+              <span>{{ t("gutter.showTimestamps") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("gutter.showTimestampsHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("gutter.timestampFormat") }}</span>
+              <input class="mono" spellcheck="false" :maxlength="64" :placeholder="GUTTER_TIMESTAMP_DEFAULT_FORMAT" :value="gutter.timestampFormat" @change="updateGutterFormat(textFieldValue($event))" />
+            </label>
+            <p class="muted settings-note">{{ t("gutter.timestampFormatHint") }}</p>
 
             <p class="muted settings-note">{{ t("terminalBehavior.scopeNote") }}</p>
             <p class="muted settings-note">{{ t("terminalFont.movedHint") }}</p>

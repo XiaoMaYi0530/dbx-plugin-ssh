@@ -12,6 +12,8 @@ const STORAGE_VERSION: u64 = 1;
 const FILE_NAME: &str = "preferences.json";
 /// Bounded so a broken renderer cannot grow the file without limit.
 const MAX_DOWNLOAD_DIR_LEN: usize = 512;
+/// 时间戳格式串上限（前端 terminalGutter.ts 的 GUTTER_TIMESTAMP_FORMAT_MAX 同界）。
+const MAX_TIMESTAMP_FORMAT_LEN: usize = 64;
 
 pub fn store_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join(FILE_NAME)
@@ -36,6 +38,38 @@ fn sanitize_conflict_policy(value: &Value) -> Option<&'static str> {
         "overwrite" => Some("overwrite"),
         _ => None,
     }
+}
+
+/// 动作链接三类匹配器开关（ipv4/host_port/archive）。逐字段收紧、缺省 true；
+/// 整键缺失或形状非法由调用方跳过（前端按缺省处理）。
+fn sanitize_action_links_matchers(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let flag = |key: &str| object.get(key).and_then(Value::as_bool).unwrap_or(true);
+    Some(json!({
+        "ipv4": flag("ipv4"),
+        "host_port": flag("host_port"),
+        "archive": flag("archive"),
+    }))
+}
+
+/// 终端时间戳格式：白名单字符（字母数字与 []:-./, 空格）+ 64 字符截断；
+/// 清洗后为空回退默认 "[HH:mm:ss]"，与前端 sanitizeGutterSettings 同向。
+fn sanitize_timestamp_format(value: &Value) -> Option<String> {
+    let raw = value.as_str()?;
+    let cleaned: String = raw
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '[' | ']' | ':' | '-' | '.' | '/' | ',' | ' ')
+        })
+        .take(MAX_TIMESTAMP_FORMAT_LEN)
+        .collect();
+    let trimmed = cleaned.trim();
+    Some(if trimmed.is_empty() {
+        "[HH:mm:ss]".to_string()
+    } else {
+        cleaned
+    })
 }
 
 /// Reads the raw preferences map; a missing or corrupted file yields an empty
@@ -80,6 +114,33 @@ pub fn load_preferences(data_dir: &Path) -> Value {
             Value::Bool(integration),
         );
     }
+    if let Some(enabled) = map.get("action_links_enabled").and_then(Value::as_bool) {
+        prefs.insert("action_links_enabled".to_string(), Value::Bool(enabled));
+    }
+    if let Some(matchers) = map
+        .get("action_links_matchers")
+        .and_then(sanitize_action_links_matchers)
+    {
+        prefs.insert("action_links_matchers".to_string(), matchers);
+    }
+    if let Some(line_numbers) = map.get("terminal_show_line_numbers").and_then(Value::as_bool) {
+        prefs.insert(
+            "terminal_show_line_numbers".to_string(),
+            Value::Bool(line_numbers),
+        );
+    }
+    if let Some(timestamps) = map.get("terminal_show_timestamps").and_then(Value::as_bool) {
+        prefs.insert(
+            "terminal_show_timestamps".to_string(),
+            Value::Bool(timestamps),
+        );
+    }
+    if let Some(format) = map
+        .get("terminal_timestamp_format")
+        .and_then(sanitize_timestamp_format)
+    {
+        prefs.insert("terminal_timestamp_format".to_string(), Value::String(format));
+    }
     Value::Object(prefs)
 }
 
@@ -121,6 +182,43 @@ pub fn save_preferences(data_dir: &Path, params: &Value) -> Result<Value, String
         map.insert(
             "localShellIntegration".to_string(),
             Value::Bool(integration),
+        );
+    }
+    if let Some(value) = params.get("action_links_enabled") {
+        let enabled = value
+            .as_bool()
+            .ok_or_else(|| "action_links_enabled must be a boolean".to_string())?;
+        map.insert("action_links_enabled".to_string(), Value::Bool(enabled));
+    }
+    if let Some(value) = params.get("action_links_matchers") {
+        let matchers = sanitize_action_links_matchers(value)
+            .ok_or_else(|| "action_links_matchers must be an object".to_string())?;
+        map.insert("action_links_matchers".to_string(), matchers);
+    }
+    if let Some(value) = params.get("terminal_show_line_numbers") {
+        let line_numbers = value
+            .as_bool()
+            .ok_or_else(|| "terminal_show_line_numbers must be a boolean".to_string())?;
+        map.insert(
+            "terminal_show_line_numbers".to_string(),
+            Value::Bool(line_numbers),
+        );
+    }
+    if let Some(value) = params.get("terminal_show_timestamps") {
+        let timestamps = value
+            .as_bool()
+            .ok_or_else(|| "terminal_show_timestamps must be a boolean".to_string())?;
+        map.insert(
+            "terminal_show_timestamps".to_string(),
+            Value::Bool(timestamps),
+        );
+    }
+    if let Some(value) = params.get("terminal_timestamp_format") {
+        let format = sanitize_timestamp_format(value)
+            .ok_or_else(|| "terminal_timestamp_format must be a string".to_string())?;
+        map.insert(
+            "terminal_timestamp_format".to_string(),
+            Value::String(format),
         );
     }
     let path = store_path(data_dir);
@@ -199,5 +297,54 @@ mod tests {
         assert!(
             save_preferences(data_dir.path(), &json!({ "downloadUseDefaultDir": "yes" })).is_err()
         );
+    }
+
+    #[test]
+    fn terminal_feature_prefs_roundtrip_with_defaults() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        // 空偏好：五键都不出现（前端按缺省 = 功能全关处理）。
+        let prefs = load_preferences(data_dir.path());
+        assert!(prefs.get("action_links_enabled").is_none());
+        assert!(prefs.get("action_links_matchers").is_none());
+        assert!(prefs.get("terminal_show_line_numbers").is_none());
+        assert!(prefs.get("terminal_show_timestamps").is_none());
+        assert!(prefs.get("terminal_timestamp_format").is_none());
+        // 写入 + 读回：matchers 部分字段缺省为 true；格式串原样保留。
+        save_preferences(
+            data_dir.path(),
+            &serde_json::json!({
+                "action_links_enabled": true,
+                "action_links_matchers": { "ipv4": false },
+                "terminal_show_line_numbers": true,
+                "terminal_show_timestamps": true,
+                "terminal_timestamp_format": "[HH:mm]",
+            }),
+        )
+        .expect("save");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(prefs["action_links_enabled"], true);
+        assert_eq!(prefs["action_links_matchers"]["ipv4"], false);
+        assert_eq!(prefs["action_links_matchers"]["host_port"], true);
+        assert_eq!(prefs["action_links_matchers"]["archive"], true);
+        assert_eq!(prefs["terminal_show_line_numbers"], true);
+        assert_eq!(prefs["terminal_show_timestamps"], true);
+        assert_eq!(prefs["terminal_timestamp_format"], "[HH:mm]");
+        // 非法形状报错且不落盘污染；matchers 非对象拒绝。
+        assert!(save_preferences(data_dir.path(), &serde_json::json!({ "action_links_enabled": 1 })).is_err());
+        assert!(save_preferences(data_dir.path(), &serde_json::json!({ "action_links_matchers": "all" })).is_err());
+        assert!(save_preferences(data_dir.path(), &serde_json::json!({ "terminal_show_timestamps": "yes" })).is_err());
+        // 格式串清洗：危险字符剔除、超长截断、清洗后为空回退默认。
+        save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "terminal_timestamp_format": "  <>  " }),
+        )
+        .expect("save fallback");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(prefs["terminal_timestamp_format"], "[HH:mm:ss]");
+        let long = "Y".repeat(100);
+        save_preferences(data_dir.path(), &serde_json::json!({ "terminal_timestamp_format": long }))
+            .expect("save long");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(prefs["terminal_timestamp_format"].as_str().unwrap().len(), 64);
     }
 }
