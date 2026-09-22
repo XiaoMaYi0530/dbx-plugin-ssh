@@ -367,6 +367,38 @@ try {
   await sleep(400);
   check("escape closes the search panel", (await page.locator(".terminal-search-panel:visible").count()) === 0);
 
+  // Regression guard for the keys d983f8fc dropped from i18n.ts while leaving
+  // their call sites behind: the permission-mode options used to render as the
+  // raw strings "mcpSettings.permissionModeAutonomous" / "...Confirm" because
+  // workbenchMessage falls back to the key itself. This is the one restored key
+  // reachable without a live SSH session, so it is worth asserting in a browser
+  // rather than only against the message table.
+  console.log("==> MCP pane: restored copy renders instead of raw keys");
+  // The dispatch group above closed the dialog to focus the terminal, so the
+  // settings surface has to be reopened before touching the category nav again.
+  await openSettings();
+  await openCategory(8);
+  const approvalField = page.locator(".settings-pane:visible label.settings-field", { hasText: "MCP execution approval" });
+  check("MCP execution-approval field rendered", (await approvalField.count()) === 1);
+  if (await approvalField.count()) {
+    await approvalField.locator("[role='combobox']").first().click();
+    await sleep(300);
+    const optionTexts = (await page.locator("[role='option']").allTextContents()).map((text) => text.trim());
+    check(
+      "permission-mode options are translated, not raw keys",
+      optionTexts.includes("Autonomous") && optionTexts.includes("Confirm before running"),
+      JSON.stringify(optionTexts),
+    );
+    check(
+      "no raw i18n key leaked into the options",
+      !optionTexts.some((text) => /^mcpSettings\.[A-Za-z]+$/.test(text)),
+      JSON.stringify(optionTexts),
+    );
+    await page.keyboard.press("Escape");
+    await sleep(250);
+  }
+  await page.screenshot({ path: join(SHOT_DIR, "06-mcp-approval.png") });
+
   console.log("==> zh-CN localisation of the new categories");
   const zhPage = await browser.newPage({ viewport: VIEWPORT });
   await zhPage.goto(`${baseUrl}?render=dom&locale=zh-CN`, { waitUntil: "domcontentloaded", timeout: 30_000 });

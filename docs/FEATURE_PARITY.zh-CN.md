@@ -385,7 +385,8 @@ sudo / 智能体 / 传输 / 安全 / MCP。
 
 新增 `scripts/smoke_ui_settings.mjs`，沿用既有 `smoke_ui_mock.mjs` 的约定（vite 起 `mock.html`、
 headless Chrome + playwright-core 走系统 Chrome channel、依赖缺失即 SKIP 退出 0、
-截图落在未跟踪的 `docs/screenshots-ui-settings/`）。**45 项断言全绿**，覆盖：
+截图落在未跟踪的 `docs/screenshots-ui-settings/`）。**44 项断言全绿**（运行时报 `ok` 的行数；
+静态 `check(` 调用为 42 处，其余来自循环），覆盖：
 
 | 断言组 | 内容 |
 | --- | --- |
@@ -484,6 +485,22 @@ PATH 导出，否则 `spawn pnpm ENOENT`。
 - 新增单测 5 例；全量 vitest **70 文件 / 680 用例全绿**；`vue-tsc --noEmit` 通过；
   `scripts/validate_repo.py` 与 `scripts/connection-forms/verify.mjs` 均 PASS
   （后者本身就校验「七语言标签/选项」）。
-- 无新增 smoke 用例：本轮未新增用户可见能力，只恢复文案；既有
-  `scripts/smoke_ui_settings.mjs`（45 项断言）与 `scripts/smoke_ui_mock.mjs` 未受影响。
+- 无新增单测以外的能力：本轮只恢复文案并补护栏；既有 `scripts/smoke_ui_settings.mjs` 新增 3 条断言
+  （见下），`scripts/smoke_ui_mock.mjs` 未改动且回归全绿。
 - 未新增运行时依赖；未提交 `ui/`（integrator 所有权）。
+
+### UI 走查（e2e）补充
+
+上面那 19 个键里，只有 `mcpSettings.permissionModeAutonomous` / `permissionModeConfirm` 能在
+没有真实 SSH 会话的情况下触达（它们位于设置面板的 MCP 分类）。因此在
+`scripts/smoke_ui_settings.mjs` 末尾新增一组断言，把「修复真的到达了界面」钉住：
+
+| 断言 | 内容 |
+| --- | --- |
+| MCP execution-approval field rendered | 通过标签文本「MCP execution approval」定位到字段，并确认其内的下拉存在 |
+| permission-mode options are translated, not raw keys | 展开下拉后，选项文案为 `Autonomous` / `Confirm before running` |
+| no raw i18n key leaked into the options | 选项里不得出现 `mcpSettings.<X>` 形式的原始键 |
+
+运行时报 `ok` 47 条、0 失败（本轮 3 条 + 既有 44 条）。
+`metricsSwap` 与拖拽上传对话框的 5 个键需要真实会话/拖拽事件才能触达，
+故只在单测层（运行时语言表解析）覆盖，不在 e2e 覆盖。
