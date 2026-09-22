@@ -90,7 +90,7 @@ function deviceKeyTitle(device: NpuDeviceView) {
           <div v-if="card.totalMem" class="disk-row">
             <span class="mono">{{ t("metricsGpu.memory") }}</span>
             <progress :value="memShare(card.usedMem, card.totalMem)" max="100" :class="{ 'disk-warn': memShare(card.usedMem, card.totalMem) >= 85 }" />
-            <span class="numeric">{{ formatBytes(card.usedMem ?? 0) }} / {{ formatBytes(card.totalMem) }} · {{ Math.round(memShare(card.usedMem, card.totalMem)) }}%</span>
+            <span class="numeric" :title="`${formatBytes(card.usedMem ?? 0)} / ${formatBytes(card.totalMem)} · ${Math.round(memShare(card.usedMem, card.totalMem))}%`">{{ formatBytes(card.usedMem ?? 0) }} / {{ formatBytes(card.totalMem) }} · {{ Math.round(memShare(card.usedMem, card.totalMem)) }}%</span>
           </div>
           <div v-if="card.processes.length" class="gpu-npu-processes">
             <div v-for="proc in card.processes" :key="`${card.uuid}-${proc.pid}-${proc.mem ?? 0}`" class="gpu-npu-process-row">
@@ -143,7 +143,7 @@ function deviceKeyTitle(device: NpuDeviceView) {
 /* 对齐 style.css 的 .metric-card / .metrics-grid：同样的边框、圆角、底色
    token 与 auto-fit 网格，保证与监控面板其余卡片视觉一致。 */
 .gpu-npu-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
-.gpu-npu-card { display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; background: color-mix(in srgb, var(--muted) 40%, transparent); }
+.gpu-npu-card { display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; background: color-mix(in srgb, var(--muted) 40%, transparent); overflow: hidden; }
 .gpu-npu-card-head { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
 .gpu-npu-card-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .gpu-npu-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; color: var(--muted-foreground); font-size: 10px; }
@@ -153,7 +153,10 @@ function deviceKeyTitle(device: NpuDeviceView) {
 .gpu-npu-processes { display: flex; flex-direction: column; gap: 2px; }
 .gpu-npu-process-row { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; gap: 6px; font-size: 10px; }
 .gpu-npu-process-name { min-width: 0; overflow: hidden; color: var(--muted-foreground); text-overflow: ellipsis; white-space: nowrap; }
-.gpu-npu-cann { color: var(--muted-foreground); font-size: 10px; }
+.gpu-npu-cann { display: inline-block; margin-left: 8px; color: var(--muted-foreground); font-size: 10px; }
+/* 窄卡片（auto-fit 两列时 ~185px）里显存数值会被挤成竖排折行：禁止折行并
+   缩一号字，溢出由卡片 overflow 承担，保证 "33.00 GiB / 40.00 GiB · 83%" 一行可读。 */
+.gpu-npu-section .numeric { white-space: nowrap; font-size: 10px; }
 .gpu-npu-driver { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 /* 不可用态刻意弱化：面板其余区域保持主要地位。 */
 .gpu-npu-unavailable { opacity: 0.75; }

@@ -745,6 +745,48 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
         { pid: 812, user: "www-data", cpuPercent: 12.6, memPercent: 3.1, command: "nginx: worker process" },
         { pid: 1042, user: "demo", cpuPercent: 2.4, memPercent: 1.2, command: "htop" },
       ],
+      // GPU / Ascend NPU 视觉夹具（IMPL_PLAN Task P1-4）：字段与 metrics_gpu.rs
+      // 的 JSON 输出一致，供监控卡片渲染、警戒色与空进程态可被视觉验证。
+      gpu: {
+        available: true,
+        gpus: [
+          {
+            index: 0, uuid: "GPU-7f3a2c11-9b04-e8d2-aa51-6c0f5b19d301", name: "NVIDIA A100-SXM4-40GB",
+            driver: "550.54.15", temperature: 67, utilization: 93, memUtil: 81,
+            totalMem: 42_949_672_960, usedMem: 35_433_601_024, freeMem: 7_516_071_936,
+            powerDraw: 298, powerLimit: 400, fan: 62, pstate: "P0",
+            processes: [
+              { uuid: "GPU-7f3a2c11-9b04-e8d2-aa51-6c0f5b19d301", pid: 2211, mem: 31_221_622_784, name: "python train_llm.py" },
+              { uuid: "GPU-7f3a2c11-9b04-e8d2-aa51-6c0f5b19d301", pid: 2212, mem: 3_921_678_336, name: "python eval.py" },
+            ],
+          },
+          {
+            index: 1, uuid: "GPU-7f3a2c11-9b04-e8d2-aa51-6c0f5b19d302", name: "NVIDIA A100-SXM4-40GB",
+            driver: "550.54.15", temperature: 41, utilization: 0, memUtil: 0,
+            totalMem: 42_949_672_960, usedMem: 1_073_741_824, freeMem: 41_875_931_136,
+            powerDraw: 68, powerLimit: 400, fan: 22, pstate: "P8",
+            processes: [],
+          },
+        ],
+      },
+      npu: {
+        available: true,
+        cann: "8.0.RC3.beta1",
+        devices: [
+          {
+            deviceKey: "ascend:0:0", npuIndex: 0, chipId: 0, name: "910B4", health: "OK",
+            power: 212.4, temperature: 58, aicore: 76, memoryLabel: "hbm",
+            usedMem: 22_158_430_208, totalMem: 31_675_758_592,
+            processes: [{ pid: 3310, name: "mindspore-train", npuIndex: 0, mem: 21_474_836_480 }],
+          },
+          {
+            deviceKey: "ascend:1:0", npuIndex: 1, chipId: 0, name: "310P3", health: "OK",
+            power: 45.1, temperature: 39, aicore: 0, memoryLabel: "memory",
+            usedMem: 1_073_741_824, totalMem: 16_856_718_131,
+            processes: [],
+          },
+        ],
+      },
     };
   }
   else if (method === "sftp/diskUsage") {
