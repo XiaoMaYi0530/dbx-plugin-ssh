@@ -3267,3 +3267,41 @@ amd64 与 arm64 均有报告。
 kafka 现网动态包按预期拦——修复后 CI 重建即静态）。CI 模拟容器
 （rust:1-bookworm + 同款 wrapper + 官方 CLI 0.1.3 打包）产出 linux dbxp
 端到端复验。桌面 macOS/Windows 产物不受影响，无需重发。
+
+## 用户级端口映射 -L/-R（2026-09-22）
+
+**决策翻转**：FEATURE_PARITY 原 2026-09-07「端口转发 ❌ 不做」的三个理由（宿主无
+-R、无面向用户的转发会话 UI、无通用转发接口）恰为本次补齐的缺口，用户决策翻
+转立项；`-D` 动态转发维持不做（宿主 dbx-core 已内置数据库代拨动态隧道）。
+
+**sidecar**（`backend/src/forward.rs` 新模块 + ssh.rs 接线）：
+- `ssh/forward/list|start|stop`：list 按 connectionId/sessionId 过滤；start
+  校验（targetHost 必填、端口 0-65535、listenHost 缺省回环）后 local 先绑端口
+  再标 active、remote 先 `tcpip-forward`（拒绝即移除行并报错，`listenPort: 0`
+  服务端挑选）；stop 全量 abort（含已建立 relay）+ `cancel-tcpip-forward`，
+  未知 id 报错。状态迁移广播 `ssh/forward/state`。
+- local 转发：TcpListener accept → 每连接 `channel_open_direct_tcpip` →
+  `copy_bidirectional`，连接数/字节计数同源一行。
+- remote 转发：SshClient 新增 `server_channel_open_forwarded_tcpip` handler，
+  按每连接转发表（`(listen_host, bound_port) → target`，归一化 + 通配端口回
+  退）在客户端机器拨目标，relay 计数落同一行。表随连接 dial 创建、随连接末
+  会话关闭回收。
+- 会话关闭先 `stop_session_forwards`（此时 SSH 句柄仍可解析，远端监听可撤
+  销）再摘会话；映射为运行时状态不落盘。
+- 单测 9 例（spec 解析/校验/方向文案/远端表匹配），纯逻辑不连 SSH。
+
+**工作台**（组件拆分，App.vue 只留入口）：`components/PortForwardDialog.vue`
+自持状态、RPC、`ssh/forward/state` 订阅（App.vue 零改动，错误经 `@error` 走
+`showError(…, "terminal")`）；纯逻辑在 `lib/portForward.ts`（解析/表单校验/
+路由文案/字节格式化，9 例 vitest）；七语文案 `forwards.*` 全补；mockDbxHost
+注册 `ssh/forward/*`（0 端口 mock 随机挑选 + active 事件）供 fixture 验证。
+
+**验证**：`cargo fmt --check`/`clippy -D warnings`/`cargo test` 540 全绿；
+`vue-tsc` 0 错；`vitest` 61 文件 519 用例全绿；`pnpm build` 过；
+`scripts/smoke_forward_test.py` 对测试容器（AllowTcpForwarding yes）双冒烟：
+-L 隧道读 SSH banner、-R 经 busybox nc 回环 payload、stop/未知 id/会话关闭
+清理。
+
+**剩余风险**：真机（DBX 桌面宿主）面板验收未跑；remote 转发的服务端
+forwarded-tcpip 回报地址形态依赖 OpenSSH 行为（已做归一化 + 端口回退，非
+OpenSSH 服务端未验证）；`-D`/映射持久化（跨会话记忆表单）明确 deferred。
