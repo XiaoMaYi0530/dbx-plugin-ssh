@@ -4,6 +4,28 @@
 
 This file records user-facing changes for DBX SSH Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
+## [0.6.0] — 2026-09-22
+
+0.6.0 正式版，收束 0.6.0-beta.1–4 的全部变更。
+
+The 0.6.0 stable release, collecting everything from 0.6.0-beta.1 through beta.4.
+
+### 新增 / Added
+
+- **SSH 端口映射（-L/-R）**：工作台新增转发面板（`PortForwardDialog`），sidecar 支持用户级本地/远程端口映射；录入带校验与冲突预检，监听地址输入与接口选择合并为一个字段。
+  **SSH port forwarding (-L/-R):** the workbench gains a forwarding panel backed by user-level local/remote tunnels in the sidecar; input is validated with conflict pre-checks, and the listen-host input and interface picker are merged into one field.
+
+- **终端 electerm 对标特性**：xterm 升级到 6.1（beta 线起步），新增 electerm 风格全选快捷键与工作台设置中的终端字号调整（issue #31）；WebGL 渲染器在上下文丢失后按有界预算自动重建，不再黑屏。
+  **electerm-parity terminal features:** xterm upgraded to 6.1 (entered on the beta line), electerm-style select-all shortcut and a terminal font-size setting in the workbench settings dialog (issue #31); the WebGL renderer rebuilds itself after context loss within a bounded budget instead of leaving a black canvas.
+
+### 修复 / Fixed
+
+- **macOS 快速输入不再丢键/串键**：WKWebView 下绕开 xterm 6.1 延迟 textarea diff 的直写提交路径，输入队列按传输顺序回放，快速连续输入不再丢字符。
+  **Fast typing on macOS no longer drops or scrambles keys:** the macOS WKWebView path routes direct key commits around xterm 6.1's deferred textarea diff, and the input queue replays in transport order.
+
+- **上传不再被宿主桥故障卡死**（#83/#79）：宿主文件桥 pick/读盘失败时自动回退 webview 原生文件选择器（File API）重挑继续上传；宿主级拖入上传读盘失败同样回退。三条拖拽上传链路（终端、SFTP 面板、宿主级拖入）统一共用「已连接 + 可写会话」门禁——宿主级拖入此前不设防，只读连接也能发起上传——拒绝时给出七语提示而不是静默吞掉；SFTP 面板仅在文件拖入时点亮放置高亮。
+  **Uploads survive host-bridge failures (#83/#79):** when the host file bridge fails on pick or read, the webview's native file picker (File API) opens so the upload can continue; host-level drop uploads fall back the same way. All three drop-upload channels (terminal, SFTP pane, host-level drop) now share one connected + writable-session gate — the host channel previously had no gate and allowed uploads on read-only connections — and refusals show a seven-language notice instead of failing silently; the SFTP pane only lights its drop highlight for file drags.
+
 ## [0.4.79] — 2026-09-18
 
 ### 改进 / Improved
