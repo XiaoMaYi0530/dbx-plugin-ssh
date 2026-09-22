@@ -1,66 +1,14 @@
+// 键位路由与右键语义已迁往可编辑设置：键位在 terminalHotkeys.spec.ts，
+// 右键/粘贴/响铃等终端行为在 terminalBehavior.spec.ts。本文件只覆盖不可配置的
+// 门禁与搜索辅助逻辑。
 import { describe, expect, it } from "vitest";
-import { canAcceptFileDrop, canAcceptTerminalDrop, isApplePlatform, isTerminalSelectAllShortcut, normalizeDropTargetDir, resolveTerminalKeyAction, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
+import { canAcceptFileDrop, canAcceptTerminalDrop, isApplePlatform, normalizeDropTargetDir, sanitizeSearchOptions, terminalSearchSeedFromSelection } from "./terminalInteraction";
 
-describe("terminal interaction preferences (select-to-copy / right-click-paste)", () => {
-  it("defaults select-to-copy to enabled and only honors an explicit 'false'", () => {
-    expect(sanitizeSelectCopyEnabled(null)).toBe(true);
-    expect(sanitizeSelectCopyEnabled("")).toBe(true);
-    expect(sanitizeSelectCopyEnabled("true")).toBe(true);
-    expect(sanitizeSelectCopyEnabled("garbage")).toBe(true);
-    expect(sanitizeSelectCopyEnabled("false")).toBe(false);
-  });
-
-  it("routes plain right-click to paste only while the mode is on", () => {
-    expect(resolveTerminalRightClickAction({ selectCopy: true, shiftKey: false })).toBe("paste");
-    // Shift+right-click keeps the context menu reachable even in paste mode.
-    expect(resolveTerminalRightClickAction({ selectCopy: true, shiftKey: true })).toBe("menu");
-    // Mode off: right-click always opens the menu (historical behavior).
-    expect(resolveTerminalRightClickAction({ selectCopy: false, shiftKey: false })).toBe("menu");
-    expect(resolveTerminalRightClickAction({ selectCopy: false, shiftKey: true })).toBe("menu");
-  });
-});
-
-describe("terminal keyboard shortcuts (copy/paste routing)", () => {
-  it("routes Ctrl/Cmd+Shift+C with a selection to copy and without one to none", () => {
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "c", hasSelection: true })).toBe("copy");
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "C", hasSelection: true })).toBe("copy");
-    // No selection: nothing to copy; the chord must not reach the remote shell either.
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "c", hasSelection: false })).toBe("none");
-    // Plain Ctrl+Shift+C without the modifier is untouched.
-    expect(resolveTerminalKeyAction({ mod: false, shiftKey: true, key: "c", hasSelection: true })).toBe("none");
-  });
-
-  it("routes select-all to Cmd+A on Apple platforms and Ctrl+Shift+A elsewhere", () => {
-    // Apple: bare Cmd+A selects; Ctrl+Shift+A also matches (harmless superset).
-    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: true, key: "a", applePlatform: true })).toBe(true);
-    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: true, metaKey: false, key: "a", applePlatform: true })).toBe(true);
-    // Non-Apple: bare Ctrl+A must reach readline (line start), only +Shift selects.
-    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: false, key: "a", applePlatform: false })).toBe(false);
-    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: true, metaKey: false, key: "a", applePlatform: false })).toBe(true);
-    // Meta+A on non-Apple (Super+A) is left to the desktop, and other keys never match.
-    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: true, key: "a", applePlatform: false })).toBe(false);
-    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: true, key: "v", applePlatform: true })).toBe(false);
-  });
-
+describe("Apple platform detection", () => {
   it("detects Apple platforms from the user agent", () => {
     expect(isApplePlatform("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")).toBe(true);
     expect(isApplePlatform("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")).toBe(false);
     expect(isApplePlatform("Mozilla/5.0 (X11; Linux x86_64)")).toBe(false);
-  });
-
-  it("routes plain Ctrl/Cmd+C with a selection to copy (Windows Terminal / iTerm2 semantics)", () => {
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "c", hasSelection: true })).toBe("copy");
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "C", hasSelection: true })).toBe("copy");
-  });
-
-  it("keeps plain Ctrl/Cmd+C without a selection as shell input (SIGINT)", () => {
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "c", hasSelection: false })).toBe("none");
-  });
-
-  it("routes both Ctrl+V and Ctrl/Cmd+Shift+V to paste", () => {
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "v", hasSelection: false })).toBe("paste");
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "V", hasSelection: false })).toBe("paste");
-    expect(resolveTerminalKeyAction({ mod: false, shiftKey: true, key: "v", hasSelection: false })).toBe("none");
   });
 });
 

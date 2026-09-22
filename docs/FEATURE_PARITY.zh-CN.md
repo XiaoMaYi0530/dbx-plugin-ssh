@@ -266,3 +266,152 @@ python3 scripts/gen-terminal-schemes.py   # 重新扫描 Xresources → 覆写 t
 - 七语文案（zh-CN/zh-TW/en/es/it/ja/pt-BR）全量补齐；`workbench.spec.ts` 的
   key 集合与占位符对齐断言覆盖新键。
 - 未新增任何运行时依赖（YAML 导入为手写扫描器）。
+
+## Tabby 终端行为与快捷键对标补充（2026-09-22，同分支第二轮）
+
+接上一轮的「外观」对标，补齐 Tabby 设置面的另外两块：**Terminal**（行为）与 **Hotkeys**
+（快捷键）。同时按 Tabby 的分类粒度把原「外观」拆成「外观 / 配色方案」两页。仍然是
+**纯前端改动、后端零改动**（无新增 sidecar 方法，smoke 家族不适用）。
+
+### 分类对齐
+
+Tabby 把 Terminal 设置注册为三个页签，并对 Appearance 与 Color scheme 标记 `prioritized`。
+本轮据此把本插件的设置导航重排为：**外观 → 配色方案 → 终端 → 快捷键**，再接本插件特有的
+sudo / 智能体 / 传输 / 安全 / MCP。
+
+| 页签 | 对标 Tabby 页签 | 内容 |
+| --- | --- | --- |
+| 外观 | Appearance | 字体与字号、字重、粗体字重、行高、字间距、内边距、光标、粗体用亮色、最小对比度 + 实时预览 |
+| 配色方案 | Color scheme | 主题快照（预设 6 套 + 用户保存）、实时预览、深浅双槽配色方案、终端背景来源、四格式导入 |
+| 终端 | Terminal | 渲染 / 键盘 / 鼠标 / 剪贴板 / 声音 五组 |
+| 快捷键 | Hotkeys | 注册表编辑器：分组列出、搜动作名、点键位录制、冲突标注、单项与整体复位 |
+
+### 新增模块
+
+| 模块 | 职责 |
+| --- | --- |
+| `frontend/src/lib/terminalBehavior.ts` | 行为偏好的类型、默认值、归一化、持久化、xterm 选项映射、右键四档判决、粘贴文本变换、链接修饰键判定 |
+| `frontend/src/lib/terminalHotkeys.ts` | 快捷键动作表、平台默认、`event.code` → 组合串折算、组合串解析与规范化、平台化显示、匹配与冲突检测 |
+| `frontend/src/components/TerminalHotkeyEditor.vue` | 快捷键编辑器（唯一样式化交互新组件） |
+
+`frontend/src/lib/terminalInteraction.ts` 中原有的 `sanitizeSelectCopyEnabled` /
+`resolveTerminalRightClickAction` / `resolveTerminalKeyAction` / `isTerminalSelectAllShortcut`
+四个硬编码判决器**已删除**，由上述两个可配置模块取代；`terminalInteraction.ts` 只保留
+平台判定、搜索选项与拖放判定。
+
+### 默认值：逐项复现改动前行为
+
+这一轮的功能全部是「把原来写死的换成可配置」，因此**每个默认值都必须等于改动前的硬编码值**，
+否则升级即等于静默改变用户终端行为。逐项对照如下（括号内为 Tabby 默认值，不同处已注明理由）：
+
+| 设置 | 本插件默认 | 与 Tabby 的差异及理由 |
+| --- | --- | --- |
+| 回滚缓冲行数 | 25000 | 与 Tabby 相同；改动前即硬编码 25000 |
+| Alt 用作 Meta 键 | 关 | 与 Tabby 相同 |
+| 输入时滚到底部 | 开 | 与 Tabby 相同（xterm `scrollOnUserInput` 上游默认亦为 true） |
+| 右键语义 | **粘贴** | Tabby 为「上下文菜单」。沿用本插件既有行为，且 `Shift+右键` 出菜单的逃生口保持不变 |
+| 中键粘贴 | 关 | Tabby 在 macOS 亦为开（但那是 X11 主选区语义，浏览器里读到的是普通剪贴板，故保持可选） |
+| 词分隔符 | `` ()[]{}\'" `` | 与 Tabby 相同 |
+| 链接修饰键 | 无 | 与 Tabby 相同（链接始终可点） |
+| 选中即复制 | **开** | Tabby 为关。沿用本插件既有行为；旧键 `ssh-terminal-select-copy` 作为兼容镜像继续读写 |
+| 括号粘贴 | 开 | 与 Tabby 相同（xterm 选项是反向的 `ignoreBracketedPasteMode`） |
+| 多行粘贴警告 | 开 | 与 Tabby 相同；关闭只影响多行/超长提示，**危险命令（`rm -rf` 等）的确认不受该开关约束** |
+| 换行折空格 | 关 | 与 Tabby 相同 |
+| 去首尾空白 | **关** | Tabby 为开。保持关，粘贴内容逐字节不变 |
+| 终端响铃 | 关 | 与 Tabby 相同 |
+
+### 两处有意的行为变更（需 review 关注）
+
+1. **非 Apple 平台「终端搜索」默认键位由 `Ctrl+F` 改为 `Ctrl+Shift+F`**（对齐 Tabby；
+   macOS 仍为 `Cmd+F`）。原因：`Ctrl+F` 是 readline 的 `forward-char`，绑定搜索会把它从远端
+   shell 手里抢走；本插件此前占用该键位是与 Tabby 的偏差而非特性。此变更通过新的快捷键编辑器
+   可随时改回，属显式放开而非收紧。
+2. **「选中即复制」从独立开关收敛为「剪贴板」组内的一项**，且右键语义从「选中复制 ⇒ 右键粘贴」
+   的隐式联动改为独立四档。改动前 `resolveTerminalRightClickAction` 是「选中复制开 ⇒ 右键粘贴」，
+   对应现在的默认组合（`rightClick: "paste"` + `copyOnSelect: true`），**逐例等价**；但用户若只改
+   其中一项，不再联动另一项（这正是四档模型的目的）。同时退役了被取代的文案键
+   `terminalSelectCopy.section` 与冗余键 `terminalBehavior.copyOnSelect`。
+
+### 能力清单
+
+| 能力 | 实现位置 | 说明 |
+| --- | --- | --- |
+| 渲染组 | `terminalBehavior.ts` → `terminalBehaviorOptionPatch` | WebGL 渲染器（沿用既有开关）、回滚缓冲（100–200000，越界夹取） |
+| 键盘组 | 同上 + `App.vue` | Alt 作 Meta（`macOptionIsMeta`）、输入滚到底（`scrollOnUserInput`）、词分隔符（`wordSeparator`，超 32 字符截断） |
+| 鼠标组 | `resolveRightClickBehavior` + `App.vue` | 右键四档 off / menu / paste / clipboard（无选区粘贴、有选区复制）+ `Shift` 恒定出菜单；中键粘贴；链接修饰键（none/ctrl/alt/shift/meta） |
+| 剪贴板组 | `transformPasteText` + App | 选中即复制、括号粘贴、多行粘贴警告、换行折空格、去首尾空白。变换与确认收口在 `sendConfirmedPaste`，所有粘贴路径共用 |
+| 声音组 | `App.vue handleTerminalBell` | 三态 off / visual / audible。xterm 6.x 已移除 `bellStyle` 只抛 `onBell`，故视觉态走 `::after` 覆盖层 CSS 动画（150ms），听觉态用 WebAudio 现场合成（不引音频资源），沙箱拒建 `AudioContext` 时退化为视觉闪动 |
+| 快捷键注册表 | `terminalHotkeys.ts` | 10 个动作（搜索/复制/粘贴/全选/清屏/放大/缩小/复位字号/滚到顶/滚到底），按剪贴板·视图·导航三组 |
+| 组合串口径 | `keyComboFromEvent` / `sanitizeKeyCombo` | 基于 `event.code` 而非 `event.key`，故 `Ctrl+=` 与 `Ctrl+Shift+=` 不会塌成一个；`Shift` 因此必须恒保留为修饰键 |
+| 编辑器 | `TerminalHotkeyEditor.vue` | 动作名搜索、点键位录制（再点取消、`Esc` 取消、纯修饰键不自成一体）、裸键拒绝、同动作内去重、每动作上限 3 条、冲突标注（不拦截）、单项复位与整体复位 |
+
+### 刻意不做的项（附理由）
+
+| 未做 | 理由 |
+| --- | --- |
+| 连字（Ligatures） | `@xterm/addon-ligatures` 经 opentype.js 触达 Node 内置模块，在本插件的沙箱 iframe 中会崩（既有 App 注释已记录），给不出诚实的开关 |
+| Sixel 开关 | 图片渲染已由 `ImageAddon` 固定开启（32 MiB 像素上限），做成开关需要条件加载插件，收益不足 |
+| 会话启动 / 窗口（COMSPEC、环境刷新）/ 任务栏闪烁 | 属宿主或 Electron 专有，插件工作台内无对应物 |
+| 复制为 HTML | 需要新依赖；纯文本终端下收益有限 |
+| Tabby 的 `Ctrl+±` 字号键位 | 与既有的 `Ctrl/Cmd+滚轮` 缩放重叠，避免两套口径打架（该动作仍可在编辑器里自行绑定） |
+| 新建标签页 / 分屏 / 退出 / 重开已关标签 / 上一个提示符 | 工作台的标签与分屏归宿主所有，插件注册这些动作只会得到一堆死绑定 |
+| 「智能 Ctrl-C」独立动作 | Tabby 用专门动作表达「有选区则复制、否则中断」；本插件的 `copy` 动作已是同一语义，无需再拆 |
+
+### 需要留意的接缝
+
+1. **`bellStyle` 已不存在**：xterm 6.1-beta 只保留 `onBell: IEvent<void>`。响铃三态必须由调用方
+   在事件里自行实现；视觉态用 `::after` 覆盖层而非宿主自身的 `outline`/`box-shadow`，因为宿主背景
+   已被 xterm 画布铺满，只有独立伪元素能稳定压在最上层。
+2. **组合串必须基于 `event.code`**：若用 `event.key`，`Shift` 会把字母改写成大写、把 `=` 改写成 `+`，
+   `Ctrl+=` 与 `Ctrl+Shift+=` 就会塌成同一个键位。代价是 `Shift` 必须始终作为修饰键保留。
+3. **匹配读表是实时的**：`handleTerminalKey` 每次按键都查一次注册表，因此改键位无需重挂钩子；
+   钩子只在 `createTerminal` 里挂一次。
+4. **录制期事件必须吞掉**：编辑器在 `window` 捕获阶段监听并 `preventDefault`。设置弹窗是模态的，
+   终端拿不到焦点，故不影响会话；但若将来设置改成非模态，这里需要重新评估。
+
+### 验收口径（本轮）
+
+- 基线 SHA：`dc36c9d`（上一轮主题对标的提交，同一分支继续）。
+- 新增单测 **77 例**：`terminalBehavior.spec.ts` 29 + `terminalHotkeys.spec.ts` 33 +
+  `TerminalHotkeyEditor.spec.ts` 15。全量 vitest **69 文件 / 675 用例全绿**；
+  `vue-tsc --noEmit` 通过。
+- 无新增 smoke 用例：本轮未注册任何 sidecar 方法，按开发规范第 6 条「未注册方法 SKIP 而非 FAIL」。
+- **不提交 `ui/`**：同上轮，`frontend/build.mjs` 输出到 `../ui` 属 integrator 所有权，
+  本轮验证性打包写入 `/tmp` 下的临时目录。
+- 七语文案全量补齐；同时退役两个被取代的键，`workbench.spec.ts` 的 key 集合与占位符对齐断言覆盖。
+- 未新增任何运行时依赖（听觉响铃为 WebAudio 合成，无音频资源文件）。
+
+### UI 走查（e2e）
+
+新增 `scripts/smoke_ui_settings.mjs`，沿用既有 `smoke_ui_mock.mjs` 的约定（vite 起 `mock.html`、
+headless Chrome + playwright-core 走系统 Chrome channel、依赖缺失即 SKIP 退出 0、
+截图落在未跟踪的 `docs/screenshots-ui-settings/`）。**45 项断言全绿**，覆盖：
+
+| 断言组 | 内容 |
+| --- | --- |
+| 分类顺序 | 9 个分类；外观 / 配色方案 / 终端 / 快捷键 排在最前 |
+| 两页拆分 | 外观只留排版与光标、配色控件确实移出；两页各自都有实时预览 |
+| 终端默认值 | 五个分区标题齐备；回滚 25000、右键默认 `paste`（四档）、响铃默认 `off`（三档）、词分隔符与 Tabby 逐字符相同、选中复制默认开 |
+| 快捷键编辑器 | 10 个动作、三组分组、搜索过滤与空态、录制改写、裸键被拒且保持录制、冲突标注与占用者提示、移除重复后冲突消失 |
+| 往返 | 改右键语义与回滚行数 → 落 localStorage → 刷新页面 → 重开设置回显一致；兼容旧键镜像同步 |
+| 派发贯通 | 把「终端搜索」从其平台默认键位改到新组合后：**旧默认键位不再打开搜索面板，新组合能打开，`Esc` 能关闭** |
+| 本地化 | `?locale=zh-CN` 下新分类显示为「外观 / 配色方案 / 快捷键」 |
+
+关于派发断言的口径：mock 的 PTY **不模拟 tty 回显**（只有批量发送路径会显式回显），
+因此不能靠「往终端打字再看回显」来证明按键生效。改用搜索面板这一**无内容依赖**的可观测量——
+它同时证明了「注册表被真实派发链路消费」，而不只是「值被写进了 localStorage」。
+
+既有 `scripts/smoke_ui_mock.mjs`（工作台锚点、快捷命令 CRUD、批量发送、WebGL 渲染器）
+在本轮改动后**回归全绿**。
+
+### 调试路径（本轮实测）
+
+| 方式 | 命令 | 适用 |
+| --- | --- | --- |
+| 官方开发宿主 | `export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$HOME/Library/pnpm:$HOME/.cargo/bin:$PATH"`<br>`dbx-plugin dev --path . --port 5190` | 宿主级联调（会按 `[backend]` 构建并拉起 Rust sidecar）。**它服务的是构建产物 `ui/`**，而 `ui/` 属 integrator 所有权，因此前端迭代期不适合用它 |
+| 前端 fixture | `node scripts/smoke_ui_settings.mjs` / `scripts/smoke_ui_mock.mjs`（内部起 vite 服务 `frontend/mock.html`） | 前端改动迭代与 e2e 回归：直接服务 `frontend/src`，改完即生效，不写 `ui/` |
+| 脱敏日志 | `node <dbx-plugin-skill>/scripts/dev-logs.mjs --port 5190 --level error --follow` | 官方 dev 宿主的诊断 API |
+
+注意：`dbx-plugin` 装在 nvm 全局 bin（`~/.nvm/versions/node/<ver>/bin/dbx-plugin`，实测 0.1.9），
+**不在默认 PATH 上**；`scripts/smoke_ui_mock.mjs` 依赖 `pnpm` 在 PATH 上，跑之前需按上面的
+PATH 导出，否则 `spawn pnpm ENOENT`。

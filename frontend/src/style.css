@@ -193,6 +193,24 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    会穿透 z-index: 2 的 .terminal-overlay——连接/成功动画期间 replay 写入的
    内容其高亮块（如 Last login 的 IP）会浮到卡片遮罩之上。 */
 .terminal-host { position: absolute; z-index: 0; inset: 0; background: var(--ssh-terminal-background); }
+/* 终端响铃的视觉提示（对标 Tabby「Terminal → Sound」bell = visual，默认 off）：
+   走 ::after 覆盖层而非宿主自身的 outline / box-shadow —— 宿主背景已被 xterm 画布
+   铺满，只有独立伪元素能稳定压在最上层。强调色用 --primary：深浅两套终端配色下
+   都保得住对比度，且无需新增主题变量。时长须与 App.vue 的 TERMINAL_BELL_FLASH_MS 一致。 */
+.terminal-host::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  box-shadow: inset 0 0 0 2px var(--primary);
+}
+.terminal-host.bell-flash::after { animation: terminal-bell-flash 150ms ease-out; }
+@keyframes terminal-bell-flash {
+  from { opacity: 1; background: color-mix(in srgb, var(--primary) 16%, transparent); }
+  to { opacity: 0; }
+}
 /* 内边距可经外观设置覆盖：四个方向各自一个变量，变量缺失时回落内置值
    （左 10 / 右 0 / 上 5 / 下 8）。必须挂在 .xterm（terminal.element）上——
    FitAddon 只读 element 自身 padding 扣减行数，挂宿主 div 会多算一行。 */

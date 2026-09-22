@@ -1,54 +1,15 @@
 /**
- * Terminal interaction preferences (select-to-copy / right-click-to-paste).
- * The toggle is a pure-frontend behavior (no sidecar involvement), so it
- * persists in localStorage; "false" disables it, every other value (including
- * a missing entry) keeps the historical default of enabled.
+ * Terminal interaction gates and search persistence.
+ *
+ * Key routing and right-click behavior used to live here as ad-hoc resolvers;
+ * they now come from the user-editable settings in `terminalBehavior.ts` and
+ * `terminalHotkeys.ts`, so this module keeps only the pieces that are not
+ * configurable: the drop gates and the search-option/seed helpers.
  */
-
-export type TerminalRightClickAction = "paste" | "menu";
-
-export function sanitizeSelectCopyEnabled(raw: string | null): boolean {
-  return raw !== "false";
-}
-
-/**
- * Right-click semantics with the copy-on-select mode enabled: a plain
- * right-click pastes straight from the clipboard (XShell/SecureCRT style),
- * while Shift+right-click keeps the full context menu reachable.
- */
-export function resolveTerminalRightClickAction(options: { selectCopy: boolean; shiftKey: boolean }): TerminalRightClickAction {
-  return options.selectCopy && !options.shiftKey ? "paste" : "menu";
-}
-
-export type TerminalKeyAction = "copy" | "paste" | "none";
-
-/**
- * Keyboard shortcut routing inside the terminal (Windows Terminal/iTerm2
- * style): Ctrl/Cmd+V and Ctrl/Cmd+Shift+V paste, Ctrl/Cmd+C copies when a
- * selection exists and otherwise stays untouched so it keeps reaching the
- * remote shell as SIGINT.
- */
-export function resolveTerminalKeyAction(options: { mod: boolean; shiftKey: boolean; key: string; hasSelection: boolean }): TerminalKeyAction {
-  const key = options.key.toLowerCase();
-  if (options.mod && key === "v") return "paste";
-  if (options.mod && key === "c" && options.hasSelection) return "copy";
-  return "none";
-}
 
 /** Whether the browser runs on Apple hardware（Cmd 是主修饰键，electerm 同判定）。 */
 export function isApplePlatform(userAgent: string = navigator.userAgent): boolean {
   return /mac/i.test(userAgent);
-}
-
-/**
- * 全选快捷键判定（electerm/iTerm2 同款）：Apple 平台 Cmd+A 直选，其余平台
- * Ctrl+Shift+A。裸 Ctrl+A 永不命中——必须继续发给 readline 当"跳行首"。
- */
-export function isTerminalSelectAllShortcut(options: { mod: boolean; shiftKey: boolean; metaKey: boolean; key: string; applePlatform: boolean }): boolean {
-  const key = options.key.toLowerCase();
-  if (key !== "a") return false;
-  if (options.mod && options.shiftKey) return true;
-  return options.applePlatform && options.metaKey;
 }
 
 export interface TerminalSearchOptions {

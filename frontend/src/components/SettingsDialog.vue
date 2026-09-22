@@ -14,6 +14,7 @@ import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 import { Switch } from "./ui/switch";
 import TerminalAppearancePreview from "./TerminalAppearancePreview.vue";
 import TerminalSchemePicker from "./TerminalSchemePicker.vue";
+import TerminalHotkeyEditor from "./TerminalHotkeyEditor.vue";
 import { AGENT_MODES, sanitizeRememberedCommands } from "../lib/agentTerminal";
 import { clampFontSize, TERMINAL_FONT_MAX, TERMINAL_FONT_MIN } from "../lib/terminalZoom";
 import { loadTerminalFontOverride } from "../lib/terminalFont";
@@ -32,6 +33,19 @@ import {
   type TerminalCursorStyle,
 } from "../lib/terminalAppearance";
 import { BUILTIN_TERMINAL_SCHEMES, contrastRatio, parseHexColor, parseSchemeImport, type TerminalColorScheme, type TerminalThemeLike } from "../lib/terminalScheme";
+import {
+  BELL_MODES,
+  LINK_MODIFIERS,
+  RIGHT_CLICK_MODES,
+  SCROLLBACK_MAX,
+  SCROLLBACK_MIN,
+  WORD_SEPARATOR_MAX_LENGTH,
+  type TerminalBehaviorSettings,
+  type TerminalBellMode,
+  type TerminalLinkModifier,
+  type TerminalRightClickMode,
+} from "../lib/terminalBehavior";
+import type { TerminalHotkeyBindings } from "../lib/terminalHotkeys";
 
 const props = defineProps<{
   open: boolean;
@@ -46,7 +60,12 @@ const props = defineProps<{
   localDownloadDir: string;
   localCanSave: boolean;
   webglEnabled: boolean;
-  termSelectCopy: boolean;
+  /** 终端行为偏好（对标 Tabby「Terminal」页）：权威态在 App，本组件只读 + 上抛增量。 */
+  terminalBehavior: TerminalBehaviorSettings;
+  /** 终端快捷键绑定（对标 Tabby「Hotkeys」页）：权威态在 App。 */
+  terminalHotkeys: TerminalHotkeyBindings;
+  /** 是否 Apple 平台：决定快捷键修饰键的显示符号与默认键位口径。 */
+  applePlatform: boolean;
   /** 终端外观偏好（权威态在 App）：本组件只读 + 经 emits 上抛改动意图。 */
   appearance: TerminalAppearanceState;
   /** 用户保存的主题快照（内置预设由 lib 常量提供，不需经 props）。 */
@@ -75,7 +94,10 @@ const emit = defineEmits<{
   (e: "error", cause: unknown): void;
   (e: "browse-download-dir"): void;
   (e: "update:webgl", value: boolean): void;
-  (e: "toggle-select-copy"): void;
+  /** 行为设置局部增量：App 侧会归一化 + 持久化 + 即时落地到 xterm 选项。 */
+  (e: "update-behavior", patch: Partial<TerminalBehaviorSettings>): void;
+  /** 快捷键整表替换（编辑器内部管理增删改，只上抛最终结果）。 */
+  (e: "update-hotkeys", bindings: TerminalHotkeyBindings): void;
   (e: "apply-font", payload: { family: string | null; size: number }): void;
   (e: "update-appearance", patch: Partial<TerminalAppearanceSettings>): void;
   (e: "apply-theme", theme: TerminalAppearanceProfile): void;
@@ -87,12 +109,17 @@ const emit = defineEmits<{
 
 const t = props.t;
 
+// 分类顺序对齐 Tabby 的设置页优先级：外观 / 配色方案 / 终端 / 快捷键 四个
+// 终端相关分类排在最前（Tabby 把 Appearance 与 Color scheme 标为 prioritized），
+// 之后才是本插件特有的 sudo / 智能体 / 传输 / 安全 / MCP。
 const SETTINGS_CATEGORIES = [
   { id: "appearance", labelKey: "settingsNav.appearance" },
+  { id: "scheme", labelKey: "settingsNav.scheme" },
+  { id: "terminal", labelKey: "settingsNav.terminal" },
+  { id: "hotkeys", labelKey: "settingsNav.hotkeys" },
   { id: "sudo", labelKey: "settingsNav.sudo" },
   { id: "agent", labelKey: "agentTerminalSection" },
   { id: "transfer", labelKey: "downloadSettings.title" },
-  { id: "terminal", labelKey: "settingsNav.terminal" },
   { id: "security", labelKey: "settingsNav.security" },
   { id: "mcp", labelKey: "mcpLimits.title" },
 ] as const;
@@ -390,6 +417,56 @@ const BACKGROUND_SOURCES: Array<{ value: TerminalAppearanceSettings["backgroundS
   { value: "scheme", label: "terminalAppearance.backgroundScheme" },
   { value: "host", label: "terminalAppearance.backgroundHost" },
 ];
+
+/** 终端行为枚举 → i18n key。模板按 lib 的常量数组顺序迭代，渲染单选组。 */
+const RIGHT_CLICK_LABELS: Record<TerminalRightClickMode, string> = {
+  off: "terminalBehavior.rightClickOff",
+  menu: "terminalBehavior.rightClickMenu",
+  paste: "terminalBehavior.rightClickPaste",
+  clipboard: "terminalBehavior.rightClickClipboard",
+};
+const BELL_LABELS: Record<TerminalBellMode, string> = {
+  off: "terminalBehavior.bellOff",
+  visual: "terminalBehavior.bellVisual",
+  audible: "terminalBehavior.bellAudible",
+};
+const LINK_MODIFIER_LABELS: Record<TerminalLinkModifier, string> = {
+  none: "terminalBehavior.linkModifierNone",
+  ctrl: "terminalBehavior.linkModifierCtrl",
+  alt: "terminalBehavior.linkModifierAlt",
+  shift: "terminalBehavior.linkModifierShift",
+  meta: "terminalBehavior.linkModifierMeta",
+};
+
+// 行为设置只上抛增量：归一化、持久化与落地到 xterm 选项全在 App，
+// 保证「权威态唯一」——本组件不持有行为设置的副本，重开弹窗也不会出现回显漂移。
+function updateBehavior(patch: Partial<TerminalBehaviorSettings>) {
+  emit("update-behavior", patch);
+}
+
+/** 数字输入框 → 行为字段：空串或非数值直接忽略，避免清空输入框把值打成 NaN。 */
+function updateScrollback(raw: string) {
+  const trimmed = raw.trim();
+  if (!trimmed) return;
+  const value = Number(trimmed);
+  if (!Number.isFinite(value)) return;
+  updateBehavior({ scrollbackLines: value });
+}
+
+/** 快捷键整表替换：编辑器内部管草稿，只把最终结果上抛给 App 持久化。 */
+function updateHotkeys(bindings: TerminalHotkeyBindings) {
+  emit("update-hotkeys", bindings);
+}
+
+/** 文本输入框取原始串（同 numberFieldValue，避免在模板里写 as 断言）。 */
+function textFieldValue(event: Event): string {
+  return (event.target as HTMLInputElement).value;
+}
+
+/** reka Select 回传 AcceptableValue（含 null 与对象），这里只接受字符串形态。 */
+function updateLinkModifier(value: unknown) {
+  updateBehavior({ linkModifier: String(value) as TerminalLinkModifier });
+}
 
 async function reloadSettings() {
   downloadDirDraft.value = props.downloadPrefs.loadDir();
@@ -765,8 +842,9 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               </Tabs>
             </nav>
             <div class="settings-content">
-            <!-- 外观：主题快照（预设 + 我的）、配色方案两槽、字体间距、光标、渲染与实时预览。 -->
-            <div v-show="settingsCategory === 'appearance'" class="settings-pane">
+            <!-- 配色方案（对标 Tabby「Color scheme」页，从原「外观」里拆出）：主题
+                 快照、实时预览、深浅两槽配色方案、终端背景来源、自定义方案导入。 -->
+            <div v-show="settingsCategory === 'scheme'" class="settings-pane">
             <h3 class="settings-section-title">{{ t("terminalAppearance.themeSection") }}</h3>
             <p class="muted settings-note">{{ t("terminalAppearance.themeHint") }}</p>
             <div class="theme-chips">
@@ -885,7 +963,11 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               </li>
             </ul>
             <p class="muted">{{ t("profilesLimit", { count: appearance.customSchemes.length, limit: CUSTOM_SCHEME_LIMIT }) }}</p>
+            </div>
 
+            <!-- 外观（对标 Tabby「Appearance」页）：字体与字号、字重/行高/字间距/内边距、
+                 光标、渲染细项，末尾再放一次实时预览以便边调边看排版效果。 -->
+            <div v-show="settingsCategory === 'appearance'" class="settings-pane">
             <h4 class="settings-section-title">{{ t("terminalAppearance.typographySection") }}</h4>
             <label class="settings-field">
               <span>{{ t("terminalFont.family") }}</span>
@@ -981,6 +1063,23 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <input type="number" min="1" max="21" step="0.5" :value="appearanceSettings.minimumContrastRatio" @change="updateAppearanceNumber('minimumContrastRatio', numberFieldValue($event))" />
             </label>
             <p class="muted settings-note">{{ t("terminalAppearance.minimumContrastHint") }}</p>
+
+            <h4 class="settings-section-title">{{ t("terminalAppearance.previewTitle") }}</h4>
+            <!-- 与「配色方案」页共用同一个纯展示预览组件：两处 props 必须保持一致，
+                 它是无状态无 id 的纯 DOM 复刻，实例化两次没有额外副作用。 -->
+            <TerminalAppearancePreview
+              :theme="previewTheme"
+              :font-family="previewFontFamily"
+              :font-size="terminalFontSize"
+              :font-weight="previewOptions.fontWeight"
+              :font-weight-bold="previewOptions.fontWeightBold"
+              :line-height="previewOptions.lineHeight"
+              :letter-spacing="previewOptions.letterSpacing"
+              :cursor-style="previewOptions.cursorStyle"
+              :cursor-blink="previewOptions.cursorBlink"
+              :contrast-ratio="previewContrast"
+              :t="t"
+            />
             </div>
 
             <div v-show="settingsCategory === 'sudo'" class="settings-pane">
@@ -1159,21 +1258,102 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
             <p class="muted settings-note">{{ t("downloadSettings.hint") }}</p>
             </div>
 
+            <!-- 终端（对标 Tabby「Terminal」页）：渲染 / 键盘 / 鼠标 / 剪贴板 / 声音五组。
+                 只上抛增量，归一化与落地在 App；每项默认值都复现改动前的行为。 -->
             <div v-show="settingsCategory === 'terminal'" class="settings-pane">
-            <h3 class="settings-section-title">{{ t("webglSection") }}</h3>
+            <h3 class="settings-section-title">{{ t("terminalBehavior.renderingSection") }}</h3>
             <label class="settings-field settings-switch-row">
               <Switch size="sm" :model-value="webglEnabled" @update:model-value="(value) => emit('update:webgl', value === true)" />
               <span>{{ t("webglLabel") }}</span>
             </label>
             <p class="muted settings-note">{{ t("webglHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("terminalBehavior.scrollbackLines") }}</span>
+              <input type="number" :min="SCROLLBACK_MIN" :max="SCROLLBACK_MAX" step="100" :value="terminalBehavior.scrollbackLines" @change="updateScrollback(numberFieldValue($event))" />
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.scrollbackHint") }}</p>
 
-            <h3 class="settings-section-title">{{ t("terminalSelectCopy.section") }}</h3>
-            <label class="quick-sudo-control">
-              <Switch size="sm" :model-value="termSelectCopy" @update:model-value="emit('toggle-select-copy')" />
+            <h3 class="settings-section-title">{{ t("terminalBehavior.keyboardSection") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.altIsMeta" @update:model-value="(v) => updateBehavior({ altIsMeta: v === true })" />
+              <span>{{ t("terminalBehavior.altIsMeta") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.altIsMetaHint") }}</p>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.scrollOnInput" @update:model-value="(v) => updateBehavior({ scrollOnInput: v === true })" />
+              <span>{{ t("terminalBehavior.scrollOnInput") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.scrollOnInputHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("terminalBehavior.mouseSection") }}</h3>
+            <h4 class="settings-section-title">{{ t("terminalBehavior.rightClick") }}</h4>
+            <label v-for="mode in RIGHT_CLICK_MODES" :key="mode" class="settings-field settings-radio-row">
+              <input type="radio" name="terminal-right-click" :value="mode" :checked="terminalBehavior.rightClick === mode" @change="updateBehavior({ rightClick: mode })" />
+              <span>{{ t(RIGHT_CLICK_LABELS[mode]) }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.rightClickHint") }}</p>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.pasteOnMiddleClick" @update:model-value="(v) => updateBehavior({ pasteOnMiddleClick: v === true })" />
+              <span>{{ t("terminalBehavior.pasteOnMiddleClick") }}</span>
+            </label>
+            <label class="settings-field">
+              <span>{{ t("terminalBehavior.wordSeparator") }}</span>
+              <input class="mono" spellcheck="false" :maxlength="WORD_SEPARATOR_MAX_LENGTH" :value="terminalBehavior.wordSeparator" @change="updateBehavior({ wordSeparator: textFieldValue($event) })" />
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.wordSeparatorHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("terminalBehavior.linkModifier") }}</span>
+              <Select :model-value="terminalBehavior.linkModifier" @update:model-value="updateLinkModifier">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="modifier in LINK_MODIFIERS" :key="modifier" :value="modifier">{{ t(LINK_MODIFIER_LABELS[modifier]) }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.linkModifierHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("terminalBehavior.clipboardSection") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.copyOnSelect" @update:model-value="(v) => updateBehavior({ copyOnSelect: v === true })" />
               <span>{{ t("terminalSelectCopy.label") }}</span>
             </label>
             <p class="muted settings-note">{{ t("terminalSelectCopy.hint") }}</p>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.bracketedPaste" @update:model-value="(v) => updateBehavior({ bracketedPaste: v === true })" />
+              <span>{{ t("terminalBehavior.bracketedPaste") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.bracketedPasteHint") }}</p>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.warnOnMultilinePaste" @update:model-value="(v) => updateBehavior({ warnOnMultilinePaste: v === true })" />
+              <span>{{ t("terminalBehavior.warnOnMultilinePaste") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.warnOnMultilinePasteHint") }}</p>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.replaceNewlinesWithSpaces" @update:model-value="(v) => updateBehavior({ replaceNewlinesWithSpaces: v === true })" />
+              <span>{{ t("terminalBehavior.replaceNewlines") }}</span>
+            </label>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="terminalBehavior.trimWhitespaceOnPaste" @update:model-value="(v) => updateBehavior({ trimWhitespaceOnPaste: v === true })" />
+              <span>{{ t("terminalBehavior.trimWhitespace") }}</span>
+            </label>
+
+            <h3 class="settings-section-title">{{ t("terminalBehavior.soundSection") }}</h3>
+            <h4 class="settings-section-title">{{ t("terminalBehavior.bell") }}</h4>
+            <label v-for="mode in BELL_MODES" :key="mode" class="settings-field settings-radio-row">
+              <input type="radio" name="terminal-bell" :value="mode" :checked="terminalBehavior.bell === mode" @change="updateBehavior({ bell: mode })" />
+              <span>{{ t(BELL_LABELS[mode]) }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.bellHint") }}</p>
+
+            <p class="muted settings-note">{{ t("terminalBehavior.scopeNote") }}</p>
             <p class="muted settings-note">{{ t("terminalFont.movedHint") }}</p>
+            </div>
+
+            <!-- 快捷键（对标 Tabby「Hotkeys」页）：注册表编辑器，逐动作增删改 + 冲突提示 + 单项/整体复位。 -->
+            <div v-show="settingsCategory === 'hotkeys'" class="settings-pane">
+            <h3 class="settings-section-title">{{ t("terminalHotkeys.sectionTitle") }}</h3>
+            <p class="muted settings-note">{{ t("terminalHotkeys.hint") }}</p>
+            <TerminalHotkeyEditor :bindings="terminalHotkeys" :apple-platform="applePlatform" :t="t" @update="updateHotkeys" />
             </div>
 
           <div v-show="settingsCategory === 'security'" class="settings-pane">
