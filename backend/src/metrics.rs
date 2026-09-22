@@ -15,6 +15,11 @@ use std::collections::BTreeMap;
 use russh::client::Handle;
 use serde::Serialize;
 
+// Lives in its own file but stays nested under `crate::metrics` so main.rs's
+// flat `mod` list (integrator-owned) is untouched.
+#[path = "metrics_gpu.rs"]
+pub mod metrics_gpu;
+
 use crate::exec::exec_plain;
 use crate::ssh::SshClient;
 
@@ -82,7 +87,9 @@ const METRICS_SCRIPT: &str = concat!(
 );
 
 /// Collects the extended metrics sample over a new exec channel. Read-only
-/// commands only; the extra `sleep 1` is bounded by the timeout below.
+/// commands only; the extra `sleep 1` is bounded by the timeout below. The
+/// GPU/NPU accelerator overviews ride the same document (best-effort probe,
+/// see [`merge_accelerator_sections`]).
 pub async fn collect_metrics(handle: &Handle<SshClient>) -> Result<serde_json::Value, String> {
     // Plugin-internal collector: no client setEnv so locale overrides on the
     // connection cannot reshape the output this parser expects.
@@ -96,7 +103,33 @@ pub async fn collect_metrics(handle: &Handle<SshClient>) -> Result<serde_json::V
     if outcome.exit_code != 0 && outcome.output.is_empty() {
         return Err(format!("metrics collection failed: {}", outcome.output));
     }
-    Ok(parse_metrics_output(&outcome.output))
+    let mut metrics = parse_metrics_output(&outcome.output);
+    merge_accelerator_sections(handle, &mut metrics).await;
+    Ok(metrics)
+}
+
+/// Runs the GPU and NPU probes concurrently and merges the results under the
+/// `gpu` / `npu` top-level keys. Best-effort by design: a failed probe (no
+/// accelerator, restricted driver, exec hiccup) degrades to
+/// `{"available": false}` so it can never fail the base metrics collection,
+/// and [`project_metrics_sections`] treats the keys like any other section.
+async fn merge_accelerator_sections(handle: &Handle<SshClient>, metrics: &mut serde_json::Value) {
+    let (gpu, npu) = tokio::join!(
+        metrics_gpu::collect_gpu_overview(handle),
+        metrics_gpu::collect_npu_overview(handle)
+    );
+    if let Some(object) = metrics.as_object_mut() {
+        object.insert(
+            "gpu".to_string(),
+            gpu.unwrap_or_else(|_| serde_json::json!({ "available": false, "gpus": [] })),
+        );
+        object.insert(
+            "npu".to_string(),
+            npu.unwrap_or_else(
+                |_| serde_json::json!({ "available": false, "cann": null, "devices": [] }),
+            ),
+        );
+    }
 }
 
 /// Top-level section names of the metrics document, used by the MCP
@@ -115,6 +148,11 @@ pub const METRICS_SECTIONS: &[&str] = &[
     "topMemory",
     "osId",
     "osPretty",
+    // Accelerator overviews (IMPL_PLAN Task P1-4); emitted by
+    // [`collect_metrics`] whenever the sidecar runs, `available: false` on
+    // hosts without NVIDIA / Ascend hardware.
+    "gpu",
+    "npu",
 ];
 
 /// Validates requested section names against the known universe. Unknown
@@ -1027,5 +1065,28 @@ bad line here
         // 合法但该主机缺失的段（如 osId）静默省略，不算错。
         project_metrics_sections(&mut doc, &["osId".to_string(), "cpu".to_string()]).unwrap();
         assert!(doc.as_object().unwrap().contains_key("cpu"));
+    }
+
+    // —— GPU / NPU sections（Task P1-4）——————————————————
+
+    #[test]
+    fn gpu_and_npu_sections_validate_and_project() {
+        // 白名单校验放行新段（MCP ssh_metrics 的 sections 枚举同步受益）。
+        validate_section_names(&["gpu".to_string(), "npu".to_string()]).unwrap();
+        let mut doc = parse_metrics_output(LINUX_FIXTURE);
+        if let Some(object) = doc.as_object_mut() {
+            object.insert(
+                "gpu".to_string(),
+                serde_json::json!({ "available": false, "gpus": [] }),
+            );
+        }
+        project_metrics_sections(&mut doc, &["gpu".to_string()]).unwrap();
+        let keys: Vec<&str> = doc
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["gpu"]);
     }
 }

@@ -114,6 +114,7 @@ import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib
 import { filesFromClipboard } from "./lib/clipboardFiles";
 import { friendlySftpError } from "./lib/sftpErrors";
 import { filterDiskMounts, filterNetworkInterfaces } from "./lib/metricsView";
+import type { GpuOverviewView, NpuOverviewView } from "./lib/metricsGpuNpu";
 import { isCountdownActive, nextCountdownValue, RECORD_COUNTDOWN_START } from "./lib/recordingCountdown";
 import { expandSelection, filterSftpEntries, type SftpTypeFilter } from "./lib/sftpFileFilters";
 import { pushPathHistory, sanitizePathHistories } from "./lib/sftpPathHistory";
@@ -233,6 +234,7 @@ import { randomUUID } from "./lib/uuid";
 import TextPreview from "./components/TextPreview.vue";
 import TerminalSearchPanel from "./components/TerminalSearchPanel.vue";
 import ConnectingCard from "./components/ConnectingCard.vue";
+import GpuNpuMonitor from "./components/GpuNpuMonitor.vue";
 import FolderPickerDialog from "./components/FolderPickerDialog.vue";
 import SideNavPanel, { type SftpSideQuickPath } from "./components/SideNavPanel.vue";
 import { Switch } from "./components/ui/switch";
@@ -407,6 +409,10 @@ interface ServerMetrics {
   // 旧 sidecar 自然缺失，前端不渲染徽标（optional 降级）。
   osId?: string;
   osPretty?: string;
+  // GPU / Ascend NPU 总览（Task P1-4）：仅新 sidecar 输出，缺省时监控面板
+  // 不渲染 GPU/NPU 区（optional 降级）。
+  gpu?: GpuOverviewView;
+  npu?: NpuOverviewView;
 }
 
 interface DiskUsage {
@@ -8576,6 +8582,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
+              <GpuNpuMonitor :locale="locale" :gpu="metrics.gpu" :npu="metrics.npu" />
               <div v-if="metrics.processes?.length">
                 <h3 class="settings-section-title"><span>{{ t("metricsProc") }}</span><button class="link-button" @click="toggleProcessPanel">{{ t(processesOpen ? "procCollapse" : "procManage") }}</button></h3>
                 <div class="file-header" :style="metricsProcGridStyle">
