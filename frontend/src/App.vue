@@ -191,6 +191,21 @@ import { shouldCommitRename } from "./lib/sftpRename";
 import { folderDownloadOutcome, type FolderDownloadFinish } from "./lib/sftpFolderDownload";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
 import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRecoveryOptions, type WebglRendererLike } from "./lib/terminalWebgl";
+import {
+  activeProfileId,
+  applySchemeToTerminalTheme,
+  CUSTOM_SCHEME_LIMIT,
+  CUSTOM_THEME_LIMIT,
+  loadTerminalAppearance,
+  persistTerminalAppearance,
+  sanitizeAppearanceSettings,
+  terminalOptionPatch,
+  terminalPaddingVars,
+  type TerminalAppearanceProfile,
+  type TerminalAppearanceSettings,
+  type TerminalAppearanceState,
+} from "./lib/terminalAppearance";
+import { schemeIdFromName, schemeTone, uniqueSchemeId, type TerminalColorScheme, type TerminalThemeLike } from "./lib/terminalScheme";
 import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from "./lib/terminalClickCursor";
 import { bridgeBinaryBytes } from "../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
@@ -744,6 +759,20 @@ const terminalFontSize = ref(appearance.value.terminal.fontSize);
 // setup 期读取安全：loadTerminalFontOverride 在函数体内 try（沙箱 opaque origin
 // 下「访问 window.localStorage 属性」本身抛错，见 lib/terminalFont.ts 说明）。
 const terminalFontOverride = ref<TerminalFontOverride>(loadTerminalFontOverride());
+// 终端外观偏好（对标 Tabby 的 Settings → Appearance）：配色方案两槽（随宿主
+// 亮暗自动切换）、底色策略、字体间距、光标形态与多套主题快照。默认态为
+// schemeSource: "host"，即不启用任何方案、行为与既有版本完全一致。
+//
+// 字体字段（font）不在此持久化状态里作为真相：权威态是 terminalFontOverride
+// （Ctrl+滚轮缩放也写它）。读取时用 terminalAppearanceState 覆盖合成，避免
+// 「缩放改过字号后主题仍高亮」这类双真相漂移。
+const terminalAppearance = ref<TerminalAppearanceState>(loadTerminalAppearance());
+const terminalAppearanceState = computed<TerminalAppearanceState>(() => ({
+  ...terminalAppearance.value,
+  font: { family: terminalFontOverride.value.fontFamily, size: terminalFontOverride.value.fontSize },
+}));
+// 当前配置命中的主题 id（null = 已改动，不再等于任何预设/我的主题）。
+const activeAppearanceThemeId = computed(() => activeProfileId(terminalAppearanceState.value));
 // 设置弹窗（独立组件 SettingsDialog）：实例 ref 用于 Esc 内联分层消费与
 // 下载草稿回填；下载偏好权威态在本组件，经适配器交给组件读写。
 const settingsDialog = ref<InstanceType<typeof SettingsDialog>>();
@@ -1277,7 +1306,9 @@ function showError(cause: unknown, target: "terminal" | "sftp" = "sftp", retry?:
   }
 }
 
-function terminalTheme() {
+// 宿主派生的终端主题（未启用配色方案时的最终结果）：DBX 面板色 + 内置 16 色
+// ANSI。作为「跟随宿主」基底，也是设置页预览的基准。
+function hostTerminalTheme(): TerminalThemeLike {
   const colors = appearance.value.colors;
   return {
     background: colors.background,
@@ -1287,6 +1318,151 @@ function terminalTheme() {
     selectionBackground: appearance.value.colorScheme === "dark" ? "#5f6f8a88" : "#93b4e088",
     ...TERMINAL_ANSI[appearance.value.colorScheme],
   };
+}
+
+// 实际生效的主题：宿主基底 + 用户选定方案（未启用方案时原样返回基底）。
+function terminalTheme(): TerminalThemeLike {
+  return applySchemeToTerminalTheme(
+    hostTerminalTheme(),
+    terminalAppearance.value.settings,
+    terminalAppearance.value.customSchemes,
+    appearance.value.colorScheme,
+  );
+}
+
+// 终端内边距经 CSS 变量下发（style.css 的 .terminal-host .xterm 读取）；
+// 未设置的方向删变量，回落内置值（左 10 / 右 0 / 上 5 / 下 8）。
+function applyTerminalPaddingVars() {
+  const root = document.documentElement;
+  const padding = terminalPaddingVars(terminalAppearance.value.settings);
+  const entries: Array<[string, string | null]> = [
+    ["--ssh-terminal-padding-left", padding.left],
+    ["--ssh-terminal-padding-right", padding.right],
+    ["--ssh-terminal-padding-top", padding.top],
+    ["--ssh-terminal-padding-bottom", padding.bottom],
+  ];
+  for (const [name, value] of entries) {
+    if (value === null) root.style.removeProperty(name);
+    else root.style.setProperty(name, value);
+  }
+}
+
+/**
+ * 外观改动落地：CSS 变量 + xterm 选项 + 主题 + OSC 颜色应答重挂。
+ * 行高/字间距/内边距都会改变单元格尺寸，末尾必须 scheduleFit 重算行列。
+ */
+function applyTerminalAppearance() {
+  applyTerminalPaddingVars();
+  const theme = terminalTheme();
+  document.documentElement.style.setProperty("--ssh-terminal-background", theme.background);
+  if (!terminal) return;
+  const patch = terminalOptionPatch(terminalAppearance.value.settings);
+  terminal.options.fontWeight = patch.fontWeight;
+  terminal.options.fontWeightBold = patch.fontWeightBold;
+  terminal.options.lineHeight = patch.lineHeight;
+  terminal.options.letterSpacing = patch.letterSpacing;
+  terminal.options.cursorStyle = patch.cursorStyle;
+  terminal.options.cursorBlink = patch.cursorBlink;
+  terminal.options.cursorInactiveStyle = patch.cursorInactiveStyle;
+  terminal.options.drawBoldTextInBrightColors = patch.drawBoldTextInBrightColors;
+  terminal.options.minimumContrastRatio = patch.minimumContrastRatio;
+  terminal.options.theme = theme;
+  // 10/11 应答闭包捕获注册时的颜色值：配色切换后重挂，查询才返回新颜色。
+  registerOscColorQueryHandlers();
+  scheduleFit();
+}
+
+/** 外观设置局部更新（设置页控件）：归一化 → 持久化 → 即时应用。 */
+function updateTerminalAppearance(patch: Partial<TerminalAppearanceSettings>) {
+  terminalAppearance.value = {
+    ...terminalAppearance.value,
+    settings: sanitizeAppearanceSettings({ ...terminalAppearance.value.settings, ...patch }),
+  };
+  persistTerminalAppearance(terminalAppearance.value);
+  applyTerminalAppearance();
+}
+
+/** 套用主题快照：设置 + 字体一起落地（字体走既有 terminalFont 键与链路）。 */
+function applyTerminalAppearanceTheme(theme: TerminalAppearanceProfile) {
+  terminalAppearance.value = { ...terminalAppearance.value, settings: sanitizeAppearanceSettings(theme.settings) };
+  persistTerminalAppearance(terminalAppearance.value);
+  // 主题里的字体为 null 表示「跟随宿主」：把字号键一起清掉（null），否则
+  // 快照与实际态不一致、主题永远无法高亮。
+  setTerminalFont(theme.font.family, theme.font.size);
+  applyTerminalAppearance();
+  showNotice(t("terminalAppearance.themeApplied", { name: t(theme.name) }));
+}
+
+/** 保存当前配置为「我的主题」（字体取缩放链路当前的覆盖态）。 */
+function saveTerminalAppearanceTheme(name: string) {
+  const theme: TerminalAppearanceProfile = {
+    id: uniqueSchemeId(schemeIdFromName(name), terminalAppearance.value.customThemes.map((item) => item.id)),
+    name,
+    builtin: false,
+    settings: sanitizeAppearanceSettings(terminalAppearance.value.settings),
+    font: { family: terminalFontOverride.value.fontFamily, size: terminalFontOverride.value.fontSize },
+  };
+  const customThemes = [...terminalAppearance.value.customThemes, theme].slice(-CUSTOM_THEME_LIMIT);
+  terminalAppearance.value = { ...terminalAppearance.value, customThemes };
+  persistTerminalAppearance(terminalAppearance.value);
+  showNotice(t("terminalAppearance.themeSaved", { name }));
+}
+
+function deleteTerminalAppearanceTheme(id: string) {
+  terminalAppearance.value = {
+    ...terminalAppearance.value,
+    customThemes: terminalAppearance.value.customThemes.filter((theme) => theme.id !== id),
+  };
+  persistTerminalAppearance(terminalAppearance.value);
+}
+
+/**
+ * 导入外部配色方案（Tabby/iTerm2/Windows Terminal/Xresources）：
+ * 分配唯一 id、落盘；单个方案或首个方案按自身亮暗挂到对应槽位并切到
+ * 「使用配色方案」——导入的意图通常就是立刻用上，否则用户还要再点一次。
+ */
+function addImportedSchemes(schemes: Array<Omit<TerminalColorScheme, "id" | "source">>) {
+  const existing = terminalAppearance.value.customSchemes;
+  const taken = existing.map((scheme) => scheme.id);
+  const added: TerminalColorScheme[] = [];
+  for (const item of schemes) {
+    if (existing.length + added.length >= CUSTOM_SCHEME_LIMIT) break;
+    const id = uniqueSchemeId(schemeIdFromName(item.name), taken);
+    taken.push(id);
+    added.push({ ...item, id, source: "custom" });
+  }
+  if (!added.length) {
+    showNotice(t("terminalAppearance.importEmpty"));
+    return;
+  }
+  const first = added[0];
+  const slot = schemeTone(first) === "light" ? "lightSchemeId" : "darkSchemeId";
+  terminalAppearance.value = {
+    ...terminalAppearance.value,
+    customSchemes: [...existing, ...added],
+    settings: sanitizeAppearanceSettings({ ...terminalAppearance.value.settings, schemeSource: "custom", [slot]: first.id }),
+  };
+  persistTerminalAppearance(terminalAppearance.value);
+  applyTerminalAppearance();
+  showNotice(t("terminalAppearance.importImported", { count: added.length }));
+}
+
+/** 删除自定义方案：同时清掉引用它的槽位，避免持久化悬空 id。 */
+function removeImportedScheme(id: string) {
+  const scheme = terminalAppearance.value.customSchemes.find((item) => item.id === id);
+  const settings = terminalAppearance.value.settings;
+  terminalAppearance.value = {
+    ...terminalAppearance.value,
+    customSchemes: terminalAppearance.value.customSchemes.filter((item) => item.id !== id),
+    settings: sanitizeAppearanceSettings({
+      ...settings,
+      darkSchemeId: settings.darkSchemeId === id ? null : settings.darkSchemeId,
+      lightSchemeId: settings.lightSchemeId === id ? null : settings.lightSchemeId,
+    }),
+  };
+  persistTerminalAppearance(terminalAppearance.value);
+  applyTerminalAppearance();
+  if (scheme) showNotice(t("terminalAppearance.schemeRemoved", { name: scheme.name }));
 }
 
 function applyAppearance(next: DbxPluginAppearanceInput) {
@@ -1305,13 +1481,11 @@ function applyAppearance(next: DbxPluginAppearanceInput) {
   root.style.setProperty("--border", resolved.colors.border);
   root.style.setProperty("--destructive", resolved.colors.destructive);
   root.style.setProperty("--popover", DBX_POPOVER[resolved.colorScheme]);
-  root.style.setProperty("--ssh-terminal-background", resolved.colors.background);
+  // 终端底色：启用配色方案且背景来源为「方案」时取方案底色，否则宿主面板色。
+  root.style.setProperty("--ssh-terminal-background", terminalTheme().background);
   followHostFonts(resolved);
+  applyTerminalAppearance();
   if (terminal) {
-    terminal.options.theme = terminalTheme();
-    // 10/11 应答闭包捕获注册时的颜色值：主题切换后重挂，查询才能返回新主题色
-    //（对标 electerm 的 registerTerminalColorQueryHandlers 语义）。
-    registerOscColorQueryHandlers();
     // 宿主下发的字体大小即缩放基准；外观切换后回到基准值，
     // 但用户单独调过的字号（issue #31 持久化覆盖）优先于宿主基准。
     terminalFontSize.value = terminalFontOverride.value.fontSize ?? resolved.terminal.fontSize;
@@ -1329,13 +1503,15 @@ function registerOscColorQueryHandlers() {
   oscColorQueryDisposables = [];
   if (!terminal) return;
   const term = terminal;
-  const colors = appearance.value.colors;
+  // 应答当前「生效」主题的前景/背景（宿主基底已被配色方案覆盖时返回方案色），
+  // 否则 vim/tmux 会按宿主色板渲染，与屏幕实际底色不一致。
+  const theme = terminalTheme();
   oscColorQueryDisposables.push(
     term.parser.registerOscHandler(10, (data) =>
-      handleTerminalColorQuery(term, 10, colors.foreground, OSC_COLOR_FALLBACK.foreground, data),
+      handleTerminalColorQuery(term, 10, theme.foreground, OSC_COLOR_FALLBACK.foreground, data),
     ),
     term.parser.registerOscHandler(11, (data) =>
-      handleTerminalColorQuery(term, 11, colors.background, OSC_COLOR_FALLBACK.background, data),
+      handleTerminalColorQuery(term, 11, theme.background, OSC_COLOR_FALLBACK.background, data),
     ),
   );
 }
@@ -1383,15 +1559,23 @@ function createTerminal() {
     fontFamily: hostTerminalFontFamily(appearance.value),
     fontSize: appearance.value.terminal.fontSize,
   });
+  const optionPatch = terminalOptionPatch(terminalAppearance.value.settings);
   terminalFontSize.value = font.fontSize;
   terminal = new Terminal({
     convertEol: false,
-    cursorBlink: true,
-    // 细竖线光标（bar）：块状光标在宽字距下显得笨重，竖线更接近常规输入框观感。
-    cursorStyle: "bar",
+    cursorBlink: optionPatch.cursorBlink,
+    // 默认细竖线（bar）：块状光标在宽字距下显得笨重，竖线更接近常规输入框观感。
+    // 具体形态由外观设置覆盖（样式/闪烁/失焦态三档）。
+    cursorStyle: optionPatch.cursorStyle,
+    cursorInactiveStyle: optionPatch.cursorInactiveStyle,
     fontFamily: font.fontFamily,
     fontSize: font.fontSize,
-    lineHeight: 1.15,
+    fontWeight: optionPatch.fontWeight,
+    fontWeightBold: optionPatch.fontWeightBold,
+    lineHeight: optionPatch.lineHeight,
+    letterSpacing: optionPatch.letterSpacing,
+    drawBoldTextInBrightColors: optionPatch.drawBoldTextInBrightColors,
+    minimumContrastRatio: optionPatch.minimumContrastRatio,
     scrollback: 25_000,
     // SearchAddon 的 highlight decorations 走 proposed API，缺这一项会在
     // findNext/registerDecoration 时直接抛 "allowProposedApi option"。
@@ -1566,20 +1750,34 @@ function adjustTerminalZoom(delta: number) {
 }
 
 function resetTerminalZoom() {
-  const base = appearance.value.terminal.fontSize;
+  // 主题可能自带字号（外观快照的 font.size）：复位回到「主题基准」，没有主题
+  // 或主题未指定字号时才回宿主基准（= 既有行为）。
+  const base = terminalAppearance.value.font.size ?? appearance.value.terminal.fontSize;
   if (terminalFontSize.value === base) return;
   applyTerminalFontSize(base);
 }
 
-// 缩放只动字号：同步内存覆盖态并经 lib 持久化（键与解析逻辑集中在 terminalFont.ts）。
-function applyTerminalFontSize(size: number) {
-  terminalFontSize.value = size;
-  terminalFontOverride.value = { ...terminalFontOverride.value, fontSize: size };
+/**
+ * 字体落地唯一入口：内存覆盖态 + terminalFont 两个键 + xterm 生效值。
+ * `size` 允许为 null（跟随宿主字号）——主题快照的「未指定」语义靠它表达，
+ * 若在此处把 null 折成宿主具体值，快照与实况就会永远不相等、主题无法高亮。
+ */
+function setTerminalFont(family: string | null, size: number | null) {
+  terminalFontOverride.value = { fontFamily: family, fontSize: size };
+  persistTerminalFontFamily(family);
+  persistTerminalFontSize(size);
+  const effectiveSize = size ?? appearance.value.terminal.fontSize;
+  terminalFontSize.value = effectiveSize;
   if (terminal) {
-    terminal.options.fontSize = size;
+    terminal.options.fontFamily = family ?? hostTerminalFontFamily(appearance.value);
+    terminal.options.fontSize = effectiveSize;
     scheduleFit();
   }
-  persistTerminalFontSize(size);
+}
+
+// 缩放只动字号：同步内存覆盖态并经 lib 持久化（键与解析逻辑集中在 terminalFont.ts）。
+function applyTerminalFontSize(size: number) {
+  setTerminalFont(terminalFontOverride.value.fontFamily, size);
   window.clearTimeout(zoomNoticeTimer);
   zoomNoticeTimer = window.setTimeout(() => showNotice(t("terminalZoom.fontSize", { size })), 500);
 }
@@ -1587,15 +1785,7 @@ function applyTerminalFontSize(size: number) {
 // 应用用户字体设置并持久化：family null = 恢复跟随宿主。立即生效并 toast 反馈。
 function applyTerminalFontSettings(family: string | null, size: number) {
   const followHost = family == null;
-  terminalFontOverride.value = { fontFamily: family, fontSize: size };
-  persistTerminalFontFamily(family);
-  persistTerminalFontSize(size);
-  terminalFontSize.value = size;
-  if (terminal) {
-    terminal.options.fontFamily = family ?? hostTerminalFontFamily(appearance.value);
-    terminal.options.fontSize = size;
-    scheduleFit();
-  }
+  setTerminalFont(family, size);
   showNotice(followHost ? t("terminalFont.resetDone") : t("terminalFont.applied", { size }));
 }
 
@@ -6235,14 +6425,25 @@ async function openReplay(item: RecordingSummary) {
     replayPlaying.value = false;
     await nextTick();
     if (replayHost.value) {
-      // 回放终端跟随宿主外观（主题色/字体/字号），不再是默认纯黑 xterm。
+      // 回放终端跟随终端外观（配色/字体/字号/字重/行高/字间距），
+      // 不再是默认纯黑 xterm，也不与主终端产生字形差异。
+      const font = resolveTerminalFont(terminalFontOverride.value, {
+        fontFamily: hostTerminalFontFamily(appearance.value),
+        fontSize: appearance.value.terminal.fontSize,
+      });
+      const optionPatch = terminalOptionPatch(terminalAppearance.value.settings);
       replayTerminal = new Terminal({
         cols: 100,
         rows: 26,
         convertEol: false,
         theme: terminalTheme(),
-        fontFamily: hostTerminalFontFamily(appearance.value),
-        fontSize: appearance.value.terminal.fontSize,
+        fontFamily: font.fontFamily,
+        fontSize: font.fontSize,
+        fontWeight: optionPatch.fontWeight,
+        fontWeightBold: optionPatch.fontWeightBold,
+        lineHeight: optionPatch.lineHeight,
+        letterSpacing: optionPatch.letterSpacing,
+        drawBoldTextInBrightColors: optionPatch.drawBoldTextInBrightColors,
       });
       replayTerminal.open(replayHost.value);
       // 与主终端同用 Unicode 11 宽度表：emoji/宽字符行在回放里保持相同折行。
@@ -6340,7 +6541,25 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
   document.body.appendChild(host);
   let term: Terminal | null = null;
   try {
-    term = new Terminal({ cols: COLS, rows: ROWS });
+    // 离屏终端与主终端同款外观（配色/字体/字重/行高）：导出的 GIF 必须和用户
+    // 屏幕上看到的一致，否则「导出」就失去意义。
+    const exportFont = resolveTerminalFont(terminalFontOverride.value, {
+      fontFamily: hostTerminalFontFamily(appearance.value),
+      fontSize: appearance.value.terminal.fontSize,
+    });
+    const exportPatch = terminalOptionPatch(terminalAppearance.value.settings);
+    term = new Terminal({
+      cols: COLS,
+      rows: ROWS,
+      theme: terminalTheme(),
+      fontFamily: exportFont.fontFamily,
+      fontSize: exportFont.fontSize,
+      fontWeight: exportPatch.fontWeight,
+      fontWeightBold: exportPatch.fontWeightBold,
+      lineHeight: exportPatch.lineHeight,
+      letterSpacing: exportPatch.letterSpacing,
+      drawBoldTextInBrightColors: exportPatch.drawBoldTextInBrightColors,
+    });
     term.open(host);
     // xterm 6 移除了 canvas 渲染器：DOM 渲染器不产出 canvas，逐帧取像素必须
     // 挂 WebGL renderer。两个此前就存在的坑在此一并修掉：screenElement 下第
@@ -7000,6 +7219,9 @@ async function initialize() {
   locale.value = api.locale || "zh-CN";
   restoreUiState();
   const appearanceAppliedAtBoot = Boolean(api.appearance || api.theme);
+  // 外观偏好的 CSS 部分（终端内边距变量）与宿主是否推送 appearance 无关，
+  // 开机先落一次，否则用户设了内边距要等下次主题推送才生效。
+  applyTerminalPaddingVars();
   if (api.appearance) applyAppearance(api.appearance);
   else if (isDbxPluginTheme(api.theme)) applyAppearance(themeToAppearance(api.theme));
   // 宿主可能在 init 前先应答 host.getContext（如重推连接期间 init 被延迟）：
@@ -8320,10 +8542,16 @@ onBeforeUnmount(() => {
       :session-id="session?.sessionId"
       :terminal-font-size="terminalFontSize"
       :host-font-size="appearance.terminal.fontSize"
+      :host-font-family="hostTerminalFontFamily(appearance)"
       :local-download-dir="localDownloadDir"
       :local-can-save="localCanSave"
       :webgl-enabled="webglEnabled"
       :term-select-copy="termSelectCopy"
+      :appearance="terminalAppearanceState"
+      :custom-themes="terminalAppearance.customThemes"
+      :active-theme-id="activeAppearanceThemeId"
+      :host-theme="hostTerminalTheme()"
+      :host-color-scheme="appearance.colorScheme"
       :download-prefs="downloadPrefsAdapter"
       :t="t"
       @notice="showNotice"
@@ -8332,6 +8560,12 @@ onBeforeUnmount(() => {
       @update:webgl="setWebglEnabled"
       @toggle-select-copy="toggleSelectCopy"
       @apply-font="(payload) => applyTerminalFontSettings(payload.family, payload.size)"
+      @update-appearance="updateTerminalAppearance"
+      @apply-theme="applyTerminalAppearanceTheme"
+      @save-theme="saveTerminalAppearanceTheme"
+      @delete-theme="deleteTerminalAppearanceTheme"
+      @add-schemes="addImportedSchemes"
+      @remove-scheme="removeImportedScheme"
     />
 
     <Dialog :open="auditOpen" @update:open="(open) => { if (!open) auditOpen = false; }">

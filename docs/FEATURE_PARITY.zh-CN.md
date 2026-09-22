@@ -25,6 +25,7 @@ profile 分组、全局外观）不重复实现。
 | 连接信息面板（Host/Port/User/认证方式/只读/延迟） | 连接信息摘要 | ✅ 已有（App.vue `connection-info-popover`；`ssh/sessions/list` 行新增只读 `authMethod`（model.rs:46 `method_name()`、ssh.rs:599/609/1236/1249），延迟走既有 ssh/exec echo 探测，A-SSH） | — |
 | 终端字体缩放（Ctrl/⌘ 滚轮、复位、持久化） | batch3 工作包 A 第 3 条细化 | ✅ 已有（`frontend/src/lib/terminalZoom.ts` `clampFontSize` 绝对字号 [8,32] + App.vue A+/A− 按钮与 localStorage 持久化，A-SSH） | — |
 | 点击定位光标（iTerm2/kitty 风格）+ 细竖线光标 | iTerm2 Option+Click / kitty click-to-move | ✅ 已有（2026-09-09：`frontend/src/lib/terminalClickCursor.ts` 纯几何计算——同逻辑行内原地点击按字符差值代发左右方向键，宽字符 2 格记 1、折行跨行展开、备用屏/鼠标上报应用/trzsz·zmodem 占流一律不动作；光标 `cursorStyle: "bar"`。终端协议无直接落点能力，readline 只认按键，行外点击不动作防翻历史） | — |
+| **终端配色方案与多套主题**（Tabby 对标：192 内置配色 / 深浅双槽自动切换 / 字体·间距·光标·渲染细项 / 四格式方案导入 / 实时可视化预览） | Tabby `TerminalColorScheme` + `colorSchemeSelector` + `colorSchemePreview`；tabby-community-color-schemes（上游 iTerm2-Color-Schemes） | ✅ 已有（2026-09-22，`codex/ssh/terminal-themes` 分支）：见下文专节。**默认仍为「跟随宿主」，不改变既有观感**——只有用户显式选方案才覆盖 | — |
 | known_hosts 管理（list/remove，宿主侧文件） | ssh_service.go ListKnownHosts/RemoveKnownHost | ✅ 已有（第一批，实测通过） | — |
 | 主机密钥预检/接受/拒绝（profile 维度） | CheckHostKey/Accept/RejectHostKey | ✅ ssh/host-key/check（探针预检三态，真机验证）+ 挑战流程 | P1 完成 |
 | 本地 SSH 私钥发现（~/.ssh 扫描 + 指纹） | DiscoverKeys | ✅ 已有（第一批，实测通过）；2026-09-15 起另供 `keys/discover/options` 下拉形态（`{options:[{value,label}]}`），只出元数据不出密钥材料；2026-09-17 起 **label 即路径本身**（不再拼算法/指纹，避免下拉控件被撑长），算法与指纹保留在 `keys/discover` 返回值里 | P0 |
@@ -181,3 +182,87 @@ React 19 独立桌面 SSH 工作台）为参照的能力借鉴（实施计划
 | 会话录制回放 + GIF 导出 | ✅ 已有（同批新增） | `ssh/recording/*` 五方法：asciicast v2 `.cast` 落盘（会话关闭自动收尾）、`ssh/recording/get` 分页回放（xterm 重放、0.5–4× 倍速、进度条 seek）、GIF 导出（离屏 xterm 逐事件重放 + 500ms 抽帧 + 零依赖 GIF89a 编码器，封顶 120 帧）。iShell 的暂停/快进/水印/帧率质量参数未做 |
 | GPU 监控、大文件扫描、主机巡检报告 | ⏸ 未做（候选） | GPU 依赖远端 nvidia-smi 等工具可用性；大文件扫描与巡检报告维持"另有对标项"候选结论 |
 | 终端 WebGL GPU 加速渲染 | ✅ 已有（2026-09-13 落地） | `@xterm/addon-webgl`（0.18.0，配 xterm 5.5）：主终端默认挂 GPU renderer（localStorage 偏好 `ssh-terminal-webgl`，设置弹窗「终端渲染」开关即时切换）；WebGL 不可用（headless/无 context/驱动限制）构造即回退 DOM 渲染器，context loss（GPU 重置）自动 dispose 回退；回放弹窗与 GIF 导出的离屏终端刻意保持 2d canvas（导出依赖 drawImage 稳定路径、且浏览器 WebGL context 总数有限）。纯逻辑（偏好/挂载/回退/切换）独立模块 `terminalWebgl.ts` + 单测 7 |
+
+## Tabby 主题对标补充（2026-09-22，`codex/ssh/terminal-themes` 分支）
+
+以 [Tabby](https://github.com/Eugeny/tabby) 的终端外观体系为参照，把「配色方案 + 多套主题 +
+排版细项」按 Tabby 的语义模型迁移进插件工作台。**纯前端改动，后端零改动**（无新增协议方法，
+因此无新增 smoke 用例——见下方「验收口径」）。
+
+### 迁移来源与授权
+
+| 来源 | 内容 | 授权 |
+| --- | --- | --- |
+| `tabby-terminal/src/colorSchemes.ts` | Tabby Default / Tabby Default Light 两套出厂配色（`#171717`/`#cacaca`） | MIT |
+| `tabby-community-color-schemes/schemes/*` | 190 个 Xresources 配色文件 | MIT（上游 iTerm2-Color-Schemes，MIT） |
+
+共 **192 套内置配色**（2 出厂 + 190 社区）。上游 191 个文件中的 `Melange Dark` 只声明了
+1 个 ANSI 色（不足 16 色，Tabby 自身解析器同样会截断产出不完整方案），已跳过并在产物头部注明。
+配色表以**紧凑元组数组**（`readonly TerminalSchemeTuple[]`）落库而非 192 个对象字面量，
+目的是压住包体；同一份表由 `scripts/gen-terminal-schemes.py` 生成，**可重跑复现**：
+
+```bash
+python3 scripts/gen-terminal-schemes.py   # 重新扫描 Xresources → 覆写 terminalSchemeCatalog.ts
+```
+
+生成器刻意**复用 Tabby 自己的解析语义**：扫描 `#define` 变量表做值替换，按 `color0..color15`
+**顺序**收集并在第一个缺口处停止。TS 侧 `schemeIdFromName` 与生成器的 slug 规则逐字对齐
+（`[^a-z0-9]+` → `-`，去首尾 `-`，空则回落 `scheme`）——两边规则一旦漂移，导入去重就会失效。
+
+### 「不重复宿主」原则的守卫方式
+
+本仓库既有原则是「全局外观由宿主承担，插件不重复实现」（见文首与开发规范第 3 条）。
+本轮不改这条原则，而是把它做成**默认态**：
+
+- `schemeSource` 默认 `"host"`。此时 `applySchemeToTerminalTheme()` **原样返回宿主基底主题**，
+  终端观感与改动前逐值相等（默认值 `bar` 光标 / 1.15 行高 / 0 字间距 / 左10·右0·上5·下8 内边距
+  与旧硬编码一致，由单测 `terminalOptionPatch(DEFAULT) === TERMINAL_OPTION_DEFAULTS` 钉住）。
+- 只有用户显式选「使用配色方案」才覆盖背景/前景/16 色。宿主仍在负责它自己的面板配色；
+  插件只新增「终端区域可被用户单独指定」，与宿主互不争夺。
+- 宿主切换亮/暗时（`appearance.colorScheme`）自动在**深浅双槽**间切换：`darkSchemeId` /
+  `lightSchemeId` 各挂一套，由此满足「黑白主题配置选择」。
+
+### 能力清单
+
+| 能力 | 实现位置 | 说明 |
+| --- | --- | --- |
+| 192 套内置配色目录 | `frontend/src/lib/terminalSchemeCatalog.ts`（生成物） | 紧凑元组 + 溯源头部（授权、上游、重生成命令、跳过文件说明） |
+| 配色纯逻辑层 | `frontend/src/lib/terminalScheme.ts` | 类型、目录索引、亮暗判定（WCAG 相对亮度 > 0.5 为亮）、搜索/色调过滤、主题合成、四格式导入解析器 |
+| 偏好模型与持久化 | `frontend/src/lib/terminalAppearance.ts` | `ssh-terminal-appearance` 单键；自定义方案上限 60、自定义主题上限 30（localStorage 单键约 5 MB 的容量压力） |
+| 多套主题（快照） | 同上 `TerminalAppearanceProfile` | = 外观设置 + 字体（family/size）。Tabby 原生下拉只放 2 套配色，而「配置多套主题」需要连字体/间距一起存，故按**快照**建模 |
+| 出厂预设 | 同上 `TERMINAL_APPEARANCE_PRESETS` | 跟随宿主 / Dracula / Nord / Tokyo Night / Gruvbox / 高对比，共 6 套 |
+| 排版细项 | 同上 `TerminalOptionPatch` | 字重、粗体字重、行高、字间距、横向/纵向内边距、光标样式（block/underline/bar）、光标闪烁、失焦光标样式、粗体用亮色、最小对比度 |
+| 方案导入 | `terminalScheme.ts` 四个 parser | Xresources（Tabby/类 Unix）、iTerm2 `.itermcolors`（plist）、Windows Terminal（JSON）、Tabby（YAML）。YAML 走**手写缩进扫描器**，不引 YAML 库 |
+| 可视化预览 | `frontend/src/components/TerminalAppearancePreview.vue` | 纯 DOM 实时预览（不实例化真 xterm）：`ls -la` 配色样例、选区色块、粗体样例、光标样式动画（`prefers-reduced-motion` 降级）、低对比度告警（< 4.5:1） |
+| 方案选择器 | `frontend/src/components/TerminalSchemePicker.vue` | 深浅双槽页签 + 搜索 + 全部/亮/暗过滤 + 「跟随宿主」行 + 每行 16 色色块 + 自定义徽标 + 色调标签 + 空态 |
+| 设置入口 | `frontend/src/components/SettingsDialog.vue` | 新增「外观」分类并置于**首位**、弹窗默认落在该分类；原「终端字体」块移出终端页，留七语指引 |
+
+光标形状/宽字符/折行等**几何**行为不受影响——`terminalClickCursor.ts` 原地定位逻辑照旧，
+本轮只把 `cursorStyle` 从硬编码 `"bar"` 改为可配置、默认值不变。
+
+### 三处需要留意的接缝
+
+1. **DOM 沙箱与 localStorage**：工作台 iframe 是 `sandbox="allow-scripts"`（不透明源），
+   在**默认参数位置**读 `window.localStorage` 会抛 `SecurityError`。故所有存储访问都在函数体
+   `try` 内（`terminalFont.ts` / `terminalWebgl.ts` 既有同一模式，本轮 `terminalAppearance.ts` 沿用）。
+2. **FitAddon 与内边距**：内边距必须挂在 `.xterm`（即 `terminal.element`）而不是宿主 div 上，
+   否则 FitAddon 会多算一行。故内边距经 CSS 变量下发、由 `style.css` 的
+   `.terminal-host .xterm` 消费，未设置的方向 `removeProperty` 回落内置值。
+3. **字体单一事实源**：字体仍由既有 `terminalFontOverride` 权威持有；`terminalAppearanceState`
+   只是**计算合并**用于展示与主题匹配。`setTerminalFont` 保留 `null`（而非折成宿主具体值）——
+   否则主题快照与实况永不相等，主题高亮会永远失效。
+
+### 验收口径
+
+- 基线 SHA：`acddf777ac5943adda4912e77090e59a0cc3726e`（main）。
+- 新增单测 **44 例**（`terminalScheme.spec.ts` 18 + `terminalAppearance.spec.ts` 26），
+  全量 vitest **66 文件 / 605 用例全绿**；`vue-tsc --noEmit` 通过；Vite 打包通过
+  （3.35 MB 自包含 UI，仅剩既有 trzsz externalize 与 chunk size 告警）。
+- `python3 scripts/validate_repo.py`、`node scripts/connection-forms/verify.mjs` 均 PASS。
+- 无新增 smoke 用例：本轮未注册任何 sidecar 方法，按开发规范第 6 条
+  「未注册方法 SKIP 而非 FAIL」，smoke 家族不适用。
+- **不提交 `ui/`**：`frontend/build.mjs` 输出到 `../ui`，而 `ui/` 与 `dist/` 属 integrator
+  所有权（`.github/agent-flow.yml`），打包由 integrator 统一执行。
+- 七语文案（zh-CN/zh-TW/en/es/it/ja/pt-BR）全量补齐；`workbench.spec.ts` 的
+  key 集合与占位符对齐断言覆盖新键。
+- 未新增任何运行时依赖（YAML 导入为手写扫描器）。

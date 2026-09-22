@@ -193,7 +193,14 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    会穿透 z-index: 2 的 .terminal-overlay——连接/成功动画期间 replay 写入的
    内容其高亮块（如 Last login 的 IP）会浮到卡片遮罩之上。 */
 .terminal-host { position: absolute; z-index: 0; inset: 0; background: var(--ssh-terminal-background); }
-.terminal-host .xterm { height: 100%; padding: 5px 0 8px 10px; background: var(--ssh-terminal-background); }
+/* 内边距可经外观设置覆盖：四个方向各自一个变量，变量缺失时回落内置值
+   （左 10 / 右 0 / 上 5 / 下 8）。必须挂在 .xterm（terminal.element）上——
+   FitAddon 只读 element 自身 padding 扣减行数，挂宿主 div 会多算一行。 */
+.terminal-host .xterm {
+  height: 100%;
+  padding: var(--ssh-terminal-padding-top, 5px) var(--ssh-terminal-padding-right, 0) var(--ssh-terminal-padding-bottom, 8px) var(--ssh-terminal-padding-left, 10px);
+  background: var(--ssh-terminal-background);
+}
 /* 选择器必须压过 xterm 6.1-beta 的 `.xterm:not(.allow-transparency)
    .xterm-viewport{background-color:#000}`（特异性 0,3,0）——6.0.0 时该规则
    是 `.xterm .xterm-viewport`（0,2,0），靠导入顺序即可覆盖；升 beta 后特异性
@@ -881,3 +888,33 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .forward-field-pair { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 6px; }
 .forward-form-error { margin: 0; font-size: 11px; color: var(--destructive); }
 .forward-form footer { display: flex; justify-content: flex-end; }
+
+/* ---------------------------------------------------------------------------
+   终端外观设置（对标 Tabby 的 Appearance）：主题快照列表、导入动作与色卡。
+   设置弹窗自身无 scoped 样式块（历史约定），新控件样式统一落在这里。
+   --------------------------------------------------------------------------- */
+.theme-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.theme-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 4px 8px; background: var(--background); color: var(--foreground);
+  font-size: 11px; cursor: pointer;
+}
+.theme-chip:hover { background: var(--accent); }
+.theme-chip.active { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, var(--background)); }
+.theme-chip--dirty { cursor: default; border-style: dashed; color: var(--muted-foreground); }
+.theme-chip--dirty:hover { background: var(--background); }
+.theme-chip-icon { width: 11px; height: 11px; flex: 0 0 11px; color: var(--primary); }
+.theme-chip-delete { display: inline-flex; align-items: center; color: var(--muted-foreground); }
+.theme-chip-delete:hover { color: var(--destructive); }
+.theme-chip-delete svg { width: 11px; height: 11px; }
+.theme-save-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.theme-save-row input { min-width: 0; flex: 1 1 180px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.theme-save-row button { flex: 0 0 auto; }
+.appearance-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 隐藏的原生文件选择器：外观导入与下载目录选择共用「按钮触发」的交互形态。 */
+.hidden-file-input { display: none; }
+/* 数值项两列排布：六项间距/字重排成三行，避免设置弹窗被拉成长条。 */
+.appearance-number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+.scheme-mini-swatch { display: inline-flex; gap: 1px; }
+.scheme-mini-swatch i { display: block; width: 6px; height: 10px; border-radius: 1px; }

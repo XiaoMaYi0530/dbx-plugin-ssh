@@ -7,16 +7,31 @@
 // （WebGL/选中复制/终端字体）的权威态在宿主 App——下载偏好经 downloadPrefs
 // 适配器读写，终端偏好经 props 下发 + emits 上抛。
 import { computed, reactive, ref, watch } from "vue";
-import { FolderOpen, KeyRound, Loader2, Pencil, Plus, ShieldCheck, Trash2, X } from "@lucide/vue";
+import { Check, FolderOpen, KeyRound, Loader2, Pencil, Plus, RotateCcw, ShieldCheck, Trash2, Upload, X } from "@lucide/vue";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 import { Switch } from "./ui/switch";
+import TerminalAppearancePreview from "./TerminalAppearancePreview.vue";
+import TerminalSchemePicker from "./TerminalSchemePicker.vue";
 import { AGENT_MODES, sanitizeRememberedCommands } from "../lib/agentTerminal";
 import { clampFontSize, TERMINAL_FONT_MAX, TERMINAL_FONT_MIN } from "../lib/terminalZoom";
 import { loadTerminalFontOverride } from "../lib/terminalFont";
 import { MIB, mibField, settingsErrorOf, type DiscoveredKey, type KnownHostEntry, type McpSizeSettings, type SshSettings, type SudoProfileView } from "../lib/settingsModel";
 import { DOWNLOAD_CONFLICT_POLICIES, type DownloadConflictPolicy } from "../lib/downloadPrefs";
+import {
+  allAppearanceProfiles,
+  applySchemeToTerminalTheme,
+  CUSTOM_SCHEME_LIMIT,
+  TERMINAL_APPEARANCE_PRESETS,
+  terminalOptionPatch,
+  type TerminalAppearanceProfile,
+  type TerminalAppearanceSettings,
+  type TerminalAppearanceState,
+  type TerminalCursorInactiveStyle,
+  type TerminalCursorStyle,
+} from "../lib/terminalAppearance";
+import { BUILTIN_TERMINAL_SCHEMES, contrastRatio, parseHexColor, parseSchemeImport, type TerminalColorScheme, type TerminalThemeLike } from "../lib/terminalScheme";
 
 const props = defineProps<{
   open: boolean;
@@ -26,10 +41,21 @@ const props = defineProps<{
   terminalFontSize: number;
   /** 宿主主题终端基准字号（「恢复默认」回到该值）。 */
   hostFontSize: number;
+  /** 宿主终端字体族（用户未单独设置字体时预览用它）。 */
+  hostFontFamily: string;
   localDownloadDir: string;
   localCanSave: boolean;
   webglEnabled: boolean;
   termSelectCopy: boolean;
+  /** 终端外观偏好（权威态在 App）：本组件只读 + 经 emits 上抛改动意图。 */
+  appearance: TerminalAppearanceState;
+  /** 用户保存的主题快照（内置预设由 lib 常量提供，不需经 props）。 */
+  customThemes: TerminalAppearanceProfile[];
+  /** 当前配置命中的主题 id（null = 已改动，不再等于任何主题）。 */
+  activeThemeId: string | null;
+  /** 宿主派生的基础终端主题（未启用配色方案时的最终结果）。 */
+  hostTheme: TerminalThemeLike;
+  hostColorScheme: "light" | "dark";
   /** 下载偏好的读写适配器（权威态与 sidecar preferences 同步在 App）。 */
   downloadPrefs: {
     loadDir(): string;
@@ -51,11 +77,18 @@ const emit = defineEmits<{
   (e: "update:webgl", value: boolean): void;
   (e: "toggle-select-copy"): void;
   (e: "apply-font", payload: { family: string | null; size: number }): void;
+  (e: "update-appearance", patch: Partial<TerminalAppearanceSettings>): void;
+  (e: "apply-theme", theme: TerminalAppearanceProfile): void;
+  (e: "save-theme", name: string): void;
+  (e: "delete-theme", id: string): void;
+  (e: "add-schemes", schemes: Array<Omit<TerminalColorScheme, "id" | "source">>): void;
+  (e: "remove-scheme", id: string): void;
 }>();
 
 const t = props.t;
 
 const SETTINGS_CATEGORIES = [
+  { id: "appearance", labelKey: "settingsNav.appearance" },
   { id: "sudo", labelKey: "settingsNav.sudo" },
   { id: "agent", labelKey: "agentTerminalSection" },
   { id: "transfer", labelKey: "downloadSettings.title" },
@@ -64,7 +97,7 @@ const SETTINGS_CATEGORIES = [
   { id: "mcp", labelKey: "mcpLimits.title" },
 ] as const;
 type SettingsCategory = (typeof SETTINGS_CATEGORIES)[number]["id"];
-const settingsCategory = ref<SettingsCategory>("sudo");
+const settingsCategory = ref<SettingsCategory>("appearance");
 
 function onSettingsCategoryChange(value: string | number) {
   settingsCategory.value = value as SettingsCategory;
@@ -191,16 +224,172 @@ function applyTerminalFontFromControls() {
   applyTerminalFont(family, size);
 }
 
-// 恢复默认：清掉用户设置（连字号键一起删），回到宿主基准。
-function resetTerminalFont() {
-  applyTerminalFont(null, props.hostFontSize);
-}
+// 恢复默认：并入「外观」分类的 resetAppearance（同一套默认值链路），
+// 此处不再保留独立的字体重置入口。
 
 /// 应用用户字体设置：应用侧（App）负责落到 xterm、持久化与 toast。
 function applyTerminalFont(family: string | null, size: number) {
   emit("apply-font", { family, size });
   syncFontControls(family, size);
 }
+
+// ---------------------------------------------------------------------------
+// 终端外观（配色方案 / 主题快照 / 字体间距 / 光标）
+// ---------------------------------------------------------------------------
+const appearanceSettings = computed(() => props.appearance.settings);
+const appearanceProfiles = computed(() => allAppearanceProfiles({ ...props.appearance, customThemes: props.customThemes }));
+
+// 预览与真实终端共用同一套纯函数合成：预览呈现的就是 xterm 实际拿到的主题，
+// 不会出现「设置页好看、终端不对」的偏差。
+const previewTheme = computed(() => applySchemeToTerminalTheme(
+  props.hostTheme,
+  appearanceSettings.value,
+  props.appearance.customSchemes,
+  props.hostColorScheme,
+));
+const previewOptions = computed(() => terminalOptionPatch(appearanceSettings.value));
+const previewFontFamily = computed(() => props.appearance.font.family ?? props.hostFontFamily);
+const previewContrast = computed(() => {
+  const foreground = parseHexColor(previewTheme.value.foreground);
+  const background = parseHexColor(previewTheme.value.background);
+  return foreground && background ? contrastRatio(foreground, background) : 21;
+});
+
+const allSchemes = computed<readonly TerminalColorScheme[]>(() => [...BUILTIN_TERMINAL_SCHEMES, ...props.appearance.customSchemes]);
+const themeNameDraft = ref("");
+const importText = ref("");
+const importError = ref("");
+const importOpen = ref(false);
+const schemeFileInput = ref<HTMLInputElement>();
+
+function updateAppearance(patch: Partial<TerminalAppearanceSettings>) {
+  emit("update-appearance", patch);
+}
+
+/** 数值型外观字段：留空 = 恢复默认（null 回落到 xterm 既有默认），非法输入不落地。 */
+function updateAppearanceNumber(key: keyof TerminalAppearanceSettings, raw: string) {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    updateAppearance({ [key]: null } as Partial<TerminalAppearanceSettings>);
+    return;
+  }
+  const parsed = Number(trimmed);
+  if (Number.isFinite(parsed)) updateAppearance({ [key]: parsed } as Partial<TerminalAppearanceSettings>);
+}
+
+// reka Select 不接受空串 value，字重的「默认」用哨兵值双向映射。
+const FONT_WEIGHT_AUTO = "__auto__";
+const FONT_WEIGHT_OPTIONS = ["300", "400", "500", "600", "700", "800", "900"];
+
+function updateFontWeight(key: "fontWeight" | "fontWeightBold", value: unknown) {
+  const next = String(value);
+  updateAppearance({ [key]: next === FONT_WEIGHT_AUTO ? null : Number(next) });
+}
+
+function applyTheme(theme: TerminalAppearanceProfile) {
+  emit("apply-theme", theme);
+}
+
+function resetAppearance() {
+  // 复用「跟随 DBX 宿主」预设：设置重置与字体回跟随宿主走同一条链路，
+  // 不另写一份默认值展开，避免两处默认值漂移。
+  emit("apply-theme", TERMINAL_APPEARANCE_PRESETS[0]);
+}
+
+function saveCurrentTheme() {
+  const name = themeNameDraft.value.trim();
+  if (!name) return;
+  emit("save-theme", name);
+  themeNameDraft.value = "";
+}
+
+function deleteTheme(theme: TerminalAppearanceProfile) {
+  if (!window.confirm(t("terminalAppearance.deleteThemeConfirm", { name: t(theme.name) }))) return;
+  emit("delete-theme", theme.id);
+}
+
+function removeCustomScheme(scheme: TerminalColorScheme) {
+  if (!window.confirm(t("terminalAppearance.importRemoveConfirm", { name: scheme.name }))) return;
+  emit("remove-scheme", scheme.id);
+}
+
+// 导入：粘贴文本或选文件。解析是纯逻辑（terminalScheme.parseSchemeImport），
+// 分配 id / 持久化 / 提示交给 App（权威态在 App）。
+function importSchemesFromText(text: string, fallbackName: string) {
+  const result = parseSchemeImport(text, fallbackName);
+  if (!result.schemes.length) {
+    importError.value = t("terminalAppearance.importEmpty");
+    return;
+  }
+  importError.value = "";
+  importText.value = "";
+  emit("add-schemes", result.schemes);
+}
+
+function submitImport() {
+  if (!importText.value.trim()) return;
+  importSchemesFromText(importText.value, "Imported scheme");
+}
+
+function pickSchemeFile() {
+  schemeFileInput.value?.click();
+}
+
+async function onSchemeFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  try {
+    // iTerm2/.itermcolors 与 Windows Terminal 导出都是文本，File API 读原文即可，
+    // 不依赖宿主 fileTransfer（web/docker 模式同样可用）。
+    const text = await file.text();
+    importSchemesFromText(text, file.name.replace(/\.[^.]+$/, ""));
+  } catch (cause) {
+    importError.value = settingsErrorOf(cause);
+  } finally {
+    // 清空 value：同一个文件连续选两次也要能再次触发 change。
+    input.value = "";
+  }
+}
+
+const CURSOR_STYLES: readonly TerminalCursorStyle[] = ["bar", "block", "underline"];
+const CURSOR_INACTIVE_STYLES: readonly TerminalCursorInactiveStyle[] = ["outline", "block", "bar", "underline", "none"];
+const CURSOR_STYLE_LABELS: Record<TerminalCursorStyle, string> = {
+  bar: "terminalAppearance.cursorBar",
+  block: "terminalAppearance.cursorBlock",
+  underline: "terminalAppearance.cursorUnderline",
+};
+const CURSOR_INACTIVE_LABELS: Record<TerminalCursorInactiveStyle, string> = {
+  outline: "terminalAppearance.inactiveOutline",
+  block: "terminalAppearance.inactiveBlock",
+  bar: "terminalAppearance.inactiveBar",
+  underline: "terminalAppearance.inactiveUnderline",
+  none: "terminalAppearance.inactiveNone",
+};
+
+// reka Select 回传 AcceptableValue（含 null 与对象），这里只接受字符串形态。
+function updateCursorStyle(value: unknown) {
+  updateAppearance({ cursorStyle: String(value) as TerminalCursorStyle });
+}
+
+function updateCursorInactiveStyle(value: unknown) {
+  updateAppearance({ cursorInactiveStyle: String(value) as TerminalCursorInactiveStyle });
+}
+
+/** 数值输入框取原始串（模板里避免写 as 断言，TS 模板表达式支持有限）。 */
+function numberFieldValue(event: Event): string {
+  return (event.target as HTMLInputElement).value;
+}
+
+// 单选组在模板里迭代（写死 `as const` 字面量在模板表达式中不被支持）。
+const SCHEME_SOURCES: Array<{ value: TerminalAppearanceSettings["schemeSource"]; label: string }> = [
+  { value: "host", label: "terminalAppearance.modeFollowHost" },
+  { value: "custom", label: "terminalAppearance.modeCustom" },
+];
+const BACKGROUND_SOURCES: Array<{ value: TerminalAppearanceSettings["backgroundSource"]; label: string }> = [
+  { value: "scheme", label: "terminalAppearance.backgroundScheme" },
+  { value: "host", label: "terminalAppearance.backgroundHost" },
+];
 
 async function reloadSettings() {
   downloadDirDraft.value = props.downloadPrefs.loadDir();
@@ -576,6 +765,224 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               </Tabs>
             </nav>
             <div class="settings-content">
+            <!-- 外观：主题快照（预设 + 我的）、配色方案两槽、字体间距、光标、渲染与实时预览。 -->
+            <div v-show="settingsCategory === 'appearance'" class="settings-pane">
+            <h3 class="settings-section-title">{{ t("terminalAppearance.themeSection") }}</h3>
+            <p class="muted settings-note">{{ t("terminalAppearance.themeHint") }}</p>
+            <div class="theme-chips">
+              <button
+                v-for="theme in appearanceProfiles"
+                :key="theme.id"
+                type="button"
+                class="theme-chip"
+                :class="{ active: theme.id === activeThemeId }"
+                :aria-pressed="theme.id === activeThemeId"
+                @click="applyTheme(theme)"
+              >
+                <Check v-if="theme.id === activeThemeId" class="theme-chip-icon" aria-hidden="true" />
+                <span>{{ t(theme.name) }}</span>
+                <span
+                  v-if="!theme.builtin"
+                  class="theme-chip-delete"
+                  role="button"
+                  tabindex="0"
+                  :title="t('terminalAppearance.deleteTheme')"
+                  :aria-label="t('terminalAppearance.deleteTheme')"
+                  @click.stop="deleteTheme(theme)"
+                  @keydown.enter.stop="deleteTheme(theme)"
+                ><Trash2 /></span>
+              </button>
+              <span v-if="!activeThemeId" class="theme-chip theme-chip--dirty">{{ t("terminalAppearance.themeCustom") }}</span>
+            </div>
+            <div class="theme-save-row">
+              <input v-model="themeNameDraft" spellcheck="false" :placeholder="t('terminalAppearance.themeNamePlaceholder')" />
+              <button type="button" :disabled="!themeNameDraft.trim()" @click="saveCurrentTheme">{{ t("terminalAppearance.saveTheme") }}</button>
+              <button type="button" @click="resetAppearance"><RotateCcw />{{ t("terminalAppearance.reset") }}</button>
+            </div>
+
+            <h3 class="settings-section-title">{{ t("terminalAppearance.previewTitle") }}</h3>
+            <TerminalAppearancePreview
+              :theme="previewTheme"
+              :font-family="previewFontFamily"
+              :font-size="terminalFontSize"
+              :font-weight="previewOptions.fontWeight"
+              :font-weight-bold="previewOptions.fontWeightBold"
+              :line-height="previewOptions.lineHeight"
+              :letter-spacing="previewOptions.letterSpacing"
+              :cursor-style="previewOptions.cursorStyle"
+              :cursor-blink="previewOptions.cursorBlink"
+              :contrast-ratio="previewContrast"
+              :t="t"
+            />
+
+            <h3 class="settings-section-title">{{ t("terminalAppearance.schemeSection") }}</h3>
+            <p class="muted settings-note">{{ t("terminalAppearance.schemeHint") }}</p>
+            <label v-for="option in SCHEME_SOURCES" :key="option.value" class="settings-field settings-radio-row">
+              <input
+                type="radio"
+                name="terminal-scheme-source"
+                :value="option.value"
+                :checked="appearanceSettings.schemeSource === option.value"
+                @change="updateAppearance({ schemeSource: option.value })"
+              />
+              <span>{{ t(option.label) }}</span>
+            </label>
+            <TerminalSchemePicker
+              v-if="appearanceSettings.schemeSource === 'custom'"
+              :dark-scheme-id="appearanceSettings.darkSchemeId"
+              :light-scheme-id="appearanceSettings.lightSchemeId"
+              :custom-schemes="appearance.customSchemes"
+              :schemes="allSchemes"
+              :host-follow-label="t('terminalAppearance.modeFollowHost')"
+              :t="t"
+              @pick="(payload) => updateAppearance(payload.slot === 'dark' ? { darkSchemeId: payload.id } : { lightSchemeId: payload.id })"
+            />
+            <template v-if="appearanceSettings.schemeSource === 'custom'">
+              <h4 class="settings-section-title">{{ t("terminalAppearance.backgroundSection") }}</h4>
+              <label v-for="option in BACKGROUND_SOURCES" :key="option.value" class="settings-field settings-radio-row">
+                <input
+                  type="radio"
+                  name="terminal-background-source"
+                  :value="option.value"
+                  :checked="appearanceSettings.backgroundSource === option.value"
+                  @change="updateAppearance({ backgroundSource: option.value })"
+                />
+                <span>{{ t(option.label) }}</span>
+              </label>
+              <p class="muted settings-note">{{ t("terminalAppearance.backgroundHint") }}</p>
+            </template>
+
+            <h4 class="settings-section-title">{{ t("terminalAppearance.importSection") }}</h4>
+            <p class="muted settings-note">
+              {{ t("terminalAppearance.importHint") }}
+              <button class="link-button" type="button" :aria-expanded="importOpen" @click="importOpen = !importOpen">{{ t("terminalAppearance.importAction") }}</button>
+            </p>
+            <template v-if="importOpen">
+              <label class="settings-field">
+                <span>{{ t("terminalAppearance.importSection") }}</span>
+                <textarea v-model="importText" rows="4" class="mono" spellcheck="false" :placeholder="t('terminalAppearance.importPlaceholder')" />
+              </label>
+              <div class="appearance-actions">
+                <button type="button" :disabled="!importText.trim()" @click="submitImport"><Upload />{{ t("terminalAppearance.importAction") }}</button>
+                <button type="button" @click="pickSchemeFile"><FolderOpen />{{ t("downloadSettings.browse") }}</button>
+                <input
+                  ref="schemeFileInput"
+                  type="file"
+                  class="hidden-file-input"
+                  accept=".itermcolors,.json,.xresources,.yaml,.yml,.conf,.txt"
+                  @change="onSchemeFile"
+                />
+              </div>
+              <p v-if="importError" class="task-error" role="alert">{{ importError }}</p>
+            </template>
+            <ul v-if="appearance.customSchemes.length" class="settings-list">
+              <li v-for="scheme in appearance.customSchemes" :key="scheme.id">
+                <div class="settings-list-main">
+                  <strong>{{ scheme.name }}</strong>
+                  <span class="scheme-mini-swatch" aria-hidden="true"><i v-for="(color, index) in scheme.colors.slice(0, 16)" :key="index" :style="{ background: color }" /></span>
+                </div>
+                <button class="icon-button" :title="t('terminalAppearance.importRemove')" @click="removeCustomScheme(scheme)"><Trash2 /></button>
+              </li>
+            </ul>
+            <p class="muted">{{ t("profilesLimit", { count: appearance.customSchemes.length, limit: CUSTOM_SCHEME_LIMIT }) }}</p>
+
+            <h4 class="settings-section-title">{{ t("terminalAppearance.typographySection") }}</h4>
+            <label class="settings-field">
+              <span>{{ t("terminalFont.family") }}</span>
+              <Select :model-value="terminalFontFamilyChoice" @update:model-value="(v) => onTerminalFontFamilyChoice(String(v))">
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem :value="TERMINAL_FONT_FOLLOW_HOST">{{ t("terminalFont.followHost") }}</SelectItem>
+                  <SelectItem v-for="preset in TERMINAL_FONT_PRESETS" :key="preset.value" :value="preset.value" class="terminal-font-option" :style="{ fontFamily: preset.value }">{{ preset.label }}</SelectItem>
+                  <SelectItem :value="TERMINAL_FONT_CUSTOM">{{ t("terminalFont.custom") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <label v-if="terminalFontFamilyChoice === TERMINAL_FONT_CUSTOM" class="settings-field">
+              <span>{{ t("terminalFont.custom") }}</span>
+              <input v-model="terminalFontCustomDraft" class="mono" spellcheck="false" :placeholder="t('terminalFont.customPlaceholder')" @change="applyTerminalFontFromControls" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("terminalFont.size") }}</span>
+              <input v-model="terminalFontSizeDraft" type="number" :min="TERMINAL_FONT_MIN" :max="TERMINAL_FONT_MAX" step="1" @change="applyTerminalFontFromControls" />
+            </label>
+            <div class="appearance-number-grid">
+              <label class="settings-field">
+                <span>{{ t("terminalAppearance.fontWeight") }}</span>
+                <Select :model-value="appearanceSettings.fontWeight == null ? FONT_WEIGHT_AUTO : String(appearanceSettings.fontWeight)" @update:model-value="(v) => updateFontWeight('fontWeight', v)">
+                  <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem :value="FONT_WEIGHT_AUTO">{{ t("terminalAppearance.valueAuto") }}</SelectItem>
+                    <SelectItem v-for="weight in FONT_WEIGHT_OPTIONS" :key="weight" :value="weight">{{ weight }}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+              <label class="settings-field">
+                <span>{{ t("terminalAppearance.fontWeightBold") }}</span>
+                <Select :model-value="appearanceSettings.fontWeightBold == null ? FONT_WEIGHT_AUTO : String(appearanceSettings.fontWeightBold)" @update:model-value="(v) => updateFontWeight('fontWeightBold', v)">
+                  <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem :value="FONT_WEIGHT_AUTO">{{ t("terminalAppearance.valueAuto") }}</SelectItem>
+                    <SelectItem v-for="weight in FONT_WEIGHT_OPTIONS" :key="weight" :value="weight">{{ weight }}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+              <label class="settings-field">
+                <span>{{ t("terminalAppearance.lineHeight") }}</span>
+                <input type="number" min="1" max="3" step="0.05" :value="appearanceSettings.lineHeight ?? ''" :placeholder="t('terminalAppearance.valueAuto')" @change="updateAppearanceNumber('lineHeight', numberFieldValue($event))" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("terminalAppearance.letterSpacing") }}</span>
+                <input type="number" min="-5" max="10" step="1" :value="appearanceSettings.letterSpacing ?? ''" :placeholder="t('terminalAppearance.valueAuto')" @change="updateAppearanceNumber('letterSpacing', numberFieldValue($event))" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("terminalAppearance.paddingX") }}</span>
+                <input type="number" min="0" max="32" step="1" :value="appearanceSettings.paddingX ?? ''" :placeholder="t('terminalAppearance.valueAuto')" @change="updateAppearanceNumber('paddingX', numberFieldValue($event))" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("terminalAppearance.paddingY") }}</span>
+                <input type="number" min="0" max="32" step="1" :value="appearanceSettings.paddingY ?? ''" :placeholder="t('terminalAppearance.valueAuto')" @change="updateAppearanceNumber('paddingY', numberFieldValue($event))" />
+              </label>
+            </div>
+            <p class="muted settings-note">{{ t("terminalAppearance.paddingHint") }}</p>
+
+            <h4 class="settings-section-title">{{ t("terminalAppearance.cursorSection") }}</h4>
+            <label class="settings-field">
+              <span>{{ t("terminalAppearance.cursorStyle") }}</span>
+              <Select :model-value="appearanceSettings.cursorStyle" @update:model-value="updateCursorStyle">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="style in CURSOR_STYLES" :key="style" :value="style">{{ t(CURSOR_STYLE_LABELS[style]) }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <label class="quick-sudo-control">
+              <Switch size="sm" :model-value="appearanceSettings.cursorBlink" @update:model-value="(v) => updateAppearance({ cursorBlink: v === true })" />
+              <span>{{ t("terminalAppearance.cursorBlink") }}</span>
+            </label>
+            <label class="settings-field">
+              <span>{{ t("terminalAppearance.cursorInactive") }}</span>
+              <Select :model-value="appearanceSettings.cursorInactiveStyle" @update:model-value="updateCursorInactiveStyle">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="style in CURSOR_INACTIVE_STYLES" :key="style" :value="style">{{ t(CURSOR_INACTIVE_LABELS[style]) }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+
+            <h4 class="settings-section-title">{{ t("terminalAppearance.renderSection") }}</h4>
+            <label class="quick-sudo-control">
+              <Switch size="sm" :model-value="appearanceSettings.drawBoldTextInBrightColors" @update:model-value="(v) => updateAppearance({ drawBoldTextInBrightColors: v === true })" />
+              <span>{{ t("terminalAppearance.drawBoldInBright") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalAppearance.drawBoldInBrightHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("terminalAppearance.minimumContrast") }}</span>
+              <input type="number" min="1" max="21" step="0.5" :value="appearanceSettings.minimumContrastRatio" @change="updateAppearanceNumber('minimumContrastRatio', numberFieldValue($event))" />
+            </label>
+            <p class="muted settings-note">{{ t("terminalAppearance.minimumContrastHint") }}</p>
+            </div>
+
             <div v-show="settingsCategory === 'sudo'" class="settings-pane">
             <label class="settings-field">
               <span>{{ t("settingsCredentialSource") }}</span>
@@ -766,28 +1173,7 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <span>{{ t("terminalSelectCopy.label") }}</span>
             </label>
             <p class="muted settings-note">{{ t("terminalSelectCopy.hint") }}</p>
-
-            <h3 class="settings-section-title">{{ t("terminalFont.title") }}</h3>
-            <label class="settings-field">
-              <span>{{ t("terminalFont.family") }}</span>
-              <Select :model-value="terminalFontFamilyChoice" @update:model-value="(v) => onTerminalFontFamilyChoice(String(v))">
-                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem :value="TERMINAL_FONT_FOLLOW_HOST">{{ t("terminalFont.followHost") }}</SelectItem>
-                  <SelectItem v-for="preset in TERMINAL_FONT_PRESETS" :key="preset.value" :value="preset.value" class="terminal-font-option" :style="{ fontFamily: preset.value }">{{ preset.label }}</SelectItem>
-                  <SelectItem :value="TERMINAL_FONT_CUSTOM">{{ t("terminalFont.custom") }}</SelectItem>
-                </SelectContent>
-              </Select>
-            </label>
-            <label v-if="terminalFontFamilyChoice === TERMINAL_FONT_CUSTOM" class="settings-field">
-              <span>{{ t("terminalFont.custom") }}</span>
-              <input v-model="terminalFontCustomDraft" class="mono" spellcheck="false" :placeholder="t('terminalFont.customPlaceholder')" @change="applyTerminalFontFromControls" />
-            </label>
-            <label class="settings-field">
-              <span>{{ t("terminalFont.size") }}</span>
-              <input v-model="terminalFontSizeDraft" type="number" :min="TERMINAL_FONT_MIN" :max="TERMINAL_FONT_MAX" step="1" @change="applyTerminalFontFromControls" />
-            </label>
-            <button type="button" @click="resetTerminalFont">{{ t("terminalFont.reset") }}</button>
+            <p class="muted settings-note">{{ t("terminalFont.movedHint") }}</p>
             </div>
 
           <div v-show="settingsCategory === 'security'" class="settings-pane">
