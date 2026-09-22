@@ -60,6 +60,9 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/quickCommands/list`、`ssh/quickCommands/save`、`ssh/quickCommands/delete` | 全局快速命令管理（用户自定义常用命令片段，插件数据目录持久化，所有连接/工作台共享） |
 | `ssh/terminal/batchInput` | 批量发送：把同一条命令写入多个已打开会话的交互终端（PTY 键盘语义），返回逐会话发送结果 |
 | `ssh/batchBar/state`（notify） | 批量发送命令条的跨工作台状态同步：工作台把 `{ source, draft, quickPickId, open }` 以通知送达 sidecar，sidecar 原样以同名事件广播给所有插件 webview，各端按 `source` 过滤自己的回声；纯转发不落存储，旧版 sidecar 未注册时调用方静默降级 |
+| `local/terminal/start`、`local/terminal/resize`、`local/terminal/replay` | 本地终端：sidecar 所在机器的交互式登录 shell（工作台显式入口触发，见「本地终端」节；`start` 支持显式 `shell` 与继承用的 `cwd`） |
+| `local/shells/list` | 本机可启动 shell 清单（用户登录 shell 置顶，含 `isDefault`/`isUserShell`/`injectable` 标记——最后一项表示该 shell 是否支持 integration 注入，不支持的在选择器中灰掉开关；Unix 读 `/etc/shells`+`dscl`，Windows 枚举 PATH 下的 pwsh/PowerShell/cmd/wsl），工作台 shell 选择器数据源 |
+| `local/session/list`、`local/session/close` | 本地终端会话清单（webview 重载后接回）与关闭 |
 | `local/preferences/get`、`local/preferences/set` | 工作台级 UI 偏好（`<plugin_data_dir>/preferences.json`，固定键白名单、原子写入，非法类型报错、非白名单键丢弃）：`downloadDir`（string，≤512 字符）、`downloadUseDefaultDir`（bool，默认 true）、`downloadConflictPolicy`（`rename`/`ask`/`overwrite`，默认 `rename`）。兼容：set 为部分合并，缺省键不变；旧 sidecar 缺少的键前端按缺省处理 |
 
 ## 运行时设置
@@ -487,6 +490,8 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 - `ssh/terminal/in/{sessionId}`：原始终端输入。
 - `ssh/terminal/out/{sessionId}`：首字节为流类型，随后为大端 `u64` 单调序号，再后为终端数据。
+- `local/terminal/in/{sessionId}`：本地终端输入，与 `ssh/terminal/in` 同形（8 字节大端序号 + 数据）；确认事件为 `local/terminal/inputAck`，死会话镜像 `local/terminal/error`。
+- `local/terminal/out/{sessionId}`：本地终端输出，与 `ssh/terminal/out` 同帧格式（流类型 + u64 序号）；stdout/stderr 在 PTY 内合流，数据帧恒为流 0。
 - `sftp/upload/{taskId}`：大端 `u64` 文件偏移加最多 256 KiB 数据；偏移必须等于服务端期待值。
 - `sftp/download/{taskId}`：大端 `u64` 文件偏移加最多 256 KiB 数据（树任务该偏移为整树聚合字节位置；队列耗尽后的 eof 应答携带 0 字节数据）。
 
@@ -507,6 +512,17 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - `sftp/transfer/list`：参数 `sessionId`。返回 `{ tasks: [...] }`——该会话进行中的上传 / 下载与近期历史（每个会话独立记录），元素结构 `{ taskId, sessionId, direction, fileName, size, transferred, status }`，`status` 取 `running` / `completed` / `cancelled`。
 - `sftp/transfer/status`：参数 `taskId`。返回单个任务的同构状态对象；任务不存在时先查历史，仍无则报错。
 - `sftp/transfer/history`：参数 `sessionId?`（可选过滤）、`limit?`（默认 50，上限 200）。返回 `{ tasks: [...] }`——持久化传输历史（`transfer-history.json`，环形上限 200 条，跨 sidecar 重启保留）与内存 live 任务按 `taskId` 去重合并、新→旧排序，元素结构 `{ taskId, sessionId, connectionId, direction, fileName, size, transferred, status, startedAt, finishedAt, error? }`（时间戳 Unix 毫秒；`status` 同上并含 `failed`）。无活动连接也可查询；仅状态跃迁落盘，逐块进度不落盘；跨进程（embedded 与 stdio `--mcp`）last-writer-wins；重启后遗留 `running` 呈现为 `failed`（不回写文件）。不进 MCP 工具面。
+
+## 本地终端
+
+工作台内的本机 shell 入口（sidecar 所在机器，非 SSH 远端）。与 SSH 终端共用二进制帧协议、序号重放（2 MiB 环形缓存）与输出管线，但独立会话表，不依赖任何 SSH 连接：
+
+- `local/terminal/start {workbenchId, cols, rows, shell?, shellIntegration?, cwd?}` → `{sessionId, shell, shellIntegration}`。`shell` 来自选择器偏好（`localShell`，空=自动探测）；`cwd` 供重开继承上次跟踪目录（VS Code 惯例），非法/已删目录静默回落家目录。shell 解析顺序：显式 `shell` 参数 → macOS Directory Services `UserShell`（`dscl`）→ `$SHELL` → 平台缺省（macOS `/bin/zsh`、Linux `/bin/bash`、Windows `powershell.exe`）；`nologin`/`false` 一类登录不可用 shell 视为未设置。Unix 侧一律以**登录 shell** 启动（macOS GUI 进程 PATH 不全，Ghostty/Warp 惯例），cwd 为用户家目录，`TERM=xterm-256color`、`COLORTERM=truecolor`、`TERM_PROGRAM=dbx`。会话关闭先落 master 让 shell 收到 EOF/HUP 干净退出（zsh/bash 仅在干净退出时保存命令历史），5s 宽限后才 SIGKILL 兜底（再给 2s 收取退出码）。
+- shell integration 注入（`shellIntegration: false` 可关闭；脚本落盘/包装失败时静默回退裸 shell）：自带精简脚本集（zsh 经 `ZDOTDIR` 包装链，保留用户 `.zprofile`/`.zshrc`/`.zlogin` 与登录语义；bash 走 `--rcfile` 包装自建 profile 链；fish `-C`；PowerShell `-Command`），每步 fail-safe，用户 rc 损坏不阻断 shell。脚本发射 OSC `133;A/C/D;exit`、`633;E;命令行`、`633;P;Cwd=…` 与 OSC 7（Windows 为 OSC 9;9），前端复用既有命令标记/目录解析渲染运行中命令、退出码与 cwd。**注入数据仅用于装饰与 cwd 跟踪，绝不进入任何执行路径**（VS Code shell integration RCE 前车之鉴）。
+- 输出帧同 `ssh/terminal/out`；会话结束发流 2 State 帧 `local-terminal-exited` 并伴随事件 `local/session/state {sessionId, workbenchId, state: "exited", exitCode}`（`exitCode` 为 null 表示未能取得，如进程被杀）。输入通道失配镜像 `local/terminal/error {sessionId, error}` + `local/terminal/inputAck` 确认，语义与 SSH 同构。
+- `local/session/list` 供 webview 重载后接回仍活着的 shell；`workbench/close` 会回收该工作台的本地会话；sidecar 退出即全部终止（本地 PTY 生命周期 = sidecar 生命周期）。
+- 安全语义：入口为工作台显式按钮（未连接也可用；SSH 会话在连时经确认先关闭），无自动开启路径；manifest 权限集不变（复用 `host.binary`），本机命令执行能力与用户自身终端同级，无提权。
+- 偏好（`local/preferences/*` 白名单新增）：`localShell`（字符串 ≤200，空=自动探测）、`localShellIntegration`（布尔，缺省 true）。shell 选择器在工作台本地终端按钮旁的设置菜单（`local/shells/list` 发现 + 注入开关），徽标显示 `Local · <shell>`，重开按钮在本地会话存活时保持可用（restart 语义：关当前 → 按新偏好重开）。
 
 ## 主机密钥
 

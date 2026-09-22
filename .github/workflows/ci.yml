@@ -136,7 +136,7 @@ jobs:
         run: |
           docker run -d --name dbx-ssh-test -p 2222:2222 \
             -e USER_NAME=sshuser -e USER_PASSWORD=DbxTest2026 \
-            -e PASSWORD_ACCESS=true linuxserver/openssh-server
+            -e PASSWORD_ACCESS=true linuxserver/openssh-server@sha256:96b9a4d3b5106746d08d43a6911650d4d21f7d5c7f2ac9660e792bdb5e63157c
           # s6 init materializes /config/sshd/sshd_config on first boot;
           # fresh runners exec within ~0.3s, so wait for the file first.
           for i in $(seq 1 30); do

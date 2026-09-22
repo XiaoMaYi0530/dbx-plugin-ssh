@@ -767,6 +767,31 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .session-pill .session-pill-countdown { flex: 0 0 auto; opacity: 0.85; font-variant-numeric: tabular-nums; }
 .session-pill.session-error { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
 .session-pill.session-error .session-dot { background: var(--destructive); }
+.session-pill.session-local { color: var(--violet-foreground, var(--foreground)); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.session-pill.session-local .session-dot { background: var(--primary); }
+
+/* 本地终端退出态覆盖层（VS Code 式：退出码 + 重开/关闭出口）。挂在
+   .terminal-overlay 内，复用其居中与背景。 */
+.local-exit-card { display: flex; align-items: center; flex-direction: column; gap: 10px; max-width: 420px; padding: 28px 32px; border: 1px solid var(--border); border-radius: var(--radius); background: color-mix(in srgb, var(--background) 96%, transparent); }
+.local-exit-card .local-exit-icon { width: 28px; height: 28px; color: var(--muted-foreground); }
+.local-exit-card strong { font-size: 14px; color: var(--foreground); }
+.local-exit-card .local-exit-code { font-size: 12px; }
+.local-exit-card .local-exit-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.local-shell-chevron { margin-left: -6px; }
+.local-shell-popover { min-width: 300px; }
+.local-shell-popover .local-shell-hint { margin: 0 0 8px; font-size: 11px; }
+.local-shell-popover .local-shell-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.local-shell-popover .local-shell-program { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; opacity: 0.75; }
+.local-shell-popover .local-shell-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; font-size: 9px; color: var(--muted-foreground); }
+.local-shell-popover .local-shell-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
+.local-rerun-command { display: inline-block; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+
+/* BEL 视觉铃：程序输出 \x07 时终端面板边框短促脉冲（alert() 的终端惯例替代） */
+.terminal-pane.bell-flash { animation: terminal-bell-pulse 0.4s ease-out; }
+@keyframes terminal-bell-pulse {
+  0% { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--warning, #e5a400) 70%, transparent); }
+  100% { box-shadow: inset 0 0 0 0 transparent; }
+}
 
 /* OSC 633 command marker strip at the bottom-left of the terminal pane; hidden
    unless the remote shell integration emits 633 frames. The zmodem banner

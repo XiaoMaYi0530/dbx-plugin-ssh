@@ -85,6 +85,30 @@ function emitTerminal(text: string) {
   for (const listener of binaryListeners) listener(event);
 }
 
+// ---- 本地终端夹具：local/terminal/* 全链路（按钮 → 633/133 标记 → 回显）----
+let localSessionId = "";
+let localSequence = 0;
+let localExited = false;
+function emitLocalTerminal(text: string) {
+  if (!localSessionId) return;
+  localSequence += 1;
+  const event = { channel: `local/terminal/out/${localSessionId}`, data: terminalFrame(localSequence, text) };
+  for (const listener of binaryListeners) listener(event);
+}
+function localPromptMarks(cwd: string) {
+  // 与真实 shell integration 同形状：提示符只带 prompt-start（633;A/133;A）
+  // + cwd；C/D 标记在回显用户命令时成对出现（见 sendBinary 的本地分支）。
+  return `\u001b]633;A\u0007\u001b]133;A\u0007\u001b]633;P;Cwd=${cwd}\u0007jinpy@MacBook-Pro ~ % `;
+}
+function localCommandMarks(command: string) {
+  // 与真实 integration 脚本一致：E（命令行）→ C（开始执行），parser 以 E 为
+  // "命令开始"信号。
+  return `\u001b]633;E;${command}\u0007\u001b]633;C\u0007\u001b]133;C\u0007`;
+}
+function localDoneMarks(code: number) {
+  return `\u001b]633;D;${code}\u0007\u001b]133;D;${code}\u0007`;
+}
+
 // ---- 内存 fixture 树：路径感知的 sftp/list 与写操作（无条件生效，无开关参数）----
 interface MockNode {
   name: string;
@@ -239,7 +263,7 @@ const highlightRuleViews = () => [...highlightRulesState].sort((a, b) => a.creat
 // 权限档与连接作用域，镜像持久化 + 校验语义。
 const mcpSettingsState = { execPermissionMode: "autonomous", connectionScope: [] as string[] };
 // 插件级 UI 偏好（local/preferences/get|set）：镜像 sidecar preferences.json 的合并语义。
-const localPrefsState = { downloadDir: "", downloadUseDefaultDir: true, downloadConflictPolicy: "rename" };
+const localPrefsState = { downloadDir: "", downloadUseDefaultDir: true, downloadConflictPolicy: "rename", localShell: "", localShellIntegration: true };
 // 镜像并行批次 ssh/audit/list 的真实形状（AuditEntry：tsMs/tool/connectionId/
 // gate/approval/outcome/exitCode/durationMs/mode/command/output/error，
 // 0.4.77 起带 command/output 尾部）；末条保留计划 §1.1 旧形状（ts 秒 + kind +
@@ -484,7 +508,40 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     mockTransferHistoryCleared = true;
     result = { success: true };
   }
-  else if (method === "local/capabilities") result = { canSaveLocal: false, downloadsDir: "" };
+  else if (method === "local/terminal/start") {
+    localSessionId = `local-session-${Math.random().toString(36).slice(2, 8)}`;
+    localSequence = 0;
+    localExited = false;
+    setTimeout(() => emitLocalTerminal(localPromptMarks("/Users/demo")), 40);
+    result = {
+      sessionId: localSessionId,
+      // 真实 sidecar 回显实际 spawn 的 shell；夹具同样回显请求参数。
+      shell: (params as { shell?: string } | undefined)?.shell || "/bin/zsh",
+      shellIntegration: (params as { shellIntegration?: boolean } | undefined)?.shellIntegration !== false,
+    };
+  } else if (method === "local/terminal/resize") result = { success: true };
+  else if (method === "local/terminal/replay") {
+    result = { frameCount: 0, firstAvailableSequence: localSequence + 1, tailSequence: localSequence, complete: true };
+  } else if (method === "local/session/close") {
+    localSessionId = "";
+    result = { success: true };
+  } else if (method === "local/session/list") {
+    result = {
+      sessions: localSessionId && !localExited
+        ? [{ sessionId: localSessionId, workbenchId: "mock-workbench", shell: "/bin/zsh", createdAt: 0 }]
+        : [],
+    };
+  } else if (method === "local/shells/list") {
+    result = {
+      platform: "macos",
+      shells: [
+        { program: "/opt/homebrew/bin/fish", name: "Fish", isDefault: false, isUserShell: true },
+        { program: "/bin/zsh", name: "Zsh", isDefault: true, isUserShell: false },
+        { program: "/bin/bash", name: "Bash", isDefault: false, isUserShell: false },
+        { program: "/bin/csh", name: "Csh", isDefault: false, isUserShell: false, injectable: false },
+      ],
+    };
+  } else if (method === "local/capabilities") result = { canSaveLocal: false, downloadsDir: "" };
   else if (method === "local/preferences/get") result = { ...localPrefsState };
   else if (method === "local/fs/drives") result = { drives: ["C:\\", "D:\\"] };
   else if (method === "local/fs/exists") result = { exists: false, path: "" };
@@ -876,6 +933,14 @@ window.dbxPlugin = {
       for (const listener of eventListeners) listener({ method: "sftp/transfer/progress", params: { taskId, direction: "upload", transferred: nextOffset, size: 0, phase: "staging", status: "running" } });
       return;
     }
+    if (channel.startsWith("local/terminal/in/")) {
+      const bytes = typeof data === "string" ? Uint8Array.from(atob(data), (value) => value.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
+      const inputSequence = Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, false));
+      for (const listener of eventListeners) listener({ method: "local/terminal/inputAck", params: { sessionId: channel.slice("local/terminal/in/".length), sequence: inputSequence } });
+      const typed = new TextDecoder().decode(bytes.slice(8));
+      setTimeout(() => emitLocalTerminal(`${typed}\r\n${localCommandMarks(typed.trim())}dbx-mock echo: ${typed.trim()}\r\n${localDoneMarks(0)}${localPromptMarks("/Users/demo")}`), 12);
+      return;
+    }
     if (!channel.startsWith("ssh/terminal/in/")) return;
     const bytes = typeof data === "string" ? Uint8Array.from(atob(data), (value) => value.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
     const inputSequence = Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, false));
@@ -920,6 +985,14 @@ window.dbxPlugin = {
 (window as unknown as { __dbxMockSetLocale?: (next: string) => void }).__dbxMockSetLocale = (next: string) => {
   currentLocale = next || "en";
   for (const listener of localeListeners) listener(currentLocale);
+};
+
+// mock 专有调试入口：把本地终端打入退出态（验证退出覆盖层/退出码显示）。
+(window as unknown as { __dbxMockExitLocal?: () => void }).__dbxMockExitLocal = () => {
+  if (!localSessionId) return;
+  const sessionId = localSessionId;
+  localExited = true;
+  for (const listener of eventListeners) listener({ method: "local/session/state", params: { sessionId, state: "exited", exitCode: 127 } });
 };
 
 // 供单元测试（mockDbxHost.spec.ts）以模块形式动态导入并重置状态。

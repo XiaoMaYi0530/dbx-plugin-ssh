@@ -104,7 +104,9 @@ def main() -> None:
         # terminal input frames carry a u64 BE sequence prefix; output frames
         # are [sequence u64][payload] on ssh/terminal/out/<sessionId>
         import struct as _struct
-        deadline = time.monotonic() + 20
+        # 45s: shared CI runners occasionally starve the first PTY output past
+        # the 20s this used to allow (prompt flakes, FAIL ~50% on busy days).
+        deadline = time.monotonic() + 45
         prompt_seen = False
         while time.monotonic() < deadline and not prompt_seen:
             for frame in list(client.binary_frames):
