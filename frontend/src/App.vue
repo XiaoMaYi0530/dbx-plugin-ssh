@@ -96,6 +96,7 @@ import {
   TERMINAL_SEARCH_OPTIONS_KEY,
   terminalSearchSeedFromSelection,
   canAcceptTerminalDrop,
+  canAcceptFileDrop,
   normalizeDropTargetDir,
   type TerminalSearchOptions,
 } from "./lib/terminalInteraction";
@@ -5217,9 +5218,19 @@ function onSftpClipboardPaste(event: ClipboardEvent) {
 
 function onDrop(event: DragEvent) {
   dragActive.value = false;
-  if (!canWrite.value) return;
+  // 与终端侧共用同一道门禁；拒绝时给提示而不是无声吞掉拖入。
+  if (!canAcceptFileDrop({ connected: connected.value, canWrite: canWrite.value })) {
+    showNotice(t("dropRefused"));
+    return;
+  }
   const files = Array.from(event.dataTransfer?.files || []);
   if (files.length) void uploadLocalFiles(files).catch(showError);
+}
+
+function onSftpDragEnter(event: DragEvent) {
+  // 只对文件拖拽点亮高亮：拖文本/元素路过不应给出可放置暗示（终端侧同款预检）。
+  if (!event.dataTransfer?.types.includes("Files")) return;
+  dragActive.value = true;
 }
 
 function onTerminalDragEnter(event: DragEvent) {
@@ -5230,7 +5241,11 @@ function onTerminalDragEnter(event: DragEvent) {
 
 function onTerminalDrop(event: DragEvent) {
   terminalDragActive.value = false;
-  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) return;
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) {
+    // 拒绝不再静默：只读会话/断连/传输占用都给同一条提示。
+    showNotice(t("dropRefused"));
+    return;
+  }
   // Files dropped on the terminal ask for a landing directory first: the
   // shell's cwd (SFTP directory tracking) or any absolute directory typed in
   // the prompt — silence would make a wrong-guess overwrite too easy.
@@ -7009,6 +7024,12 @@ async function initialize() {
   unsubscribeFileDrag = api.fileTransfer?.onDragState((active) => (dragActive.value = active));
   unsubscribeFileDrop = api.fileTransfer?.onDrop((files) => {
     dragActive.value = false;
+    // 宿主级拖入与其他两条链路共用同一道门禁：只读连接/断连时拒绝并提示，
+    // 不能成为绕过 readOnly 的旁路（此前这条通道完全不设防）。
+    if (!canAcceptFileDrop({ connected: connected.value, canWrite: canWrite.value })) {
+      showNotice(t("dropRefused"));
+      return;
+    }
     // 拖入文件同样走宿主桥读盘（issue #83/#79）：桥故障时与工具栏上传一致回退
     // 原生选择器重挑，而不是只报错走死。
     void uploadHandleFiles(files)
@@ -7799,7 +7820,7 @@ onBeforeUnmount(() => {
 
       <div v-if="sftpPaneOpen" class="divider" @pointerdown="startDividerDrag" />
 
-      <section v-if="sftpPaneOpen" ref="sftpPane" class="sftp-pane" tabindex="-1" :class="{ 'drag-active': dragActive }" @pointerdown="focusSftpPaneOnPointerDown" @paste.capture="onSftpClipboardPaste" @dragenter.prevent="dragActive = true" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop">
+      <section v-if="sftpPaneOpen" ref="sftpPane" class="sftp-pane" tabindex="-1" :class="{ 'drag-active': dragActive }" @pointerdown="focusSftpPaneOnPointerDown" @paste.capture="onSftpClipboardPaste" @dragenter.prevent="onSftpDragEnter" @dragover.prevent @dragleave.self="dragActive = false" @drop.prevent="onDrop">
         <div class="path-toolbar">
           <button class="icon-button" :title="t('parentFolder')" :disabled="currentPath === '/'" @click="goParent"><ArrowUp /></button>
           <button class="icon-button icon-amber" :title="t('home')" :disabled="!connected" @click="loadHome"><Home /></button>
