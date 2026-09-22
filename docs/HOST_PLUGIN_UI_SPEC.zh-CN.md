@@ -446,6 +446,7 @@ BottomDock 是宿主通用容器，不是终端专用实现。
 - tab 与 panel 的复用键必须包含 `presentation`，两者可以同时存在。
 - `workbenchId` 由宿主分别生成；panel 隐藏仅隐藏 UI，不销毁 webview。
 - 宿主在 context 中注入权威 `surface: "panel"`；插件据此使用紧凑布局。
+- 关闭走两段式：宿主先向 webview 发送桥消息 `workbench/close`（携带权威 `workbenchId`），插件释放自己的 workbench scope（PTY、订阅、临时状态）后回 `workbench/close-ack`；宿主最多等待一个有限宽限期即拆除 webview，未确认也照常拆除。SDK 在 ready 消息里以 `features: ["workbench.close"]` 声明支持；旧 SDK 不认识该消息，宿主立即拆除，行为与无握手时一致。tab 关闭路径若未走两段式，至少在卸载时 best-effort 发送该消息。
 - panel 关闭或插件卸载时发送 `workbench/close`；进程异常退出时 Sidecar 仍必须保证 PTY 子进程组被回收。
 - v1 不自动按空闲时间卸载正在运行的终端，避免误杀长任务；自动卸载策略留待宿主能可靠判断运行状态后再设计。
 - `Ctrl/⌘+J` 必须先进入宿主统一快捷键冲突治理，不硬编码覆盖用户键位。

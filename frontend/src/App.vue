@@ -2792,6 +2792,23 @@ async function closeLocalTerminal() {
   terminal?.focus();
 }
 
+// HOST_PLUGIN_UI_SPEC §8.3/§7.4 workbench/close 两段式关闭：宿主拆除 panel/tab webview
+// 前先通知本 workbench 释放自己的 sidecar scope（PTY 会话），避免孤儿 PTY 活到 sidecar
+// 退出。特 性探测：旧宿主不发 workbench/close，也无此 API。置 disposed 拦住在途的
+// 异步启动流程（startLocalTerminal 会据此回收刚开的会话）。
+if (window.dbxPlugin.workbench?.onClose) {
+  window.dbxPlugin.workbench.onClose(async () => {
+    disposed = true;
+    const ownedSessions = [
+      ["local/session/close", localSession.value?.sessionId],
+      ["ssh/session/close", session.value?.sessionId],
+    ].filter((pair): pair is [string, string] => typeof pair[1] === "string" && !!pair[1]);
+    await Promise.allSettled(ownedSessions.map(([method, sessionId]) => window.dbxPlugin.notify(method, { sessionId })));
+    localSession.value = null;
+    session.value = undefined;
+  });
+}
+
 // "Close" on a restored shell: there is no session to close — fall into the same disconnected state as an SSH restored tab
 // (no connection replay, spec §7.6) and the exit overlay steps aside.
 function dismissRestoredLocalShell() {
