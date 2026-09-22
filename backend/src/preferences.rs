@@ -12,7 +12,7 @@ const STORAGE_VERSION: u64 = 1;
 const FILE_NAME: &str = "preferences.json";
 /// Bounded so a broken renderer cannot grow the file without limit.
 const MAX_DOWNLOAD_DIR_LEN: usize = 512;
-/// 时间戳格式串上限（前端 terminalGutter.ts 的 GUTTER_TIMESTAMP_FORMAT_MAX 同界）。
+
 const MAX_TIMESTAMP_FORMAT_LEN: usize = 64;
 
 pub fn store_path(data_dir: &Path) -> std::path::PathBuf {
@@ -37,6 +37,19 @@ fn sanitize_conflict_policy(value: &Value) -> Option<&'static str> {
         "ask" => Some("ask"),
         "overwrite" => Some("overwrite"),
         _ => None,
+    }
+}
+
+/// 数值偏好钳制：非负整数夹进 [min, max]，超界取边界、非法取 fallback。
+fn sanitize_u64_clamped(value: &Value, min: u64, max: u64, fallback: u64) -> u64 {
+    let raw = match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    match raw {
+        Some(value) => value.clamp(min, max),
+        None => fallback,
     }
 }
 
@@ -70,17 +83,6 @@ fn sanitize_timestamp_format(value: &Value) -> Option<String> {
     } else {
         cleaned
     })
-/// 数值偏好钳制：非负整数夹进 [min, max]，超界取边界、非法取 fallback。
-fn sanitize_u64_clamped(value: &Value, min: u64, max: u64, fallback: u64) -> u64 {
-    let raw = match value {
-        Value::Number(number) => number.as_u64(),
-        Value::String(text) => text.trim().parse::<u64>().ok(),
-        _ => None,
-    };
-    match raw {
-        Some(value) => value.clamp(min, max),
-        None => fallback,
-    }
 }
 
 /// Reads the raw preferences map; a missing or corrupted file yields an empty
@@ -125,32 +127,6 @@ pub fn load_preferences(data_dir: &Path) -> Value {
             Value::Bool(integration),
         );
     }
-    if let Some(enabled) = map.get("action_links_enabled").and_then(Value::as_bool) {
-        prefs.insert("action_links_enabled".to_string(), Value::Bool(enabled));
-    }
-    if let Some(matchers) = map
-        .get("action_links_matchers")
-        .and_then(sanitize_action_links_matchers)
-    {
-        prefs.insert("action_links_matchers".to_string(), matchers);
-    }
-    if let Some(line_numbers) = map.get("terminal_show_line_numbers").and_then(Value::as_bool) {
-        prefs.insert(
-            "terminal_show_line_numbers".to_string(),
-            Value::Bool(line_numbers),
-        );
-    }
-    if let Some(timestamps) = map.get("terminal_show_timestamps").and_then(Value::as_bool) {
-        prefs.insert(
-            "terminal_show_timestamps".to_string(),
-            Value::Bool(timestamps),
-        );
-    }
-    if let Some(format) = map
-        .get("terminal_timestamp_format")
-        .and_then(sanitize_timestamp_format)
-    {
-        prefs.insert("terminal_timestamp_format".to_string(), Value::String(format));
     // 上传并发（1..=10，默认 3）与重复目标策略（P1-5）。
     if map.contains_key("transfer_concurrency") {
         let concurrency = sanitize_u64_clamped(&map["transfer_concurrency"], 1, 10, 3);
@@ -189,6 +165,40 @@ pub fn load_preferences(data_dir: &Path) -> Value {
             Value::from(max_chars),
         );
     }
+    if let Some(enabled) = map.get("action_links_enabled").and_then(Value::as_bool) {
+        prefs.insert("action_links_enabled".to_string(), Value::Bool(enabled));
+    }
+    if let Some(matchers) = map
+        .get("action_links_matchers")
+        .and_then(sanitize_action_links_matchers)
+    {
+        prefs.insert("action_links_matchers".to_string(), matchers);
+    }
+    if let Some(line_numbers) = map
+        .get("terminal_show_line_numbers")
+        .and_then(Value::as_bool)
+    {
+        prefs.insert(
+            "terminal_show_line_numbers".to_string(),
+            Value::Bool(line_numbers),
+        );
+    }
+    if let Some(timestamps) = map.get("terminal_show_timestamps").and_then(Value::as_bool) {
+        prefs.insert(
+            "terminal_show_timestamps".to_string(),
+            Value::Bool(timestamps),
+        );
+    }
+    if let Some(format) = map
+        .get("terminal_timestamp_format")
+        .and_then(sanitize_timestamp_format)
+    {
+        prefs.insert(
+            "terminal_timestamp_format".to_string(),
+            Value::String(format),
+        );
+    }
+
     Value::Object(prefs)
 }
 
@@ -232,41 +242,6 @@ pub fn save_preferences(data_dir: &Path, params: &Value) -> Result<Value, String
             Value::Bool(integration),
         );
     }
-    if let Some(value) = params.get("action_links_enabled") {
-        let enabled = value
-            .as_bool()
-            .ok_or_else(|| "action_links_enabled must be a boolean".to_string())?;
-        map.insert("action_links_enabled".to_string(), Value::Bool(enabled));
-    }
-    if let Some(value) = params.get("action_links_matchers") {
-        let matchers = sanitize_action_links_matchers(value)
-            .ok_or_else(|| "action_links_matchers must be an object".to_string())?;
-        map.insert("action_links_matchers".to_string(), matchers);
-    }
-    if let Some(value) = params.get("terminal_show_line_numbers") {
-        let line_numbers = value
-            .as_bool()
-            .ok_or_else(|| "terminal_show_line_numbers must be a boolean".to_string())?;
-        map.insert(
-            "terminal_show_line_numbers".to_string(),
-            Value::Bool(line_numbers),
-        );
-    }
-    if let Some(value) = params.get("terminal_show_timestamps") {
-        let timestamps = value
-            .as_bool()
-            .ok_or_else(|| "terminal_show_timestamps must be a boolean".to_string())?;
-        map.insert(
-            "terminal_show_timestamps".to_string(),
-            Value::Bool(timestamps),
-        );
-    }
-    if let Some(value) = params.get("terminal_timestamp_format") {
-        let format = sanitize_timestamp_format(value)
-            .ok_or_else(|| "terminal_timestamp_format must be a string".to_string())?;
-        map.insert(
-            "terminal_timestamp_format".to_string(),
-            Value::String(format),
     // 上传并发/重复策略与命令建议键：数值一律钳制到合法区间（非法回落默认），
     // 不报错，保证旧前端/手改文件不会把偏好写入卡死。
     if params.get("transfer_concurrency").is_some() {
@@ -320,6 +295,44 @@ pub fn save_preferences(data_dir: &Path, params: &Value) -> Result<Value, String
             )),
         );
     }
+    if let Some(value) = params.get("action_links_enabled") {
+        let enabled = value
+            .as_bool()
+            .ok_or_else(|| "action_links_enabled must be a boolean".to_string())?;
+        map.insert("action_links_enabled".to_string(), Value::Bool(enabled));
+    }
+    if let Some(value) = params.get("action_links_matchers") {
+        let matchers = sanitize_action_links_matchers(value)
+            .ok_or_else(|| "action_links_matchers must be an object".to_string())?;
+        map.insert("action_links_matchers".to_string(), matchers);
+    }
+    if let Some(value) = params.get("terminal_show_line_numbers") {
+        let line_numbers = value
+            .as_bool()
+            .ok_or_else(|| "terminal_show_line_numbers must be a boolean".to_string())?;
+        map.insert(
+            "terminal_show_line_numbers".to_string(),
+            Value::Bool(line_numbers),
+        );
+    }
+    if let Some(value) = params.get("terminal_show_timestamps") {
+        let timestamps = value
+            .as_bool()
+            .ok_or_else(|| "terminal_show_timestamps must be a boolean".to_string())?;
+        map.insert(
+            "terminal_show_timestamps".to_string(),
+            Value::Bool(timestamps),
+        );
+    }
+    if let Some(value) = params.get("terminal_timestamp_format") {
+        let format = sanitize_timestamp_format(value)
+            .ok_or_else(|| "terminal_timestamp_format must be a string".to_string())?;
+        map.insert(
+            "terminal_timestamp_format".to_string(),
+            Value::String(format),
+        );
+    }
+
     let path = store_path(data_dir);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -399,6 +412,37 @@ mod tests {
     }
 
     #[test]
+    fn transfer_and_suggestion_prefs_clamp_and_roundtrip() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        save_preferences(
+            data_dir.path(),
+            &json!({
+                "transfer_concurrency": 99,
+                "transfer_duplicate_policy": "ask",
+                "history_suggestions_enabled": false,
+                "history_suggestion_min_chars": 0,
+                "history_suggestion_max_chars": 999,
+            }),
+        )
+        .expect("save");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(prefs["transfer_concurrency"], 10);
+        assert_eq!(prefs["transfer_duplicate_policy"], "ask");
+        assert_eq!(prefs["history_suggestions_enabled"], false);
+        assert_eq!(prefs["history_suggestion_min_chars"], 1);
+        assert_eq!(prefs["history_suggestion_max_chars"], 512);
+        // 非法策略名报错；缺省键不出现（前端按默认处理）。
+        let error = save_preferences(
+            data_dir.path(),
+            &json!({ "transfer_duplicate_policy": "clobber" }),
+        )
+        .expect_err("must reject");
+        assert!(error.contains("transfer_duplicate_policy"));
+        let fresh = tempfile::tempdir().expect("tempdir");
+        assert_eq!(load_preferences(fresh.path()), json!({}));
+    }
+
+    #[test]
     fn terminal_feature_prefs_roundtrip_with_defaults() {
         let data_dir = tempfile::tempdir().expect("tempdir");
         // 空偏好：五键都不出现（前端按缺省 = 功能全关处理）。
@@ -417,16 +461,6 @@ mod tests {
                 "terminal_show_line_numbers": true,
                 "terminal_show_timestamps": true,
                 "terminal_timestamp_format": "[HH:mm]",
-    fn transfer_and_suggestion_prefs_clamp_and_roundtrip() {
-        let data_dir = tempfile::tempdir().expect("tempdir");
-        save_preferences(
-            data_dir.path(),
-            &json!({
-                "transfer_concurrency": 99,
-                "transfer_duplicate_policy": "ask",
-                "history_suggestions_enabled": false,
-                "history_suggestion_min_chars": 0,
-                "history_suggestion_max_chars": 999,
             }),
         )
         .expect("save");
@@ -439,9 +473,21 @@ mod tests {
         assert_eq!(prefs["terminal_show_timestamps"], true);
         assert_eq!(prefs["terminal_timestamp_format"], "[HH:mm]");
         // 非法形状报错且不落盘污染；matchers 非对象拒绝。
-        assert!(save_preferences(data_dir.path(), &serde_json::json!({ "action_links_enabled": 1 })).is_err());
-        assert!(save_preferences(data_dir.path(), &serde_json::json!({ "action_links_matchers": "all" })).is_err());
-        assert!(save_preferences(data_dir.path(), &serde_json::json!({ "terminal_show_timestamps": "yes" })).is_err());
+        assert!(save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "action_links_enabled": 1 })
+        )
+        .is_err());
+        assert!(save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "action_links_matchers": "all" })
+        )
+        .is_err());
+        assert!(save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "terminal_show_timestamps": "yes" })
+        )
+        .is_err());
         // 格式串清洗：危险字符剔除、超长截断、清洗后为空回退默认。
         save_preferences(
             data_dir.path(),
@@ -451,23 +497,15 @@ mod tests {
         let prefs = load_preferences(data_dir.path());
         assert_eq!(prefs["terminal_timestamp_format"], "[HH:mm:ss]");
         let long = "Y".repeat(100);
-        save_preferences(data_dir.path(), &serde_json::json!({ "terminal_timestamp_format": long }))
-            .expect("save long");
-        let prefs = load_preferences(data_dir.path());
-        assert_eq!(prefs["terminal_timestamp_format"].as_str().unwrap().len(), 64);
-        assert_eq!(prefs["transfer_concurrency"], 10);
-        assert_eq!(prefs["transfer_duplicate_policy"], "ask");
-        assert_eq!(prefs["history_suggestions_enabled"], false);
-        assert_eq!(prefs["history_suggestion_min_chars"], 1);
-        assert_eq!(prefs["history_suggestion_max_chars"], 512);
-        // 非法策略名报错；缺省键不出现（前端按默认处理）。
-        let error = save_preferences(
+        save_preferences(
             data_dir.path(),
-            &json!({ "transfer_duplicate_policy": "clobber" }),
+            &serde_json::json!({ "terminal_timestamp_format": long }),
         )
-        .expect_err("must reject");
-        assert!(error.contains("transfer_duplicate_policy"));
-        let fresh = tempfile::tempdir().expect("tempdir");
-        assert_eq!(load_preferences(fresh.path()), json!({}));
+        .expect("save long");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(
+            prefs["terminal_timestamp_format"].as_str().unwrap().len(),
+            64
+        );
     }
 }
