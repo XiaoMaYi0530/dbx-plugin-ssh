@@ -87,12 +87,8 @@ import {
 import { Osc7DirectoryParser } from "./lib/terminalDirectoryTracking";
 import { handleOsc52ClipboardWrite, handleTerminalColorQuery } from "./lib/terminalOsc";
 import {
-  resolveTerminalKeyAction,
-  resolveTerminalRightClickAction,
   sanitizeSearchOptions,
-  sanitizeSelectCopyEnabled,
   isApplePlatform,
-  isTerminalSelectAllShortcut,
   TERMINAL_SEARCH_OPTIONS_KEY,
   terminalSearchSeedFromSelection,
   canAcceptTerminalDrop,
@@ -191,6 +187,39 @@ import { shouldCommitRename } from "./lib/sftpRename";
 import { folderDownloadOutcome, type FolderDownloadFinish } from "./lib/sftpFolderDownload";
 import { decideFileRowAction } from "./lib/fileRowKeydown";
 import { attachWebglRenderer, loadWebglEnabled, persistWebglEnabled, syncWebglRenderer, type WebglRecoveryOptions, type WebglRendererLike } from "./lib/terminalWebgl";
+import {
+  activeProfileId,
+  applySchemeToTerminalTheme,
+  CUSTOM_SCHEME_LIMIT,
+  CUSTOM_THEME_LIMIT,
+  loadTerminalAppearance,
+  persistTerminalAppearance,
+  sanitizeAppearanceSettings,
+  terminalOptionPatch,
+  terminalPaddingVars,
+  type TerminalAppearanceProfile,
+  type TerminalAppearanceSettings,
+  type TerminalAppearanceState,
+} from "./lib/terminalAppearance";
+import { schemeIdFromName, schemeTone, uniqueSchemeId, type TerminalColorScheme, type TerminalThemeLike } from "./lib/terminalScheme";
+import {
+  isLinkModifierSatisfied,
+  loadTerminalBehavior,
+  persistTerminalBehavior,
+  resolveRightClickBehavior,
+  sanitizeTerminalBehavior,
+  terminalBehaviorOptionPatch,
+  transformPasteText,
+  type TerminalBehaviorSettings,
+} from "./lib/terminalBehavior";
+import {
+  keyComboFromEvent,
+  loadTerminalHotkeys,
+  matchTerminalHotkey,
+  persistTerminalHotkeys,
+  sanitizeTerminalHotkeys,
+  type TerminalHotkeyBindings,
+} from "./lib/terminalHotkeys";
 import { cellFromMouseEvent, clickCursorArrows, resolveClickCursorMove } from "./lib/terminalClickCursor";
 import { bridgeBinaryBytes } from "../../shared/frontend/binaryEvent";
 import { applyTreeChildren, createTreeRoot, findTreeNode, markTreeStale, type DirTreeNode } from "./lib/sftpDirTree";
@@ -433,10 +462,11 @@ const downloadConflictState = ref<DownloadConflictPolicy>("rename");
 function sanitizeConflictPolicy(value: unknown): DownloadConflictPolicy {
   return value === "ask" || value === "overwrite" ? value : "rename";
 }
-// 终端交互：选中复制 + 右键粘贴（localStorage 全局偏好，默认开，"false" 关闭）。
-const SELECT_COPY_KEY = "ssh-terminal-select-copy";
+// Apple 平台判定（Cmd 为主修饰键）：既有的全选语义与新增的快捷键默认键位都要用，
+// 因此在此单点声明，供后面的偏好初始值与终端选项复用。
+const applePlatform = isApplePlatform();
 // 关键词高亮总开关（IMPL_PLAN_NETCATTY_PARITY §3-B1）：localStorage 全局持久化，
-// 默认开、仅显式 "false" 关（对齐 sanitizeSelectCopyEnabled 模式）；关闭时零挂钩子。
+// 默认开、仅显式 "false" 关；关闭时零挂钩子。
 const HIGHLIGHT_ENABLED_KEY = "ssh-keyword-highlight";
 // decoration 引擎护栏：全局在档 decoration 上限（超限停止本帧注册）。
 const HIGHLIGHT_DECORATION_LIMIT = 400;
@@ -507,8 +537,13 @@ const sftpSideCollapsed = ref(loadSftpSideCollapsed());
 const sftpTree = ref<DirTreeNode>(createTreeRoot("/", "/"));
 // sftp/home 探测结果：quick tab 置顶展示（获取失败时该项隐藏）。
 const sftpHomePath = ref("");
-// 选中复制 + 右键粘贴（终端交互偏好，全局生效，切换即持久化）。
-const termSelectCopy = ref(loadSelectCopyEnabled());
+// 终端行为偏好（对标 Tabby「Terminal」页）：右键语义、剪贴板、响铃、渲染细项，
+// 单键 localStorage 持久化；选中复制是其一个字段。
+const terminalBehavior = ref<TerminalBehaviorSettings>(loadTerminalBehavior());
+/** 选中复制（既有消费点：选区变更钩子与设置页开关）。 */
+const termSelectCopy = computed(() => terminalBehavior.value.copyOnSelect);
+// 终端快捷键绑定（对标 Tabby「Hotkeys」页）：平台默认 + 用户改写，单键持久化。
+const terminalHotkeys = ref<TerminalHotkeyBindings>(loadTerminalHotkeys(applePlatform));
 const followDirectory = ref(false);
 const directoryTrackingSupported = ref<boolean | undefined>();
 const visibleColumns = ref<SftpColumn[]>([...DEFAULT_VISIBLE_COLUMNS]);
@@ -744,6 +779,20 @@ const terminalFontSize = ref(appearance.value.terminal.fontSize);
 // setup 期读取安全：loadTerminalFontOverride 在函数体内 try（沙箱 opaque origin
 // 下「访问 window.localStorage 属性」本身抛错，见 lib/terminalFont.ts 说明）。
 const terminalFontOverride = ref<TerminalFontOverride>(loadTerminalFontOverride());
+// 终端外观偏好（对标 Tabby 的 Settings → Appearance）：配色方案两槽（随宿主
+// 亮暗自动切换）、底色策略、字体间距、光标形态与多套主题快照。默认态为
+// schemeSource: "host"，即不启用任何方案、行为与既有版本完全一致。
+//
+// 字体字段（font）不在此持久化状态里作为真相：权威态是 terminalFontOverride
+// （Ctrl+滚轮缩放也写它）。读取时用 terminalAppearanceState 覆盖合成，避免
+// 「缩放改过字号后主题仍高亮」这类双真相漂移。
+const terminalAppearance = ref<TerminalAppearanceState>(loadTerminalAppearance());
+const terminalAppearanceState = computed<TerminalAppearanceState>(() => ({
+  ...terminalAppearance.value,
+  font: { family: terminalFontOverride.value.fontFamily, size: terminalFontOverride.value.fontSize },
+}));
+// 当前配置命中的主题 id（null = 已改动，不再等于任何预设/我的主题）。
+const activeAppearanceThemeId = computed(() => activeProfileId(terminalAppearanceState.value));
 // 设置弹窗（独立组件 SettingsDialog）：实例 ref 用于 Esc 内联分层消费与
 // 下载草稿回填；下载偏好权威态在本组件，经适配器交给组件读写。
 const settingsDialog = ref<InstanceType<typeof SettingsDialog>>();
@@ -863,6 +912,19 @@ let resizeObserver: ResizeObserver | undefined;
 let disposeInput: { dispose(): void } | undefined;
 let disposeWebkitInputFallback: (() => void) | undefined;
 let disposeSelectionCopy: { dispose(): void } | undefined;
+let disposeTerminalBell: { dispose(): void } | undefined;
+/** 视觉响铃高亮时长（对标 Tabby bell: visual 的一次闪烁）。 */
+const TERMINAL_BELL_FLASH_MS = 150;
+/** 连响时先摘类、下一帧再加回，否则浏览器认为动画仍在播放不会重播。 */
+const TERMINAL_BELL_RETRIGGER_MS = 0;
+/** 听觉响铃的合成参数：短促一声 A5 正弦音，音量取保守值避免惊吓。 */
+const TERMINAL_BELL_FREQUENCY_HZ = 880;
+const TERMINAL_BELL_GAIN = 0.08;
+const TERMINAL_BELL_DURATION_S = 0.15;
+/** 响铃视觉提示的短暂高亮（xterm 6.x 无 bellStyle，须自行实现）。 */
+const terminalBellFlash = ref(false);
+let terminalBellFlashTimer = 0;
+let bellAudioContext: AudioContext | undefined;
 let unsubscribeEvent: (() => void) | undefined;
 let unsubscribeBinary: (() => void) | undefined;
 let unsubscribeAppearance: (() => void) | undefined;
@@ -1277,7 +1339,9 @@ function showError(cause: unknown, target: "terminal" | "sftp" = "sftp", retry?:
   }
 }
 
-function terminalTheme() {
+// 宿主派生的终端主题（未启用配色方案时的最终结果）：DBX 面板色 + 内置 16 色
+// ANSI。作为「跟随宿主」基底，也是设置页预览的基准。
+function hostTerminalTheme(): TerminalThemeLike {
   const colors = appearance.value.colors;
   return {
     background: colors.background,
@@ -1287,6 +1351,151 @@ function terminalTheme() {
     selectionBackground: appearance.value.colorScheme === "dark" ? "#5f6f8a88" : "#93b4e088",
     ...TERMINAL_ANSI[appearance.value.colorScheme],
   };
+}
+
+// 实际生效的主题：宿主基底 + 用户选定方案（未启用方案时原样返回基底）。
+function terminalTheme(): TerminalThemeLike {
+  return applySchemeToTerminalTheme(
+    hostTerminalTheme(),
+    terminalAppearance.value.settings,
+    terminalAppearance.value.customSchemes,
+    appearance.value.colorScheme,
+  );
+}
+
+// 终端内边距经 CSS 变量下发（style.css 的 .terminal-host .xterm 读取）；
+// 未设置的方向删变量，回落内置值（左 10 / 右 0 / 上 5 / 下 8）。
+function applyTerminalPaddingVars() {
+  const root = document.documentElement;
+  const padding = terminalPaddingVars(terminalAppearance.value.settings);
+  const entries: Array<[string, string | null]> = [
+    ["--ssh-terminal-padding-left", padding.left],
+    ["--ssh-terminal-padding-right", padding.right],
+    ["--ssh-terminal-padding-top", padding.top],
+    ["--ssh-terminal-padding-bottom", padding.bottom],
+  ];
+  for (const [name, value] of entries) {
+    if (value === null) root.style.removeProperty(name);
+    else root.style.setProperty(name, value);
+  }
+}
+
+/**
+ * 外观改动落地：CSS 变量 + xterm 选项 + 主题 + OSC 颜色应答重挂。
+ * 行高/字间距/内边距都会改变单元格尺寸，末尾必须 scheduleFit 重算行列。
+ */
+function applyTerminalAppearance() {
+  applyTerminalPaddingVars();
+  const theme = terminalTheme();
+  document.documentElement.style.setProperty("--ssh-terminal-background", theme.background);
+  if (!terminal) return;
+  const patch = terminalOptionPatch(terminalAppearance.value.settings);
+  terminal.options.fontWeight = patch.fontWeight;
+  terminal.options.fontWeightBold = patch.fontWeightBold;
+  terminal.options.lineHeight = patch.lineHeight;
+  terminal.options.letterSpacing = patch.letterSpacing;
+  terminal.options.cursorStyle = patch.cursorStyle;
+  terminal.options.cursorBlink = patch.cursorBlink;
+  terminal.options.cursorInactiveStyle = patch.cursorInactiveStyle;
+  terminal.options.drawBoldTextInBrightColors = patch.drawBoldTextInBrightColors;
+  terminal.options.minimumContrastRatio = patch.minimumContrastRatio;
+  terminal.options.theme = theme;
+  // 10/11 应答闭包捕获注册时的颜色值：配色切换后重挂，查询才返回新颜色。
+  registerOscColorQueryHandlers();
+  scheduleFit();
+}
+
+/** 外观设置局部更新（设置页控件）：归一化 → 持久化 → 即时应用。 */
+function updateTerminalAppearance(patch: Partial<TerminalAppearanceSettings>) {
+  terminalAppearance.value = {
+    ...terminalAppearance.value,
+    settings: sanitizeAppearanceSettings({ ...terminalAppearance.value.settings, ...patch }),
+  };
+  persistTerminalAppearance(terminalAppearance.value);
+  applyTerminalAppearance();
+}
+
+/** 套用主题快照：设置 + 字体一起落地（字体走既有 terminalFont 键与链路）。 */
+function applyTerminalAppearanceTheme(theme: TerminalAppearanceProfile) {
+  terminalAppearance.value = { ...terminalAppearance.value, settings: sanitizeAppearanceSettings(theme.settings) };
+  persistTerminalAppearance(terminalAppearance.value);
+  // 主题里的字体为 null 表示「跟随宿主」：把字号键一起清掉（null），否则
+  // 快照与实际态不一致、主题永远无法高亮。
+  setTerminalFont(theme.font.family, theme.font.size);
+  applyTerminalAppearance();
+  showNotice(t("terminalAppearance.themeApplied", { name: t(theme.name) }));
+}
+
+/** 保存当前配置为「我的主题」（字体取缩放链路当前的覆盖态）。 */
+function saveTerminalAppearanceTheme(name: string) {
+  const theme: TerminalAppearanceProfile = {
+    id: uniqueSchemeId(schemeIdFromName(name), terminalAppearance.value.customThemes.map((item) => item.id)),
+    name,
+    builtin: false,
+    settings: sanitizeAppearanceSettings(terminalAppearance.value.settings),
+    font: { family: terminalFontOverride.value.fontFamily, size: terminalFontOverride.value.fontSize },
+  };
+  const customThemes = [...terminalAppearance.value.customThemes, theme].slice(-CUSTOM_THEME_LIMIT);
+  terminalAppearance.value = { ...terminalAppearance.value, customThemes };
+  persistTerminalAppearance(terminalAppearance.value);
+  showNotice(t("terminalAppearance.themeSaved", { name }));
+}
+
+function deleteTerminalAppearanceTheme(id: string) {
+  terminalAppearance.value = {
+    ...terminalAppearance.value,
+    customThemes: terminalAppearance.value.customThemes.filter((theme) => theme.id !== id),
+  };
+  persistTerminalAppearance(terminalAppearance.value);
+}
+
+/**
+ * 导入外部配色方案（Tabby/iTerm2/Windows Terminal/Xresources）：
+ * 分配唯一 id、落盘；单个方案或首个方案按自身亮暗挂到对应槽位并切到
+ * 「使用配色方案」——导入的意图通常就是立刻用上，否则用户还要再点一次。
+ */
+function addImportedSchemes(schemes: Array<Omit<TerminalColorScheme, "id" | "source">>) {
+  const existing = terminalAppearance.value.customSchemes;
+  const taken = existing.map((scheme) => scheme.id);
+  const added: TerminalColorScheme[] = [];
+  for (const item of schemes) {
+    if (existing.length + added.length >= CUSTOM_SCHEME_LIMIT) break;
+    const id = uniqueSchemeId(schemeIdFromName(item.name), taken);
+    taken.push(id);
+    added.push({ ...item, id, source: "custom" });
+  }
+  if (!added.length) {
+    showNotice(t("terminalAppearance.importEmpty"));
+    return;
+  }
+  const first = added[0];
+  const slot = schemeTone(first) === "light" ? "lightSchemeId" : "darkSchemeId";
+  terminalAppearance.value = {
+    ...terminalAppearance.value,
+    customSchemes: [...existing, ...added],
+    settings: sanitizeAppearanceSettings({ ...terminalAppearance.value.settings, schemeSource: "custom", [slot]: first.id }),
+  };
+  persistTerminalAppearance(terminalAppearance.value);
+  applyTerminalAppearance();
+  showNotice(t("terminalAppearance.importImported", { count: added.length }));
+}
+
+/** 删除自定义方案：同时清掉引用它的槽位，避免持久化悬空 id。 */
+function removeImportedScheme(id: string) {
+  const scheme = terminalAppearance.value.customSchemes.find((item) => item.id === id);
+  const settings = terminalAppearance.value.settings;
+  terminalAppearance.value = {
+    ...terminalAppearance.value,
+    customSchemes: terminalAppearance.value.customSchemes.filter((item) => item.id !== id),
+    settings: sanitizeAppearanceSettings({
+      ...settings,
+      darkSchemeId: settings.darkSchemeId === id ? null : settings.darkSchemeId,
+      lightSchemeId: settings.lightSchemeId === id ? null : settings.lightSchemeId,
+    }),
+  };
+  persistTerminalAppearance(terminalAppearance.value);
+  applyTerminalAppearance();
+  if (scheme) showNotice(t("terminalAppearance.schemeRemoved", { name: scheme.name }));
 }
 
 function applyAppearance(next: DbxPluginAppearanceInput) {
@@ -1305,13 +1514,11 @@ function applyAppearance(next: DbxPluginAppearanceInput) {
   root.style.setProperty("--border", resolved.colors.border);
   root.style.setProperty("--destructive", resolved.colors.destructive);
   root.style.setProperty("--popover", DBX_POPOVER[resolved.colorScheme]);
-  root.style.setProperty("--ssh-terminal-background", resolved.colors.background);
+  // 终端底色：启用配色方案且背景来源为「方案」时取方案底色，否则宿主面板色。
+  root.style.setProperty("--ssh-terminal-background", terminalTheme().background);
   followHostFonts(resolved);
+  applyTerminalAppearance();
   if (terminal) {
-    terminal.options.theme = terminalTheme();
-    // 10/11 应答闭包捕获注册时的颜色值：主题切换后重挂，查询才能返回新主题色
-    //（对标 electerm 的 registerTerminalColorQueryHandlers 语义）。
-    registerOscColorQueryHandlers();
     // 宿主下发的字体大小即缩放基准；外观切换后回到基准值，
     // 但用户单独调过的字号（issue #31 持久化覆盖）优先于宿主基准。
     terminalFontSize.value = terminalFontOverride.value.fontSize ?? resolved.terminal.fontSize;
@@ -1329,13 +1536,15 @@ function registerOscColorQueryHandlers() {
   oscColorQueryDisposables = [];
   if (!terminal) return;
   const term = terminal;
-  const colors = appearance.value.colors;
+  // 应答当前「生效」主题的前景/背景（宿主基底已被配色方案覆盖时返回方案色），
+  // 否则 vim/tmux 会按宿主色板渲染，与屏幕实际底色不一致。
+  const theme = terminalTheme();
   oscColorQueryDisposables.push(
     term.parser.registerOscHandler(10, (data) =>
-      handleTerminalColorQuery(term, 10, colors.foreground, OSC_COLOR_FALLBACK.foreground, data),
+      handleTerminalColorQuery(term, 10, theme.foreground, OSC_COLOR_FALLBACK.foreground, data),
     ),
     term.parser.registerOscHandler(11, (data) =>
-      handleTerminalColorQuery(term, 11, colors.background, OSC_COLOR_FALLBACK.background, data),
+      handleTerminalColorQuery(term, 11, theme.background, OSC_COLOR_FALLBACK.background, data),
     ),
   );
 }
@@ -1383,16 +1592,30 @@ function createTerminal() {
     fontFamily: hostTerminalFontFamily(appearance.value),
     fontSize: appearance.value.terminal.fontSize,
   });
+  const optionPatch = terminalOptionPatch(terminalAppearance.value.settings);
   terminalFontSize.value = font.fontSize;
+  const behaviorPatch = terminalBehaviorOptionPatch(terminalBehavior.value);
   terminal = new Terminal({
     convertEol: false,
-    cursorBlink: true,
-    // 细竖线光标（bar）：块状光标在宽字距下显得笨重，竖线更接近常规输入框观感。
-    cursorStyle: "bar",
+    cursorBlink: optionPatch.cursorBlink,
+    // 默认细竖线（bar）：块状光标在宽字距下显得笨重，竖线更接近常规输入框观感。
+    // 具体形态由外观设置覆盖（样式/闪烁/失焦态三档）。
+    cursorStyle: optionPatch.cursorStyle,
+    cursorInactiveStyle: optionPatch.cursorInactiveStyle,
     fontFamily: font.fontFamily,
     fontSize: font.fontSize,
-    lineHeight: 1.15,
-    scrollback: 25_000,
+    fontWeight: optionPatch.fontWeight,
+    fontWeightBold: optionPatch.fontWeightBold,
+    lineHeight: optionPatch.lineHeight,
+    letterSpacing: optionPatch.letterSpacing,
+    drawBoldTextInBrightColors: optionPatch.drawBoldTextInBrightColors,
+    minimumContrastRatio: optionPatch.minimumContrastRatio,
+    // 行为类选项（对标 Tabby「Terminal」页）：回滚行数默认与既有硬编码一致。
+    scrollback: behaviorPatch.scrollback,
+    scrollOnUserInput: behaviorPatch.scrollOnUserInput,
+    wordSeparator: behaviorPatch.wordSeparator,
+    ignoreBracketedPasteMode: behaviorPatch.ignoreBracketedPasteMode,
+    macOptionIsMeta: behaviorPatch.macOptionIsMeta,
     // SearchAddon 的 highlight decorations 走 proposed API，缺这一项会在
     // findNext/registerDecoration 时直接抛 "allowProposedApi option"。
     allowProposedApi: true,
@@ -1402,7 +1625,9 @@ function createTerminal() {
   searchAddon = new SearchAddon();
   terminal.loadAddon(fitAddon);
   terminal.loadAddon(searchAddon);
-  terminal.loadAddon(new WebLinksAddon());
+  // 链接点击处理器自持：既做「需按住修饰键才可点」的门禁，也复刻 addon 默认的
+  // 反制反向标签劫持（开空白窗 → 清 opener → 导航），不给安全打折扣。
+  terminal.loadAddon(new WebLinksAddon(openTerminalLink));
   terminal.open(terminalHost.value);
   // 对标 electerm 的终端体验增强（须在 open 之后挂载）：
   // - Unicode 11 宽度表：emoji/新版 CJK 符号按两列计宽，旧宽度表会错位对齐；
@@ -1450,6 +1675,9 @@ function createTerminal() {
     if (!termSelectCopy.value || !terminal?.hasSelection()) return;
     void writeClipboardText(terminal.getSelection(), clipboardDeps()).catch(() => undefined);
   });
+  // 终端响铃（对标 Tabby「Terminal → Sound」）：xterm 6.x 移除了 bellStyle，
+  // 只在每次响铃时抛 onBell，因此「关闭 / 视觉 / 听觉」三态只能由这里自行实现。
+  disposeTerminalBell = terminal.onBell(handleTerminalBell);
   // 捕获阶段的 paste 监听：拦截 Ctrl+V 之外的所有粘贴路径（浏览器右键菜单等），
   // 统一走风险确认后再写入终端。
   terminalPasteHandler = (event) => interceptTerminalPaste(event);
@@ -1477,11 +1705,15 @@ function setWebglEnabled(next: boolean) {
   webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon(), webglRecoveryOptions());
 }
 
-// Apple 平台用 Cmd+A 直选全选，其余平台 Ctrl+Shift+A（isTerminalSelectAllShortcut）。
-const applePlatform = isApplePlatform();
-
+/**
+ * 终端快捷键派发（对标 Tabby「Hotkeys」页）：先由 lib 侧把事件折算成规范组合串
+ * （基于 event.code，Shift 恒保留为修饰键，故 Ctrl+= 与 Ctrl+Shift+= 不会塌成一个），
+ * 再到用户可改写的注册表里查动作。lib 只做纯解析与匹配，命令执行留在 App。
+ *
+ * 默认表刻意不绑裸 Ctrl+A / Ctrl+C / Ctrl+F：这些要留给远端 shell 的
+ * readline 与 SIGINT，只有 macOS 的 Cmd 系列、以及其余平台的 Ctrl+Shift 系列被占用。
+ */
 function handleTerminalKey(event: KeyboardEvent) {
-  const mod = event.ctrlKey || event.metaKey;
   if (event.type !== "keydown") return true;
   // xterm 的 false 只跳过终端处理，不会取消浏览器默认动作或冒泡。
   const consume = () => {
@@ -1489,42 +1721,140 @@ function handleTerminalKey(event: KeyboardEvent) {
     event.stopPropagation();
     return false;
   };
-  if (mod && (event.key === "f" || event.key === "F")) {
-    openTerminalSearch();
-    return consume();
-  }
-  if (mod && event.key === "0") {
-    resetTerminalZoom();
-    return consume();
-  }
-  // 全选（electerm/iTerm2 同款）：Apple 平台 Cmd+A、其余 Ctrl+Shift+A；
-  // 裸 Ctrl+A 不拦截，保持发给远端 readline 跳行首。
-  if (isTerminalSelectAllShortcut({ mod, shiftKey: event.shiftKey, metaKey: event.metaKey, key: event.key, applePlatform })) {
-    selectAllTerminal();
-    terminal?.focus();
-    return consume();
-  }
+  // 搜索框已打开时 Esc 先关面板，不参与快捷键匹配（关闭键不可改写）。
   if (event.key === "Escape" && searchOpen.value) {
     closeTerminalSearch();
     return consume();
   }
-  // Windows Terminal/iTerm2 风格组合键：Ctrl/Cmd+V 与 Ctrl/Cmd+Shift+V 粘贴，
-  // Ctrl/Cmd+C 有选区时复制、无选区时保持发给远端（SIGINT）。
-  const keyAction = resolveTerminalKeyAction({ mod, shiftKey: event.shiftKey, key: event.key, hasSelection: terminal?.hasSelection() ?? false });
-  if (keyAction === "paste") {
-    // 不取消默认动作：放行浏览器原生 paste 事件（自带真实 clipboardData，
-    // 沙箱 iframe 中无需剪贴板读权限），由 terminalHost 的 capture 拦截器
-    // 统一走风险确认。stopPropagation 挡住宿主/文档级快捷键；返回 false
-    // 让 xterm 跳过该键，否则 Ctrl+V 会先作为 ^V 字符发给远端。
-    event.stopPropagation();
-    return false;
+  const combo = keyComboFromEvent(event);
+  if (!combo) return true;
+  switch (matchTerminalHotkey(terminalHotkeys.value, combo)) {
+    case "search":
+      openTerminalSearch();
+      return consume();
+    case "copy":
+      // 无选区时不消费：裸 Ctrl+C 仍要作为 SIGINT 发给远端。
+      if (!terminal?.hasSelection()) return true;
+      void copyTerminalSelection();
+      return consume();
+    case "paste":
+      // 不取消默认动作：放行浏览器原生 paste 事件（自带真实 clipboardData，
+      // 沙箱 iframe 中无需剪贴板读权限），由 terminalHost 的 capture 拦截器
+      // 统一走风险确认。stopPropagation 挡住宿主/文档级快捷键；返回 false
+      // 让 xterm 跳过该键，否则 Ctrl+V 会先作为 ^V 字符发给远端。
+      event.stopPropagation();
+      return false;
+    case "select-all":
+      selectAllTerminal();
+      return consume();
+    case "clear":
+      clearTerminal();
+      return consume();
+    case "zoom-in":
+      adjustTerminalZoom(1);
+      return consume();
+    case "zoom-out":
+      adjustTerminalZoom(-1);
+      return consume();
+    case "reset-zoom":
+      resetTerminalZoom();
+      return consume();
+    case "scroll-to-top":
+      terminal?.scrollToTop();
+      return consume();
+    case "scroll-to-bottom":
+      terminal?.scrollToBottom();
+      return consume();
+    default:
+      return true;
   }
-  if (keyAction === "copy") {
-    void copyTerminalSelection();
-    return consume();
-  }
-  return true;
 }
+
+/**
+ * 终端响铃（对标 Tabby「Terminal → Sound」）：xterm 6.x 只抛 onBell、
+ * 不再有 bellStyle，「视觉 / 听觉」两态在这里按设置自行实现。
+ */
+function handleTerminalBell() {
+  if (terminalBehavior.value.bell === "visual") flashTerminalBell();
+  else if (terminalBehavior.value.bell === "audible") playTerminalBell();
+}
+
+/**
+ * 视觉响铃：给终端区域加一个短暂高亮类。先摘掉类、下一帧再加回，否则连续
+ * 响铃时浏览器认为动画已在播放，不会重新触发。
+ */
+function flashTerminalBell() {
+  window.clearTimeout(terminalBellFlashTimer);
+  terminalBellFlash.value = false;
+  terminalBellFlashTimer = window.setTimeout(() => {
+    terminalBellFlash.value = true;
+    terminalBellFlashTimer = window.setTimeout(() => {
+      terminalBellFlash.value = false;
+    }, TERMINAL_BELL_FLASH_MS);
+  }, TERMINAL_BELL_RETRIGGER_MS);
+}
+
+/**
+ * 听觉响铃：不引入音频资源（仓库规则禁止新增运行时依赖，二进制资源也无必要），
+ * 用 WebAudio 现场合成一声短促正弦提示音。AudioContext 懒建并复用。沙箱可能
+ * 直接拒绝构造，或自动播放策略让声音静默挂起；两种情况下都退化为视觉闪动，
+ * 保证响铃至少有可见反馈，不抛错打断终端。
+ */
+function playTerminalBell() {
+  try {
+    bellAudioContext ??= new AudioContext();
+    const context = bellAudioContext;
+    void context.resume();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.value = TERMINAL_BELL_FREQUENCY_HZ;
+    const startedAt = context.currentTime;
+    // 用指数包络避免方波式的爆音；起止值不能为 0（指数斜坡不接受 0）。
+    gain.gain.setValueAtTime(0.0001, startedAt);
+    gain.gain.exponentialRampToValueAtTime(TERMINAL_BELL_GAIN, startedAt + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startedAt + TERMINAL_BELL_DURATION_S);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start(startedAt);
+    oscillator.stop(startedAt + TERMINAL_BELL_DURATION_S);
+  } catch {
+    flashTerminalBell();
+  }
+}
+
+/**
+ * 链接点击（对标 Tabby「Mouse → Require a key to click links」）：链接修饰键未按下
+ * 时直接忽略，把点击还给下面的终端内容。
+ *
+ * 打开动作逐句复刻 addon 内置处理器（先开空窗拿句柄 → 清 opener → 改写 location），
+ * 只是多了上面这道修饰键闸门：清 opener 是防「反向标签劫持」的关键，不能省。
+ * 沙箱 iframe 未开 allow-popups 时 window.open 会返回 null，此时静默放弃。
+ */
+function openTerminalLink(event: MouseEvent, uri: string) {
+  if (!isLinkModifierSatisfied(terminalBehavior.value, event)) return;
+  const opened = window.open();
+  if (!opened) return;
+  try {
+    opened.opener = null;
+  } catch {
+    // Electron 等环境写入 opener 会抛错；与内置处理器同样忽略。
+  }
+  opened.location.href = uri;
+}
+
+/**
+ * 中键粘贴（对标 Tabby「Mouse → Paste on middle-click」，默认关闭）。
+ * 仅当设置开启时消费事件：默认放行，保持浏览器既有行为不变。
+ */
+function handleTerminalMiddleClick(event: MouseEvent) {
+  if (!terminalBehavior.value.pasteOnMiddleClick) return;
+  event.preventDefault();
+  terminalMenuOpen.value = false;
+  fileMenu.value = undefined;
+  void pasteTerminal();
+}
+
 
 function handleTerminalWheel(event: WheelEvent) {
   if (!(event.ctrlKey || event.metaKey)) return;
@@ -1566,20 +1896,34 @@ function adjustTerminalZoom(delta: number) {
 }
 
 function resetTerminalZoom() {
-  const base = appearance.value.terminal.fontSize;
+  // 主题可能自带字号（外观快照的 font.size）：复位回到「主题基准」，没有主题
+  // 或主题未指定字号时才回宿主基准（= 既有行为）。
+  const base = terminalAppearance.value.font.size ?? appearance.value.terminal.fontSize;
   if (terminalFontSize.value === base) return;
   applyTerminalFontSize(base);
 }
 
-// 缩放只动字号：同步内存覆盖态并经 lib 持久化（键与解析逻辑集中在 terminalFont.ts）。
-function applyTerminalFontSize(size: number) {
-  terminalFontSize.value = size;
-  terminalFontOverride.value = { ...terminalFontOverride.value, fontSize: size };
+/**
+ * 字体落地唯一入口：内存覆盖态 + terminalFont 两个键 + xterm 生效值。
+ * `size` 允许为 null（跟随宿主字号）——主题快照的「未指定」语义靠它表达，
+ * 若在此处把 null 折成宿主具体值，快照与实况就会永远不相等、主题无法高亮。
+ */
+function setTerminalFont(family: string | null, size: number | null) {
+  terminalFontOverride.value = { fontFamily: family, fontSize: size };
+  persistTerminalFontFamily(family);
+  persistTerminalFontSize(size);
+  const effectiveSize = size ?? appearance.value.terminal.fontSize;
+  terminalFontSize.value = effectiveSize;
   if (terminal) {
-    terminal.options.fontSize = size;
+    terminal.options.fontFamily = family ?? hostTerminalFontFamily(appearance.value);
+    terminal.options.fontSize = effectiveSize;
     scheduleFit();
   }
-  persistTerminalFontSize(size);
+}
+
+// 缩放只动字号：同步内存覆盖态并经 lib 持久化（键与解析逻辑集中在 terminalFont.ts）。
+function applyTerminalFontSize(size: number) {
+  setTerminalFont(terminalFontOverride.value.fontFamily, size);
   window.clearTimeout(zoomNoticeTimer);
   zoomNoticeTimer = window.setTimeout(() => showNotice(t("terminalZoom.fontSize", { size })), 500);
 }
@@ -1587,15 +1931,7 @@ function applyTerminalFontSize(size: number) {
 // 应用用户字体设置并持久化：family null = 恢复跟随宿主。立即生效并 toast 反馈。
 function applyTerminalFontSettings(family: string | null, size: number) {
   const followHost = family == null;
-  terminalFontOverride.value = { fontFamily: family, fontSize: size };
-  persistTerminalFontFamily(family);
-  persistTerminalFontSize(size);
-  terminalFontSize.value = size;
-  if (terminal) {
-    terminal.options.fontFamily = family ?? hostTerminalFontFamily(appearance.value);
-    terminal.options.fontSize = size;
-    scheduleFit();
-  }
+  setTerminalFont(family, size);
   showNotice(followHost ? t("terminalFont.resetDone") : t("terminalFont.applied", { size }));
 }
 
@@ -3818,14 +4154,6 @@ async function resolveDownloadConflictFor(dir: string, fileName: string): Promis
   }
 }
 
-function loadSelectCopyEnabled(): boolean {
-  try {
-    return sanitizeSelectCopyEnabled(window.localStorage.getItem(SELECT_COPY_KEY));
-  } catch {
-    return true;
-  }
-}
-
 // 侧栏形态偏好：localStorage 全局持久化（不可用时仅当前会话生效，默认 tree/展开）。
 function loadSftpSideTab(): "tree" | "quick" {
   try {
@@ -3863,15 +4191,38 @@ function setSftpSideCollapsed(collapsed: boolean) {
   persistSftpSideShape();
 }
 
-// 切换即生效并持久化（纯前端行为，不进连接级 ssh/settings）。
-function toggleSelectCopy() {
-  termSelectCopy.value = !termSelectCopy.value;
-  try {
-    window.localStorage.setItem(SELECT_COPY_KEY, termSelectCopy.value ? "true" : "false");
-  } catch {
-    // localStorage 不可用时偏好仅对当前会话生效。
+/**
+ * 终端行为落地：把行为偏好写进 xterm 选项。字体/行高/字间距等外观项不在此处
+ * （见 applyTerminalAppearance），这里只管行为类选项。
+ */
+function applyTerminalBehavior() {
+  if (!terminal) return;
+  const patch = terminalBehaviorOptionPatch(terminalBehavior.value);
+  terminal.options.scrollback = patch.scrollback;
+  terminal.options.scrollOnUserInput = patch.scrollOnUserInput;
+  terminal.options.wordSeparator = patch.wordSeparator;
+  terminal.options.ignoreBracketedPasteMode = patch.ignoreBracketedPasteMode;
+  terminal.options.macOptionIsMeta = patch.macOptionIsMeta;
+}
+
+/** 行为设置局部更新（设置页控件）：归一化 → 持久化 → 即时生效。 */
+function updateTerminalBehavior(patch: Partial<TerminalBehaviorSettings>) {
+  const next = sanitizeTerminalBehavior({ ...terminalBehavior.value, ...patch });
+  const copyChanged = next.copyOnSelect !== terminalBehavior.value.copyOnSelect;
+  terminalBehavior.value = next;
+  persistTerminalBehavior(next);
+  applyTerminalBehavior();
+  // 选中复制沿用既有即时反馈文案。
+  if (copyChanged) {
+    showNotice(t(next.copyOnSelect ? "terminalSelectCopy.enabledNotice" : "terminalSelectCopy.disabledNotice"));
   }
-  showNotice(t(termSelectCopy.value ? "terminalSelectCopy.enabledNotice" : "terminalSelectCopy.disabledNotice"));
+}
+
+/** 快捷键绑定更新：归一化 → 持久化。派发每次按键实时读表，无需重挂钩子。 */
+function updateTerminalHotkeys(bindings: TerminalHotkeyBindings) {
+  const next = sanitizeTerminalHotkeys(bindings, applePlatform);
+  terminalHotkeys.value = next;
+  persistTerminalHotkeys(next);
 }
 
 function startDividerDrag(event: PointerEvent) {
@@ -5343,20 +5694,26 @@ function interceptTerminalPaste(event: ClipboardEvent) {
 }
 
 async function sendConfirmedPaste(text: string) {
-  if (!text) return;
-  const accepted = await confirmRiskyPaste(text);
+  // 粘贴文本变换的唯一收口：所有粘贴路径（原生 Ctrl+V、右键/菜单粘贴、中键粘贴）
+  // 都经这里，保证「去首尾空白 / 换行折空格」只实现一次、不会分叉。
+  // 默认两开关均为关闭，因此这里的默认行为与改动前逐字节一致。
+  const payload = transformPasteText(text, terminalBehavior.value);
+  if (!payload) return;
+  const accepted = await confirmRiskyPaste(payload);
   if (!accepted) {
     terminal?.focus();
     return;
   }
   if (!session.value || terminalTransferBusy.value) return;
-  trackPendingInput(text);
-  sendTerminalBytes(new TextEncoder().encode(text));
+  trackPendingInput(payload);
+  sendTerminalBytes(new TextEncoder().encode(payload));
   terminal?.focus();
 }
 
 function confirmRiskyPaste(text: string): Promise<boolean> {
-  const confirmation = buildPasteConfirmation(text);
+  // 多行/超长粘贴警告可关（对标 Tabby「Clipboard → Warn on multi-line paste」）；
+  // 危险命令（rm -rf 等）的确认是安全兜底，不受该开关约束，永远要确认。
+  const confirmation = buildPasteConfirmation(text, { warnOnMultiline: terminalBehavior.value.warnOnMultilinePaste });
   if (!confirmation.required) return Promise.resolve(true);
   return new Promise((resolve) => {
     pasteConfirmResolver = resolve;
@@ -6235,14 +6592,25 @@ async function openReplay(item: RecordingSummary) {
     replayPlaying.value = false;
     await nextTick();
     if (replayHost.value) {
-      // 回放终端跟随宿主外观（主题色/字体/字号），不再是默认纯黑 xterm。
+      // 回放终端跟随终端外观（配色/字体/字号/字重/行高/字间距），
+      // 不再是默认纯黑 xterm，也不与主终端产生字形差异。
+      const font = resolveTerminalFont(terminalFontOverride.value, {
+        fontFamily: hostTerminalFontFamily(appearance.value),
+        fontSize: appearance.value.terminal.fontSize,
+      });
+      const optionPatch = terminalOptionPatch(terminalAppearance.value.settings);
       replayTerminal = new Terminal({
         cols: 100,
         rows: 26,
         convertEol: false,
         theme: terminalTheme(),
-        fontFamily: hostTerminalFontFamily(appearance.value),
-        fontSize: appearance.value.terminal.fontSize,
+        fontFamily: font.fontFamily,
+        fontSize: font.fontSize,
+        fontWeight: optionPatch.fontWeight,
+        fontWeightBold: optionPatch.fontWeightBold,
+        lineHeight: optionPatch.lineHeight,
+        letterSpacing: optionPatch.letterSpacing,
+        drawBoldTextInBrightColors: optionPatch.drawBoldTextInBrightColors,
       });
       replayTerminal.open(replayHost.value);
       // 与主终端同用 Unicode 11 宽度表：emoji/宽字符行在回放里保持相同折行。
@@ -6340,7 +6708,25 @@ async function exportRecordingGif(summary: RecordingSummary, events: readonly Re
   document.body.appendChild(host);
   let term: Terminal | null = null;
   try {
-    term = new Terminal({ cols: COLS, rows: ROWS });
+    // 离屏终端与主终端同款外观（配色/字体/字重/行高）：导出的 GIF 必须和用户
+    // 屏幕上看到的一致，否则「导出」就失去意义。
+    const exportFont = resolveTerminalFont(terminalFontOverride.value, {
+      fontFamily: hostTerminalFontFamily(appearance.value),
+      fontSize: appearance.value.terminal.fontSize,
+    });
+    const exportPatch = terminalOptionPatch(terminalAppearance.value.settings);
+    term = new Terminal({
+      cols: COLS,
+      rows: ROWS,
+      theme: terminalTheme(),
+      fontFamily: exportFont.fontFamily,
+      fontSize: exportFont.fontSize,
+      fontWeight: exportPatch.fontWeight,
+      fontWeightBold: exportPatch.fontWeightBold,
+      lineHeight: exportPatch.lineHeight,
+      letterSpacing: exportPatch.letterSpacing,
+      drawBoldTextInBrightColors: exportPatch.drawBoldTextInBrightColors,
+    });
     term.open(host);
     // xterm 6 移除了 canvas 渲染器：DOM 渲染器不产出 canvas，逐帧取像素必须
     // 挂 WebGL renderer。两个此前就存在的坑在此一并修掉：screenElement 下第
@@ -6601,18 +6987,25 @@ function onZmodemInput(event: Event) {
 }
 
 function showTerminalMenu(event: MouseEvent) {
-  // 选中复制模式下右键直接粘贴；Shift+右键（或关闭该模式）保留完整菜单。
-  // 粘贴分支必须 preventDefault：reka 触发器据此跳过开菜单（同时也压住系统菜单）；
-  // 菜单分支不能 preventDefault，否则 reka ContextMenuTrigger 不会打开。
-  if (resolveTerminalRightClickAction({ selectCopy: termSelectCopy.value, shiftKey: event.shiftKey }) === "paste") {
-    event.preventDefault();
-    terminalMenuOpen.value = false;
+  // 右键四档（对标 Tabby「Mouse → Right click」）：off / menu / paste / clipboard。
+  // clipboard 档按有无选区决定复制还是粘贴；Shift+右键恒出菜单，是 off 与 paste
+  // 档下唯一回到菜单的逃生口（与既有行为一致）。
+  // preventDefault 只给非菜单分支：reka 触发器据此跳过开菜单（同时也压住系统菜单）；
+  // 菜单分支一旦 preventDefault，ContextMenuTrigger 自己就打不开了。
+  const target = resolveRightClickBehavior(terminalBehavior.value, {
+    hasSelection: terminal?.hasSelection() ?? false,
+    shiftKey: event.shiftKey,
+  });
+  if (target === "menu") {
+    terminalMenuOpen.value = true;
     fileMenu.value = undefined;
-    void pasteTerminal();
     return;
   }
-  terminalMenuOpen.value = true;
+  event.preventDefault();
+  terminalMenuOpen.value = false;
   fileMenu.value = undefined;
+  if (target === "paste") void pasteTerminal();
+  else if (target === "copy") void copyTerminalSelection();
 }
 
 function showFileMenu(event: MouseEvent, entry: SftpEntry) {
@@ -7000,6 +7393,9 @@ async function initialize() {
   locale.value = api.locale || "zh-CN";
   restoreUiState();
   const appearanceAppliedAtBoot = Boolean(api.appearance || api.theme);
+  // 外观偏好的 CSS 部分（终端内边距变量）与宿主是否推送 appearance 无关，
+  // 开机先落一次，否则用户设了内边距要等下次主题推送才生效。
+  applyTerminalPaddingVars();
   if (api.appearance) applyAppearance(api.appearance);
   else if (isDbxPluginTheme(api.theme)) applyAppearance(themeToAppearance(api.theme));
   // 宿主可能在 init 前先应答 host.getContext（如重推连接期间 init 被延迟）：
@@ -7156,6 +7552,10 @@ onBeforeUnmount(() => {
   disposeWebkitInputFallback?.();
   disposeWebkitInputFallback = undefined;
   disposeSelectionCopy?.dispose();
+  disposeTerminalBell?.dispose();
+  disposeTerminalBell = undefined;
+  window.clearTimeout(terminalBellFlashTimer);
+  terminalBellFlash.value = false;
   terminalWriteThrottle.dispose();
   detachHighlightRender();
   terminal?.dispose();
@@ -7454,7 +7854,7 @@ onBeforeUnmount(() => {
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
       <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen }" :style="terminalBasis" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
-        <div ref="terminalHost" class="terminal-host" />
+        <div ref="terminalHost" class="terminal-host" :class="{ 'bell-flash': terminalBellFlash }" @mousedown.middle="handleTerminalMiddleClick" />
         <div v-if="terminalDragActive || (dragActive && !sftpPaneOpen)" class="drop-overlay"><FileUp /><strong>{{ t("terminalDrop.hint") }}</strong></div>
         <TerminalSearchPanel
           v-if="searchOpen"
@@ -8320,18 +8720,33 @@ onBeforeUnmount(() => {
       :session-id="session?.sessionId"
       :terminal-font-size="terminalFontSize"
       :host-font-size="appearance.terminal.fontSize"
+      :host-font-family="hostTerminalFontFamily(appearance)"
       :local-download-dir="localDownloadDir"
       :local-can-save="localCanSave"
       :webgl-enabled="webglEnabled"
-      :term-select-copy="termSelectCopy"
+      :terminal-behavior="terminalBehavior"
+      :terminal-hotkeys="terminalHotkeys"
+      :apple-platform="applePlatform"
+      :appearance="terminalAppearanceState"
+      :custom-themes="terminalAppearance.customThemes"
+      :active-theme-id="activeAppearanceThemeId"
+      :host-theme="hostTerminalTheme()"
+      :host-color-scheme="appearance.colorScheme"
       :download-prefs="downloadPrefsAdapter"
       :t="t"
       @notice="showNotice"
       @error="showError"
       @browse-download-dir="folderPickerTarget = 'settings'"
       @update:webgl="setWebglEnabled"
-      @toggle-select-copy="toggleSelectCopy"
+      @update-behavior="updateTerminalBehavior"
+      @update-hotkeys="updateTerminalHotkeys"
       @apply-font="(payload) => applyTerminalFontSettings(payload.family, payload.size)"
+      @update-appearance="updateTerminalAppearance"
+      @apply-theme="applyTerminalAppearanceTheme"
+      @save-theme="saveTerminalAppearanceTheme"
+      @delete-theme="deleteTerminalAppearanceTheme"
+      @add-schemes="addImportedSchemes"
+      @remove-scheme="removeImportedScheme"
     />
 
     <Dialog :open="auditOpen" @update:open="(open) => { if (!open) auditOpen = false; }">

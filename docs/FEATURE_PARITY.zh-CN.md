@@ -25,6 +25,7 @@ profile 分组、全局外观）不重复实现。
 | 连接信息面板（Host/Port/User/认证方式/只读/延迟） | 连接信息摘要 | ✅ 已有（App.vue `connection-info-popover`；`ssh/sessions/list` 行新增只读 `authMethod`（model.rs:46 `method_name()`、ssh.rs:599/609/1236/1249），延迟走既有 ssh/exec echo 探测，A-SSH） | — |
 | 终端字体缩放（Ctrl/⌘ 滚轮、复位、持久化） | batch3 工作包 A 第 3 条细化 | ✅ 已有（`frontend/src/lib/terminalZoom.ts` `clampFontSize` 绝对字号 [8,32] + App.vue A+/A− 按钮与 localStorage 持久化，A-SSH） | — |
 | 点击定位光标（iTerm2/kitty 风格）+ 细竖线光标 | iTerm2 Option+Click / kitty click-to-move | ✅ 已有（2026-09-09：`frontend/src/lib/terminalClickCursor.ts` 纯几何计算——同逻辑行内原地点击按字符差值代发左右方向键，宽字符 2 格记 1、折行跨行展开、备用屏/鼠标上报应用/trzsz·zmodem 占流一律不动作；光标 `cursorStyle: "bar"`。终端协议无直接落点能力，readline 只认按键，行外点击不动作防翻历史） | — |
+| **终端配色方案与多套主题**（Tabby 对标：192 内置配色 / 深浅双槽自动切换 / 字体·间距·光标·渲染细项 / 四格式方案导入 / 实时可视化预览） | Tabby `TerminalColorScheme` + `colorSchemeSelector` + `colorSchemePreview`；tabby-community-color-schemes（上游 iTerm2-Color-Schemes） | ✅ 已有（2026-09-22，`codex/ssh/terminal-themes` 分支）：见下文专节。**默认仍为「跟随宿主」，不改变既有观感**——只有用户显式选方案才覆盖 | — |
 | known_hosts 管理（list/remove，宿主侧文件） | ssh_service.go ListKnownHosts/RemoveKnownHost | ✅ 已有（第一批，实测通过） | — |
 | 主机密钥预检/接受/拒绝（profile 维度） | CheckHostKey/Accept/RejectHostKey | ✅ ssh/host-key/check（探针预检三态，真机验证）+ 挑战流程 | P1 完成 |
 | 本地 SSH 私钥发现（~/.ssh 扫描 + 指纹） | DiscoverKeys | ✅ 已有（第一批，实测通过）；2026-09-15 起另供 `keys/discover/options` 下拉形态（`{options:[{value,label}]}`），只出元数据不出密钥材料；2026-09-17 起 **label 即路径本身**（不再拼算法/指纹，避免下拉控件被撑长），算法与指纹保留在 `keys/discover` 返回值里 | P0 |
@@ -181,3 +182,325 @@ React 19 独立桌面 SSH 工作台）为参照的能力借鉴（实施计划
 | 会话录制回放 + GIF 导出 | ✅ 已有（同批新增） | `ssh/recording/*` 五方法：asciicast v2 `.cast` 落盘（会话关闭自动收尾）、`ssh/recording/get` 分页回放（xterm 重放、0.5–4× 倍速、进度条 seek）、GIF 导出（离屏 xterm 逐事件重放 + 500ms 抽帧 + 零依赖 GIF89a 编码器，封顶 120 帧）。iShell 的暂停/快进/水印/帧率质量参数未做 |
 | GPU 监控、大文件扫描、主机巡检报告 | ⏸ 未做（候选） | GPU 依赖远端 nvidia-smi 等工具可用性；大文件扫描与巡检报告维持"另有对标项"候选结论 |
 | 终端 WebGL GPU 加速渲染 | ✅ 已有（2026-09-13 落地） | `@xterm/addon-webgl`（0.18.0，配 xterm 5.5）：主终端默认挂 GPU renderer（localStorage 偏好 `ssh-terminal-webgl`，设置弹窗「终端渲染」开关即时切换）；WebGL 不可用（headless/无 context/驱动限制）构造即回退 DOM 渲染器，context loss（GPU 重置）自动 dispose 回退；回放弹窗与 GIF 导出的离屏终端刻意保持 2d canvas（导出依赖 drawImage 稳定路径、且浏览器 WebGL context 总数有限）。纯逻辑（偏好/挂载/回退/切换）独立模块 `terminalWebgl.ts` + 单测 7 |
+
+## Tabby 主题对标补充（2026-09-22，`codex/ssh/terminal-themes` 分支）
+
+以 [Tabby](https://github.com/Eugeny/tabby) 的终端外观体系为参照，把「配色方案 + 多套主题 +
+排版细项」按 Tabby 的语义模型迁移进插件工作台。**纯前端改动，后端零改动**（无新增协议方法，
+因此无新增 smoke 用例——见下方「验收口径」）。
+
+### 迁移来源与授权
+
+| 来源 | 内容 | 授权 |
+| --- | --- | --- |
+| `tabby-terminal/src/colorSchemes.ts` | Tabby Default / Tabby Default Light 两套出厂配色（`#171717`/`#cacaca`） | MIT |
+| `tabby-community-color-schemes/schemes/*` | 190 个 Xresources 配色文件 | MIT（上游 iTerm2-Color-Schemes，MIT） |
+
+共 **192 套内置配色**（2 出厂 + 190 社区）。上游 191 个文件中的 `Melange Dark` 只声明了
+1 个 ANSI 色（不足 16 色，Tabby 自身解析器同样会截断产出不完整方案），已跳过并在产物头部注明。
+配色表以**紧凑元组数组**（`readonly TerminalSchemeTuple[]`）落库而非 192 个对象字面量，
+目的是压住包体；同一份表由 `scripts/gen-terminal-schemes.py` 生成，**可重跑复现**：
+
+```bash
+python3 scripts/gen-terminal-schemes.py   # 重新扫描 Xresources → 覆写 terminalSchemeCatalog.ts
+```
+
+生成器刻意**复用 Tabby 自己的解析语义**：扫描 `#define` 变量表做值替换，按 `color0..color15`
+**顺序**收集并在第一个缺口处停止。TS 侧 `schemeIdFromName` 与生成器的 slug 规则逐字对齐
+（`[^a-z0-9]+` → `-`，去首尾 `-`，空则回落 `scheme`）——两边规则一旦漂移，导入去重就会失效。
+
+### 「不重复宿主」原则的守卫方式
+
+本仓库既有原则是「全局外观由宿主承担，插件不重复实现」（见文首与开发规范第 3 条）。
+本轮不改这条原则，而是把它做成**默认态**：
+
+- `schemeSource` 默认 `"host"`。此时 `applySchemeToTerminalTheme()` **原样返回宿主基底主题**，
+  终端观感与改动前逐值相等（默认值 `bar` 光标 / 1.15 行高 / 0 字间距 / 左10·右0·上5·下8 内边距
+  与旧硬编码一致，由单测 `terminalOptionPatch(DEFAULT) === TERMINAL_OPTION_DEFAULTS` 钉住）。
+- 只有用户显式选「使用配色方案」才覆盖背景/前景/16 色。宿主仍在负责它自己的面板配色；
+  插件只新增「终端区域可被用户单独指定」，与宿主互不争夺。
+- 宿主切换亮/暗时（`appearance.colorScheme`）自动在**深浅双槽**间切换：`darkSchemeId` /
+  `lightSchemeId` 各挂一套，由此满足「黑白主题配置选择」。
+
+### 能力清单
+
+| 能力 | 实现位置 | 说明 |
+| --- | --- | --- |
+| 192 套内置配色目录 | `frontend/src/lib/terminalSchemeCatalog.ts`（生成物） | 紧凑元组 + 溯源头部（授权、上游、重生成命令、跳过文件说明） |
+| 配色纯逻辑层 | `frontend/src/lib/terminalScheme.ts` | 类型、目录索引、亮暗判定（WCAG 相对亮度 > 0.5 为亮）、搜索/色调过滤、主题合成、四格式导入解析器 |
+| 偏好模型与持久化 | `frontend/src/lib/terminalAppearance.ts` | `ssh-terminal-appearance` 单键；自定义方案上限 60、自定义主题上限 30（localStorage 单键约 5 MB 的容量压力） |
+| 多套主题（快照） | 同上 `TerminalAppearanceProfile` | = 外观设置 + 字体（family/size）。Tabby 原生下拉只放 2 套配色，而「配置多套主题」需要连字体/间距一起存，故按**快照**建模 |
+| 出厂预设 | 同上 `TERMINAL_APPEARANCE_PRESETS` | 跟随宿主 / Dracula / Nord / Tokyo Night / Gruvbox / 高对比，共 6 套 |
+| 排版细项 | 同上 `TerminalOptionPatch` | 字重、粗体字重、行高、字间距、横向/纵向内边距、光标样式（block/underline/bar）、光标闪烁、失焦光标样式、粗体用亮色、最小对比度 |
+| 方案导入 | `terminalScheme.ts` 四个 parser | Xresources（Tabby/类 Unix）、iTerm2 `.itermcolors`（plist）、Windows Terminal（JSON）、Tabby（YAML）。YAML 走**手写缩进扫描器**，不引 YAML 库 |
+| 可视化预览 | `frontend/src/components/TerminalAppearancePreview.vue` | 纯 DOM 实时预览（不实例化真 xterm）：`ls -la` 配色样例、选区色块、粗体样例、光标样式动画（`prefers-reduced-motion` 降级）、低对比度告警（< 4.5:1） |
+| 方案选择器 | `frontend/src/components/TerminalSchemePicker.vue` | 深浅双槽页签 + 搜索 + 全部/亮/暗过滤 + 「跟随宿主」行 + 每行 16 色色块 + 自定义徽标 + 色调标签 + 空态 |
+| 设置入口 | `frontend/src/components/SettingsDialog.vue` | 新增「外观」分类并置于**首位**、弹窗默认落在该分类；原「终端字体」块移出终端页，留七语指引 |
+
+光标形状/宽字符/折行等**几何**行为不受影响——`terminalClickCursor.ts` 原地定位逻辑照旧，
+本轮只把 `cursorStyle` 从硬编码 `"bar"` 改为可配置、默认值不变。
+
+### 三处需要留意的接缝
+
+1. **DOM 沙箱与 localStorage**：工作台 iframe 是 `sandbox="allow-scripts"`（不透明源），
+   在**默认参数位置**读 `window.localStorage` 会抛 `SecurityError`。故所有存储访问都在函数体
+   `try` 内（`terminalFont.ts` / `terminalWebgl.ts` 既有同一模式，本轮 `terminalAppearance.ts` 沿用）。
+2. **FitAddon 与内边距**：内边距必须挂在 `.xterm`（即 `terminal.element`）而不是宿主 div 上，
+   否则 FitAddon 会多算一行。故内边距经 CSS 变量下发、由 `style.css` 的
+   `.terminal-host .xterm` 消费，未设置的方向 `removeProperty` 回落内置值。
+3. **字体单一事实源**：字体仍由既有 `terminalFontOverride` 权威持有；`terminalAppearanceState`
+   只是**计算合并**用于展示与主题匹配。`setTerminalFont` 保留 `null`（而非折成宿主具体值）——
+   否则主题快照与实况永不相等，主题高亮会永远失效。
+
+### 验收口径
+
+- 基线 SHA：`acddf777ac5943adda4912e77090e59a0cc3726e`（main）。
+- 新增单测 **44 例**（`terminalScheme.spec.ts` 18 + `terminalAppearance.spec.ts` 26），
+  全量 vitest **66 文件 / 605 用例全绿**；`vue-tsc --noEmit` 通过；Vite 打包通过
+  （3.35 MB 自包含 UI，仅剩既有 trzsz externalize 与 chunk size 告警）。
+- `python3 scripts/validate_repo.py`、`node scripts/connection-forms/verify.mjs` 均 PASS。
+- 无新增 smoke 用例：本轮未注册任何 sidecar 方法，按开发规范第 6 条
+  「未注册方法 SKIP 而非 FAIL」，smoke 家族不适用。
+- **不提交 `ui/`**：`frontend/build.mjs` 输出到 `../ui`，而 `ui/` 与 `dist/` 属 integrator
+  所有权（`.github/agent-flow.yml`），打包由 integrator 统一执行。
+- 七语文案（zh-CN/zh-TW/en/es/it/ja/pt-BR）全量补齐；`workbench.spec.ts` 的
+  key 集合与占位符对齐断言覆盖新键。
+- 未新增任何运行时依赖（YAML 导入为手写扫描器）。
+
+## Tabby 终端行为与快捷键对标补充（2026-09-22，同分支第二轮）
+
+接上一轮的「外观」对标，补齐 Tabby 设置面的另外两块：**Terminal**（行为）与 **Hotkeys**
+（快捷键）。同时按 Tabby 的分类粒度把原「外观」拆成「外观 / 配色方案」两页。仍然是
+**纯前端改动、后端零改动**（无新增 sidecar 方法，smoke 家族不适用）。
+
+### 分类对齐
+
+Tabby 把 Terminal 设置注册为三个页签，并对 Appearance 与 Color scheme 标记 `prioritized`。
+本轮据此把本插件的设置导航重排为：**外观 → 配色方案 → 终端 → 快捷键**，再接本插件特有的
+sudo / 智能体 / 传输 / 安全 / MCP。
+
+| 页签 | 对标 Tabby 页签 | 内容 |
+| --- | --- | --- |
+| 外观 | Appearance | 字体与字号、字重、粗体字重、行高、字间距、内边距、光标、粗体用亮色、最小对比度 + 实时预览 |
+| 配色方案 | Color scheme | 主题快照（预设 6 套 + 用户保存）、实时预览、深浅双槽配色方案、终端背景来源、四格式导入 |
+| 终端 | Terminal | 渲染 / 键盘 / 鼠标 / 剪贴板 / 声音 五组 |
+| 快捷键 | Hotkeys | 注册表编辑器：分组列出、搜动作名、点键位录制、冲突标注、单项与整体复位 |
+
+### 新增模块
+
+| 模块 | 职责 |
+| --- | --- |
+| `frontend/src/lib/terminalBehavior.ts` | 行为偏好的类型、默认值、归一化、持久化、xterm 选项映射、右键四档判决、粘贴文本变换、链接修饰键判定 |
+| `frontend/src/lib/terminalHotkeys.ts` | 快捷键动作表、平台默认、`event.code` → 组合串折算、组合串解析与规范化、平台化显示、匹配与冲突检测 |
+| `frontend/src/components/TerminalHotkeyEditor.vue` | 快捷键编辑器（唯一样式化交互新组件） |
+
+`frontend/src/lib/terminalInteraction.ts` 中原有的 `sanitizeSelectCopyEnabled` /
+`resolveTerminalRightClickAction` / `resolveTerminalKeyAction` / `isTerminalSelectAllShortcut`
+四个硬编码判决器**已删除**，由上述两个可配置模块取代；`terminalInteraction.ts` 只保留
+平台判定、搜索选项与拖放判定。
+
+### 默认值：逐项复现改动前行为
+
+这一轮的功能全部是「把原来写死的换成可配置」，因此**每个默认值都必须等于改动前的硬编码值**，
+否则升级即等于静默改变用户终端行为。逐项对照如下（括号内为 Tabby 默认值，不同处已注明理由）：
+
+| 设置 | 本插件默认 | 与 Tabby 的差异及理由 |
+| --- | --- | --- |
+| 回滚缓冲行数 | 25000 | 与 Tabby 相同；改动前即硬编码 25000 |
+| Alt 用作 Meta 键 | 关 | 与 Tabby 相同 |
+| 输入时滚到底部 | 开 | 与 Tabby 相同（xterm `scrollOnUserInput` 上游默认亦为 true） |
+| 右键语义 | **粘贴** | Tabby 为「上下文菜单」。沿用本插件既有行为，且 `Shift+右键` 出菜单的逃生口保持不变 |
+| 中键粘贴 | 关 | Tabby 在 macOS 亦为开（但那是 X11 主选区语义，浏览器里读到的是普通剪贴板，故保持可选） |
+| 词分隔符 | `` ()[]{}\'" `` | 与 Tabby 相同 |
+| 链接修饰键 | 无 | 与 Tabby 相同（链接始终可点） |
+| 选中即复制 | **开** | Tabby 为关。沿用本插件既有行为；旧键 `ssh-terminal-select-copy` 作为兼容镜像继续读写 |
+| 括号粘贴 | 开 | 与 Tabby 相同（xterm 选项是反向的 `ignoreBracketedPasteMode`） |
+| 多行粘贴警告 | 开 | 与 Tabby 相同；关闭只影响多行/超长提示，**危险命令（`rm -rf` 等）的确认不受该开关约束** |
+| 换行折空格 | 关 | 与 Tabby 相同 |
+| 去首尾空白 | **关** | Tabby 为开。保持关，粘贴内容逐字节不变 |
+| 终端响铃 | 关 | 与 Tabby 相同 |
+
+### 两处有意的行为变更（需 review 关注）
+
+1. **非 Apple 平台「终端搜索」默认键位由 `Ctrl+F` 改为 `Ctrl+Shift+F`**（对齐 Tabby；
+   macOS 仍为 `Cmd+F`）。原因：`Ctrl+F` 是 readline 的 `forward-char`，绑定搜索会把它从远端
+   shell 手里抢走；本插件此前占用该键位是与 Tabby 的偏差而非特性。此变更通过新的快捷键编辑器
+   可随时改回，属显式放开而非收紧。
+2. **「选中即复制」从独立开关收敛为「剪贴板」组内的一项**，且右键语义从「选中复制 ⇒ 右键粘贴」
+   的隐式联动改为独立四档。改动前 `resolveTerminalRightClickAction` 是「选中复制开 ⇒ 右键粘贴」，
+   对应现在的默认组合（`rightClick: "paste"` + `copyOnSelect: true`），**逐例等价**；但用户若只改
+   其中一项，不再联动另一项（这正是四档模型的目的）。同时退役了被取代的文案键
+   `terminalSelectCopy.section` 与冗余键 `terminalBehavior.copyOnSelect`。
+
+### 能力清单
+
+| 能力 | 实现位置 | 说明 |
+| --- | --- | --- |
+| 渲染组 | `terminalBehavior.ts` → `terminalBehaviorOptionPatch` | WebGL 渲染器（沿用既有开关）、回滚缓冲（100–200000，越界夹取） |
+| 键盘组 | 同上 + `App.vue` | Alt 作 Meta（`macOptionIsMeta`）、输入滚到底（`scrollOnUserInput`）、词分隔符（`wordSeparator`，超 32 字符截断） |
+| 鼠标组 | `resolveRightClickBehavior` + `App.vue` | 右键四档 off / menu / paste / clipboard（无选区粘贴、有选区复制）+ `Shift` 恒定出菜单；中键粘贴；链接修饰键（none/ctrl/alt/shift/meta） |
+| 剪贴板组 | `transformPasteText` + App | 选中即复制、括号粘贴、多行粘贴警告、换行折空格、去首尾空白。变换与确认收口在 `sendConfirmedPaste`，所有粘贴路径共用 |
+| 声音组 | `App.vue handleTerminalBell` | 三态 off / visual / audible。xterm 6.x 已移除 `bellStyle` 只抛 `onBell`，故视觉态走 `::after` 覆盖层 CSS 动画（150ms），听觉态用 WebAudio 现场合成（不引音频资源），沙箱拒建 `AudioContext` 时退化为视觉闪动 |
+| 快捷键注册表 | `terminalHotkeys.ts` | 10 个动作（搜索/复制/粘贴/全选/清屏/放大/缩小/复位字号/滚到顶/滚到底），按剪贴板·视图·导航三组 |
+| 组合串口径 | `keyComboFromEvent` / `sanitizeKeyCombo` | 基于 `event.code` 而非 `event.key`，故 `Ctrl+=` 与 `Ctrl+Shift+=` 不会塌成一个；`Shift` 因此必须恒保留为修饰键 |
+| 编辑器 | `TerminalHotkeyEditor.vue` | 动作名搜索、点键位录制（再点取消、`Esc` 取消、纯修饰键不自成一体）、裸键拒绝、同动作内去重、每动作上限 3 条、冲突标注（不拦截）、单项复位与整体复位 |
+
+### 刻意不做的项（附理由）
+
+| 未做 | 理由 |
+| --- | --- |
+| 连字（Ligatures） | `@xterm/addon-ligatures` 经 opentype.js 触达 Node 内置模块，在本插件的沙箱 iframe 中会崩（既有 App 注释已记录），给不出诚实的开关 |
+| Sixel 开关 | 图片渲染已由 `ImageAddon` 固定开启（32 MiB 像素上限），做成开关需要条件加载插件，收益不足 |
+| 会话启动 / 窗口（COMSPEC、环境刷新）/ 任务栏闪烁 | 属宿主或 Electron 专有，插件工作台内无对应物 |
+| 复制为 HTML | 需要新依赖；纯文本终端下收益有限 |
+| Tabby 的 `Ctrl+±` 字号键位 | 与既有的 `Ctrl/Cmd+滚轮` 缩放重叠，避免两套口径打架（该动作仍可在编辑器里自行绑定） |
+| 新建标签页 / 分屏 / 退出 / 重开已关标签 / 上一个提示符 | 工作台的标签与分屏归宿主所有，插件注册这些动作只会得到一堆死绑定 |
+| 「智能 Ctrl-C」独立动作 | Tabby 用专门动作表达「有选区则复制、否则中断」；本插件的 `copy` 动作已是同一语义，无需再拆 |
+
+### 需要留意的接缝
+
+1. **`bellStyle` 已不存在**：xterm 6.1-beta 只保留 `onBell: IEvent<void>`。响铃三态必须由调用方
+   在事件里自行实现；视觉态用 `::after` 覆盖层而非宿主自身的 `outline`/`box-shadow`，因为宿主背景
+   已被 xterm 画布铺满，只有独立伪元素能稳定压在最上层。
+2. **组合串必须基于 `event.code`**：若用 `event.key`，`Shift` 会把字母改写成大写、把 `=` 改写成 `+`，
+   `Ctrl+=` 与 `Ctrl+Shift+=` 就会塌成同一个键位。代价是 `Shift` 必须始终作为修饰键保留。
+3. **匹配读表是实时的**：`handleTerminalKey` 每次按键都查一次注册表，因此改键位无需重挂钩子；
+   钩子只在 `createTerminal` 里挂一次。
+4. **录制期事件必须吞掉**：编辑器在 `window` 捕获阶段监听并 `preventDefault`。设置弹窗是模态的，
+   终端拿不到焦点，故不影响会话；但若将来设置改成非模态，这里需要重新评估。
+
+### 验收口径（本轮）
+
+- 基线 SHA：`dc36c9d`（上一轮主题对标的提交，同一分支继续）。
+- 新增单测 **77 例**：`terminalBehavior.spec.ts` 29 + `terminalHotkeys.spec.ts` 33 +
+  `TerminalHotkeyEditor.spec.ts` 15。全量 vitest **69 文件 / 675 用例全绿**；
+  `vue-tsc --noEmit` 通过。
+- 无新增 smoke 用例：本轮未注册任何 sidecar 方法，按开发规范第 6 条「未注册方法 SKIP 而非 FAIL」。
+- **不提交 `ui/`**：同上轮，`frontend/build.mjs` 输出到 `../ui` 属 integrator 所有权，
+  本轮验证性打包写入 `/tmp` 下的临时目录。
+- 七语文案全量补齐；同时退役两个被取代的键，`workbench.spec.ts` 的 key 集合与占位符对齐断言覆盖。
+- 未新增任何运行时依赖（听觉响铃为 WebAudio 合成，无音频资源文件）。
+
+### UI 走查（e2e）
+
+新增 `scripts/smoke_ui_settings.mjs`，沿用既有 `smoke_ui_mock.mjs` 的约定（vite 起 `mock.html`、
+headless Chrome + playwright-core 走系统 Chrome channel、依赖缺失即 SKIP 退出 0、
+截图落在未跟踪的 `docs/screenshots-ui-settings/`）。**44 项断言全绿**（运行时报 `ok` 的行数；
+静态 `check(` 调用为 42 处，其余来自循环），覆盖：
+
+| 断言组 | 内容 |
+| --- | --- |
+| 分类顺序 | 9 个分类；外观 / 配色方案 / 终端 / 快捷键 排在最前 |
+| 两页拆分 | 外观只留排版与光标、配色控件确实移出；两页各自都有实时预览 |
+| 终端默认值 | 五个分区标题齐备；回滚 25000、右键默认 `paste`（四档）、响铃默认 `off`（三档）、词分隔符与 Tabby 逐字符相同、选中复制默认开 |
+| 快捷键编辑器 | 10 个动作、三组分组、搜索过滤与空态、录制改写、裸键被拒且保持录制、冲突标注与占用者提示、移除重复后冲突消失 |
+| 往返 | 改右键语义与回滚行数 → 落 localStorage → 刷新页面 → 重开设置回显一致；兼容旧键镜像同步 |
+| 派发贯通 | 把「终端搜索」从其平台默认键位改到新组合后：**旧默认键位不再打开搜索面板，新组合能打开，`Esc` 能关闭** |
+| 本地化 | `?locale=zh-CN` 下新分类显示为「外观 / 配色方案 / 快捷键」 |
+
+关于派发断言的口径：mock 的 PTY **不模拟 tty 回显**（只有批量发送路径会显式回显），
+因此不能靠「往终端打字再看回显」来证明按键生效。改用搜索面板这一**无内容依赖**的可观测量——
+它同时证明了「注册表被真实派发链路消费」，而不只是「值被写进了 localStorage」。
+
+既有 `scripts/smoke_ui_mock.mjs`（工作台锚点、快捷命令 CRUD、批量发送、WebGL 渲染器）
+在本轮改动后**回归全绿**。
+
+### 调试路径（本轮实测）
+
+| 方式 | 命令 | 适用 |
+| --- | --- | --- |
+| 官方开发宿主 | `export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$HOME/Library/pnpm:$HOME/.cargo/bin:$PATH"`<br>`dbx-plugin dev --path . --port 5190` | 宿主级联调（会按 `[backend]` 构建并拉起 Rust sidecar）。**它服务的是构建产物 `ui/`**，而 `ui/` 属 integrator 所有权，因此前端迭代期不适合用它 |
+| 前端 fixture | `node scripts/smoke_ui_settings.mjs` / `scripts/smoke_ui_mock.mjs`（内部起 vite 服务 `frontend/mock.html`） | 前端改动迭代与 e2e 回归：直接服务 `frontend/src`，改完即生效，不写 `ui/` |
+| 脱敏日志 | `node <dbx-plugin-skill>/scripts/dev-logs.mjs --port 5190 --level error --follow` | 官方 dev 宿主的诊断 API |
+
+注意：`dbx-plugin` 装在 nvm 全局 bin（`~/.nvm/versions/node/<ver>/bin/dbx-plugin`，实测 0.1.9），
+**不在默认 PATH 上**；`scripts/smoke_ui_mock.mjs` 依赖 `pnpm` 在 PATH 上，跑之前需按上面的
+PATH 导出，否则 `spawn pnpm ENOENT`。
+
+## i18n 键引用护栏与 `d983f8fc` 回归修复（2026-09-22，同分支第三轮）
+
+### 起因
+
+上一轮从七语中退役了 `terminalSelectCopy.section` 与 `terminalBehavior.copyOnSelect`（并入 Clipboard 板块）。
+而 `workbenchMessage` 在查不到键时**会把 key 原样返回**，所以任何残留引用都会把原始的
+点号键直接渲染到界面上。既有断言（`workbench.spec.ts:171`）只比对**七个语言之间**的键集合是否一致——
+**一个在七语中同时缺失的键，这条断言天然抓不到**。因此先补护栏，再用它验证退役是否干净。
+
+### 新增护栏：`frontend/src/lib/i18nKeyReferences.spec.ts`
+
+用 `import.meta.glob("../**/*.{vue,ts}", { query: "?raw", eager: true })` 内联源码（不需要文件系统访问，
+默认 node 环境即可运行），扫描两类引用并断言其全部存在于 `en` 表：
+
+| 扫描面 | 形态 | 实测规模 |
+| --- | --- | --- |
+| 翻译调用首参 | `t("a.b")` / `props.t("a.b")` / `translate(...)` / `workbenchMessage(...)` | 903 处 |
+| 动作表间接引用 | `labelKey: "a.b"` | 19 处 |
+| **唯一引用合计** | | **617 条**，覆盖 130 个源文件 |
+
+五个断言：① 扫描面非空（含**分类型下限**）；② 所有引用均可解析；③ 任意语言下都不会把键名当文案返回；
+④ 上一轮退役的两个键不得复活；⑤ 新命名空间 `terminalBehavior.*` / `terminalHotkeys.*` 必须被扫到。
+
+**为什么第①条要分类型下限**：初版把键统一取 `match[2]`，而属性式正则的第二个捕获组是**引号字符**，
+于是 19 处 `labelKey` 引用被静默跳过，总数看起来依旧健康。这个自身缺陷只有在修正分组索引后才暴露出来。
+
+**为什么属性扫描用白名单而非 `*Key` 通配**：`*Key` 会连 `shiftKey` / `ctrlKey` / `altKey` / `metaKey`（DOM 修饰键）、
+`purposeKey`（后端 playbook 契约键，由 `lib/alertTriage.ts` 映射为 `alertTriage.purpose.<key>`）、
+`hostKey`、`authMethodPrivateKey`（SSH 领域概念）以及恰好以 key 结尾的 `hotkey` 一并命中，产生 4 条误报。
+
+### 发现：19 个「被引用、但七语中都不存在」的键
+
+护栏首次运行即报出 19 条未解析引用。逐项核对确认**并非扫描器误报**（对应值全部取自运行时表）：
+
+| 来源 | 键 | 用户可见后果 |
+| --- | --- | --- |
+| `App.vue` 模板直渲 | `metricsSwap` | 会话指标面板显示字面量 `metricsSwap`，而非「交换空间」 |
+| `App.vue` 模板直渲 | `terminalDropPrompt.title` / `summary` / `toCurrent` / `toCustom` / `pathPlaceholder` | 拖拽上传确认框的标题、说明、两个目标选项与路径占位符全部显示原始键 |
+| `SettingsDialog.vue` 模板 | `mcpSettings.permissionModeAutonomous` / `permissionModeConfirm` | MCP 自动执行权限模式下拉项显示原始键 |
+| `App.vue` / `lib/sftpErrors.ts` 错误路径 | `errors.sessionChanged`、`errors.uploadAckTimeout`、`errors.downloadChunkLength`、`errors.downloadEmptyChunk`、`errors.downloadChunkTimeout`、`errors.probeOutput`、`errors.hostBridgeMissing`、`errors.workbenchDetached`、`errors.permissionDenied`、`errors.remoteNotFound`、`terminalCopyUnavailable` | 错误提示把原始键当文案抛出 |
+
+### 根因：`d983f8fc` 的 i18n 回退
+
+`git log -S` 显示这些键在 `i18n.ts` 上各只有两次变更：首次引入与 `d983f8fc`
+（"feat: add trigger-driven SSH authentication providers"）。该提交对本文件的改动为
+**+28 / -112 行**，把 `terminalDropPrompt` 整块、`metricsSwap`、`permissionMode*` 等键一并删除，
+而 `App.vue` / `SettingsDialog.vue` / `sftpErrors.ts` 的调用点保留至今
+（调用点本身引入于更早的 `9b212eaa`）。即：**一次顺带的 i18n 重写让 19 处文案丢失，且没有任何断言能发现。**
+
+### 修复：逐字恢复，纯新增
+
+新增 `restoredMessages` 表并合并进 `supplemental`，沿用本文件既有写法
+（`terminalFontMovedMessages`、`uploadBridgeMessages` 同为该模式，且已有 `"errors.localFileShortRead"`
+这类扁平点号键先例）。`workbenchMessage` 的解析顺序是「嵌套 → `en` 嵌套 → `supplemental` → 原样返回 key」，
+因此**扁平点号键与嵌套键完全等价**，无需还原原嵌套结构，改动面收敛为每语言一个插入点。
+
+- **19 键 × 7 语言 = 133 条**，取值逐字取自 `d983f8fc^:frontend/src/lib/i18n.ts`
+  （脚本提取 + JSON 往返规范化转义），**不是重新翻译**。
+- `git diff` 为 **+157 / -0**，未修改任何既有行。
+- `errors.terminalInputAckTimeout` 同样被该提交删除，但**全仓库零引用**（含 `backend/`），故不恢复。
+
+### 验收口径（本轮）
+
+- 基线：同一分支的 `f1c764c`。
+- 七语键数由 750 恢复至 **769**；`workbench.spec.ts` 的七语集合与占位符对齐断言继续通过。
+- 新增单测 5 例；全量 vitest **70 文件 / 680 用例全绿**；`vue-tsc --noEmit` 通过；
+  `scripts/validate_repo.py` 与 `scripts/connection-forms/verify.mjs` 均 PASS
+  （后者本身就校验「七语言标签/选项」）。
+- 无新增单测以外的能力：本轮只恢复文案并补护栏；既有 `scripts/smoke_ui_settings.mjs` 新增 3 条断言
+  （见下），`scripts/smoke_ui_mock.mjs` 未改动且回归全绿。
+- 未新增运行时依赖；未提交 `ui/`（integrator 所有权）。
+
+### UI 走查（e2e）补充
+
+上面那 19 个键里，只有 `mcpSettings.permissionModeAutonomous` / `permissionModeConfirm` 能在
+没有真实 SSH 会话的情况下触达（它们位于设置面板的 MCP 分类）。因此在
+`scripts/smoke_ui_settings.mjs` 末尾新增一组断言，把「修复真的到达了界面」钉住：
+
+| 断言 | 内容 |
+| --- | --- |
+| MCP execution-approval field rendered | 通过标签文本「MCP execution approval」定位到字段，并确认其内的下拉存在 |
+| permission-mode options are translated, not raw keys | 展开下拉后，选项文案为 `Autonomous` / `Confirm before running` |
+| no raw i18n key leaked into the options | 选项里不得出现 `mcpSettings.<X>` 形式的原始键 |
+
+运行时报 `ok` 47 条、0 失败（本轮 3 条 + 既有 44 条）。
+`metricsSwap` 与拖拽上传对话框的 5 个键需要真实会话/拖拽事件才能触达，
+故只在单测层（运行时语言表解析）覆盖，不在 e2e 覆盖。

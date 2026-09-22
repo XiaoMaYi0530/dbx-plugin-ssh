@@ -66,15 +66,28 @@ export interface PasteConfirmation {
   required: boolean;
 }
 
+export interface PasteConfirmationOptions {
+  /**
+   * Whether a multi-line (or oversized) paste asks for confirmation. Mirrors
+   * Tabby's "Warn on multi-line paste" setting. Dangerous commands are never
+   * governed by this flag — they always require confirmation.
+   */
+  warnOnMultiline?: boolean;
+}
+
 /**
  * 评估一段待粘贴文本：多行、超过字符阈值或命中危险命令时需要确认。
  * `required` 为 false 时调用方可直接粘贴，无需弹窗。
+ *
+ * 危险命令一律确认（安全红线，不受设置影响）；多行/超长提示可通过
+ * `warnOnMultiline: false` 关闭，对齐 Tabby 的同类开关。
  */
-export function buildPasteConfirmation(text: string): PasteConfirmation {
+export function buildPasteConfirmation(text: string, options: PasteConfirmationOptions = {}): PasteConfirmation {
   const inspection = inspect(text);
   const danger = inspection.level === "danger";
   const multiLine = PASTE_NEWLINE_RE.test(text);
   const large = text.length >= PASTE_CONFIRM_CHAR_THRESHOLD;
+  const warnOnMultiline = options.warnOnMultiline !== false;
   return {
     text,
     lines: text.split(PASTE_NEWLINE_RE).length,
@@ -82,6 +95,6 @@ export function buildPasteConfirmation(text: string): PasteConfirmation {
     preview: text.length <= PASTE_PREVIEW_LIMIT ? text : `${text.slice(0, PASTE_PREVIEW_LIMIT)}…`,
     danger,
     hits: inspection.hits,
-    required: danger || multiLine || large,
+    required: danger || (warnOnMultiline && (multiLine || large)),
   };
 }
