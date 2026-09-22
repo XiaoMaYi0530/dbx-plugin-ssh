@@ -44,6 +44,7 @@ import {
   ListChecks,
   Loader2,
   Lock,
+  Network,
   PackageOpen,
   Palette,
   PanelRightClose,
@@ -205,6 +206,7 @@ import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator,
 import { Popover, PopoverAnchor, PopoverContent } from "./components/ui/popover";
 import { Dialog, DialogContent, DialogTitle } from "./components/ui/dialog";
 import SettingsDialog from "./components/SettingsDialog.vue";
+import PortForwardDialog from "./components/PortForwardDialog.vue";
 import { ToastAction, ToastClose, ToastProvider, ToastRoot, ToastViewport } from "./components/ui/toast";
 
 interface SessionInfo {
@@ -2951,6 +2953,10 @@ function openAlertTriage() {
   alertTriageOpen.value = true;
   alertTriageError.value = "";
 }
+
+// 端口映射（-L/-R）管理弹窗：全部逻辑在 components/PortForwardDialog.vue，
+// 这里只保留工具栏入口的开关状态。
+const forwardsOpen = ref(false);
 
 async function runAlertTriage() {
   if (alertTriageBusy.value) return;
@@ -7134,6 +7140,7 @@ onBeforeUnmount(() => {
         <button class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
         <button class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
         <button class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
+        <button class="icon-button icon-cyan" :title="t('forwards.title')" :disabled="!session" @click="forwardsOpen = true"><Network /></button>
         <label class="follow-directory-control" :title="t('followTerminal')">
           <Switch size="sm" :model-value="followDirectory" :disabled="!connected" @update:model-value="setDirectoryTracking" />
           <span>{{ t("followTerminal") }}</span>
@@ -8008,12 +8015,22 @@ onBeforeUnmount(() => {
       </DialogContent>
     </Dialog>
 
+    <!-- 端口映射管理（-L/-R）：列表/添加/停止与 ssh/forward/state 订阅都在
+         PortForwardDialog 内；会话断开由 sidecar 清理全部映射。 -->
+    <PortForwardDialog
+      :locale="locale"
+      :open="forwardsOpen"
+      :connection-id="connectionId"
+      :session-id="session?.sessionId ?? null"
+      @update:open="forwardsOpen = $event"
+      @error="showError($event, 'terminal')"
+    />
+
     <Dialog :open="operationDialog === 'mkdir'" @update:open="(open) => { if (!open) operationDialog = null; }">
       <DialogContent class="modal small-modal" @escape-key-down.prevent>
         <header><DialogTitle>{{ t("newFolder") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="operationDialog = null"><X /></button></header>
         <input v-model="operationDraft" autofocus @keydown.enter="createDirectory" />
-        <footer><button @click="operationDialog = null">{{ t("cancel") }}</button><button class="primary-button" :disabled="!operationDraft.trim()" @click="createDirectory">{{ t("confirm") }}</button></footer>
-      </DialogContent>
+        <footer><button @click="operationDialog = null">{{ t("cancel") }}</button><button class="primary-button" :disabled="!operationDraft.trim()" @click="createDirectory">{{ t("confirm") }}</button></footer>      </DialogContent>
     </Dialog>
 
     <Dialog :open="commandOpen" @update:open="(open) => { if (!open) commandOpen = false; }">

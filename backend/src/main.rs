@@ -4,6 +4,7 @@ mod alert_triage;
 mod app_bridge;
 mod audit_log;
 mod exec;
+mod forward;
 mod highlight_rules;
 mod host_key;
 mod keys;
@@ -148,6 +149,15 @@ impl Plugin {
                 let session_id = required_string(&params, "sessionId")?;
                 self.runtime.block_on(self.ssh.close_session(session_id))?;
                 Ok(json!({ "success": true }))
+            }
+            "ssh/forward/list" => Ok(self.ssh.forward_list(&params)),
+            "ssh/forward/interfaces" => Ok(forward::local_interface_rows()),
+            "ssh/forward/start" => self
+                .runtime
+                .block_on(self.ssh.forward_start(&params, emitter.clone())),
+            "ssh/forward/stop" => {
+                let id = required_string(&params, "id")?;
+                self.runtime.block_on(self.ssh.forward_stop(id))
             }
             "ssh/exec" => {
                 let session_id = required_string(&params, "sessionId")?;
