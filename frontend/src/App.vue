@@ -4686,11 +4686,10 @@ async function chooseUpload() {
     await loadDirectory();
     if (selection.files.length) showNotice(t("uploaded", { count: selection.files.length }));
   } catch (cause) {
-    // 宿主文件桥读盘失败（如 unknown plugin file handle，issue #83/#79）时不再
-    // 直接终止：回退到 webview 原生文件选择（File API），上传仍可继续。
+    // 宿主文件桥失败（pick 或读盘，如 unknown plugin file handle，issue #83/#79）
+    // 时不再直接终止：回退到 webview 原生文件选择（File API），上传仍可继续。
     if (isHostBridgeReadFailure(cause)) {
-      showNotice(t("uploadBridgeFallback"));
-      uploadInput.value?.click();
+      fallbackToNativeUploadPicker();
       return;
     }
     showError(cause);
@@ -4723,6 +4722,13 @@ function isHostBridgeReadFailure(cause: unknown): boolean {
   if (!(cause instanceof Error)) return false;
   const code = (cause as Error & { code?: unknown }).code;
   return code === "upload-read-failed" || /file handle/i.test(cause.message);
+}
+
+// 桥接不可用时的兜底（对标 dbx-plugin-files PR #47）：提示后自动打开 webview
+// 原生文件选择器（File API，不依赖宿主句柄），上传仍可完成。
+function fallbackToNativeUploadPicker() {
+  showNotice(t("uploadBridgeFallback"));
+  uploadInput.value?.click();
 }
 
 async function uploadLocalFiles(files: readonly File[], targetDir?: string) {
@@ -6985,7 +6991,14 @@ async function initialize() {
   unsubscribeFileDrag = api.fileTransfer?.onDragState((active) => (dragActive.value = active));
   unsubscribeFileDrop = api.fileTransfer?.onDrop((files) => {
     dragActive.value = false;
-    void uploadHandleFiles(files).then(() => loadDirectory()).catch(showError);
+    // 拖入文件同样走宿主桥读盘（issue #83/#79）：桥故障时与工具栏上传一致回退
+    // 原生选择器重挑，而不是只报错走死。
+    void uploadHandleFiles(files)
+      .then(() => loadDirectory())
+      .catch((cause) => {
+        if (isHostBridgeReadFailure(cause)) fallbackToNativeUploadPicker();
+        else showError(cause);
+      });
   });
   await nextTick();
   createTerminal();
