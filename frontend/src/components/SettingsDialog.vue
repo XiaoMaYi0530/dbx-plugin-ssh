@@ -20,6 +20,7 @@ import { clampFontSize, TERMINAL_FONT_MAX, TERMINAL_FONT_MIN } from "../lib/term
 import { loadTerminalFontOverride } from "../lib/terminalFont";
 import { MIB, mibField, settingsErrorOf, type DiscoveredKey, type KnownHostEntry, type McpSizeSettings, type SshSettings, type SudoProfileView } from "../lib/settingsModel";
 import { DOWNLOAD_CONFLICT_POLICIES, type DownloadConflictPolicy } from "../lib/downloadPrefs";
+import { TRANSFER_DUPLICATE_POLICIES, type TransferDuplicatePolicy } from "../lib/transferQueue";
 import {
   allAppearanceProfiles,
   applySchemeToTerminalTheme,
@@ -83,6 +84,22 @@ const props = defineProps<{
     persistDir(value: string): void;
     persistUseDefault(value: boolean): void;
     persistConflict(value: DownloadConflictPolicy): void;
+  };
+  /** 上传并发 / 重复目标策略的读写适配器（权威态在 App，sidecar preferences 同步）。 */
+  transferPrefs: {
+    loadConcurrency(): number;
+    loadDuplicatePolicy(): TransferDuplicatePolicy;
+    persistConcurrency(value: number): void;
+    persistDuplicatePolicy(value: TransferDuplicatePolicy): void;
+  };
+  /** 命令输入建议（开关 + 查询长度上下限）的读写适配器，权威态同在 App。 */
+  suggestionPrefs: {
+    loadEnabled(): boolean;
+    loadMinChars(): number;
+    loadMaxChars(): number;
+    persistEnabled(value: boolean): void;
+    persistMinChars(value: number): void;
+    persistMaxChars(value: number): void;
   };
   t: (key: string, values?: Record<string, string | number>) => string;
 }>();
@@ -151,6 +168,12 @@ const settingsDraft = reactive({
 const downloadDirDraft = ref("");
 const downloadUseDefaultDraft = ref(props.downloadPrefs.loadUseDefault());
 const downloadConflictDraft = ref<DownloadConflictPolicy>("rename");
+// 上传并发（1..10，默认 3）与重复目标策略（P1-5）草稿；建议设置草稿（P1-1）。
+const transferConcurrencyDraft = ref(String(props.transferPrefs.loadConcurrency()));
+const transferDuplicateDraft = ref<TransferDuplicatePolicy>(props.transferPrefs.loadDuplicatePolicy());
+const suggestionsEnabledDraft = ref(props.suggestionPrefs.loadEnabled());
+const suggestionMinCharsDraft = ref(String(props.suggestionPrefs.loadMinChars()));
+const suggestionMaxCharsDraft = ref(String(props.suggestionPrefs.loadMaxChars()));
 // 全局 quick sudo 配置：列表与编辑表单状态（密钥只在提交时发送）。设置弹窗
 // 内联 section 与独立 profiles 弹窗共存复用同一份状态。
 const sudoProfiles = ref<SudoProfileView[]>([]);
@@ -472,6 +495,11 @@ async function reloadSettings() {
   downloadDirDraft.value = props.downloadPrefs.loadDir();
   downloadUseDefaultDraft.value = props.downloadPrefs.loadUseDefault();
   downloadConflictDraft.value = props.downloadPrefs.loadConflict();
+  transferConcurrencyDraft.value = String(props.transferPrefs.loadConcurrency());
+  transferDuplicateDraft.value = props.transferPrefs.loadDuplicatePolicy();
+  suggestionsEnabledDraft.value = props.suggestionPrefs.loadEnabled();
+  suggestionMinCharsDraft.value = String(props.suggestionPrefs.loadMinChars());
+  suggestionMaxCharsDraft.value = String(props.suggestionPrefs.loadMaxChars());
   if (settingsLoading.value || settingsSaving.value) return;
   settingsLoading.value = true;
   settingsLoadFailed.value = false;
@@ -748,6 +776,11 @@ async function saveSettings() {
     props.downloadPrefs.persistDir(downloadDirDraft.value);
     props.downloadPrefs.persistUseDefault(downloadUseDefaultDraft.value);
     props.downloadPrefs.persistConflict(downloadConflictDraft.value);
+    props.transferPrefs.persistConcurrency(Number.parseInt(transferConcurrencyDraft.value, 10) || 3);
+    props.transferPrefs.persistDuplicatePolicy(transferDuplicateDraft.value);
+    props.suggestionPrefs.persistEnabled(suggestionsEnabledDraft.value);
+    props.suggestionPrefs.persistMinChars(Number.parseInt(suggestionMinCharsDraft.value, 10) || 2);
+    props.suggestionPrefs.persistMaxChars(Number.parseInt(suggestionMaxCharsDraft.value, 10) || 64);
     if (profileEditing.value) await saveProfileDraft();
     const updates: Record<string, unknown> = {
       quickSudo: settingsDraft.quickSudo,
@@ -1256,6 +1289,22 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
             </label>
             <p class="muted settings-note">{{ t("downloadSettings.conflictHint") }}</p>
             <p class="muted settings-note">{{ t("downloadSettings.hint") }}</p>
+            <h3 class="settings-section-title">{{ t("transferCfg.title") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("transferCfg.concurrency") }}</span>
+              <input v-model="transferConcurrencyDraft" type="number" min="1" max="10" step="1" @change="transferConcurrencyDraft = String(Math.min(10, Math.max(1, Number.parseInt(transferConcurrencyDraft, 10) || 3)))" />
+            </label>
+            <p class="muted settings-note">{{ t("transferCfg.concurrencyHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("transferCfg.duplicatePolicy") }}</span>
+              <Select :model-value="transferDuplicateDraft" @update:model-value="(v) => (transferDuplicateDraft = String(v) as TransferDuplicatePolicy)">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="policy in TRANSFER_DUPLICATE_POLICIES" :key="policy" :value="policy">{{ t(`transferCfg.policy.${policy}`) }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <p class="muted settings-note">{{ t("transferCfg.duplicatePolicyHint") }}</p>
             </div>
 
             <!-- 终端（对标 Tabby「Terminal」页）：渲染 / 键盘 / 鼠标 / 剪贴板 / 声音五组。
@@ -1347,6 +1396,23 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
 
             <p class="muted settings-note">{{ t("terminalBehavior.scopeNote") }}</p>
             <p class="muted settings-note">{{ t("terminalFont.movedHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("suggestions.settingsTitle") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <Switch v-model="suggestionsEnabledDraft" size="sm" />
+              <span>{{ t("suggestions.settingsEnabled") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("suggestions.settingsEnabledHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("suggestions.settingsMinChars") }}</span>
+              <input v-model="suggestionMinCharsDraft" type="number" min="1" max="16" step="1" @change="suggestionMinCharsDraft = String(Math.min(16, Math.max(1, Number.parseInt(suggestionMinCharsDraft, 10) || 2)))" />
+            </label>
+            <p class="muted settings-note">{{ t("suggestions.settingsMinCharsHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("suggestions.settingsMaxChars") }}</span>
+              <input v-model="suggestionMaxCharsDraft" type="number" min="8" max="512" step="1" @change="suggestionMaxCharsDraft = String(Math.min(512, Math.max(8, Number.parseInt(suggestionMaxCharsDraft, 10) || 64)))" />
+            </label>
+            <p class="muted settings-note">{{ t("suggestions.settingsMaxCharsHint") }}</p>
             </div>
 
             <!-- 快捷键（对标 Tabby「Hotkeys」页）：注册表编辑器，逐动作增删改 + 冲突提示 + 单项/整体复位。 -->

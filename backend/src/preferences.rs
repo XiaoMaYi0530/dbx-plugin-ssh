@@ -38,6 +38,19 @@ fn sanitize_conflict_policy(value: &Value) -> Option<&'static str> {
     }
 }
 
+/// 数值偏好钳制：非负整数夹进 [min, max]，超界取边界、非法取 fallback。
+fn sanitize_u64_clamped(value: &Value, min: u64, max: u64, fallback: u64) -> u64 {
+    let raw = match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    match raw {
+        Some(value) => value.clamp(min, max),
+        None => fallback,
+    }
+}
+
 /// Reads the raw preferences map; a missing or corrupted file yields an empty
 /// map so a bad file can never break the workbench (same policy as
 /// quick-commands).
@@ -78,6 +91,44 @@ pub fn load_preferences(data_dir: &Path) -> Value {
         prefs.insert(
             "localShellIntegration".to_string(),
             Value::Bool(integration),
+        );
+    }
+    // 上传并发（1..=10，默认 3）与重复目标策略（P1-5）。
+    if map.contains_key("transfer_concurrency") {
+        let concurrency = sanitize_u64_clamped(&map["transfer_concurrency"], 1, 10, 3);
+        prefs.insert("transfer_concurrency".to_string(), Value::from(concurrency));
+    }
+    if let Some(policy) = map
+        .get("transfer_duplicate_policy")
+        .and_then(sanitize_conflict_policy)
+    {
+        prefs.insert(
+            "transfer_duplicate_policy".to_string(),
+            Value::String(policy.to_string()),
+        );
+    }
+    // 命令输入建议（P1-1）：开关（默认开）与查询长度上下限。
+    if let Some(enabled) = map
+        .get("history_suggestions_enabled")
+        .and_then(Value::as_bool)
+    {
+        prefs.insert(
+            "history_suggestions_enabled".to_string(),
+            Value::Bool(enabled),
+        );
+    }
+    if map.contains_key("history_suggestion_min_chars") {
+        let min_chars = sanitize_u64_clamped(&map["history_suggestion_min_chars"], 1, 16, 2);
+        prefs.insert(
+            "history_suggestion_min_chars".to_string(),
+            Value::from(min_chars),
+        );
+    }
+    if map.contains_key("history_suggestion_max_chars") {
+        let max_chars = sanitize_u64_clamped(&map["history_suggestion_max_chars"], 8, 512, 64);
+        prefs.insert(
+            "history_suggestion_max_chars".to_string(),
+            Value::from(max_chars),
         );
     }
     Value::Object(prefs)
@@ -121,6 +172,59 @@ pub fn save_preferences(data_dir: &Path, params: &Value) -> Result<Value, String
         map.insert(
             "localShellIntegration".to_string(),
             Value::Bool(integration),
+        );
+    }
+    // 上传并发/重复策略与命令建议键：数值一律钳制到合法区间（非法回落默认），
+    // 不报错，保证旧前端/手改文件不会把偏好写入卡死。
+    if params.get("transfer_concurrency").is_some() {
+        map.insert(
+            "transfer_concurrency".to_string(),
+            Value::from(sanitize_u64_clamped(
+                &params["transfer_concurrency"],
+                1,
+                10,
+                3,
+            )),
+        );
+    }
+    if let Some(value) = params.get("transfer_duplicate_policy") {
+        let policy = sanitize_conflict_policy(value).ok_or_else(|| {
+            "transfer_duplicate_policy must be rename, ask or overwrite".to_string()
+        })?;
+        map.insert(
+            "transfer_duplicate_policy".to_string(),
+            Value::String(policy.to_string()),
+        );
+    }
+    if let Some(value) = params.get("history_suggestions_enabled") {
+        let enabled = value
+            .as_bool()
+            .ok_or_else(|| "history_suggestions_enabled must be a boolean".to_string())?;
+        map.insert(
+            "history_suggestions_enabled".to_string(),
+            Value::Bool(enabled),
+        );
+    }
+    if params.get("history_suggestion_min_chars").is_some() {
+        map.insert(
+            "history_suggestion_min_chars".to_string(),
+            Value::from(sanitize_u64_clamped(
+                &params["history_suggestion_min_chars"],
+                1,
+                16,
+                2,
+            )),
+        );
+    }
+    if params.get("history_suggestion_max_chars").is_some() {
+        map.insert(
+            "history_suggestion_max_chars".to_string(),
+            Value::from(sanitize_u64_clamped(
+                &params["history_suggestion_max_chars"],
+                8,
+                512,
+                64,
+            )),
         );
     }
     let path = store_path(data_dir);
@@ -199,5 +303,36 @@ mod tests {
         assert!(
             save_preferences(data_dir.path(), &json!({ "downloadUseDefaultDir": "yes" })).is_err()
         );
+    }
+
+    #[test]
+    fn transfer_and_suggestion_prefs_clamp_and_roundtrip() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        save_preferences(
+            data_dir.path(),
+            &json!({
+                "transfer_concurrency": 99,
+                "transfer_duplicate_policy": "ask",
+                "history_suggestions_enabled": false,
+                "history_suggestion_min_chars": 0,
+                "history_suggestion_max_chars": 999,
+            }),
+        )
+        .expect("save");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(prefs["transfer_concurrency"], 10);
+        assert_eq!(prefs["transfer_duplicate_policy"], "ask");
+        assert_eq!(prefs["history_suggestions_enabled"], false);
+        assert_eq!(prefs["history_suggestion_min_chars"], 1);
+        assert_eq!(prefs["history_suggestion_max_chars"], 512);
+        // 非法策略名报错；缺省键不出现（前端按默认处理）。
+        let error = save_preferences(
+            data_dir.path(),
+            &json!({ "transfer_duplicate_policy": "clobber" }),
+        )
+        .expect_err("must reject");
+        assert!(error.contains("transfer_duplicate_policy"));
+        let fresh = tempfile::tempdir().expect("tempdir");
+        assert_eq!(load_preferences(fresh.path()), json!({}));
     }
 }
