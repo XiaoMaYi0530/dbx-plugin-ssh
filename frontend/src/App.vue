@@ -140,6 +140,7 @@ import { advanceBatchProgress, batchProgressPercent, createBatchProgress, type B
 import { describeWorkbenchSessionStatus, type WorkbenchSessionStatus } from "./lib/sessionStatus";
 import { sanitizeCommandOutput } from "./lib/terminalOutputText";
 import { normalizeTerminalInputBytes } from "./lib/terminalInput";
+import { installMacWebkitInputFallback } from "./lib/terminalWebkitInput";
 import { looksBinary } from "./lib/textSniff";
 import { formatBytes, formatRate } from "./lib/format";
 import { mergeTransferProgress, transferCancelReason, type TransferPhase } from "./lib/transferProgress";
@@ -849,6 +850,7 @@ let dropUploadResolver: ((choice: "cancel" | "cwd" | { dir: string }) => void) |
 let zoomNoticeTimer = 0;
 let resizeObserver: ResizeObserver | undefined;
 let disposeInput: { dispose(): void } | undefined;
+let disposeWebkitInputFallback: (() => void) | undefined;
 let disposeSelectionCopy: { dispose(): void } | undefined;
 let unsubscribeEvent: (() => void) | undefined;
 let unsubscribeBinary: (() => void) | undefined;
@@ -1412,7 +1414,7 @@ function createTerminal() {
     searchResultIndex.value = resultCount > 0 && resultIndex >= 0 ? resultIndex + 1 : 0;
     searchMatchState.value = resultCount > 0 ? "match" : "no-match";
   });
-  disposeInput = terminal.onData((data) => {
+  const routeTerminalData = (data: string) => {
     if (!session.value) return;
     // 文件传输占用路由：trzsz 持有流时，传输中的输入进 filter（Ctrl+C 停传输、
     // 其余吞掉），等待协商期直接吞掉（防止杂散键入干扰 trz 握手）；zmodem 持有
@@ -1425,7 +1427,13 @@ function createTerminal() {
     if (route === "blocked") return;
     trackPendingInput(data);
     sendTerminalBytes(new TextEncoder().encode(data));
-  });
+  };
+  disposeInput = terminal.onData(routeTerminalData);
+  // xterm.js 6.1 still drops rapid direct commits on macOS WKWebView when an
+  // IME reports printable keys as keyCode=229 (#5887/#6045/#6144 upstream).
+  // The adapter runs before xterm's hidden textarea listeners and routes only
+  // single-byte text outside real composition through the same PTY path.
+  disposeWebkitInputFallback = installMacWebkitInputFallback({ terminal, onData: routeTerminalData });
   // 选中复制（可在设置里关闭）：选择一变化即静默写入剪贴板，不弹提示。
   disposeSelectionCopy = terminal.onSelectionChange(() => {
     if (!termSelectCopy.value || !terminal?.hasSelection()) return;
@@ -7101,6 +7109,8 @@ onBeforeUnmount(() => {
   osc52Disposable?.dispose();
   osc52Disposable = undefined;
   disposeInput?.dispose();
+  disposeWebkitInputFallback?.();
+  disposeWebkitInputFallback = undefined;
   disposeSelectionCopy?.dispose();
   terminalWriteThrottle.dispose();
   detachHighlightRender();
@@ -8761,6 +8771,5 @@ onBeforeUnmount(() => {
 /* 拖拽过程中全局光标 */
 body.resizing-col { cursor: col-resize !important; user-select: none; }
 </style>
-
 
 
