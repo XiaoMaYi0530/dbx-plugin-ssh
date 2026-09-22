@@ -773,6 +773,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    (z-index 3) takes precedence when both would overlap. */
 .terminal-command-marker { position: absolute; z-index: 2; left: 8px; bottom: 8px; display: inline-flex; align-items: center; gap: 6px; max-width: calc(100% - 16px); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; background: color-mix(in srgb, var(--background) 90%, transparent); color: var(--muted-foreground); font-size: 10px; pointer-events: auto; cursor: default; }
 .terminal-command-marker svg { width: 12px; height: 12px; flex: 0 0 12px; }
+
+/* #33/#71 快速输入丢失诊断浮层（Ctrl/Cmd+Shift+D 切换，双击关闭）：
+   与 command-marker 同侧但右上角，避免遮挡交互元素。 */
+.terminal-diag-overlay { position: absolute; z-index: 4; right: 8px; top: 8px; border: 1px solid var(--warning, var(--border)); border-radius: 6px; padding: 3px 8px; background: color-mix(in srgb, var(--background) 92%, transparent); color: var(--foreground); font-family: var(--mono-font, monospace); font-size: 10px; pointer-events: auto; cursor: default; user-select: none; }
 .terminal-command-marker .marker-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .terminal-command-marker .marker-elapsed { flex: 0 0 auto; opacity: 0.8; font-variant-numeric: tabular-nums; }
 .terminal-command-marker .marker-cwd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40ch; opacity: 0.75; }

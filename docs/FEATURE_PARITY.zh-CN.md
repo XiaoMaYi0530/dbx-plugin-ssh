@@ -15,7 +15,7 @@ profile 分组、全局外观）不重复实现。
 | 终端 PTY/回放/resize/目录跟随 | ssh_service.go | ✅ 已有 | — |
 | ssh/exec + sudo（含 PTY/MFA/TOTP 编排） | sudo_exec_service.go | ✅ 已有（exec.rs）；2026-09-04 OTP 多密钥轮换升级：使用/防重放台账进程全局（跨 exec 调用、跨会话；MCP `ssh_exec_sudo` 每调用独立实例也连续轮换），密钥 SHA-256 指纹+窗口+码键控，静态码 usage 键防时间戳漂移，选择排序对齐 resolveRotatingOTP（未用优先→剩余时长最长→配置顺序） | — |
 | ZMODEM rz/sz | ssh_service.go | ✅ 已有 | — |
-| 终端拖入文件上传（落点询问：当前目录 / 指定绝对路径目录） | Tabby/WindTerm 等拖拽上传 | ✅ 已有（2026-09-15：拖到终端面板先弹落点询问——上传到 SFTP 当前目录（目录跟随时即 shell cwd）或输入目标目录绝对路径（`normalizeDropTargetDir` 归一化，七语 `terminalDropPrompt`），确认后走 `sftp/upload/*` 既有链路；SFTP 面板与宿主 fileTransfer 拖放通道保持直传不变） | — |
+| 终端拖入文件上传（落点询问：当前目录 / 指定绝对路径目录） | Tabby/WindTerm 等拖拽上传 | ✅ 已有（2026-09-15：拖到终端面板先弹落点询问——上传到 SFTP 当前目录（目录跟随时即 shell cwd）或输入目标目录绝对路径（`normalizeDropTargetDir` 归一化，七语 `terminalDropPrompt`），确认后走 `sftp/upload/*` 既有链路；SFTP 面板拖放保持直传不变。2026-09-22 起桌面宿主 OS 级拖放经 fileTransfer onDrop/onDragState 桥接进工作台（`planHostFileDrop` 分流：SFTP 面板打开→当前目录直传，solo 终端→同一落点询问，只读/传输中→忽略；上游宿主事件已合入，真机验收待跑），并移除 initialize() 残留的第二套 onDrop/onDragState 直传注册避免真机双上传） | — |
 | 终端 Shell Integration 命令标记（OSC 633：命令/退出码/时长/cwd） | frontend/src/modules/ssh/osc633-parser.js | ✅ 已有（`terminalCommandMarkers.ts` 解析器移植 + 状态条，S-B；运行中时长 1s tick `runningCommandElapsedMs` + `marker-elapsed` span，X-B） | — |
 | 会话状态规范化展示（连接中/已连接/重连中/已断开/错误） | frontend/src/modules/ssh/session-status.js | ✅ 已有（`sessionStatus.ts` 移植 + reconnecting 扩展，S-B；多会话择优不适用未移植） | — |
 | 命令输出净化（控制序列剥离/回显移除） | frontend/src/modules/ssh/terminal-output.js | ✅ 已有（`terminalOutputText.ts` 通用部分移植；`.mcp_ctl_*` hook 特判不适用） | — |
