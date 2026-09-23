@@ -73,6 +73,12 @@ const props = defineProps<{
   actionLinks: ActionLinksSettings;
   /** 行号/时间戳 gutter 偏好（权威态在 App）：只读 + 上抛增量。 */
   gutter: GutterSettings;
+  /** 右键「在线搜索」引擎表原始文本（每行 name|url；权威态在 App，sidecar 持久化）。 */
+  ctxSearchEngines: string;
+  /** 背景图偏好（权威态在 App）：开关 / 透明度（10..=90 百分比）/ 会话内存态标记。 */
+  wallpaperEnabled: boolean;
+  wallpaperOpacity: number;
+  wallpaperSessionOnly: boolean;
   /** 终端外观偏好（权威态在 App）：本组件只读 + 经 emits 上抛改动意图。 */
   appearance: TerminalAppearanceState;
   /** 用户保存的主题快照（内置预设由 lib 常量提供，不需经 props）。 */
@@ -127,6 +133,13 @@ const emit = defineEmits<{
   (e: "update:actionLinks", patch: { enabled?: boolean; matchers?: Partial<ActionLinkMatcherToggles> }): void;
   /** gutter 设置增量：App 侧归一化 + sidecar 持久化 + 即时挂/摘。 */
   (e: "update:gutter", patch: { showLineNumbers?: boolean; showTimestamps?: boolean; timestampFormat?: string }): void;
+  /** 在线搜索引擎表整表替换：App 侧解析 + sidecar 持久化。 */
+  (e: "update:ctxSearchEngines", value: string): void;
+  /** 背景图：开关/透明度上抛增量；图片经本地读取 base64 后交 App 走 sidecar。 */
+  (e: "update:wallpaperEnabled", value: boolean): void;
+  (e: "update:wallpaperOpacity", value: number): void;
+  (e: "set-wallpaper-image", image: { base64: string; mime: string }): void;
+  (e: "clear-wallpaper"): void;
   (e: "apply-theme", theme: TerminalAppearanceProfile): void;
   (e: "save-theme", name: string): void;
   (e: "delete-theme", id: string): void;
@@ -230,6 +243,34 @@ const agentTerminalModeHint = computed(() => t(
 // 终端字体设置控件态（issue #31）：预设等宽字体 + 跟随宿主 + 自定义；哨兵值
 // 只作选择器键使用，不会作为字体串写入（写入前映射回 null/真实字体串）。
 const TERMINAL_FONT_FOLLOW_HOST = "__follow-host__";
+
+// 背景图上传（P2-9）：本地 FileReader 读成 data URL，拆出 mime + 纯 base64
+// 交 App 走 sidecar 落盘（web/docker 失败时 App 降级会话内存态）。客户端先做
+// 8MiB 上限与 accept 类型粗校验，权威校验在 sidecar（魔数 + 大小）。
+const WALLPAPER_MAX_BYTES = 8 * 1024 * 1024;
+const wallpaperFileInput = ref<HTMLInputElement>();
+function onWallpaperFileChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  if (file.size > WALLPAPER_MAX_BYTES) {
+    emit("error", new Error(t("wallpaper.tooLarge")));
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = typeof reader.result === "string" ? reader.result : "";
+    const match = /^data:(image\/(?:png|jpeg|webp));base64,(.+)$/.exec(dataUrl);
+    if (!match) {
+      emit("error", new Error(t("wallpaper.invalidImage")));
+      return;
+    }
+    emit("set-wallpaper-image", { base64: match[2], mime: match[1] });
+  };
+  reader.onerror = () => emit("error", new Error(t("wallpaper.invalidImage")));
+  reader.readAsDataURL(file);
+}
 const TERMINAL_FONT_CUSTOM = "__custom__";
 const TERMINAL_FONT_PRESETS: Array<{ value: string; label: string }> = [
   { value: "'JetBrains Mono', Consolas, monospace", label: "JetBrains Mono" },
@@ -1134,6 +1175,26 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
             </label>
             <p class="muted settings-note">{{ t("terminalAppearance.minimumContrastHint") }}</p>
 
+            <h4 class="settings-section-title">{{ t("wallpaper.sectionTitle") }}</h4>
+            <label class="quick-sudo-control">
+              <Switch size="sm" :model-value="wallpaperEnabled" @update:model-value="(v) => emit('update:wallpaperEnabled', v === true)" />
+              <span>{{ t("wallpaper.enabled") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("wallpaper.enabledHint") }}</p>
+            <template v-if="wallpaperEnabled">
+              <div class="appearance-actions">
+                <button type="button" @click="wallpaperFileInput?.click()"><Upload />{{ t("wallpaper.upload") }}</button>
+                <button type="button" @click="emit('clear-wallpaper')"><Trash2 />{{ t("wallpaper.clear") }}</button>
+              </div>
+              <input ref="wallpaperFileInput" class="hidden-file-input" type="file" accept="image/png,image/jpeg,image/webp" @change="onWallpaperFileChange" />
+              <label class="settings-field">
+                <span>{{ t("wallpaper.opacity") }}</span>
+                <input type="range" min="10" max="90" step="5" :value="wallpaperOpacity" @change="emit('update:wallpaperOpacity', Number(($event.target as HTMLInputElement).value))" />
+              </label>
+              <p class="muted settings-note">{{ t("wallpaper.limitHint") }}</p>
+              <p v-if="wallpaperSessionOnly" class="muted settings-note">{{ t("wallpaper.sessionOnly") }}</p>
+            </template>
+
             <h4 class="settings-section-title">{{ t("terminalAppearance.previewTitle") }}</h4>
             <!-- 与「配色方案」页共用同一个纯展示预览组件：两处 props 必须保持一致，
                  它是无状态无 id 的纯 DOM 复刻，实例化两次没有额外副作用。 -->
@@ -1460,6 +1521,13 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <input class="mono" spellcheck="false" :maxlength="64" :placeholder="GUTTER_TIMESTAMP_DEFAULT_FORMAT" :value="gutter.timestampFormat" @change="updateGutterFormat(textFieldValue($event))" />
             </label>
             <p class="muted settings-note">{{ t("gutter.timestampFormatHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("ctxSearch.sectionTitle") }}</h3>
+            <p class="muted settings-note">{{ t("ctxSearch.hint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("ctxSearch.enginesLabel") }}</span>
+              <textarea class="mono" rows="4" spellcheck="false" :value="ctxSearchEngines" @change="emit('update:ctxSearchEngines', ($event.target as HTMLTextAreaElement).value)"></textarea>
+            </label>
 
             <p class="muted settings-note">{{ t("terminalBehavior.scopeNote") }}</p>
             <p class="muted settings-note">{{ t("terminalFont.movedHint") }}</p>

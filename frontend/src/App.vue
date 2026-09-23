@@ -102,6 +102,7 @@ import {
 } from "./lib/terminalInteraction";
 import { planHostFileDrop } from "./lib/hostFileDrop";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
+import { createOutputGate } from "./lib/terminalBackpressure";
 import { createTerminalInputQueue } from "./lib/terminalInputQueue";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
@@ -268,6 +269,12 @@ import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator,
 import { Popover, PopoverAnchor, PopoverContent } from "./components/ui/popover";
 import { Dialog, DialogContent, DialogTitle } from "./components/ui/dialog";
 import SettingsDialog from "./components/SettingsDialog.vue";
+import TerminalContextMenu, {
+  buildSearchUrl,
+  DEFAULT_CTX_SEARCH_ENGINES_TEXT,
+  parseCtxSearchEnginesText,
+  type CtxSearchEngine,
+} from "./components/TerminalContextMenu.vue";
 import PortForwardDialog from "./components/PortForwardDialog.vue";
 import TelnetConnectDialog, { type TelnetConnectOptions } from "./components/TelnetConnectDialog.vue";
 import { ToastAction, ToastClose, ToastProvider, ToastRoot, ToastViewport } from "./components/ui/toast";
@@ -886,6 +893,8 @@ const suggestionPrefsAdapter = {
 // 终端长期挂 renderer；回放弹窗保持 DOM 渲染，GIF 导出在导出期间给离屏
 // 终端临时挂载（取像素依赖 canvas），导出完随终端 dispose 释放 context。
 const webglEnabled = ref(loadWebglEnabled());
+// 背景图开启时强制回退 DOM 渲染器（见 rendererWebglEffective watch）。
+const rendererWebglEffective = computed(() => webglEnabled.value && !wallpaperActive.value);
 const webglRenderer = ref<WebglRendererLike | null>(null);
 // GPU 重置/驱动切换后有限次重建 renderer（Tabby 同款策略）：成功经
 // onRecovered 回填引用，偏好已关闭则放弃重建，预算耗尽静默留在 DOM 渲染。
@@ -1118,8 +1127,38 @@ const selectedShellInjectable = computed<boolean | undefined>(() => {
 // reads `terminal` lazily so it also works across terminal recreation. The
 // write completion callback is the gutter timestamp capture point (P1-3): it
 // stamps the logical rows each merged batch actually produced.
+//
+// 大输出保护（IMPL_PLAN Task P2-7）：积压口径 = 已交给 xterm 但 write 回调尚未
+// 触发（还没解析完）的字节数。≥128KiB 进入 strained：合并批次按 32KiB 分帧写、
+// 挂起 gutter/关键词高亮/动作链接扫描；回落到 64KiB 以下自动恢复并补扫一次。
+const outputGate = createOutputGate();
+let outputInFlightBytes = 0;
+function settleOutputChunk(chunk: Uint8Array) {
+  outputInFlightBytes = Math.max(0, outputInFlightBytes - chunk.byteLength);
+  // 写入完成回调同时是模式复评点；恢复时挂起的扫描由 onOutputGateRelease 补上。
+  if (outputGate.feed(outputInFlightBytes) && outputGate.mode === "normal") onOutputGateRelease();
+  stampGutterWrittenRows();
+}
+function onOutputGateRelease() {
+  showNotice(t("backpressure.released"));
+  rescanHighlightViewport();
+  if (actionLinksEnabled.value && terminal) scheduleActionLinkScan(0, terminal.rows - 1);
+  scheduleGutterRecompute();
+}
 const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle({
-  sink: (data) => terminal?.write(data, stampGutterWrittenRows),
+  sink: (data) => {
+    if (!terminal) return;
+    outputInFlightBytes += data.byteLength;
+    if (outputGate.feed(outputInFlightBytes) && outputGate.mode === "strained") {
+      showNotice(t("backpressure.engaged"));
+      scheduleGutterRecompute();
+    }
+    if (outputGate.mode === "strained") {
+      for (const frame of outputGate.write(data)) terminal.write(frame, () => settleOutputChunk(frame));
+    } else {
+      terminal.write(data, () => settleOutputChunk(data));
+    }
+  },
 });
 // #33/#71 快速输入丢字母的分层计数：keys(onData 实际路由到 PTY 的按键)、
 // sends(提交给宿主桥的帧)、acks(sidecar 确认收到的帧)、errors(桥拒绝)、
@@ -1857,7 +1896,11 @@ function createTerminal() {
   // IME reports printable keys as keyCode=229 (#5887/#6045/#6144 upstream).
   // The adapter runs before xterm's hidden textarea listeners and routes only
   // single-byte text outside real composition through the same PTY path.
-  disposeWebkitInputFallback = installMacWebkitInputFallback({ terminal, onData: routeTerminalData });
+  // 右键菜单打开时暂停直写捕获（P2-8）：菜单操作不该漏进 PTY。
+  disposeWebkitInputFallback = installMacWebkitInputFallback({ terminal, onData: (data) => {
+    if (terminalMenuOpen.value) return;
+    routeTerminalData(data);
+  } });
   // 选中复制（可在设置里关闭）：选择一变化即静默写入剪贴板，不弹提示。
   disposeSelectionCopy = terminal.onSelectionChange(() => {
     if (!termSelectCopy.value || !terminal?.hasSelection()) return;
@@ -1878,7 +1921,7 @@ function createTerminal() {
   terminalHost.value.addEventListener("mouseup", terminalMouseUpHandler);
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value);
-  if (webglEnabled.value) {
+  if (webglEnabled.value && !wallpaperActive.value) {
     webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon(), webglRecoveryOptions());
   }
   if (highlightEnabled.value) attachHighlightRender();
@@ -1905,6 +1948,9 @@ function setWebglEnabled(next: boolean) {
  */
 function handleTerminalKey(event: KeyboardEvent) {
   if (event.type !== "keydown") return true;
+  // 右键菜单打开时暂停终端键盘捕获（P2-8）：按键归菜单导航，不落远端 shell
+  // （macOS 直写路径已在 onData 包装层同步暂停）。不取消浏览器默认动作。
+  if (terminalMenuOpen.value) return false;
   // xterm 的 false 只跳过终端处理，不会取消浏览器默认动作或冒泡。
   const consume = () => {
     event.preventDefault();
@@ -4426,6 +4472,8 @@ function rescanHighlightViewport() {
 
 function scheduleHighlightScan(start: number, end: number) {
   if (!terminal || !highlightEnabled.value || !compiledHighlightRules.value.length) return;
+  // 大输出保护生效期挂起扫描，恢复时由 onOutputGateRelease 补扫视口。
+  if (outputGate.mode === "strained") return;
   highlightPendingRange = highlightPendingRange
     ? { start: Math.min(highlightPendingRange.start, start), end: Math.max(highlightPendingRange.end, end) }
     : { start, end };
@@ -4609,6 +4657,8 @@ function hideActionLinkHint() {
 
 function scheduleActionLinkScan(start: number, end: number) {
   if (!terminal || !actionLinksEnabled.value) return;
+  // 大输出保护生效期挂起扫描，恢复时由 onOutputGateRelease 补扫视口。
+  if (outputGate.mode === "strained") return;
   actionLinkPendingRange = actionLinkPendingRange
     ? { start: Math.min(actionLinkPendingRange.start, start), end: Math.max(actionLinkPendingRange.end, end) }
     : { start, end };
@@ -4769,6 +4819,8 @@ function detachGutterListeners() {
 
 function scheduleGutterRecompute() {
   if (!isGutterActive()) return;
+  // 大输出保护生效期挂起重算（与下方积压跳帧同一目标，口径更早介入）。
+  if (outputGate.mode === "strained") return;
   if (gutterRafId) return;
   gutterRafId = window.requestAnimationFrame(runGutterRecompute);
 }
@@ -4778,6 +4830,7 @@ function runGutterRecompute() {
   const term = terminal;
   if (!term || !isGutterActive()) return;
   if (terminalWriteThrottle.pendingBytes > GUTTER_SUSPEND_PENDING_BYTES) return;
+  if (outputGate.mode === "strained") return;
   gutterCellHeight.value = getRenderCellHeight(term);
   const buffer = term.buffer.active;
   // 首视口行的像素起点 = xterm 元素的 padding-top（gutter 文本与画布行对齐）。
@@ -5398,7 +5451,12 @@ async function hydratePrefsOnce() {
       history_suggestions_enabled?: unknown;
       history_suggestion_min_chars?: unknown;
       history_suggestion_max_chars?: unknown;
+      ctx_search_engines?: unknown;
+      wallpaper_enabled?: unknown;
+      wallpaper_opacity?: unknown;
     }>("local/preferences/get", {});
+    // 背景图本体与偏好同拉（旧 sidecar 无 wallpaper/* 时静默缺席）。
+    void loadWallpaperImage();
     if (typeof prefs.downloadDir === "string") downloadDirState.value = prefs.downloadDir.trim();
     if (typeof prefs.downloadUseDefaultDir === "boolean") downloadUseDefaultState.value = prefs.downloadUseDefaultDir;
     if (prefs.downloadConflictPolicy !== undefined) downloadConflictState.value = sanitizeConflictPolicy(prefs.downloadConflictPolicy);
@@ -5420,6 +5478,11 @@ async function hydratePrefsOnce() {
     if (prefs.history_suggestions_enabled !== undefined) suggestionsEnabledState.value = prefs.history_suggestions_enabled === true;
     if (prefs.history_suggestion_min_chars !== undefined) suggestionMinCharsState.value = clampSuggestionMinChars(prefs.history_suggestion_min_chars);
     if (prefs.history_suggestion_max_chars !== undefined) suggestionMaxCharsState.value = clampSuggestionMaxChars(prefs.history_suggestion_max_chars);
+    // 在线搜索引擎表：键缺省保持默认 Google（ctxSearchEngines 解析对空/非法行鲁棒）。
+    if (typeof prefs.ctx_search_engines === "string") ctxSearchEnginesText.value = prefs.ctx_search_engines;
+    // 背景图偏好：键缺省保持内存默认（关 / 45%）。
+    if (typeof prefs.wallpaper_enabled === "boolean") wallpaperEnabled.value = prefs.wallpaper_enabled;
+    if (prefs.wallpaper_opacity !== undefined) wallpaperOpacity.value = Math.min(90, Math.max(10, Math.round(Number(prefs.wallpaper_opacity) || 45)));
     cachePrefs();
   } catch {
     // 旧 sidecar：保留 localStorage 种子或默认。
@@ -7173,6 +7236,83 @@ function interceptTerminalPaste(event: ClipboardEvent) {
   if (!text) return;
   void sendConfirmedPaste(text);
 }
+
+// —— 右键菜单「在线搜索」（IMPL_PLAN Task P2-8）——
+// 引擎表以原始文本持久化（sidecar preferences，allowlist 键 ctx_search_engines，
+// 每行 name|url 模板）；解析收口在 TerminalContextMenu.vue 的纯函数，非法行静默
+// 丢弃、解析永不失败（空表只是隐藏 Search online 项）。
+const ctxSearchEnginesText = ref(DEFAULT_CTX_SEARCH_ENGINES_TEXT);
+const ctxSearchEngines = computed(() => parseCtxSearchEnginesText(ctxSearchEnginesText.value));
+function updateCtxSearchEngines(text: string) {
+  ctxSearchEnginesText.value = text;
+  void persistTerminalFeaturePrefs({ ctx_search_engines: text });
+}
+function searchSelectionOnline(engine: CtxSearchEngine) {
+  terminalMenuOpen.value = false;
+  const query = terminal?.getSelection() || "";
+  if (!query) return;
+  const url = buildSearchUrl(engine, query);
+  if (!url) return;
+  // TODO(host): 宿主尚未提供 openExternal；待宿主开放后改为直接唤起系统浏览器。
+  // 当前兜底：把搜索链接复制进剪贴板并提示（失败走 sftp 错误条）。
+  copyTextToClipboard(url, "ctxSearch.linkCopied");
+  terminal?.focus();
+}
+
+// —— 背景图（IMPL_PLAN Task P2-9，对标 NyaTerm；MVP 简化）——
+// 图源权威态在 sidecar（local/wallpaper/get|set|clear，桌面端落盘
+// <plugin_data_dir>/wallpaper，≤8MiB png/jpeg/webp）；web/docker 形态 set 失败
+// （sidecar 存储不在本机）或旧 sidecar 无此方法时降级为仅本次会话内存态，
+// UI 有说明且不持久化。开关/透明度经 preferences allowlist 键持久化。
+const wallpaperEnabled = ref(false);
+// 百分比 10..=90（sidecar 侧钳制同口径），渲染时 /100。
+const wallpaperOpacity = ref(45);
+const wallpaperDataUrl = ref("");
+const wallpaperSessionOnly = ref(false);
+const wallpaperActive = computed(() => wallpaperEnabled.value && !!wallpaperDataUrl.value);
+async function loadWallpaperImage() {
+  try {
+    const result = await window.dbxPlugin.invoke<{ dataUrl?: string }>("local/wallpaper/get", {});
+    if (typeof result.dataUrl === "string") wallpaperDataUrl.value = result.dataUrl;
+  } catch {
+    // 旧 sidecar：背景图缺席，保持内存态。
+  }
+}
+async function setWallpaperImage(image: { base64: string; mime: string }) {
+  try {
+    const result = await window.dbxPlugin.invoke<{ dataUrl?: string }>("local/wallpaper/set", { imageBase64: image.base64 });
+    if (typeof result.dataUrl === "string") wallpaperDataUrl.value = result.dataUrl;
+    wallpaperSessionOnly.value = false;
+  } catch {
+    // web/docker 形态或旧 sidecar：仅本次会话内存态（mime 来自上传文件读取）。
+    wallpaperDataUrl.value = `data:${image.mime || "image/png"};base64,${image.base64}`;
+    wallpaperSessionOnly.value = true;
+  }
+}
+async function clearWallpaperImage() {
+  wallpaperSessionOnly.value = false;
+  wallpaperDataUrl.value = "";
+  try {
+    await window.dbxPlugin.invoke("local/wallpaper/clear", {});
+  } catch {
+    // 同 set：会话内存态已清，落盘态留待桌面形态下次清除。
+  }
+}
+function updateWallpaperEnabled(enabled: boolean) {
+  wallpaperEnabled.value = enabled;
+  void persistTerminalFeaturePrefs({ wallpaper_enabled: enabled });
+}
+function updateWallpaperOpacity(percent: number) {
+  wallpaperOpacity.value = Math.min(90, Math.max(10, Math.round(percent)));
+  void persistTerminalFeaturePrefs({ wallpaper_opacity: wallpaperOpacity.value });
+}
+// 背景图生效期强制 DOM 渲染器（P2-9）：WebGL 画布不透明，盖死背景层；关闭
+// 背景图后按用户 WebGL 开关恢复。复用现有 syncWebglRenderer 切换点。
+// （注册点必须在 wallpaperActive 定义之后：watch 首次求值会沿依赖链触达它。）
+watch(rendererWebglEffective, (next) => {
+  if (!terminal) return;
+  webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon(), webglRecoveryOptions());
+});
 
 async function sendConfirmedPaste(text: string) {
   // 粘贴文本变换的唯一收口：所有粘贴路径（原生 Ctrl+V、右键/菜单粘贴、中键粘贴）
@@ -9059,6 +9199,9 @@ onBeforeUnmount(() => {
   window.clearTimeout(terminalBellFlashTimer);
   terminalBellFlash.value = false;
   terminalWriteThrottle.dispose();
+  // 终端重建/会话关闭：在途写入回调整体作废，保护态复位，避免旧积压误判。
+  outputInFlightBytes = 0;
+  outputGate.reset();
   detachHighlightRender();
   detachActionLinks();
   detachGutterListeners();
@@ -9431,7 +9574,10 @@ onBeforeUnmount(() => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+        <!-- P2-9 背景图层：pointer-events:none 垫底（DOM 序先于 terminal-host），
+             透明度 0.1-0.9 由设置页滑杆控制；开启期间强制 DOM 渲染器透出本层。 -->
+        <div v-if="wallpaperActive" class="terminal-wallpaper" :style="{ backgroundImage: `url(${wallpaperDataUrl})`, opacity: wallpaperOpacity / 100 }" aria-hidden="true" />
         <!-- P1-3 行号/时间戳 gutter：绝对定位覆盖左缘 padding 环带（z-index 1，
              低于浮层 z-index 2），xterm 左 padding 随 --dbx-gutter-width 加宽，
              不遮文本；drop-overlay/搜索面板/诊断浮层定位不受影响。 -->
@@ -9833,9 +9979,19 @@ onBeforeUnmount(() => {
         </section>
       </section>
         </ContextMenuTrigger>
-        <ContextMenuContent>
-          <ContextMenuItem :disabled="!terminal?.hasSelection()" @select="copyTerminalSelection"><Copy />{{ t("terminalCopy") }}</ContextMenuItem>
-          <ContextMenuItem :disabled="!connected || terminalTransferBusy" @select="pasteTerminal"><ClipboardPaste />{{ t("terminalPaste") }}</ContextMenuItem>
+        <!-- P2-8：Copy/Paste/Search online/Close 由 TerminalContextMenu 承载；
+             插件自有菜单项经默认插槽保持在原有位置。 -->
+        <TerminalContextMenu
+          :open="terminalMenuOpen"
+          :has-selection="terminal?.hasSelection() ?? false"
+          :can-paste="connected && !terminalTransferBusy"
+          :engines="ctxSearchEngines"
+          :t="t"
+          @copy="copyTerminalSelection"
+          @paste="pasteTerminal"
+          @search="searchSelectionOnline"
+          @close="terminalMenuOpen = false"
+        >
           <!-- 本地终端最近命令（VS Code Run Recent Command 简化版）：
                依赖 shell integration 注入的 633;E 命令行。 -->
           <template v-if="isLocalMode && localRecentCommands.length">
@@ -9850,7 +10006,7 @@ onBeforeUnmount(() => {
           <ContextMenuSeparator />
           <ContextMenuItem :disabled="!connected || terminalTransferBusy || !canWrite" @select="chooseZmodem"><FileUp />{{ t("zmodemUpload") }}</ContextMenuItem>
           <ContextMenuItem :disabled="!connected || terminalTransferBusy || !canWrite" @select="chooseTrzszUpload"><FileUp />{{ t("trzszUpload") }}</ContextMenuItem>
-        </ContextMenuContent>
+        </TerminalContextMenu>
       </ContextMenu>
 
       <div v-if="sftpPaneOpen" class="divider" @pointerdown="startDividerDrag" />
@@ -10384,6 +10540,10 @@ onBeforeUnmount(() => {
       :apple-platform="applePlatform"
       :action-links="actionLinksSettings"
       :gutter="gutterSettings"
+      :ctx-search-engines="ctxSearchEnginesText"
+      :wallpaper-enabled="wallpaperEnabled"
+      :wallpaper-opacity="wallpaperOpacity"
+      :wallpaper-session-only="wallpaperSessionOnly"
       :appearance="terminalAppearanceState"
       :custom-themes="terminalAppearance.customThemes"
       :active-theme-id="activeAppearanceThemeId"
@@ -10401,6 +10561,11 @@ onBeforeUnmount(() => {
       @update-hotkeys="updateTerminalHotkeys"
       @update:action-links="updateActionLinksSettings"
       @update:gutter="updateGutterSettings"
+      @update:ctx-search-engines="updateCtxSearchEngines"
+      @update:wallpaper-enabled="updateWallpaperEnabled"
+      @update:wallpaper-opacity="updateWallpaperOpacity"
+      @set-wallpaper-image="setWallpaperImage"
+      @clear-wallpaper="clearWallpaperImage"
       @apply-font="(payload) => applyTerminalFontSettings(payload.family, payload.size)"
       @update-appearance="updateTerminalAppearance"
       @apply-theme="applyTerminalAppearanceTheme"
@@ -10933,6 +11098,28 @@ body.resizing-col { cursor: col-resize !important; user-select: none; }
 .terminal-pane.gutter-visible .terminal-host :deep(.xterm) {
   padding-left: calc(var(--dbx-gutter-width, 0px) + var(--ssh-terminal-padding-left, 10px));
 }
+/* —— P2-9 背景图（对标 NyaTerm，MVP 简化）——
+   图层垫底（DOM 序先于 terminal-host，pointer-events 关）；开启期间 pane/
+   宿主/xterm 表面底色透明化（color-mix 保留一层底色防纯黑/纯白刺眼），
+   !important 压过 xterm 6.x 内联在 .xterm-scrollable-element 的主题背景。
+   开启期间渲染器强制回退 DOM（rendererWebglEffective），否则 WebGL 画布
+   不透明会盖死本层。 */
+.terminal-wallpaper {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  pointer-events: none;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+.terminal-pane.wallpaper-active { background: color-mix(in srgb, var(--ssh-terminal-background) 55%, transparent); }
+.terminal-pane.wallpaper-active .terminal-host { background: transparent; }
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm),
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm .xterm-viewport),
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm .xterm-scrollable-element),
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm .xterm-screen),
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm .xterm-rows) { background: transparent !important; }
 .action-link-hint {
   position: absolute;
   z-index: 3;

@@ -4,8 +4,10 @@
 //! store for workbench preferences such as the download directory. The schema
 //! is a fixed allowlist — arbitrary keys from the renderer are dropped.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 const STORAGE_VERSION: u64 = 1;
@@ -14,6 +16,92 @@ const FILE_NAME: &str = "preferences.json";
 const MAX_DOWNLOAD_DIR_LEN: usize = 512;
 
 const MAX_TIMESTAMP_FORMAT_LEN: usize = 64;
+
+/// 右键「在线搜索」引擎表原始文本（每行 name|url 模板）上限：12 行内短串足够，
+/// 更大的输入按坏输入截断（前端解析器同样有行数/长度上限）。
+const MAX_CTX_SEARCH_ENGINES_LEN: usize = 2048;
+
+/// 背景图（P2-9）落盘位置：`<plugin_data_dir>/wallpaper`（无扩展名，格式由
+/// 魔数判定），与 preferences.json 同层。
+const WALLPAPER_FILE_NAME: &str = "wallpaper";
+/// 背景图上限 8 MiB。
+const WALLPAPER_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+pub fn wallpaper_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(WALLPAPER_FILE_NAME)
+}
+
+/// png / jpeg / webp 魔数识别；其余一律拒绝（不信任扩展名）。
+fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpeg");
+    }
+    if bytes.len() >= 12 && bytes[0..4] == *b"RIFF" && bytes[8..12] == *b"WEBP" {
+        return Some("webp");
+    }
+    None
+}
+
+/// 读取落盘背景并打包成 data URL；文件缺失或魔数非法（手工替换/损坏）一律
+/// 返回空对象，前端按无背景处理。
+pub fn load_wallpaper(data_dir: &Path) -> Value {
+    let bytes = match std::fs::read(wallpaper_path(data_dir)) {
+        Ok(bytes) => bytes,
+        Err(_) => return json!({}),
+    };
+    match detect_image_format(&bytes) {
+        Some(format) => json!({
+            "dataUrl": format!("data:image/{format};base64,{}", BASE64_STANDARD.encode(bytes)),
+        }),
+        None => json!({}),
+    }
+}
+
+/// 保存背景图：校验 ≤8 MiB 且为 png/jpeg/webp 魔数后原子落盘（tmp + rename），
+/// 返回与 get 相同的 data URL 载荷。
+pub fn save_wallpaper(data_dir: &Path, params: &Value) -> Result<Value, String> {
+    let data_base64 = params
+        .get("imageBase64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "imageBase64 must be a base64 string".to_string())?;
+    // 粗判：base64 每 3 字节占 4 字符，超限先拒，避免无谓解码大 payload。
+    if data_base64.len() > WALLPAPER_MAX_BYTES / 3 * 4 + 4 {
+        return Err(format!(
+            "imageBase64 exceeds the wallpaper limit of {} MiB",
+            WALLPAPER_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    let bytes = BASE64_STANDARD
+        .decode(data_base64.trim())
+        .map_err(|error| format!("imageBase64 is not valid base64: {error}"))?;
+    if bytes.is_empty() || bytes.len() > WALLPAPER_MAX_BYTES {
+        return Err(format!(
+            "imageBase64 exceeds the wallpaper limit of {} MiB",
+            WALLPAPER_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    detect_image_format(&bytes)
+        .ok_or_else(|| "imageBase64 must be a png, jpeg or webp image".to_string())?;
+    let path = wallpaper_path(data_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("wallpaper.tmp");
+    std::fs::write(&tmp, &bytes)
+        .map_err(|error| format!("Failed to write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
+    Ok(load_wallpaper(data_dir))
+}
+
+/// 清除背景图：文件不存在视为成功（幂等）。
+pub fn clear_wallpaper(data_dir: &Path) -> Value {
+    let _ = std::fs::remove_file(wallpaper_path(data_dir));
+    json!({})
+}
 
 pub fn store_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join(FILE_NAME)
@@ -83,6 +171,12 @@ fn sanitize_timestamp_format(value: &Value) -> Option<String> {
     } else {
         cleaned
     })
+}
+
+/// 在线搜索引擎表原始文本：仅裁首尾空白并截断到上限；行级校验在前端解析器。
+fn sanitize_ctx_search_engines(value: &Value) -> Option<String> {
+    let text = value.as_str()?.trim();
+    Some(text.chars().take(MAX_CTX_SEARCH_ENGINES_LEN).collect())
 }
 
 /// Reads the raw preferences map; a missing or corrupted file yields an empty
@@ -197,6 +291,20 @@ pub fn load_preferences(data_dir: &Path) -> Value {
             "terminal_timestamp_format".to_string(),
             Value::String(format),
         );
+    }
+    if let Some(engines) = map
+        .get("ctx_search_engines")
+        .and_then(sanitize_ctx_search_engines)
+    {
+        prefs.insert("ctx_search_engines".to_string(), Value::String(engines));
+    }
+    // 背景图开关与透明度（百分比 10..=90，缺省 45；前端展示时 /100）。
+    if let Some(enabled) = map.get("wallpaper_enabled").and_then(Value::as_bool) {
+        prefs.insert("wallpaper_enabled".to_string(), Value::Bool(enabled));
+    }
+    if map.contains_key("wallpaper_opacity") {
+        let opacity = sanitize_u64_clamped(&map["wallpaper_opacity"], 10, 90, 45);
+        prefs.insert("wallpaper_opacity".to_string(), Value::from(opacity));
     }
 
     Value::Object(prefs)
@@ -332,6 +440,28 @@ pub fn save_preferences(data_dir: &Path, params: &Value) -> Result<Value, String
             Value::String(format),
         );
     }
+    if let Some(value) = params.get("ctx_search_engines") {
+        let engines = sanitize_ctx_search_engines(value)
+            .ok_or_else(|| "ctx_search_engines must be a string".to_string())?;
+        map.insert("ctx_search_engines".to_string(), Value::String(engines));
+    }
+    if let Some(value) = params.get("wallpaper_enabled") {
+        let enabled = value
+            .as_bool()
+            .ok_or_else(|| "wallpaper_enabled must be a boolean".to_string())?;
+        map.insert("wallpaper_enabled".to_string(), Value::Bool(enabled));
+    }
+    if params.get("wallpaper_opacity").is_some() {
+        map.insert(
+            "wallpaper_opacity".to_string(),
+            Value::from(sanitize_u64_clamped(
+                &params["wallpaper_opacity"],
+                10,
+                90,
+                45,
+            )),
+        );
+    }
 
     let path = store_path(data_dir);
     if let Some(parent) = path.parent() {
@@ -353,6 +483,80 @@ pub fn save_preferences(data_dir: &Path, params: &Value) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallpaper_roundtrip_validates_magic_and_size() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        // 空存储：get 返回空对象。
+        assert_eq!(load_wallpaper(data_dir.path()), json!({}));
+        // png 魔数（1x1 透明 png 文件头即可，不做像素解码）。
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+        let saved = save_wallpaper(data_dir.path(), &json!({ "imageBase64": B64.encode(&png) }))
+            .expect("save png");
+        let data_url = saved["dataUrl"].as_str().unwrap();
+        assert!(data_url.starts_with("data:image/png;base64,"));
+        assert_eq!(load_wallpaper(data_dir.path()), saved);
+        // jpeg / webp 魔数同样接受。
+        save_wallpaper(
+            data_dir.path(),
+            &json!({ "imageBase64": B64.encode([0xFF, 0xD8, 0xFF, 0xE0]) }),
+        )
+        .expect("save jpeg");
+        assert!(load_wallpaper(data_dir.path())["dataUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,"));
+        let webp: Vec<u8> = [b"RIFF".as_slice(), &[1, 2, 3, 4], b"WEBP"].concat();
+        save_wallpaper(data_dir.path(), &json!({ "imageBase64": B64.encode(webp) }))
+            .expect("save webp");
+        assert!(load_wallpaper(data_dir.path())["dataUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/webp;base64,"));
+        // 非法魔数拒绝且不落盘污染（仍是上一张 webp）。
+        let error = save_wallpaper(
+            data_dir.path(),
+            &json!({ "imageBase64": B64.encode(b"GIF89a....") }),
+        )
+        .expect_err("must reject non-image");
+        assert!(error.contains("png, jpeg or webp"));
+        // 非法 base64 拒绝；缺参/非字符串拒绝。
+        assert!(save_wallpaper(data_dir.path(), &json!({ "imageBase64": "!!!" })).is_err());
+        assert!(save_wallpaper(data_dir.path(), &json!({})).is_err());
+        // 大小上限：>8MiB 的二进制拒绝（粗判在 base64 长度上先触发）。
+        let oversized = vec![0u8; WALLPAPER_MAX_BYTES + 1];
+        let error = save_wallpaper(
+            data_dir.path(),
+            &json!({ "imageBase64": B64.encode(&oversized) }),
+        )
+        .expect_err("must reject oversize");
+        assert!(error.contains("limit"));
+        // clear 幂等：清除后 get 回空对象，再次 clear 仍成功。
+        assert_eq!(clear_wallpaper(data_dir.path()), json!({}));
+        assert_eq!(load_wallpaper(data_dir.path()), json!({}));
+        assert_eq!(clear_wallpaper(data_dir.path()), json!({}));
+    }
+
+    #[test]
+    fn wallpaper_prefs_roundtrip_with_clamp() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        // 空偏好：两键都不出现（前端按缺省处理）。
+        let prefs = load_preferences(data_dir.path());
+        assert!(prefs.get("wallpaper_enabled").is_none());
+        assert!(prefs.get("wallpaper_opacity").is_none());
+        save_preferences(
+            data_dir.path(),
+            &json!({ "wallpaper_enabled": true, "wallpaper_opacity": 999 }),
+        )
+        .expect("save");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(prefs["wallpaper_enabled"], true);
+        assert_eq!(prefs["wallpaper_opacity"], 90);
+        assert!(save_preferences(data_dir.path(), &json!({ "wallpaper_enabled": "yes" })).is_err());
+    }
 
     #[test]
     fn local_terminal_prefs_roundtrip_with_defaults() {
@@ -488,6 +692,37 @@ mod tests {
             &serde_json::json!({ "terminal_show_timestamps": "yes" })
         )
         .is_err());
+        // 在线搜索引擎表：trim + 超长截断；非字符串拒绝。
+        assert!(save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "ctx_search_engines": 7 })
+        )
+        .is_err());
+        save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "ctx_search_engines": "  Google|https://www.google.com/search?q=%s  " }),
+        )
+        .expect("save engines");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(
+            prefs["ctx_search_engines"],
+            "Google|https://www.google.com/search?q=%s"
+        );
+        let long = "x".repeat(MAX_CTX_SEARCH_ENGINES_LEN + 10);
+        save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "ctx_search_engines": long }),
+        )
+        .expect("save long engines");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(
+            prefs["ctx_search_engines"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_CTX_SEARCH_ENGINES_LEN
+        );
         // 格式串清洗：危险字符剔除、超长截断、清洗后为空回退默认。
         save_preferences(
             data_dir.path(),
