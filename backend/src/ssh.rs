@@ -800,7 +800,7 @@ impl client::Handler for SshClient {
     /// immediately and the SSH reader is never blocked by user traffic.
     async fn server_channel_open_x11(
         &mut self,
-        mut channel: russh::Channel<russh::client::Msg>,
+        channel: russh::Channel<russh::client::Msg>,
         originator_address: &str,
         originator_port: u32,
         reply: client::ChannelOpenHandle,

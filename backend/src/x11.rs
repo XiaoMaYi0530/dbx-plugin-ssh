@@ -417,6 +417,101 @@ impl X11Gate {
     }
 }
 
+// —— 会话接线（ssh.rs 消费）———————————————————————————————
+
+/// The gate of the most recent X11-enabled session (`armed()` output).
+/// `None` until a session turns X11 on; replaced on each re-arm.
+static ACTIVE_GATE: std::sync::OnceLock<Arc<X11Gate>> = std::sync::OnceLock::new();
+
+/// Arms a fresh gate for a session that turned X11 on; returns the fake
+/// cookie hex to send in `x11-req`.
+pub(crate) fn arm_session() -> Result<String, String> {
+    let (gate, hex) = X11Gate::armed()?;
+    let _ = ACTIVE_GATE.set(gate);
+    set_enabled(true);
+    Ok(hex)
+}
+
+/// Admission for `server_channel_open_x11`: only succeeds while a session
+/// has X11 armed and the per-connection bridge cap is not exhausted.
+pub(crate) fn try_admit_active() -> Option<(FakeCookie, BridgePermit)> {
+    ACTIVE_GATE.get().and_then(|gate| gate.try_admit())
+}
+
+/// Fast-path preference flag (mirrors `x11_forwarding` in preferences.json).
+/// The Handler consults this before touching the registry; the on-disk file
+/// stays the source of truth via [`enabled_from`].
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::SeqCst);
+}
+
+pub(crate) fn enabled() -> bool {
+    ENABLED.load(Ordering::SeqCst)
+}
+
+/// Reads `x11_forwarding` from the allowlisted preferences file.
+/// The display target for the current session: the `DISPLAY` environment
+/// variable parsed, falling back to the default unix socket (`:0`).
+pub(crate) fn current_display_target() -> DisplayTarget {
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    parse_display(&display).unwrap_or_else(|| unix_display(0))
+}
+
+pub(crate) fn enabled_from(data_dir: &Path) -> bool {
+    let text =
+        std::fs::read_to_string(crate::preferences::store_path(data_dir)).unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("x11_forwarding")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Bridges an accepted x11 channel into the local X server endpoint
+/// (unix socket first, TCP loopback fallback). Byte-for-byte relay: the X
+/// client's real-cookie setup packet travels untouched to the local server.
+pub(crate) async fn bridge_channel(
+    channel: russh::Channel<russh::client::Msg>,
+    target: &DisplayTarget,
+) -> Result<(), String> {
+    let connect_error = |error| format!("X11: cannot reach local display {target:?}: {error}");
+    match &target.server {
+        DisplayServer::UnixSocket(path) => {
+            let local = tokio::net::UnixStream::connect(path)
+                .await
+                .map_err(&connect_error)?;
+            let mut stream = channel.into_stream();
+            let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut { local })
+                .await
+                .map_err(|error| format!("X11: bridge error: {error}"))?;
+            tracing_bridge_stats(up, down);
+            Ok(())
+        }
+        DisplayServer::TcpLoopback(port) => {
+            let mut local = tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                .await
+                .map_err(&connect_error)?;
+            let mut stream = channel.into_stream();
+            let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut local)
+                .await
+                .map_err(|error| format!("X11: bridge error: {error}"))?;
+            tracing_bridge_stats(up, down);
+            Ok(())
+        }
+    }
+}
+
+fn tracing_bridge_stats(up: u64, down: u64) {
+    if up + down > 0 {
+        eprintln!("[x11] bridged {up}↑/{down}↓ bytes");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,100 +808,5 @@ mod tests {
         assert_eq!(pad4(1), 4);
         assert_eq!(pad4(4), 4);
         assert_eq!(pad4(18), 20);
-    }
-}
-
-// —— 会话接线（ssh.rs 消费）———————————————————————————————
-
-/// The gate of the most recent X11-enabled session (`armed()` output).
-/// `None` until a session turns X11 on; replaced on each re-arm.
-static ACTIVE_GATE: std::sync::OnceLock<Arc<X11Gate>> = std::sync::OnceLock::new();
-
-/// Arms a fresh gate for a session that turned X11 on; returns the fake
-/// cookie hex to send in `x11-req`.
-pub(crate) fn arm_session() -> Result<String, String> {
-    let (gate, hex) = X11Gate::armed()?;
-    let _ = ACTIVE_GATE.set(gate);
-    set_enabled(true);
-    Ok(hex)
-}
-
-/// Admission for `server_channel_open_x11`: only succeeds while a session
-/// has X11 armed and the per-connection bridge cap is not exhausted.
-pub(crate) fn try_admit_active() -> Option<(FakeCookie, BridgePermit)> {
-    ACTIVE_GATE.get().and_then(|gate| gate.try_admit())
-}
-
-/// Fast-path preference flag (mirrors `x11_forwarding` in preferences.json).
-/// The Handler consults this before touching the registry; the on-disk file
-/// stays the source of truth via [`enabled_from`].
-static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::SeqCst);
-}
-
-pub(crate) fn enabled() -> bool {
-    ENABLED.load(Ordering::SeqCst)
-}
-
-/// Reads `x11_forwarding` from the allowlisted preferences file.
-/// The display target for the current session: the `DISPLAY` environment
-/// variable parsed, falling back to the default unix socket (`:0`).
-pub(crate) fn current_display_target() -> DisplayTarget {
-    let display = std::env::var("DISPLAY").unwrap_or_default();
-    parse_display(&display).unwrap_or_else(|| unix_display(0))
-}
-
-pub(crate) fn enabled_from(data_dir: &Path) -> bool {
-    let text =
-        std::fs::read_to_string(crate::preferences::store_path(data_dir)).unwrap_or_default();
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("x11_forwarding")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(false)
-}
-
-/// Bridges an accepted x11 channel into the local X server endpoint
-/// (unix socket first, TCP loopback fallback). Byte-for-byte relay: the X
-/// client's real-cookie setup packet travels untouched to the local server.
-pub(crate) async fn bridge_channel(
-    channel: russh::Channel<russh::client::Msg>,
-    target: &DisplayTarget,
-) -> Result<(), String> {
-    let connect_error = |error| format!("X11: cannot reach local display {target:?}: {error}");
-    match &target.server {
-        DisplayServer::UnixSocket(path) => {
-            let local = tokio::net::UnixStream::connect(path)
-                .await
-                .map_err(|error| connect_error(error))?;
-            let mut stream = channel.into_stream();
-            let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut { local })
-                .await
-                .map_err(|error| format!("X11: bridge error: {error}"))?;
-            tracing_bridge_stats(up, down);
-            Ok(())
-        }
-        DisplayServer::TcpLoopback(port) => {
-            let mut local = tokio::net::TcpStream::connect(("127.0.0.1", *port))
-                .await
-                .map_err(|error| connect_error(error))?;
-            let mut stream = channel.into_stream();
-            let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut local)
-                .await
-                .map_err(|error| format!("X11: bridge error: {error}"))?;
-            tracing_bridge_stats(up, down);
-            Ok(())
-        }
-    }
-}
-
-fn tracing_bridge_stats(up: u64, down: u64) {
-    if up + down > 0 {
-        eprintln!("[x11] bridged {up}↑/{down}↓ bytes");
     }
 }
