@@ -454,6 +454,8 @@ pub fn bound_totp_in(data_dir: &Path, connection_id: &str) -> Option<BoundTotp> 
 }
 
 /// 自动应答回落入口：进程级 data_dir 上的 [`bound_totp_in`]。
+/// 无 data_dir 参数变体（历史签名）；自动应答现走 take_connection_totp_key。
+#[allow(dead_code)]
 pub fn bound_totp(connection_id: &str) -> Option<BoundTotp> {
     bound_totp_in(&data_dir()?, connection_id)
 }

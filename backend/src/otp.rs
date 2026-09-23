@@ -201,6 +201,8 @@ pub fn parse_otpauth_uri(uri: &str) -> Result<OtpUriParams, String> {
 
 /// 由解析产物重建 `otpauth://` URI（`otp/import-qr` 预填回显与解析/生成
 /// 往返测试共用）。label 做百分号编码，参数按 Google Authenticator 约定排列。
+/// W2b 的 OTP 面板（展示二维码/导出）接线前暂无调用方；保留完整 URI 能力。
+#[allow(dead_code)]
 pub fn to_otpauth_uri(params: &OtpUriParams) -> String {
     let mut uri = format!(
         "otpauth://{}/{}?secret={}&issuer={}&algorithm={}&digits={}&period={}",
@@ -254,6 +256,7 @@ fn normalize_base32(text: &str) -> Result<String, String> {
 
 /// RFC 3986 保留集之外原样保留；等价于 `encodeURIComponent` 的常用子集
 /// （otpauth label/issuer 只需要这一档，避免为编码再引 crate）。
+#[allow(dead_code)]
 fn percent_encode(text: &str) -> String {
     let mut encoded = String::with_capacity(text.len());
     for byte in text.as_bytes() {
