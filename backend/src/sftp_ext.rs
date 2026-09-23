@@ -9,7 +9,8 @@ use base64::Engine as _;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt as _;
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
@@ -697,6 +698,109 @@ fn check_exec_success(outcome: &Value, operation: &str) -> Result<(), String> {
     }
 }
 
+/// —— 外部编辑器回传上传（watch/upload 后端；remote-edit 目录防逃逸）——
+
+pub const MAX_UPLOAD_LOCAL_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Copy buffer for the streaming local→SFTP push.
+const UPLOAD_LOCAL_CHUNK: usize = 128 * 1024;
+
+/// `sftp/upload-local {sessionId, localPath, remotePath} -> {path, size}` —
+
+fn validate_remote_edit_path(
+    local_path: &Path,
+    data_dir: &Path,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if !local_path.is_absolute() {
+        return Err("localPath must be an absolute path".to_string());
+    }
+    let canonical = local_path.canonicalize().map_err(|error| {
+        format!(
+            "Local file '{}' does not exist: {error}",
+            local_path.display()
+        )
+    })?;
+    let downloads = crate::local_downloads::downloads_base_dir(lookup, data_dir);
+    let root = downloads.join("remote-edit");
+    let root = root
+        .canonicalize()
+        .map_err(|_| "Local file is not inside the remote-edit directory".to_string())?;
+    if !canonical.starts_with(&root) {
+        return Err("Only files inside the remote-edit directory can be uploaded".to_string());
+    }
+    Ok(canonical)
+}
+
+pub async fn upload_watched_file(
+    runtime: &SshRuntime,
+    session_id: &str,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<Value, String> {
+    runtime.ensure_writable(session_id).await?;
+    let local =
+        validate_remote_edit_path(Path::new(local_path.trim()), &runtime.data_dir(), |key| {
+            std::env::var_os(key)
+        })?;
+    let size = tokio::fs::metadata(&local)
+        .await
+        .map_err(|error| format!("Local file '{}' is unreadable: {error}", local.display()))?
+        .len();
+    if size > MAX_UPLOAD_LOCAL_SIZE {
+        return Err(format!(
+            "Remote-edit uploads are limited to {MAX_UPLOAD_LOCAL_SIZE} bytes"
+        ));
+    }
+    let remote_path = normalize_remote_path(remote_path)?;
+    let sftp = runtime.sftp(session_id).await?;
+    let task_id = Uuid::new_v4().to_string();
+    let (temporary, backup) = direct_write_paths(&remote_path, &task_id);
+    {
+        let session = sftp.lock().await;
+        let mut file = session
+            .create(temporary.clone())
+            .await
+            .map_err(sftp_error)?;
+        let mut reader = match tokio::fs::File::open(&local).await {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = session.remove_file(temporary.clone()).await;
+                return Err(format!(
+                    "Local file '{}' is unreadable: {error}",
+                    local.display()
+                ));
+            }
+        };
+        let mut buffer = vec![0u8; UPLOAD_LOCAL_CHUNK];
+        loop {
+            let read = match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    drop(file);
+                    let _ = session.remove_file(temporary.clone()).await;
+                    return Err(format!(
+                        "Local file '{}' read failed: {error}",
+                        local.display()
+                    ));
+                }
+            };
+            if let Err(error) = file.write_all(&buffer[..read]).await {
+                drop(file);
+                let _ = session.remove_file(temporary.clone()).await;
+                return Err(format!("SFTP write failed: {error}"));
+            }
+        }
+        if let Err(error) = file.flush().await {
+            drop(file);
+            let _ = session.remove_file(temporary.clone()).await;
+            return Err(format!("SFTP write flush failed: {error}"));
+        }
+    }
+    commit_temporary_file(&sftp, &temporary, &remote_path, &backup).await?;
+    Ok(json!({ "path": remote_path, "size": size }))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
