@@ -688,6 +688,44 @@ impl Plugin {
                 ))?;
                 Ok(json!({ "success": true }))
             }
+            "sftp/symlink-create" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let target = required_string(&params, "target")?;
+                let link_path = required_string(&params, "linkPath")?;
+                self.runtime.block_on(sftp_ext::symlink_create(
+                    &self.ssh, session_id, target, link_path,
+                ))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/symlink-read" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let link_path = required_string(&params, "linkPath")?;
+                self.runtime
+                    .block_on(sftp_ext::symlink_read(&self.ssh, session_id, link_path))
+            }
+            "sftp/symlink-update" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let link_path = required_string(&params, "linkPath")?;
+                let target = required_string(&params, "target")?;
+                self.runtime.block_on(sftp_ext::symlink_update(
+                    &self.ssh, session_id, link_path, target,
+                ))?;
+                Ok(json!({ "success": true }))
+            }
+            // 外部编辑器回传：把 watcher 交付的 remote-edit 本地文件推回远端。
+            // 安全边界见 sftp_ext::validate_remote_edit_path —— 只收
+            // <下载目录>/remote-edit/ 之下、经 canonicalize 校验的文件。
+            "sftp/upload-local" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let local_path = required_string(&params, "localPath")?;
+                let remote_path = required_string(&params, "remotePath")?;
+                self.runtime.block_on(sftp_ext::upload_watched_file(
+                    &self.ssh,
+                    session_id,
+                    local_path,
+                    remote_path,
+                ))
+            }
             // 外部编辑器回传（仅桌面端）：前端先用 sftp/download 把文件落到
             // 本地 remote-edit 目录，这里只注册监听；确认内容真变后经
             // watch/file-modified 事件推回工作台。
