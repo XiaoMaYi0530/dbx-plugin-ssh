@@ -25,6 +25,7 @@ use crate::agent_terminal::{self, AgentTerminalMode};
 use crate::alert_triage;
 use crate::app_bridge;
 use crate::audit_log;
+use crate::docker;
 use crate::exec::{self, AuthFlowMode, Hints, SudoAuth};
 use crate::host_key::HostKeyVerifier;
 use crate::mcp_safety::{self, CommandRisk};
@@ -306,6 +307,8 @@ fn is_connection_scoped_tool(name: &str) -> bool {
         name,
         "ssh_task_status"
             | "ssh_metrics"
+            | "docker_list"
+            | "docker_action"
             | "ssh_test_connection"
             | "ssh_close"
             | "sftp_list_dir"
@@ -1085,11 +1088,22 @@ impl McpState {
             } else {
                 "command"
             };
-            let command = required_str(arguments, command_key)?;
+            // docker_action carries no `command` argument: derive the exact
+            // approval text (`docker rm <id>`) from the validated action so
+            // the dialog shows precisely what will run, and a malformed
+            // id/action fails here instead of after approval.
+            let command: String = if name == "docker_action" {
+                let container_id = required_str(arguments, "containerId")?;
+                docker::validate_container_id(container_id)?;
+                let action = docker::parse_action(required_str(arguments, "action")?)?;
+                docker::action_command(action, container_id)
+            } else {
+                required_str(arguments, command_key)?.to_string()
+            };
             let connection_id = arguments.get("connectionId").and_then(Value::as_str);
             let approved = self
                 .runtime
-                .request_mcp_confirm(name, command, connection_id, emitter)
+                .request_mcp_confirm(name, &command, connection_id, emitter)
                 .await?;
             // The approval dialog is editable: the confirmed text replaces
             // the original for the actual execution.
@@ -1543,6 +1557,39 @@ impl McpState {
                         exec::parse_disk_usage(&outcome.output).ok_or_else(|| {
                             format!("Could not parse disk usage: {}", outcome.output)
                         })
+                    }
+                    "docker_list" => {
+                        // Read-only collection on the pooled connection; the
+                        // probe degrades to available:false instead of erroring.
+                        let connection = self.connection(arguments).await?;
+                        docker::collect_list(&connection).await
+                    }
+                    "docker_action" => {
+                        // Validation before any connection I/O (same
+                        // fail-fast shape as metrics_sections).
+                        let container_id = required_str(arguments, "containerId")?;
+                        docker::validate_container_id(container_id)?;
+                        let action = docker::parse_action(required_str(arguments, "action")?)?;
+                        let connection = self.connection(arguments).await?;
+                        // Quick Sudo credentials resolve up front from local
+                        // sources only (registry + profile store); a resolution
+                        // failure degrades to None and the fallback surfaces
+                        // the configuration guidance. No password argument
+                        // exists on this tool by contract.
+                        let stored = self
+                            .registered_connection_by_ref(arguments)
+                            .await
+                            .ok()
+                            .flatten();
+                        let sudo_auth = self.resolve_sudo_auth(arguments, None, stored).await.ok();
+                        docker::perform_action(
+                            &connection,
+                            sudo_auth.as_ref(),
+                            false,
+                            container_id,
+                            action,
+                        )
+                        .await
                     }
                     other => self.sftp_tool(other, arguments).await,
                 };
@@ -3019,6 +3066,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "ssh_run_bg",
     "ssh_task_status",
     "ssh_metrics",
+    "docker_list",
+    "docker_action",
     "ssh_alert_triage",
     "ssh_close",
     "ssh_test_connection",
@@ -3159,6 +3208,8 @@ fn is_connection_bound_tool(name: &str) -> bool {
             | "ssh_run_bg"
             | "ssh_task_status"
             | "ssh_metrics"
+            | "docker_list"
+            | "docker_action"
             | "ssh_test_connection"
             | "sftp_list_dir"
             | "sftp_stat"
@@ -3437,6 +3488,7 @@ fn is_write_tool(name: &str) -> bool {
         name,
         "ssh_exec_sudo"
             | "ssh_run_bg"
+            | "docker_action"
             | "sftp_write_file"
             | "sftp_upload"
             | "sftp_mkdir"
@@ -4010,6 +4062,8 @@ fn tool_annotations(name: &str) -> Value {
         "sftp_pwd",
         "sftp_read_file",
         "sftp_disk_usage",
+        // Docker panel read surface: list/poll containers only.
+        "docker_list",
     ];
     // May destroy or replace existing state: the exec family (arbitrary
     // remote commands), store deletions, and remove/move/overwrite-capable
@@ -4028,6 +4082,9 @@ fn tool_annotations(name: &str) -> Value {
         "sftp_upload",
         "sftp_download",
         "sftp_write_file",
+        // Container lifecycle (rm/kill especially) is destructive; the tool
+        // description spells out the confirm-first semantics.
+        "docker_action",
     ];
     // Mutating but non-destructive, and repeating them converges to the
     // same state instead of compounding (idempotentHint).
@@ -4059,6 +4116,8 @@ fn tool_title(name: &str) -> Option<&'static str> {
         "ssh_run_bg" => "Start background SSH task",
         "ssh_task_status" => "Poll background SSH task",
         "ssh_metrics" => "Collect server metrics",
+        "docker_list" => "List Docker containers",
+        "docker_action" => "Manage Docker container",
         "ssh_alert_triage" => "SSH alert triage",
         "ssh_close" => "Close SSH connection",
         "ssh_test_connection" => "Test SSH connection",
@@ -4184,6 +4243,28 @@ pub fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[]),
+                "anyOf": connection_selector_requirements(),
+            },
+        },
+        {
+            "name": "docker_list",
+            "description": "List Docker containers on a remote host (docker ps -a via read-only shell collection): name, image, state, status, ports, creation time. When the docker CLI is missing or the daemon socket is denied, available=false and containers=[] instead of an error; needsSudo=true marks the denied case, where lifecycle actions can still run through the connection's Quick Sudo credentials.",
+            "inputSchema": {
+                "type": "object",
+                "properties": connection_properties(&[]),
+                "anyOf": connection_selector_requirements(),
+            },
+        },
+        {
+            "name": "docker_action",
+            "description": "Run a lifecycle action (start | stop | restart | kill | rm) on one remote Docker container. DESTRUCTIVE for rm (removes the container) and kill (SIGKILL): get explicit human confirmation in the frontend/dialog before sending them - start/stop/restart are reversible and do not need one. containerId must be 12-64 lowercase hex characters; the tool never accepts passwords. Plain execution first; only a daemon-socket permission failure retries through the connection's Quick Sudo credentials (piped over stdin, never the command line). Read-only connections are refused.",
+            "inputSchema": {
+                "type": "object",
+                "properties": connection_properties(&[
+                    ("containerId", "string", "Container id (12-64 lowercase hex characters, as returned by docker_list)"),
+                    ("action", "string", "Lifecycle action: start | stop | restart | kill | rm. rm/kill are destructive and need explicit human confirmation"),
+                ]),
+                "required": ["containerId", "action"],
                 "anyOf": connection_selector_requirements(),
             },
         },
@@ -4499,6 +4580,7 @@ mod tests {
             "ssh_run_bg",
             "ssh_multi_exec",
             "ssh_terminal_input",
+            "docker_action",
             "sftp_write_file",
             "sftp_upload",
             "sftp_remove",
@@ -4508,6 +4590,7 @@ mod tests {
         for spared in [
             "ssh_close",
             "ssh_metrics",
+            "docker_list",
             "ssh_test_connection",
             "sftp_list_dir",
             "sftp_read_file",
@@ -4581,6 +4664,7 @@ mod tests {
             "ssh_list_known_hosts",
             "ssh_quick_sudo_profiles_list",
             "ssh_metrics",
+            "docker_list",
             "ssh_alert_triage",
             "ssh_test_connection",
             "ssh_task_status",
@@ -4606,6 +4690,7 @@ mod tests {
             "ssh_multi_exec",
             "ssh_terminal_input",
             "ssh_run_bg",
+            "docker_action",
             "ssh_remove_known_host",
             "ssh_quick_sudo_profiles_delete",
             "sftp_remove",
@@ -4638,7 +4723,7 @@ mod tests {
         let tools = definitions.as_array().unwrap();
         assert_eq!(
             tools.len(),
-            31,
+            33,
             "tool count changed; revisit annotation sets"
         );
         for tool in tools {
@@ -4652,6 +4737,7 @@ mod tests {
                         | "ssh_list_known_hosts"
                         | "ssh_quick_sudo_profiles_list"
                         | "ssh_metrics"
+                        | "docker_list"
                         | "ssh_alert_triage"
                         | "ssh_test_connection"
                         | "ssh_task_status"
@@ -7547,7 +7633,7 @@ mod tests {
             .copied()
             .filter(|name| is_connection_bound_tool(name))
             .collect();
-        assert_eq!(forwarders.len(), 21, "connection-bound tool set drifted");
+        assert_eq!(forwarders.len(), 23, "connection-bound tool set drifted");
         for name in forwarders {
             let arguments = match name {
                 "ssh_exec" | "ssh_exec_sudo" | "ssh_run_bg" => {
@@ -7555,6 +7641,9 @@ mod tests {
                 }
                 "ssh_task_status" => {
                     json!({ "connectionId": "ghost", "logPath": "/tmp/.dbx-ssh-tasks/x.log" })
+                }
+                "docker_action" => {
+                    json!({ "connectionId": "ghost", "containerId": "d4a7c9f1e2b3", "action": "start" })
                 }
                 "sftp_upload" => json!({ "connectionId": "ghost",
                     "localPath": "/tmp/in", "remotePath": "/tmp/out" }),
