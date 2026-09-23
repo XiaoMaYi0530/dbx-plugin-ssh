@@ -17,6 +17,8 @@ mod metrics;
 mod metrics_history;
 mod model;
 mod multi_exec;
+mod otp;
+mod otp_store;
 mod preferences;
 mod quick_commands;
 mod session_recording;

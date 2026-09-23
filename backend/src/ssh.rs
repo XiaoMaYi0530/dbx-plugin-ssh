@@ -43,6 +43,8 @@ use crate::model::{
     StoredConnection, SudoSource, TerminalFrame, TerminalStream, MAX_TRANSFER_SIZE,
     TERMINAL_REPLAY_LIMIT, TRANSFER_CHUNK_SIZE,
 };
+use crate::otp;
+use crate::otp_store;
 use crate::quick_commands;
 use crate::session_recording;
 use crate::sftp_tree;
@@ -52,6 +54,11 @@ use crate::transfer_history;
 use crate::triggers;
 
 /// Resolves the Quick Sudo / 2FA orchestration settings for a connection.
+/// P2-1 OTP 库回落：连接未配置自己的 `totpSecret` 且 2FA 流程未关时，取该
+/// 连接绑定的 OTP 库条目（`otp-entries.json` bindings + vault 解密）作为
+/// 轮转 TOTP 密钥追加。取码优先级不变式：连接 `totpSecret`（现状优先）→
+/// 绑定的 OTP 库条目（经共享防重放缓存，同窗口码不重复发出）→ 既有
+/// Quick Sudo 全局/自定义链（完全不动，见 `login_sudo_auth`/`apply_profile`）。
 fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
     let mut auth = SudoAuth::new(
         &connection.sudo_password,
@@ -66,7 +73,30 @@ fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
     );
     auth.otp_ledger_scope =
         exec::otp_ledger_scope_for(&connection.username, &connection.host, connection.port);
+    if auth.totp_secrets.is_empty() && auth.flow_mode != Some(AuthFlowMode::Off) {
+        // 本窗口码已被 otp/generate（或一次应答）发出时 take 返回 None：
+        // 等下一周期，期间保持现状链（不追加、不报错）。
+        if let Some(bound) = otp_store::data_dir()
+            .and_then(|dir| otp_store::take_connection_totp_key(&dir, &connection.id))
+        {
+            auth.totp_secrets.push(otp_bound_as_totp_secret(bound));
+        }
+    }
     auth
+}
+
+/// 把绑定条目的解析结果映射为 exec 编排的 TOTP 密钥（算法/位数/周期原样）。
+fn otp_bound_as_totp_secret(bound: otp_store::BoundTotp) -> exec::TotpSecret {
+    exec::TotpSecret::Key {
+        key: bound.key,
+        digits: u32::from(bound.digits),
+        period: bound.period,
+        algorithm: match bound.algorithm {
+            otp::OtpAlgorithm::Sha1 => exec::TotpAlgorithm::Sha1,
+            otp::OtpAlgorithm::Sha256 => exec::TotpAlgorithm::Sha256,
+            otp::OtpAlgorithm::Sha512 => exec::TotpAlgorithm::Sha512,
+        },
+    }
 }
 
 /// Builds the client negotiation config for one connection. The connection
@@ -1372,6 +1402,9 @@ impl SshRuntime {
         let transfer_dir = data_dir.join("transfers");
         let known_hosts_path = data_dir.join("known_hosts");
         let _ = std::fs::create_dir_all(&transfer_dir);
+        // OTP 库：自动应答取码链（sudo_auth_for）是自由函数，从这里注入
+        // 数据目录供其读取绑定条目。
+        otp_store::init_data_dir(&data_dir);
         Self {
             connections: RwLock::new(HashMap::new()),
             sessions: Arc::new(AsyncRwLock::new(HashMap::new())),
