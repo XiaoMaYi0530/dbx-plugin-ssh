@@ -71,6 +71,7 @@ import {
   TextSelect,
   Trash2,
   TriangleAlert,
+  Usb,
   X,
   Zap,
 } from "@lucide/vue";
@@ -280,6 +281,7 @@ import TerminalContextMenu, {
 } from "./components/TerminalContextMenu.vue";
 import PortForwardDialog from "./components/PortForwardDialog.vue";
 import TelnetConnectDialog, { type TelnetConnectOptions } from "./components/TelnetConnectDialog.vue";
+import SerialConnectDialog, { type SerialConnectOptions } from "./components/SerialConnectDialog.vue";
 import { ToastAction, ToastClose, ToastProvider, ToastRoot, ToastViewport } from "./components/ui/toast";
 
 interface SessionInfo {
@@ -1128,7 +1130,19 @@ let telnetReplayInFlight = false;
 let telnetReplayNoProgress = 0;
 const isTelnetMode = computed(() => telnetSession.value !== null);
 const telnetTarget = computed(() => (telnetSession.value ? `${telnetSession.value.host}:${telnetSession.value.port}` : ""));
-const localUiMode = computed(() => isLocalMode.value || localShellRestored.value || isTelnetMode.value);
+// 串口会话（P3）：与 SSH/本地/Telnet 同款互斥展示，并入 localUiMode。
+// sidecar 契约最小集：无 replay、无 resize 方法（出帧由读线程单线程递增
+// sequence，掉帧仅按 pending 上限清空兜底）；输入走 serial/write JSON 通道。
+const serialSession = ref<{ sessionId: string; port: string; baudRate: number } | null>(null);
+const serialDialogOpen = ref(false);
+const serialConfirmOpen = ref(false);
+const serialState = ref<"idle" | "running" | "closed">("idle");
+const serialError = ref("");
+const serialLastSequence = ref(0);
+const serialPendingFrames = new Map<number, { stream: number; data: Uint8Array }>();
+const isSerialMode = computed(() => serialSession.value !== null);
+const serialTarget = computed(() => (serialSession.value ? `${serialSession.value.port}@${serialSession.value.baudRate}` : ""));
+const localUiMode = computed(() => isLocalMode.value || localShellRestored.value || isTelnetMode.value || isSerialMode.value);
 // Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
 // and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
 const panelSurface = computed(() => hostContext.value.surface === "panel");
@@ -1259,6 +1273,8 @@ const connected = computed(() => terminalState.value === "connected" && !!sessio
 const sessionStatus = computed<WorkbenchSessionStatus | "local">(() => (localUiMode.value ? "local" : describeWorkbenchSessionStatus(terminalState.value, { reattaching: reconnectPending.value })));
 // 本地模式徽标附带 shell 名（Local · Zsh），一眼可见当前在哪种 shell 里。
 const sessionPillText = computed(() => {
+  // 串口徽标显示 port@baud（Serial · /dev/ttyUSB0@115200），一眼可见线路参数。
+  if (isSerialMode.value) return `${t("serial.pillPrefix")} · ${serialTarget.value}`;
   // Telnet 徽标显示明文目标（Telnet · host:port），提示这是非 SSH 连接。
   if (isTelnetMode.value) return telnetState.value === "connecting" ? t("telnet.connecting") : `${t("telnet.pillPrefix")} · ${telnetTarget.value}`;
   if (!isLocalMode.value || !localSession.value) return t(`sessionStatus.${sessionStatus.value}`);
@@ -1331,7 +1347,11 @@ const commandMarkerDetails = computed(() => commandMarkerTooltip(
 ));
 const connectionIdentity = computed(() => {
   // Connectionless local-terminal tab (including the restored shell): there is no connection identity to show.
-  if (localUiMode.value && !connectionId.value) return isTelnetMode.value ? `${t("telnet.pillPrefix")} ${telnetTarget.value}` : t("localTerminal.active");
+  if (localUiMode.value && !connectionId.value) {
+    if (isSerialMode.value) return `${t("serial.pillPrefix")} ${serialTarget.value}`;
+    if (isTelnetMode.value) return `${t("telnet.pillPrefix")} ${telnetTarget.value}`;
+    return t("localTerminal.active");
+  }
   const host = connection.value.host || connection.value.name || connectionId.value || "–";
   const identity = connection.value.username ? `${connection.value.username}@${host}` : host;
   const port = connection.value.port && connection.value.port !== 22 ? `:${connection.value.port}` : "";
@@ -2435,6 +2455,14 @@ function executeSuggestion(item: CommandSuggestion) {
 }
 
 function sendTerminalBytes(data: Uint8Array) {
+  // 串口会话优先：MVP 走 serial/write JSON 通道（base64），不进二进制输入
+  // 队列。取舍：串口无高速键盘场景，逐键 JSON 往返可接受；sidecar 暂无
+  // serial/terminal/in 二进制通道，后续需要吞吐时再加并切回同款队列。
+  if (serialSession.value) {
+    const dataBase64 = window.dbxPlugin.encodeBase64(normalizeTerminalInputBytes(data));
+    void window.dbxPlugin.invoke("serial/write", { sessionId: serialSession.value.sessionId, dataBase64 }).catch((cause) => showError(cause, "terminal"));
+    return;
+  }
   // Telnet 会话优先：同一终端视图同一时刻只挂一个会话（SSH/本地/Telnet 互斥），
   // telnet: 前缀在队列 send 回调里拆成 telnet/terminal/in/{id} 通道。
   if (telnetSession.value) {
@@ -2939,6 +2967,19 @@ function handleBinary(event: DbxPluginBinaryEvent) {
     drainTelnetFrames();
     return;
   }
+  if (event.channel.startsWith("serial/terminal/out/")) {
+    // 串口输出帧与 local/SSH/Telnet 同形（9 字节 TerminalFrame 前缀，stream
+    // 恒为 Stdout），独立 sequence/pending 状态避免与其它会话流互染。
+    const serialId = event.channel.slice("serial/terminal/out/".length);
+    if (!serialSession.value || serialId !== serialSession.value.sessionId) return;
+    const payload = bridgeBinaryBytes(event, window.dbxPlugin.decodeBase64);
+    if (payload.length < 9) return;
+    const sequence = readU64(payload, 1);
+    if (sequence <= serialLastSequence.value) return;
+    serialPendingFrames.set(sequence, { stream: payload[0], data: payload.slice(9) });
+    drainSerialFrames();
+    return;
+  }
   const sessionId = activeTerminalSessionId || session.value?.sessionId;
   if (sessionId && event.channel === `ssh/terminal/out/${sessionId}`) {
     const payload = bridgeBinaryBytes(event, window.dbxPlugin.decodeBase64);
@@ -3181,6 +3222,17 @@ function handleEvent(event: DbxPluginEvent) {
   }
   if (event.method === "telnet/terminal/error" && event.params.sessionId === telnetSession.value?.sessionId) {
     markTelnetClosed(null);
+    return;
+  }
+  // 串口生命周期：start 成功即 running；sidecar 只发 closed（主动关闭）与
+  // error（读线程 IO 失败）两种状态事件。
+  if (event.method === "serial/session/state" && event.params.sessionId === serialSession.value?.sessionId) {
+    const state = String(event.params.state || "");
+    if (state === "error") {
+      markSerialClosed(String(event.params.error || ""));
+    } else if (state === "closed") {
+      markSerialClosed(null);
+    }
     return;
   }
   if (event.method === "telnet/trigger" && event.params.sessionId === telnetSession.value?.sessionId) {
@@ -3712,6 +3764,95 @@ async function closeTelnetSession() {
   terminal?.focus();
 }
 
+// —— 串口会话生命周期（P3，与 Telnet 同款互斥展示；无 replay，掉帧仅按
+// pending 上限清空兜底）——
+// 退出态统一入口：error 为 null 表示 sidecar 未带原因（主动关闭），
+// 非空时在退出覆盖层展示（读线程 IO 失败/设备拔线）。
+function markSerialClosed(error: string | null) {
+  if (!serialSession.value || serialState.value === "closed") return;
+  serialState.value = "closed";
+  if (error !== null) serialError.value = error;
+}
+
+function drainSerialFrames() {
+  let frame = serialPendingFrames.get(serialLastSequence.value + 1);
+  while (frame) {
+    serialPendingFrames.delete(serialLastSequence.value + 1);
+    serialLastSequence.value += 1;
+    dispatchTerminalOutput(frame.data);
+    frame = serialPendingFrames.get(serialLastSequence.value + 1);
+  }
+  if (serialPendingFrames.size > TERMINAL_PENDING_FRAME_LIMIT) {
+    serialPendingFrames.clear();
+  }
+}
+
+async function startSerialSession(options: SerialConnectOptions) {
+  // 同一终端视图互斥：残留的 closed 会话先清场再开新连接。
+  if (serialSession.value && serialState.value !== "closed") await closeSerialSession();
+  try {
+    // 线上字段为 snake_case：SerialStartRequest 未启用 camelCase rename；
+    // 响应则由 sidecar 手拼 json!，sessionId/port/baudRate 为 camelCase。
+    const info = await window.dbxPlugin.invoke<{ sessionId: string; port: string; baudRate: number }>("serial/start", {
+      workbenchId: workbenchId.value,
+      port_name: options.portName,
+      baud_rate: options.baudRate,
+      data_bits: options.dataBits,
+      parity: options.parity,
+      stop_bits: options.stopBits,
+      backspace_mode: options.backspaceMode,
+    });
+    if (disposed) {
+      void window.dbxPlugin.invoke("serial/close", { sessionId: info.sessionId }).catch(() => undefined);
+      return;
+    }
+    serialSession.value = { sessionId: info.sessionId, port: info.port, baudRate: info.baudRate };
+    serialState.value = "running";
+    serialError.value = "";
+    serialLastSequence.value = 0;
+    serialPendingFrames.clear();
+    // 从 A4 恢复外壳 tab 直接起串口时清掉外壳态，退出覆盖层随即让位。
+    localShellRestored.value = false;
+    await nextTick();
+    scheduleFit();
+    terminal?.focus();
+  } catch (cause) {
+    showError(cause, "terminal");
+  }
+}
+
+async function closeSerialSession() {
+  const sessionId = serialSession.value?.sessionId;
+  serialSession.value = null;
+  serialState.value = "idle";
+  serialError.value = "";
+  serialPendingFrames.clear();
+  serialConfirmOpen.value = false;
+  if (!sessionId) return;
+  await window.dbxPlugin.invoke("serial/close", { sessionId }).catch(() => undefined);
+  terminal?.focus();
+}
+
+// 工具栏串口入口：SSH 会话仍在（或连接中/本地终端/Telnet 占用）时先经确认，
+// 与 Telnet 入口同款流程。
+function requestSerial() {
+  if (isSerialMode.value) return;
+  if (session.value || reconnectPending.value || terminalState.value === "connecting" || localSession.value || telnetSession.value) {
+    serialConfirmOpen.value = true;
+    return;
+  }
+  serialDialogOpen.value = true;
+}
+
+// 确认后：关掉占用终端视图的 SSH/本地/Telnet 会话，再弹串口连接表单。
+async function confirmSerialOpen() {
+  serialConfirmOpen.value = false;
+  await closeSession();
+  if (localSession.value) await closeLocalTerminal();
+  if (telnetSession.value) await closeTelnetSession();
+  serialDialogOpen.value = true;
+}
+
 // 工具栏 Telnet 入口：SSH 会话仍在（或连接中/本地终端占用）时先经确认，
 // 与本地终端入口同款流程。
 function requestTelnet() {
@@ -3742,11 +3883,13 @@ if (window.dbxPlugin.workbench?.onClose) {
       ["local/session/close", localSession.value?.sessionId],
       ["ssh/session/close", session.value?.sessionId],
       ["telnet/close", telnetSession.value?.sessionId],
+      ["serial/close", serialSession.value?.sessionId],
     ].filter((pair): pair is [string, string] => typeof pair[1] === "string" && !!pair[1]);
     await Promise.allSettled(ownedSessions.map(([method, sessionId]) => window.dbxPlugin.notify(method, { sessionId })));
     localSession.value = null;
     session.value = undefined;
     telnetSession.value = null;
+    serialSession.value = null;
   });
 }
 
@@ -3760,8 +3903,12 @@ function dismissRestoredLocalShell() {
 }
 
 // Toolbar local-terminal button: running -> close; restored shell -> reopen directly (nothing to close, skipping
-// SSH confirm flow); telnet mode -> close the Telnet session; an SSH state walks the existing confirm flow.
+// SSH confirm flow); serial/telnet mode -> close that session; an SSH state walks the existing confirm flow.
 function toggleLocalTerminal() {
+  if (isSerialMode.value) {
+    void closeSerialSession();
+    return;
+  }
   if (isTelnetMode.value) {
     void closeTelnetSession();
     return;
@@ -3795,8 +3942,8 @@ async function restartLocalTerminal() {
 // connecting 途中放行会让在途 ssh/session/open 成功后与本地会话抢同一终端
 // 视图），再开本地终端。
 function requestLocalTerminal() {
-  // Telnet 会话占用终端视图时不开本地终端（互斥展示）。
-  if (isTelnetMode.value) return;
+  // 串口/Telnet 会话占用终端视图时不开本地终端（互斥展示）。
+  if (isSerialMode.value || isTelnetMode.value) return;
   if (isLocalMode.value || localState.value === "starting") return;
   if (session.value || reconnectPending.value || terminalState.value === "connecting") {
     localOpenConfirmOpen.value = true;
@@ -9017,6 +9164,8 @@ const modalOpenStates = computed(() => [
   localOpenConfirmOpen.value,
   telnetConfirmOpen.value,
   telnetDialogOpen.value,
+  serialConfirmOpen.value,
+  serialDialogOpen.value,
   folderPickerTarget.value !== null,
   previewOpen.value,
   pasteConfirm.value,
@@ -9528,10 +9677,12 @@ onBeforeUnmount(() => {
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
         <!-- Telnet 明文会话入口（P2-3）：与 SSH/本地终端互斥，占用终态先经确认。 -->
         <button v-if="!localUiMode" class="icon-button icon-amber" :title="t('telnet.open')" @click="requestTelnet"><Globe /></button>
+        <!-- 串口会话入口（P3）：与 SSH/本地/Telnet 互斥，占用终态先经确认。 -->
+        <button v-if="!localUiMode" class="icon-button icon-neutral" :title="t('serial.open')" @click="requestSerial"><Usb /></button>
         <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
              已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。 -->
-        <button class="icon-button icon-violet" :class="{ 'is-active': localUiMode }" :title="isTelnetMode ? t('telnet.disconnect') : localUiMode && !localShellRestored ? t('localTerminal.close') : t('localTerminal.open')" @click="toggleLocalTerminal"><TerminalIcon /></button>
-        <div v-if="!isTelnetMode">
+        <button class="icon-button icon-violet" :class="{ 'is-active': localUiMode }" :title="isSerialMode ? t('serial.disconnect') : isTelnetMode ? t('telnet.disconnect') : localUiMode && !localShellRestored ? t('localTerminal.close') : t('localTerminal.open')" @click="toggleLocalTerminal"><TerminalIcon /></button>
+        <div v-if="!isTelnetMode && !isSerialMode">
           <!-- 本地终端设置：多平台 shell 选择（local/shells/list 发现）+ 注入开关，
                记入 sidecar 偏好（iframe 沙箱无 localStorage）。 -->
           <Popover :open="localMenuOpen" @update:open="(open) => { if (!open) localMenuOpen = false; }">
@@ -9903,7 +10054,9 @@ onBeforeUnmount(() => {
           <span class="record-countdown-number" :key="recordCountdown">{{ recordCountdown }}</span>
           <span class="record-countdown-hint">{{ t("recordingCountdownHint") }}</span>
         </div>
-        <div v-if="!isLocalMode && !localShellRestored && terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
+        <!-- SSH 连接卡片：本地/串口/Telnet 会话占用的终端视图不再叠 SSH-only
+             卡片（互斥展示；Telnet 原实现漏了该分支，一并补上）。 -->
+        <div v-if="!isLocalMode && !localShellRestored && !isSerialMode && !isTelnetMode && terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
           <ConnectingCard
             :locale="locale"
             :name="connection.name || connectionIdentity"
@@ -9943,6 +10096,17 @@ onBeforeUnmount(() => {
             <span v-if="telnetError" class="mono local-exit-code">{{ telnetError }}</span>
             <div class="local-exit-actions">
               <button @click="closeTelnetSession">{{ t("telnet.close") }}</button>
+            </div>
+          </div>
+        </div>
+        <!-- 串口退出覆盖层（读线程 IO 失败/设备拔线）：给出关闭出口，展示原因。 -->
+        <div v-if="isSerialMode && serialState === 'closed'" class="terminal-overlay">
+          <div class="local-exit-card" role="status">
+            <TriangleAlert class="local-exit-icon" />
+            <strong>{{ t("serial.closed") }}</strong>
+            <span v-if="serialError" class="mono local-exit-code">{{ serialError }}</span>
+            <div class="local-exit-actions">
+              <button @click="closeSerialSession">{{ t("serial.close") }}</button>
             </div>
           </div>
         </div>
@@ -11082,6 +11246,9 @@ onBeforeUnmount(() => {
     <!-- Telnet 连接表单（P2-3）：host/port/回退格/回车 + Expect 自动应答。 -->
     <TelnetConnectDialog :locale="locale" :open="telnetDialogOpen" @update:open="(open) => (telnetDialogOpen = open)" @connect="startTelnetSession" />
 
+    <!-- 串口连接表单（P3）：端口发现/波特率/数据位/校验/停止位/退格。 -->
+    <SerialConnectDialog :locale="locale" :open="serialDialogOpen" @update:open="(open) => (serialDialogOpen = open)" @connect="startSerialSession" />
+
     <!-- Telnet 确认：SSH 会话仍连着（或本地终端占用）时先关闭再弹连接表单 -->
     <Dialog :open="telnetConfirmOpen" @update:open="(open) => { if (!open) telnetConfirmOpen = false; }">
       <DialogContent class="modal small-modal" @escape-key-down.prevent>
@@ -11093,6 +11260,21 @@ onBeforeUnmount(() => {
         <footer>
           <button @click="telnetConfirmOpen = false">{{ t("cancel") }}</button>
           <button class="primary-button" @click="confirmTelnetOpen">{{ t("telnet.open") }}</button>
+        </footer>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 串口确认：SSH/本地/Telnet 会话仍占用终端视图时先关闭再弹连接表单 -->
+    <Dialog :open="serialConfirmOpen" @update:open="(open) => { if (!open) serialConfirmOpen = false; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header>
+          <DialogTitle>{{ t("serial.openConfirmTitle") }}</DialogTitle>
+          <button :title="t('close')" class="icon-button" @click="serialConfirmOpen = false"><X /></button>
+        </header>
+        <p class="muted">{{ t("serial.openConfirm") }}</p>
+        <footer>
+          <button @click="serialConfirmOpen = false">{{ t("cancel") }}</button>
+          <button class="primary-button" @click="confirmSerialOpen">{{ t("serial.open") }}</button>
         </footer>
       </DialogContent>
     </Dialog>
