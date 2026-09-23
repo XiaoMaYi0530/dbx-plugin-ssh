@@ -8,13 +8,26 @@ authors = ["jinpy"]
 [workspace]
 
 [dependencies]
+# Session import (connection_import.rs): the AES block cipher for the
+# WindTerm autoLogin AES-256-CBC decryption. 0.9 is the current generation
+# that shares `cipher 0.5` with the aes-gcm 0.11 tree.
+aes = "0.9"
 aes-gcm = "0.11"
 base64 = "0.23"
+# CBC mode wrapper used with `aes` above. Features are explicit: the
+# transitive cbc consumers disable defaults, which would turn off the
+# PKCS7 padding/alloc APIs the WindTerm decryptor needs.
+cbc = { version = "0.2", default-features = false, features = ["alloc", "block-padding"] }
 data-encoding = "2"
 dbx-plugin-sdk = "0.1.0"
+# GBK decoding for Xshell .xts ZIP entry names (Chinese Windows exports).
+encoding_rs = "0.8"
 getrandom = "0.4"
 hmac = "0.13"
 if-addrs = "0.15.0"
+# WindTerm autoLogin KDF: PBKDF2-HMAC-SHA3-512. pbkdf2 0.13 and sha3 0.11
+# are the digest-0.11 generation matching hmac 0.13 already in the tree.
+pbkdf2 = "0.13"
 portable-pty = "0.9.0"
 # `otp/import-qr`: QR decode (rqrr 0.9) over `image` (luma8 bitmap); image is
 # pinned to the four photo formats QR screenshots actually use with default
@@ -30,9 +43,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
 sha2 = "0.11"
+sha3 = "0.11"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+# Xshell .xts session archives; deflate is all Xshell writes (zip-bomb
+# guards live in connection_import.rs).
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 pageant = "0.2"

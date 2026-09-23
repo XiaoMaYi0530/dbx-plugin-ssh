@@ -1,0 +1,1728 @@
+//! Session import from third-party SSH clients (parity wave P2-2). Three
+//! source formats are parsed into a common in-memory shape:
+//!
+//! - **MobaXterm** `.mxtsessions`: a plain INI where every `Bookmarks*`
+//!   section lists `SessionName=#109#0%host%port%user%...` pipe-separated
+//!   connection strings. No password material exists in the file.
+//! - **Xshell** `.xts`: a ZIP of per-session `.xsh` INI files (GBK entry
+//!   names on Chinese Windows installs). Only session metadata lives in
+//!   `.xsh`; a key file is referenced by name, never embedded.
+//! - **WindTerm** `.sessions` + `user.config`: JSON; `session.autoLogin`
+//!   holds either a plaintext credential JSON or a base64 AES-256-CBC blob
+//!   whose key/IV are PBKDF2-HMAC-SHA3-512 derived from the master password
+//!   and the `application.fingerprint` salt.
+//!
+//! Parsed secrets stay plaintext in memory only. `import/parse` returns a
+//! sanitized preview (`hasSecret`, never the secret itself); `import/commit`
+//! seals every secret field through the [`crate::vault`] before it reaches
+//! the 0600 `imported-connections.json` store.
+//!
+//! All parsers are written for hostile input: no panicking indexing (only
+//! `get`/`strip_*`/checked parsing), per-file and aggregate size caps on
+//! archives, and malformed entries degrade to "skipped" instead of failing
+//! the whole import.
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use serde_json::{json, Value};
+
+use crate::vault::{self, Vault};
+
+/// Hard caps for Xshell ZIP archives (zip-bomb protection).
+pub const MAX_ZIP_ENTRIES: usize = 10_000;
+pub const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+/// Cap on a single decoded import file (the base64 transport is additionally
+/// capped in `handle_parse`/`handle_commit` before decoding).
+pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Upper bound for the committed store so a bad import cannot grow the file
+/// without limit (each entry is a few hundred bytes; 5000 is plenty).
+pub const MAX_STORED_CONNECTIONS: usize = 5000;
+/// Error returned when WindTerm encryption is detected (master-password
+/// switch on in `user.config`) but the caller did not supply the password.
+pub const WINDTERM_MASTER_PASSWORD_REQUIRED: &str = "WindTerm master password is required";
+
+const FILE_NAME: &str = "imported-connections.json";
+const STORAGE_VERSION: u64 = 1;
+/// Vault AAD field names for sealed import secrets (profile id = entry id).
+const FIELD_IMPORTED_PASSWORD: &str = "importedPassword";
+const FIELD_IMPORTED_KEY_CONTENT: &str = "importedKeyContent";
+const FIELD_IMPORTED_KEY_PASSPHRASE: &str = "importedKeyPassphrase";
+
+/// WindTerm KDF parameters: PBKDF2-HMAC-SHA3-512 over the master password,
+/// salted with the raw `application.fingerprint` bytes, producing 48 bytes
+/// (AES-256 key + CBC IV).
+const WINDTERM_PBKDF2_ROUNDS: u32 = 100_000;
+const WINDTERM_DERIVED_BYTES: usize = 48;
+
+/// Authentication material carried by one imported session. Plaintext in
+/// memory only — the store seals every secret field through the vault.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportedAuth {
+    Password {
+        value: Option<String>,
+    },
+    PrivateKey {
+        path: Option<String>,
+        content: Option<String>,
+        passphrase: Option<String>,
+    },
+    None,
+}
+
+/// One imported session in the common shape shared by all three parsers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedSession {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub group_path: Vec<String>,
+    pub description: String,
+    pub auth: ImportedAuth,
+}
+
+impl ImportedSession {
+    fn new(name: String, host: String, port: u16, username: String) -> ImportedSession {
+        ImportedSession {
+            name,
+            host,
+            port,
+            username,
+            group_path: Vec::new(),
+            description: String::new(),
+            auth: ImportedAuth::None,
+        }
+    }
+}
+
+/// Kind label shared by preview responses and stored entries.
+pub fn auth_kind(auth: &ImportedAuth) -> &'static str {
+    match auth {
+        ImportedAuth::Password { .. } => "password",
+        ImportedAuth::PrivateKey { .. } => "private-key",
+        ImportedAuth::None => "none",
+    }
+}
+
+/// True when the auth carries decryptable secret material (a key *path*
+/// alone is not a secret).
+fn has_secret(auth: &ImportedAuth) -> bool {
+    match auth {
+        ImportedAuth::Password { value } => value.is_some(),
+        ImportedAuth::PrivateKey {
+            content,
+            passphrase,
+            ..
+        } => content.is_some() || passphrase.is_some(),
+        ImportedAuth::None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MobaXterm (.mxtsessions)
+// ---------------------------------------------------------------------------
+
+/// Parses a MobaXterm `.mxtsessions` INI. Only `Bookmarks*` sections carry
+/// sessions; `SubRep` holds the folder path (`\`-separated) applied to every
+/// session in its section. SSH connection strings are the entries whose
+/// type field starts with `109` (`#109#<subtype>%host%port%user%...`).
+pub fn parse_moba_ini(text: &str) -> Result<Vec<ImportedSession>, String> {
+    let mut sessions = Vec::new();
+    for section in parse_ini_sections(text) {
+        if !section.name.starts_with("Bookmarks") {
+            continue;
+        }
+        // SubRep may appear anywhere in the section; resolve it first so
+        // group assignment does not depend on key order.
+        let group_path = section
+            .entries
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("SubRep"))
+            .map(|(_, value)| moba_group_path(value))
+            .unwrap_or_default();
+        for (key, value) in &section.entries {
+            if key.is_empty() || key.eq_ignore_ascii_case("SubRep") {
+                continue;
+            }
+            if let Some(mut session) = parse_moba_session_value(key, value) {
+                session.group_path = group_path.clone();
+                sessions.push(session);
+            }
+        }
+    }
+    Ok(sessions)
+}
+
+/// Splits one `#<type>#<subtype>%host%port%username%...` value. Returns
+/// `None` for non-SSH types and for entries without a usable host.
+fn parse_moba_session_value(name: &str, value: &str) -> Option<ImportedSession> {
+    let fields: Vec<&str> = value.split('%').collect();
+    let type_field = fields.first()?.trim();
+    // "#109#0" -> the segment between the leading '#' markers is the type.
+    let type_str = type_field.trim_start_matches('#').split('#').next()?;
+    if !type_str.starts_with("109") {
+        return None;
+    }
+    let host = fields
+        .get(1)
+        .map(|host| host.trim())
+        .filter(|host| !host.is_empty())?;
+    let port = fields
+        .get(2)
+        .and_then(|port| port.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(22);
+    let username = fields
+        .get(3)
+        .map(|username| username.trim())
+        .filter(|username| !username.is_empty())
+        .unwrap_or("root");
+    Some(ImportedSession::new(
+        name.to_string(),
+        host.to_string(),
+        port,
+        username.to_string(),
+    ))
+}
+
+fn moba_group_path(sub_rep: &str) -> Vec<String> {
+    sub_rep
+        .split('\\')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Shared INI scanning (MobaXterm + Xshell .xsh)
+// ---------------------------------------------------------------------------
+
+struct IniSection {
+    name: String,
+    entries: Vec<(String, String)>,
+}
+
+/// Minimal line-oriented INI scan: `;`/`#` comment lines, `[section]`
+/// headers, `key=value` pairs (first `=` splits). Never panics on odd bytes;
+/// a malformed line is skipped.
+fn parse_ini_sections(text: &str) -> Vec<IniSection> {
+    let mut sections: Vec<IniSection> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with([';', '#']) {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            if let Some(end) = trimmed.find(']') {
+                if let Some(name) = trimmed.get(1..end) {
+                    sections.push(IniSection {
+                        name: name.trim().to_string(),
+                        entries: Vec::new(),
+                    });
+                }
+            }
+            continue;
+        }
+        if let Some(eq) = trimmed.find('=') {
+            let (key, value) = (trimmed.get(..eq), trimmed.get(eq + 1..));
+            if let (Some(key), Some(value)) = (key, value) {
+                if let Some(section) = sections.last_mut() {
+                    section
+                        .entries
+                        .push((key.trim().to_string(), value.trim().to_string()));
+                }
+            }
+        }
+    }
+    sections
+}
+
+fn find_section<'a>(sections: &'a [IniSection], name: &str) -> Option<&'a IniSection> {
+    sections
+        .iter()
+        .find(|section| section.name.eq_ignore_ascii_case(name))
+}
+
+fn section_value<'a>(section: &'a IniSection, key: &str) -> Option<&'a str> {
+    section
+        .entries
+        .iter()
+        .rev()
+        .find(|(entry_key, _)| entry_key.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Xshell (.xts ZIP of .xsh INI files)
+// ---------------------------------------------------------------------------
+
+/// Parses an Xshell `.xts` archive: every `.xsh` entry is one session. Entry
+/// names on Chinese Windows installs are GBK-encoded, so raw bytes are
+/// decoded as UTF-8 first (modern exports) with a GBK fallback. Only SSH
+/// sessions are kept; archive expansion is bounded by [`MAX_ZIP_ENTRIES`],
+/// [`MAX_ENTRY_BYTES`], and [`MAX_TOTAL_BYTES`].
+pub fn parse_xshell(zip_bytes: &[u8]) -> Result<Vec<ImportedSession>, String> {
+    let cursor = std::io::Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|error| format!("Failed to read Xshell archive: {error}"))?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(format!(
+            "Xshell archive has more than {MAX_ZIP_ENTRIES} entries"
+        ));
+    }
+    let mut sessions = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| format!("Failed to read Xshell archive entry {index}: {error}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let declared = entry.size();
+        if declared > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "Xshell archive entry expands beyond the {} MB per-entry limit",
+                MAX_ENTRY_BYTES / (1024 * 1024)
+            ));
+        }
+        total_bytes += declared;
+        if total_bytes > MAX_TOTAL_BYTES {
+            return Err(format!(
+                "Xshell archive expands beyond the {} MB total limit",
+                MAX_TOTAL_BYTES / (1024 * 1024)
+            ));
+        }
+        // Header-declared size is honored by the reader too, but a hostile
+        // archive can lie: cap the actual read as well.
+        let name = decode_zip_name(entry.name_raw());
+        if !name.to_ascii_lowercase().ends_with(".xsh") {
+            continue;
+        }
+        let mut limited = entry.take(MAX_ENTRY_BYTES + 1);
+        let mut content = Vec::new();
+        limited
+            .read_to_end(&mut content)
+            .map_err(|error| format!("Failed to read Xshell entry '{name}': {error}"))?;
+        if content.len() as u64 > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "Xshell archive entry '{name}' exceeds the per-entry size limit"
+            ));
+        }
+        let text = String::from_utf8_lossy(&content);
+        if let Some(session) = parse_xsh_file(&name, &text) {
+            sessions.push(session);
+        }
+    }
+    Ok(sessions)
+}
+
+/// UTF-8 first (ASCII is identical under GBK), GBK fallback for Chinese
+/// Windows exports, lossy as the last resort. Never fails.
+fn decode_zip_name(raw: &[u8]) -> String {
+    match std::str::from_utf8(raw) {
+        Ok(name) => name.to_string(),
+        Err(_) => {
+            // No BOM handling: entry names never carry BOMs, and BOM
+            // sniffing would silently swallow a leading 0xFF 0xFE.
+            let (decoded, had_errors) = encoding_rs::GBK.decode_without_bom_handling(raw);
+            if had_errors {
+                String::from_utf8_lossy(raw).into_owned()
+            } else {
+                decoded.into_owned()
+            }
+        }
+    }
+}
+
+/// Parses one `.xsh` INI file. Returns `None` when the entry is not an SSH
+/// session (protocol or host missing) — a bad entry never fails the import.
+fn parse_xsh_file(entry_name: &str, text: &str) -> Option<ImportedSession> {
+    let sections = parse_ini_sections(text);
+    let connection = find_section(&sections, "CONNECTION")?;
+    let protocol = section_value(connection, "Protocol")?;
+    if !protocol.eq_ignore_ascii_case("SSH") {
+        return None;
+    }
+    let host = section_value(connection, "Host")?;
+    let port = section_value(connection, "Port")
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(22);
+    let username = find_section(&sections, "CONNECTION:AUTHENTICATION")
+        .and_then(|auth| section_value(auth, "UserName"))
+        .unwrap_or("root")
+        .to_string();
+    let auth = find_section(&sections, "CONNECTION:AUTHENTICATION")
+        .and_then(|auth| section_value(auth, "UserKey"))
+        .map(|key| ImportedAuth::PrivateKey {
+            path: Some(key.to_string()),
+            content: None,
+            passphrase: None,
+        })
+        .unwrap_or(ImportedAuth::None);
+    let mut session = ImportedSession::new(
+        xsh_session_name(entry_name),
+        host.to_string(),
+        port,
+        username,
+    );
+    session.auth = auth;
+    session.group_path = xsh_group_path(entry_name);
+    Some(session)
+}
+
+/// Session display name: the `.xsh` entry's file stem.
+fn xsh_session_name(entry_name: &str) -> String {
+    let path = entry_name.replace('\\', "/");
+    let file = path.rsplit('/').next().unwrap_or(&path);
+    strip_xsh_suffix(file).to_string()
+}
+
+fn strip_xsh_suffix(name: &str) -> &str {
+    match name.get(name.len().saturating_sub(4)..) {
+        Some(suffix) if suffix.eq_ignore_ascii_case(".xsh") => {
+            // The suffix is ASCII, so the byte boundary is a char boundary.
+            &name[..name.len() - 4]
+        }
+        _ => name,
+    }
+}
+
+/// Group path from the ZIP directory layout: `Xshell/Sessions/Prod/web.xsh`
+/// → `["Prod"]`; root-level entries have no group. The last path component
+/// is always the file name and is dropped.
+fn xsh_group_path(entry_name: &str) -> Vec<String> {
+    let path = entry_name.replace('\\', "/");
+    let lowered = path.to_ascii_lowercase();
+    let prefix_end = if let Some(index) = lowered.find("xshell/sessions/") {
+        index + "xshell/sessions/".len()
+    } else if let Some(index) = lowered.find("xshell/") {
+        index + "xshell/".len()
+    } else {
+        0
+    };
+    let relative = path.get(prefix_end..).unwrap_or(&path);
+    let components: Vec<String> = relative
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    components
+        .split_last()
+        .map(|(_, directories)| directories.to_vec())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// WindTerm (.sessions + user.config)
+// ---------------------------------------------------------------------------
+
+/// Resolved bits of `user.config` needed for credential decryption.
+#[derive(Debug, Default)]
+struct WindTermConfig {
+    /// Raw salt bytes (`application.fingerprint`), hex-decoded when possible.
+    fingerprint: Option<Vec<u8>>,
+    /// `application.masterPassword` switch.
+    master_password_enabled: bool,
+}
+
+impl WindTermConfig {
+    fn from_user_config(user_config: Option<&[u8]>) -> WindTermConfig {
+        let Some(bytes) = user_config else {
+            return WindTermConfig::default();
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            return WindTermConfig::default();
+        };
+        let application = value.get("application");
+        WindTermConfig {
+            fingerprint: application
+                .and_then(|app| app.get("fingerprint"))
+                .and_then(Value::as_str)
+                .map(fingerprint_bytes),
+            master_password_enabled: application
+                .and_then(|app| app.get("masterPassword"))
+                .map(config_flag_is_on)
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Lenient truthiness for `user.config` flags (bool true, "true", 1).
+fn config_flag_is_on(value: &Value) -> bool {
+    match value {
+        Value::Bool(flag) => *flag,
+        Value::String(flag) => flag.trim().eq_ignore_ascii_case("true"),
+        Value::Number(flag) => flag.as_u64() == Some(1),
+        _ => false,
+    }
+}
+
+/// Salt bytes: hex-decode the fingerprint when it looks like hex (WindTerm
+/// stores a hex string), otherwise use the raw string bytes.
+fn fingerprint_bytes(value: &str) -> Vec<u8> {
+    let cleaned = value.trim().trim_start_matches("0x");
+    if let Ok(bytes) = data_encoding::HEXUPPER_PERMISSIVE.decode(cleaned.as_bytes()) {
+        return bytes;
+    }
+    value.trim().as_bytes().to_vec()
+}
+
+/// PBKDF2-HMAC-SHA3-512 → 48 bytes split into an AES-256 key and a CBC IV.
+fn derive_windterm_key(master_password: &str, salt: &[u8]) -> ([u8; 32], [u8; 16]) {
+    let mut derived = [0u8; WINDTERM_DERIVED_BYTES];
+    pbkdf2::pbkdf2_hmac::<sha3::Sha3_512>(
+        master_password.as_bytes(),
+        salt,
+        WINDTERM_PBKDF2_ROUNDS,
+        &mut derived,
+    );
+    let mut key = [0u8; 32];
+    let mut iv = [0u8; 16];
+    key.copy_from_slice(&derived[..32]);
+    iv.copy_from_slice(&derived[32..]);
+    (key, iv)
+}
+
+/// AES-256-CBC/PKCS7 decryption; `None` on any failure (wrong password,
+/// tampered blob, bad padding) — callers skip the credentials.
+fn windterm_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
+    use aes::cipher::block_padding::Pkcs7;
+    use aes::cipher::{BlockModeDecrypt, KeyIvInit};
+    type Aes256CbcDecryptor = cbc::Decryptor<aes::Aes256>;
+    Aes256CbcDecryptor::new_from_slices(key, iv)
+        .ok()?
+        .decrypt_padded_vec::<Pkcs7>(ciphertext)
+        .ok()
+}
+
+/// Parses a WindTerm `.sessions` JSON array. `user_config` supplies the
+/// fingerprint salt and the master-password switch; when the switch is on
+/// the caller must supply `master_password` (else the dedicated error is
+/// returned). Items that are not SSH sessions are skipped; per-item
+/// credential failures degrade to `ImportedAuth::None` (warn semantics).
+pub fn parse_windterm(
+    sessions_json: &[u8],
+    user_config: Option<&[u8]>,
+    master_password: Option<&str>,
+) -> Result<Vec<ImportedSession>, String> {
+    let items: Vec<Value> = serde_json::from_slice(sessions_json)
+        .map_err(|error| format!("WindTerm sessions file is not a JSON array: {error}"))?;
+    let config = WindTermConfig::from_user_config(user_config);
+    if config.master_password_enabled && master_password.is_none() {
+        return Err(WINDTERM_MASTER_PASSWORD_REQUIRED.to_string());
+    }
+    let mut sessions = Vec::new();
+    for item in &items {
+        if let Some(session) = parse_windterm_item(item, &config, master_password) {
+            sessions.push(session);
+        }
+    }
+    Ok(sessions)
+}
+
+fn parse_windterm_item(
+    item: &Value,
+    config: &WindTermConfig,
+    master_password: Option<&str>,
+) -> Option<ImportedSession> {
+    let session = item.get("session")?;
+    let protocol = session
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !protocol.eq_ignore_ascii_case("SSH") {
+        return None;
+    }
+    let target = session
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (user, host) = split_windterm_target(target);
+    if host.is_empty() {
+        return None;
+    }
+    let label = session
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(&host);
+    let port = windterm_port(session.get("port"));
+    let mut imported = ImportedSession::new(
+        label.to_string(),
+        host,
+        port,
+        if user.is_empty() {
+            "root".to_string()
+        } else {
+            user
+        },
+    );
+    imported.group_path = session
+        .get("group")
+        .and_then(Value::as_str)
+        .map(|group| {
+            group
+                .split('>')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    imported.description = session
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    imported.auth = windterm_credentials(session.get("autoLogin"), config, master_password);
+    Some(imported)
+}
+
+/// `user@host` split on the last `@` (user names may contain `@`); no `@`
+/// means the default user applies.
+fn split_windterm_target(target: &str) -> (String, String) {
+    match target.trim().rsplit_once('@') {
+        Some((user, host)) => (user.trim().to_string(), host.trim().to_string()),
+        None => (String::new(), target.trim().to_string()),
+    }
+}
+
+/// Port as number or numeric string; falls back to 22.
+fn windterm_port(value: Option<&Value>) -> u16 {
+    value
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+        })
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(22)
+}
+
+/// Credential chain for `session.autoLogin`:
+/// 1. plaintext JSON (no master password in use),
+/// 2. base64 → AES-256-CBC (PBKDF2 key from master password + fingerprint),
+/// 3. anything else → no credentials for this item.
+fn windterm_credentials(
+    raw: Option<&Value>,
+    config: &WindTermConfig,
+    master_password: Option<&str>,
+) -> ImportedAuth {
+    let Some(raw) = raw
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return ImportedAuth::None;
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        return auto_login_auth(&value);
+    }
+    let Ok(ciphertext) = BASE64.decode(raw) else {
+        return ImportedAuth::None;
+    };
+    let Some(master_password) = master_password else {
+        return ImportedAuth::None;
+    };
+    let Some(salt) = config.fingerprint.as_deref() else {
+        return ImportedAuth::None;
+    };
+    let (key, iv) = derive_windterm_key(master_password, salt);
+    let Some(plaintext) = windterm_decrypt(&key, &iv, &ciphertext) else {
+        return ImportedAuth::None;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&plaintext) else {
+        return ImportedAuth::None;
+    };
+    auto_login_auth(&value)
+}
+
+/// Reads the decrypted (or plaintext) autoLogin JSON: `PasswordEnabled` +
+/// `Password` wins, then `Public Key.<platform>.path/pass`, else none.
+fn auto_login_auth(value: &Value) -> ImportedAuth {
+    let password_enabled = match value.get("PasswordEnabled") {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(flag)) => flag.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    let password = value
+        .get("Password")
+        .and_then(Value::as_str)
+        .filter(|password| !password.is_empty());
+    if password_enabled && password.is_some() {
+        return ImportedAuth::Password {
+            value: password.map(str::to_owned),
+        };
+    }
+    let public_key = value.get("Public Key").or_else(|| value.get("PublicKey"));
+    let key_entry = public_key.and_then(|public_key| {
+        ["windows", "linux", "mac"]
+            .iter()
+            .find_map(|platform| public_key.get(*platform))
+    });
+    let key_path = key_entry
+        .and_then(|entry| entry.get("path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let key_passphrase = key_entry
+        .and_then(|entry| entry.get("pass"))
+        .and_then(Value::as_str)
+        .filter(|pass| !pass.is_empty());
+    if key_path.is_some() || key_passphrase.is_some() {
+        return ImportedAuth::PrivateKey {
+            path: key_path.map(expand_home_prefix),
+            content: None,
+            passphrase: key_passphrase.map(str::to_owned),
+        };
+    }
+    ImportedAuth::None
+}
+
+/// Expands the `$(HomeDir)` / `~/` path prefixes against the local home
+/// directory; relative paths stay as-is (they are relative to the sessions
+/// file, which is only ever kept as a string here).
+fn expand_home_prefix(path: &str) -> String {
+    for token in ["$(HomeDir)", "~"] {
+        if let Some(rest) = path.strip_prefix(token) {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            if let Some(home) = home_dir() {
+                return if rest.is_empty() {
+                    home
+                } else {
+                    format!("{home}/{rest}")
+                };
+            }
+        }
+    }
+    path.to_string()
+}
+
+fn home_dir() -> Option<String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Store: <plugin_data_dir>/imported-connections.json (0600)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImportedEntry {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub group_path: Vec<String>,
+    pub description: String,
+    /// "none" | "password" | "private-key" (see [`auth_kind`]).
+    pub auth_kind: String,
+    /// Key file path — a path is metadata, not a secret, so it stays plain.
+    pub key_path: String,
+    /// Vault envelopes (`base64(nonce‖ct)`); empty means "no secret".
+    pub password_enc: String,
+    pub key_content_enc: String,
+    pub key_passphrase_enc: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImportedStore {
+    pub connections: Vec<ImportedEntry>,
+}
+
+pub fn store_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(FILE_NAME)
+}
+
+/// Loads the store; a missing or corrupted file yields an empty store so a
+/// bad file can never break the workbench (quick-commands policy).
+pub fn load_store(data_dir: &Path) -> ImportedStore {
+    let text = std::fs::read_to_string(store_path(data_dir)).unwrap_or_default();
+    let Some(value) = serde_json::from_str::<Value>(&text).ok() else {
+        return ImportedStore::default();
+    };
+    let connections = value
+        .get("connections")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(entry_from_json).collect())
+        .unwrap_or_default();
+    ImportedStore { connections }
+}
+
+/// Persists atomically (tmp + rename) with 0600 permissions on Unix.
+pub fn save_store(data_dir: &Path, store: &ImportedStore) -> Result<(), String> {
+    let path = store_path(data_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let value = json!({
+        "version": STORAGE_VERSION,
+        "connections": store.connections.iter().map(entry_json).collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("Failed to encode imported connections: {error}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)
+        .map_err(|error| format!("Failed to write {}: {error}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))
+}
+
+fn entry_from_json(value: &Value) -> Option<ImportedEntry> {
+    let object = value.as_object()?;
+    let string = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(ImportedEntry {
+        id: string("id"),
+        name: string("name"),
+        host: string("host"),
+        port: object
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .unwrap_or(22),
+        username: string("username"),
+        group_path: object
+            .get("groupPath")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        description: string("description"),
+        auth_kind: string("authKind"),
+        key_path: string("keyPath"),
+        password_enc: string("passwordEnc"),
+        key_content_enc: string("keyContentEnc"),
+        key_passphrase_enc: string("keyPassphraseEnc"),
+    })
+}
+
+fn entry_json(entry: &ImportedEntry) -> Value {
+    json!({
+        "id": entry.id,
+        "name": entry.name,
+        "host": entry.host,
+        "port": entry.port,
+        "username": entry.username,
+        "groupPath": entry.group_path,
+        "description": entry.description,
+        "authKind": entry.auth_kind,
+        "keyPath": entry.key_path,
+        "passwordEnc": entry.password_enc,
+        "keyContentEnc": entry.key_content_enc,
+        "keyPassphraseEnc": entry.key_passphrase_enc,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Protocol handlers (`import/parse`, `import/commit`)
+// ---------------------------------------------------------------------------
+
+/// `import/parse`: parses the uploaded file and returns a sanitized preview
+/// (secrets represented as `hasSecret: true`). Nothing is persisted.
+pub fn handle_parse(params: &Value) -> Result<Value, String> {
+    let sessions = parse_from_params(params)?;
+    let views = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| preview_view(index, session))
+        .collect::<Vec<_>>();
+    Ok(json!({ "sessions": views }))
+}
+
+/// `import/commit`: re-parses the uploaded file and persists the selected
+/// indexes, sealing every secret through the vault first. Returns
+/// `{ imported, skipped }` (skipped = invalid index or store cap reached).
+pub fn handle_commit(data_dir: &Path, params: &Value) -> Result<Value, String> {
+    let sessions = parse_from_params(params)?;
+    let selected: Vec<usize> = params
+        .get("selectedIndexes")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|index| index.as_u64().and_then(|index| usize::try_from(index).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    commit_sessions(data_dir, &sessions, &selected)
+}
+
+/// Dispatches on `kind`, decoding `fileBase64` (and the WindTerm extras).
+fn parse_from_params(params: &Value) -> Result<Vec<ImportedSession>, String> {
+    let kind = params
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or("Missing kind")?;
+    let file_base64 = params
+        .get("fileBase64")
+        .and_then(Value::as_str)
+        .ok_or("Missing fileBase64")?;
+    // Cap the base64 string before decoding to bound the allocation.
+    let max_base64_len = (MAX_INPUT_BYTES / 3 + 1) * 4;
+    if file_base64.len() > max_base64_len {
+        return Err(format!(
+            "Import file exceeds the {} MB limit",
+            MAX_INPUT_BYTES / (1024 * 1024)
+        ));
+    }
+    let file = BASE64
+        .decode(file_base64)
+        .map_err(|error| format!("fileBase64 is not valid base64: {error}"))?;
+    if file.len() > MAX_INPUT_BYTES {
+        return Err(format!(
+            "Import file exceeds the {} MB limit",
+            MAX_INPUT_BYTES / (1024 * 1024)
+        ));
+    }
+    match kind {
+        "moba" => parse_moba_ini(
+            std::str::from_utf8(&file).map_err(|_| "MobaXterm file is not valid UTF-8")?,
+        ),
+        "xshell" => parse_xshell(&file),
+        "windterm" => {
+            let user_config =
+                match params
+                    .get("userConfigBase64")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(encoded) => Some(BASE64.decode(encoded).map_err(|error| {
+                        format!("userConfigBase64 is not valid base64: {error}")
+                    })?),
+                    None => None,
+                };
+            let master_password = params
+                .get("masterPassword")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            parse_windterm(&file, user_config.as_deref(), master_password)
+        }
+        other => Err(format!("Unknown import kind: {other}")),
+    }
+}
+
+fn preview_view(index: usize, session: &ImportedSession) -> Value {
+    json!({
+        "index": index,
+        "name": session.name,
+        "host": session.host,
+        "port": session.port,
+        "username": session.username,
+        "groupPath": session.group_path,
+        "description": session.description,
+        "authKind": auth_kind(&session.auth),
+        "hasSecret": has_secret(&session.auth),
+    })
+}
+
+/// Commits the selected sessions into the store. A name colliding with an
+/// existing entry on the same host/port gets " (2)" appended (then (3), ...).
+pub fn commit_sessions(
+    data_dir: &Path,
+    sessions: &[ImportedSession],
+    selected: &[usize],
+) -> Result<Value, String> {
+    let mut store = load_store(data_dir);
+    let provider = vault::resolve_provider(None, data_dir);
+    let vault = Vault::new(provider.as_ref());
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    for index in selected {
+        let Some(session) = sessions.get(*index) else {
+            skipped += 1;
+            continue;
+        };
+        if store.connections.len() >= MAX_STORED_CONNECTIONS {
+            skipped += 1;
+            continue;
+        }
+        let name = unique_name(&store, &session.name, &session.host, session.port);
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .connections
+            .push(build_entry(&vault, &id, name, session));
+        imported += 1;
+    }
+    if imported > 0 {
+        save_store(data_dir, &store)?;
+    }
+    Ok(json!({ "imported": imported, "skipped": skipped }))
+}
+
+fn build_entry(vault: &Vault, id: &str, name: String, session: &ImportedSession) -> ImportedEntry {
+    let empty = (String::new(), String::new(), String::new());
+    let (password_enc, key_content_enc, key_passphrase_enc, key_path) = match &session.auth {
+        ImportedAuth::None => (empty.0, empty.1, empty.2, String::new()),
+        ImportedAuth::Password { value } => (
+            value
+                .as_deref()
+                .map(|secret| vault.seal(FIELD_IMPORTED_PASSWORD, id, secret))
+                .unwrap_or_default(),
+            empty.1,
+            empty.2,
+            String::new(),
+        ),
+        ImportedAuth::PrivateKey {
+            path,
+            content,
+            passphrase,
+        } => (
+            empty.0,
+            content
+                .as_deref()
+                .map(|secret| vault.seal(FIELD_IMPORTED_KEY_CONTENT, id, secret))
+                .unwrap_or_default(),
+            passphrase
+                .as_deref()
+                .map(|secret| vault.seal(FIELD_IMPORTED_KEY_PASSPHRASE, id, secret))
+                .unwrap_or_default(),
+            path.clone().unwrap_or_default(),
+        ),
+    };
+    ImportedEntry {
+        id: id.to_string(),
+        name,
+        host: session.host.clone(),
+        port: session.port,
+        username: session.username.clone(),
+        group_path: session.group_path.clone(),
+        description: session.description.clone(),
+        auth_kind: auth_kind(&session.auth).to_string(),
+        key_path,
+        password_enc,
+        key_content_enc,
+        key_passphrase_enc,
+    }
+}
+
+/// Same name + host + port is treated as a duplicate; the new entry gets a
+/// " (2)" suffix (incrementing on repeated collisions).
+fn unique_name(store: &ImportedStore, name: &str, host: &str, port: u16) -> String {
+    let taken = |candidate: &str| {
+        store
+            .connections
+            .iter()
+            .any(|entry| entry.name == candidate && entry.host == host && entry.port == port)
+    };
+    if !taken(name) {
+        return name.to_string();
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{name} ({suffix})");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- MobaXterm ----------------------------------------------------------
+
+    #[test]
+    fn moba_parses_ssh_sessions_with_group_and_defaults() {
+        let text = concat!(
+            "[Bookmarks]\n",
+            "SubRep=Prod\\Web\n",
+            "ImgNum=42\n",
+            "web1=#109#0%192.168.1.10%22%deploy%pw%...\n",
+            "db1=#109#0%10.0.0.5%%%pw%...\n",
+            "custom=#109#0%10.0.0.9%2222%ops%pw%...\n",
+        );
+        let sessions = parse_moba_ini(text).unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].name, "web1");
+        assert_eq!(sessions[0].group_path, vec!["Prod", "Web"]);
+        assert_eq!(sessions[0].host, "192.168.1.10");
+        assert_eq!(sessions[0].port, 22);
+        assert_eq!(sessions[0].username, "deploy");
+        assert_eq!(sessions[0].auth, ImportedAuth::None);
+        // Missing port and user fall back to 22 / root.
+        assert_eq!(sessions[1].port, 22);
+        assert_eq!(sessions[1].username, "root");
+        assert_eq!(sessions[2].port, 2222);
+    }
+
+    #[test]
+    fn moba_skips_non_ssh_entries_and_other_sections() {
+        let text = concat!(
+            "[Bookmarks]\n",
+            "shell=#1#0%192.168.1.10%22%root%\n",
+            "telnet=#99#0%192.168.1.11%23%root%\n",
+            "ssh=#109#0%192.168.1.12%22%root%\n",
+            "[Bookmarks_2]\n",
+            "in-other=#109#0%192.168.1.13%22%root%\n",
+            "[Servers]\n",
+            "wrong-section=#109#0%192.168.1.14%22%root%\n",
+        );
+        let sessions = parse_moba_ini(text).unwrap();
+        let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["ssh", "in-other"]);
+    }
+
+    #[test]
+    fn moba_empty_sub_rep_means_no_group_and_bad_values_are_skipped() {
+        let text = concat!(
+            "[Bookmarks]\n",
+            "SubRep=\n",
+            "ok=#109#0%1.2.3.4%22%root%\n",
+            "nohost=#109#0%%22%root%\n",
+            "badport=#109#0%1.2.3.5%not-a-port%root%\n",
+            "novalue=#109#0\n",
+        );
+        let sessions = parse_moba_ini(text).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions[0].group_path.is_empty());
+        // Unparsable port falls back to 22.
+        assert_eq!(sessions[1].port, 22);
+    }
+
+    #[test]
+    fn moba_tolerates_garbage_comments_and_missing_sections() {
+        assert!(parse_moba_ini("").unwrap().is_empty());
+        assert!(parse_moba_ini("not an ini at all\n;;;;\n")
+            .unwrap()
+            .is_empty());
+        assert!(parse_moba_ini("[Bookmarks\nx=#109#0%1.2.3.4%22%root%\n")
+            .unwrap()
+            .is_empty());
+        let text = "; comment\n# comment\n[Bookmarks]\n;another\nssh=#109#0%1.2.3.4%22%root%\n";
+        let sessions = parse_moba_ini(text).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].host, "1.2.3.4");
+    }
+
+    // -- Xshell -------------------------------------------------------------
+
+    /// Builds an in-memory ZIP archive with the given entries.
+    fn xshell_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, content) in entries {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(content.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    const WEB_XSH: &str = concat!(
+        "[CONNECTION]\n",
+        "Protocol=SSH\n",
+        "Host=192.168.1.20\n",
+        "Port=2222\n",
+        "\n",
+        "[CONNECTION:AUTHENTICATION]\n",
+        "UserName=deploy\n",
+        "UserKey=my-key\n",
+        "\n",
+        "[SCRIPT]\n",
+        "something=else\n",
+    );
+
+    #[test]
+    fn xshell_parses_sessions_groups_and_key_auth() {
+        let zip = xshell_zip(&[
+            ("Xshell/Sessions/Prod/web.xsh", WEB_XSH),
+            (
+                "Xshell/Sessions/db.xsh",
+                "[CONNECTION]\nProtocol=SSH\nHost=10.0.0.2\n",
+            ),
+            ("notes.txt", "ignore me"),
+        ]);
+        let sessions = parse_xshell(&zip).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let web = &sessions[0];
+        assert_eq!(web.name, "web");
+        assert_eq!(web.host, "192.168.1.20");
+        assert_eq!(web.port, 2222);
+        assert_eq!(web.username, "deploy");
+        assert_eq!(web.group_path, vec!["Prod"]);
+        assert_eq!(
+            web.auth,
+            ImportedAuth::PrivateKey {
+                path: Some("my-key".to_string()),
+                content: None,
+                passphrase: None,
+            }
+        );
+        // Defaults: port 22, user root, no group at the Sessions root.
+        assert_eq!(sessions[1].name, "db");
+        assert_eq!(sessions[1].port, 22);
+        assert_eq!(sessions[1].username, "root");
+        assert!(sessions[1].group_path.is_empty());
+        assert_eq!(sessions[1].auth, ImportedAuth::None);
+    }
+
+    #[test]
+    fn xshell_skips_non_ssh_and_non_xsh_entries() {
+        let zip = xshell_zip(&[
+            (
+                "Xshell/Sessions/serial.xsh",
+                "[CONNECTION]\nProtocol=SERIAL\nHost=COM3\n",
+            ),
+            (
+                "Xshell/Sessions/telnet.xsh",
+                "[CONNECTION]\nProtocol=Telnet\nHost=10.0.0.3\nPort=23\n",
+            ),
+            ("Xshell/Sessions/ssh.xsh", WEB_XSH),
+            ("Xshell/backup/old.xsh.bak", "junk"),
+        ]);
+        let sessions = parse_xshell(&zip).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "ssh");
+    }
+
+    #[test]
+    fn xshell_malformed_xsh_entries_are_skipped_not_fatal() {
+        let zip = xshell_zip(&[
+            ("garbage.xsh", "this is not an ini at all"),
+            ("no-host.xsh", "[CONNECTION]\nProtocol=SSH\n"),
+            ("good.xsh", WEB_XSH),
+        ]);
+        let sessions = parse_xshell(&zip).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "good");
+    }
+
+    #[test]
+    fn xshell_rejects_invalid_archives_and_enforces_entry_cap() {
+        assert!(parse_xshell(b"definitely not a zip").is_err());
+        // One entry over the cap fails the whole archive.
+        let mut entries = Vec::new();
+        for index in 0..=MAX_ZIP_ENTRIES {
+            entries.push((format!("s{index}.xsh"), String::from("[CONNECTION]\n")));
+        }
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.as_str()))
+            .collect();
+        let zip = xshell_zip(&refs);
+        let error = parse_xshell(&zip).unwrap_err();
+        assert!(error.contains("more than"), "unexpected error: {error}");
+        // Just under the cap parses fine.
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .take(MAX_ZIP_ENTRIES)
+            .map(|(n, c)| (n.as_str(), c.as_str()))
+            .collect();
+        assert!(parse_xshell(&xshell_zip(&refs)).is_ok());
+    }
+
+    #[test]
+    fn zip_entry_names_decode_utf8_first_then_gbk() {
+        // ASCII and UTF-8 names decode verbatim.
+        assert_eq!(decode_zip_name(b"web.xsh"), "web.xsh");
+        assert_eq!(decode_zip_name("生产环境.xsh".as_bytes()), "生产环境.xsh");
+        // GBK bytes for "生产环境.xsh" (Chinese Windows exports) are not
+        // valid UTF-8, so the GBK fallback applies.
+        let (gbk, _, had_errors) = encoding_rs::GBK.encode("生产环境.xsh");
+        assert!(!had_errors);
+        let mut raw = b"Xshell/Sessions/".to_vec();
+        raw.extend_from_slice(&gbk);
+        let decoded = decode_zip_name(&raw);
+        assert_eq!(decoded, "Xshell/Sessions/生产环境.xsh");
+        // Undecodable bytes degrade lossily instead of panicking.
+        assert_eq!(decode_zip_name(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
+    }
+
+    // -- WindTerm -----------------------------------------------------------
+
+    const FINGERPRINT_HEX: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+    /// Test-only helper: encrypts like WindTerm does (AES-256-CBC/PKCS7,
+    /// key/IV derived via PBKDF2-HMAC-SHA3-512), so the parser round-trips
+    /// against an independent encryption path.
+    fn windterm_encrypt(master: &str, fingerprint_hex: &str, plaintext: &str) -> String {
+        use aes::cipher::block_padding::Pkcs7;
+        use aes::cipher::{BlockModeEncrypt, KeyIvInit};
+        type Aes256CbcEncryptor = cbc::Encryptor<aes::Aes256>;
+        let salt = fingerprint_bytes(fingerprint_hex);
+        let (key, iv) = derive_windterm_key(master, &salt);
+        let ciphertext = Aes256CbcEncryptor::new_from_slices(&key, &iv)
+            .unwrap()
+            .encrypt_padded_vec::<Pkcs7>(plaintext.as_bytes());
+        BASE64.encode(ciphertext)
+    }
+
+    fn user_config_json(master_password: bool) -> String {
+        json!({
+            "application": {
+                "fingerprint": FINGERPRINT_HEX,
+                "masterPassword": master_password,
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn windterm_parses_ssh_sessions_with_defaults_and_groups() {
+        let sessions_json = json!([
+            {
+                "session": {
+                    "protocol": "SSH",
+                    "target": "ops@10.1.1.5",
+                    "label": "gateway",
+                    "port": 2200,
+                    "group": "Cloud>AWS>us-east",
+                    "description": "primary",
+                }
+            },
+            {
+                "session": {
+                    "protocol": "ssh",
+                    "target": "10.1.1.6",
+                }
+            },
+            {
+                "session": { "protocol": "Telnet", "target": "10.1.1.7" }
+            },
+            { "note": "no session object" },
+            {
+                "session": { "protocol": "SSH", "target": "@10.1.1.8" }
+            },
+            {
+                "session": { "protocol": "SSH", "target": "10.1.1.9:22", "label": "x" },
+            }
+        ])
+        .to_string();
+        let sessions = parse_windterm(sessions_json.as_bytes(), None, None).unwrap();
+        assert_eq!(sessions.len(), 4);
+        assert_eq!(sessions[0].name, "gateway");
+        assert_eq!(sessions[0].host, "10.1.1.5");
+        assert_eq!(sessions[0].port, 2200);
+        assert_eq!(sessions[0].username, "ops");
+        assert_eq!(sessions[0].group_path, vec!["Cloud", "AWS", "us-east"]);
+        assert_eq!(sessions[0].description, "primary");
+        assert_eq!(sessions[0].auth, ImportedAuth::None);
+        // Defaults: no @ → root, no port → 22, no label → host.
+        assert_eq!(sessions[1].username, "root");
+        assert_eq!(sessions[1].port, 22);
+        assert_eq!(sessions[1].name, "10.1.1.6");
+        assert!(sessions[1].group_path.is_empty());
+        assert_eq!(sessions[3].username, "root");
+    }
+
+    #[test]
+    fn windterm_plaintext_autologin_yields_password_auth() {
+        let auto_login =
+            json!({ "PasswordEnabled": true, "Password": "p@ss", "Public Key": {} }).to_string();
+        let sessions_json = json!([{
+            "session": {
+                "protocol": "SSH",
+                "target": "root@10.2.0.1",
+                "label": "plain",
+                "autoLogin": auto_login,
+            }
+        }])
+        .to_string();
+        let sessions = parse_windterm(sessions_json.as_bytes(), None, None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].auth,
+            ImportedAuth::Password {
+                value: Some("p@ss".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn windterm_encrypted_autologin_roundtrips_with_master_password() {
+        let auto_login = json!({
+            "PasswordEnabled": true,
+            "Password": "enc-p@ss",
+            "Public Key": {
+                "windows": { "path": "$(HomeDir)keys/id_ed25519", "pass": "key-phr" }
+            }
+        })
+        .to_string();
+        let mut sessions_json = json!([{
+            "session": {
+                "protocol": "SSH",
+                "target": "deploy@10.3.0.1",
+                "label": "encrypted",
+                "autoLogin": windterm_encrypt("master-key", FINGERPRINT_HEX, &auto_login),
+            }
+        }])
+        .to_string();
+        let config = user_config_json(true);
+        let sessions = parse_windterm(
+            sessions_json.as_bytes(),
+            Some(config.as_bytes()),
+            Some("master-key"),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        // Password wins over the public key entry.
+        assert_eq!(
+            sessions[0].auth,
+            ImportedAuth::Password {
+                value: Some("enc-p@ss".to_string())
+            }
+        );
+
+        // Without the PasswordEnabled flag the public key entry applies, with
+        // the $(HomeDir) prefix expanded.
+        let key_only = json!({
+            "Public Key": {
+                "windows": { "path": "~/keys/id_rsa", "pass": "key-phr" }
+            }
+        })
+        .to_string();
+        sessions_json = json!([{
+            "session": {
+                "protocol": "SSH",
+                "target": "deploy@10.3.0.1",
+                "label": "keyed",
+                "autoLogin": windterm_encrypt("master-key", FINGERPRINT_HEX, &key_only),
+            }
+        }])
+        .to_string();
+        let sessions = parse_windterm(
+            sessions_json.as_bytes(),
+            Some(config.as_bytes()),
+            Some("master-key"),
+        )
+        .unwrap();
+        match &sessions[0].auth {
+            ImportedAuth::PrivateKey {
+                path, passphrase, ..
+            } => {
+                let path = path.as_deref().unwrap();
+                assert!(path.ends_with("keys/id_rsa"), "unexpected path: {path}");
+                assert_ne!(path, "~/keys/id_rsa");
+                assert_eq!(passphrase.as_deref(), Some("key-phr"));
+            }
+            other => panic!("expected private key auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windterm_master_password_switch_requires_the_password() {
+        let auto_login = json!({ "PasswordEnabled": true, "Password": "x" }).to_string();
+        let sessions_json = json!([{
+            "session": {
+                "protocol": "SSH",
+                "target": "root@10.3.0.2",
+                "autoLogin": windterm_encrypt("master-key", FINGERPRINT_HEX, &auto_login),
+            }
+        }])
+        .to_string();
+        let config = user_config_json(true);
+        let error =
+            parse_windterm(sessions_json.as_bytes(), Some(config.as_bytes()), None).unwrap_err();
+        assert_eq!(error, "WindTerm master password is required");
+        // Switch off: no password needed, but the blob can't be decrypted —
+        // credentials are skipped, the session survives.
+        let config_off = user_config_json(false);
+        let sessions =
+            parse_windterm(sessions_json.as_bytes(), Some(config_off.as_bytes()), None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].auth, ImportedAuth::None);
+    }
+
+    #[test]
+    fn windterm_malformed_input_degrades_gracefully() {
+        assert!(parse_windterm(b"not json", None, None).is_err());
+        assert!(parse_windterm(b"{\"not\":\"an array\"}", None, None).is_err());
+        // autoLogin that is neither JSON nor base64, and ciphertext that does
+        // not decrypt: credentials skipped, sessions kept.
+        let sessions_json = json!([
+            { "session": { "protocol": "SSH", "target": "a@10.4.0.1", "autoLogin": "%%%garbage%%%" } },
+            { "session": { "protocol": "SSH", "target": "b@10.4.0.2", "autoLogin": "AAAA" } },
+        ])
+        .to_string();
+        let config = user_config_json(false);
+        let sessions =
+            parse_windterm(sessions_json.as_bytes(), Some(config.as_bytes()), None).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].auth, ImportedAuth::None);
+        assert_eq!(sessions[1].auth, ImportedAuth::None);
+    }
+
+    // -- Store / commit -----------------------------------------------------
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dbx-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample_sessions() -> Vec<ImportedSession> {
+        vec![
+            ImportedSession {
+                name: "web".to_string(),
+                host: "10.0.0.1".to_string(),
+                port: 22,
+                username: "root".to_string(),
+                group_path: vec!["Prod".to_string()],
+                description: String::new(),
+                auth: ImportedAuth::Password {
+                    value: Some("s3cret".to_string()),
+                },
+            },
+            ImportedSession {
+                name: "keyed".to_string(),
+                host: "10.0.0.2".to_string(),
+                port: 2222,
+                username: "ops".to_string(),
+                group_path: Vec::new(),
+                description: "d".to_string(),
+                auth: ImportedAuth::PrivateKey {
+                    path: Some("/home/u/key".to_string()),
+                    content: None,
+                    passphrase: Some("p@55phrase".to_string()),
+                },
+            },
+            ImportedSession {
+                name: "none".to_string(),
+                host: "10.0.0.3".to_string(),
+                port: 22,
+                username: "root".to_string(),
+                group_path: Vec::new(),
+                description: String::new(),
+                auth: ImportedAuth::None,
+            },
+        ]
+    }
+
+    #[test]
+    fn commit_seals_secrets_and_reports_counts() {
+        let dir = temp_dir();
+        let sessions = sample_sessions();
+        let result = commit_sessions(&dir, &sessions, &[0, 1, 7]).unwrap();
+        assert_eq!(result["imported"], 2);
+        assert_eq!(result["skipped"], 1);
+        let file_text = std::fs::read_to_string(store_path(&dir)).unwrap();
+        // No plaintext secret material ever reaches the store file.
+        assert!(!file_text.contains("s3cret"));
+        assert!(!file_text.contains("p@55phrase"));
+        assert!(file_text.contains("/home/u/key"));
+        let store = load_store(&dir);
+        assert_eq!(store.connections.len(), 2);
+        assert_eq!(store.connections[0].auth_kind, "password");
+        assert!(!store.connections[0].password_enc.is_empty());
+        assert_eq!(store.connections[1].auth_kind, "private-key");
+        assert!(!store.connections[1].key_passphrase_enc.is_empty());
+        // The sealed password opens again through the same keyfile vault.
+        let provider = vault::resolve_provider(None, &dir);
+        let vault = Vault::new(provider.as_ref());
+        assert_eq!(
+            vault.open(
+                "importedPassword",
+                &store.connections[0].id,
+                &store.connections[0].password_enc
+            ),
+            "s3cret"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_dedupes_same_name_host_port() {
+        let dir = temp_dir();
+        let sessions = sample_sessions();
+        commit_sessions(&dir, &sessions, &[0]).unwrap();
+        commit_sessions(&dir, &sessions, &[0]).unwrap();
+        let store = load_store(&dir);
+        assert_eq!(store.connections.len(), 2);
+        assert_eq!(store.connections[1].name, "web (2)");
+        // Different host/port with the same name is not a duplicate.
+        let mut other = sample_sessions()[2].clone();
+        other.name = "web".to_string();
+        commit_sessions(&dir, std::slice::from_ref(&other), &[0]).unwrap();
+        let store = load_store(&dir);
+        assert_eq!(store.connections.len(), 3);
+        assert_eq!(store.connections[2].name, "web");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupted_store_file_falls_back_to_empty() {
+        let dir = temp_dir();
+        std::fs::write(store_path(&dir), "{not json").unwrap();
+        assert!(load_store(&dir).connections.is_empty());
+        // Saving after corruption rewrites a valid store.
+        commit_sessions(&dir, &sample_sessions(), &[2]).unwrap();
+        assert_eq!(load_store(&dir).connections.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_roundtrip_preserves_entries() {
+        let dir = temp_dir();
+        let store = ImportedStore {
+            connections: vec![
+                ImportedEntry {
+                    id: "id-1".to_string(),
+                    name: "web".to_string(),
+                    host: "h".to_string(),
+                    port: 22,
+                    username: "root".to_string(),
+                    group_path: vec!["a".to_string(), "b".to_string()],
+                    description: "d".to_string(),
+                    auth_kind: "none".to_string(),
+                    key_path: String::new(),
+                    password_enc: String::new(),
+                    key_content_enc: String::new(),
+                    key_passphrase_enc: String::new(),
+                },
+                ImportedEntry {
+                    port: 2222,
+                    auth_kind: "private-key".to_string(),
+                    key_path: "k".to_string(),
+                    key_passphrase_enc: "env".to_string(),
+                    id: "id-2".to_string(),
+                    name: "k".to_string(),
+                    host: "h2".to_string(),
+                    username: "u".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        save_store(&dir, &store).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(load_store(&dir), store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Protocol handlers ---------------------------------------------------
+
+    #[test]
+    fn handle_parse_previews_without_leaking_secrets() {
+        let auto_login = json!({ "PasswordEnabled": true, "Password": "p@ss" }).to_string();
+        let file = json!([{
+            "session": {
+                "protocol": "SSH",
+                "target": "root@10.5.0.1",
+                "label": "preview",
+                "autoLogin": auto_login,
+            }
+        }])
+        .to_string();
+        let params = json!({
+            "kind": "windterm",
+            "fileBase64": BASE64.encode(file.as_bytes()),
+        });
+        let result = handle_parse(&params).unwrap();
+        let rendered = result.to_string();
+        assert!(!rendered.contains("p@ss"));
+        let session = &result["sessions"][0];
+        assert_eq!(session["index"], 0);
+        assert_eq!(session["name"], "preview");
+        assert_eq!(session["authKind"], "password");
+        assert_eq!(session["hasSecret"], true);
+        assert!(session.get("passwordEnc").is_none());
+    }
+
+    #[test]
+    fn handle_parse_rejects_bad_params() {
+        assert!(handle_parse(&json!({})).is_err());
+        assert!(handle_parse(&json!({ "kind": "moba" })).is_err());
+        assert!(handle_parse(&json!({ "kind": "moba", "fileBase64": "!!!" })).is_err());
+        assert!(handle_parse(&json!({ "kind": "ftp", "fileBase64": "" })).is_err());
+    }
+
+    #[test]
+    fn handle_commit_end_to_end() {
+        let dir = temp_dir();
+        let text = concat!(
+            "[Bookmarks]\n",
+            "web=#109#0%10.6.0.1%22%root%\n",
+            "db=#109#0%10.6.0.2%5432%postgres%\n",
+        );
+        let params = json!({
+            "kind": "moba",
+            "fileBase64": BASE64.encode(text.as_bytes()),
+            "selectedIndexes": [0, 1, 2, 99],
+        });
+        let result = handle_commit(&dir, &params).unwrap();
+        assert_eq!(result["imported"], 2);
+        assert_eq!(result["skipped"], 2);
+        let store = load_store(&dir);
+        assert_eq!(store.connections.len(), 2);
+        assert_eq!(store.connections[0].name, "web");
+        assert_eq!(store.connections[0].port, 22);
+        assert_eq!(store.connections[1].port, 5432);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windterm_helpers_edge_cases() {
+        // Target splitting keeps multi-@ users intact and trims spaces.
+        assert_eq!(
+            split_windterm_target(" user@mail.com @ host "),
+            ("user@mail.com".to_string(), "host".to_string())
+        );
+        assert_eq!(
+            split_windterm_target("only-host"),
+            (String::new(), "only-host".to_string())
+        );
+        // Ports arrive as numbers or strings; junk falls back to 22.
+        assert_eq!(windterm_port(Some(&json!(2222))), 2222);
+        assert_eq!(windterm_port(Some(&json!("2222"))), 2222);
+        assert_eq!(windterm_port(Some(&json!("nope"))), 22);
+        assert_eq!(windterm_port(Some(&json!(0))), 22);
+        assert_eq!(windterm_port(None), 22);
+        // Fingerprint salt: hex decodes, junk stays raw bytes.
+        assert_eq!(fingerprint_bytes("0xa1b2"), vec![0xa1, 0xb2]);
+        assert_eq!(fingerprint_bytes("A1B2"), vec![0xa1, 0xb2]);
+        assert_eq!(fingerprint_bytes("salt!"), b"salt!".to_vec());
+        // Config flags are lenient.
+        assert!(config_flag_is_on(&json!(true)));
+        assert!(config_flag_is_on(&json!("true")));
+        assert!(config_flag_is_on(&json!(1)));
+        assert!(!config_flag_is_on(&json!(false)));
+        assert!(!config_flag_is_on(&json!("off")));
+        // Home prefix expansion without HOME keeps the path verbatim.
+        assert_eq!(expand_home_prefix("relative/id_rsa"), "relative/id_rsa");
+    }
+}
