@@ -3412,3 +3412,12 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 4. RDP：vendored fork 链维护计划 + CredSSP 安全评审清单——人工评审门，未派发。
 5. 真机验收：GPU/NPU（nvidia-smi/npu-smi 主机）、Docker 主机、Windows ConPTY gutter、DBX 桌面端到端——人工项。
 6. Docker 面板"在终端打开"升级为事件直填输入行（需 App.vue 通道开放）。
+
+
+## M4 轮排期（2026-09-24，用户指令"继续排期，持续跑"）
+
+- 已派发（后台并发，worktree np4-x11 / np4-serial，分支 parity-x11 / parity-serial）：
+  1. **X11 转发实现**：按 spike 报告路线（request_x11 + server_channel_open_x11 显式 gate + DISPLAY unix/TCP 桥接 + 假 MIT-MAGIC-COOKIE 校验）；偏好键 `x11_forwarding`（默认关，read_only 禁用）；零新增依赖。
+  2. **串口会话**：serialport 4（依赖评审：MIT/Apache 双许可）+ `serial_session.rs`（仿 telnet 先例：ports/start/write/close/list）+ SerialConnectDialog 前端入口；若 Linux CI 需 libudev-dev 允许改 workflow 一处。
+- 维持人工门：VNC（引擎选型+帧通道压测）、RDP（vendored fork 链+CredSSP 评审）、真机验收、PR 合入。
+- M4 完成判据：两分支合入 integration、全量验证绿（基线 cargo 696 / vitest 861 只增不减）、e2e 回归、push 后 CI 十一门 success。
