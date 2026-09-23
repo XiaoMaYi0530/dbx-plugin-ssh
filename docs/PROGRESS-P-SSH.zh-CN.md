@@ -3429,3 +3429,17 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 - **X11 转发 ✅ 全栈完成并已合入（75c5219）**：x11.rs 残留兑现（DISPLAY 解析 7 形态/假 cookie/Xsetup 检查/.Xauthority/准入门，12 测试）+ ssh.rs 接线（request_x11 于 PTY/env 后发送；`server_channel_open_x11` 显式 fail-closed gate——russh 默认 accept 的安全边界）+ `x11_forwarding` 偏好（启动/读写三处同步快速标志）+ SettingsDialog 开关（组件内自治 RPC）+ 七语文案。真机 X server 联调记遗留。
 - **串口 backend ✅**（parity-serial 分支）：serialport 4（MIT/Apache）+ serial_session.rs（ports/start/write/close/list + Backspace 映射 + 读线程→帧通道）+ 协议注册。前端入口（SerialConnectDialog + App.vue 接线）派 np4-serial 重试 agent 补齐。
 - 执行备注：M4 首两轮后台 agent 因 API 网络瞬断失败（无产出丢失），已原样重试；X11 改由主会话直接完成。
+
+
+## M4 收口（2026-09-24）
+
+- **X11 转发 ✅ 全栈合入**（75c5219 + 6e46fec/42bb29f platform-gate）：russh UnixStream 仅 unix 平台——bridge_channel 按 cfg(unix/windows) 拆分，Windows 侧 unix-socket 形态报可读错误指路 VcXsrv TCP；fmt 修复后 CI 全绿。
+- **串口会话 ✅ 全栈合入**（cbf6fa2）：backend（parity-serial 7b3cdde…20d0edf，含 serialport 4 依赖）+ 前端 SerialConnectDialog/App.vue 接线（serial/* JSON 写通道 MVP 取舍 + localUiMode 互斥 + 顺手修复 Telnet 会话被连接卡片遮挡的一行缺陷）。
+- **执行波折**：M4 首两轮后台 agent 因 API 网络瞬断失败；X11 改由主会话直接实现（兑现 x11.rs 残留）；串口前端第三轮 agent 成功。
+- **全量**：backend cargo **696**（含 x11 12 + serial 参数/生命周期测试）/ clippy 0 / fmt 干净；frontend vitest **861** / vue-tsc 0 / build 过。
+
+### M4 遗留（人工门）
+
+1. 真机：X server（XQuartz/VcXsrv）联调、串口硬件联调、GPU/NPU 主机、Windows ConPTY、DBX 桌面端到端。
+2. VNC（引擎选型+压测）、RDP（vendored fork+CredSSP 评审）——维持人工评审门。
+3. 串口 MVP 已知限制：JSON 写通道、无 replay/resize、ports 列表 USB 后缀需手输剥离。
