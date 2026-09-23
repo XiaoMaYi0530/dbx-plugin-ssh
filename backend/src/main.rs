@@ -4,6 +4,7 @@ mod alert_triage;
 mod app_bridge;
 mod audit_log;
 mod connection_import;
+mod docker;
 mod exec;
 mod forward;
 mod highlight_rules;
@@ -616,6 +617,113 @@ impl Plugin {
                     as usize;
                 self.runtime
                     .block_on(self.ssh.metrics_history(session_id, limit))
+            }
+            // Docker 管理面板（IMPL_PLAN Task P2-4）。列表/日志是只读采集
+            // 脚本（探针区分「未装 docker」与「daemon socket 拒绝」）；动作
+            // 走白名单动词 + 容器 id 严格校验 + 只读连接直接拒绝 + 执行前
+            // 审计，plain 失败且命中 daemon 权限签名时才回落 Quick Sudo
+            // 管线（密码只走 stdin，绝不拼进命令行）。
+            "docker/list" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let response = self.runtime.block_on(self.ssh.exec(
+                    session_id,
+                    None,
+                    docker::LIST_SCRIPT,
+                    false,
+                    Some(docker::LIST_TIMEOUT.as_secs()),
+                ))?;
+                let output = response
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(docker::list_payload(output))
+            }
+            "docker/logs" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let container_id = required_string(&params, "containerId")?;
+                let tail = optional_u64(&params, "tail", docker::TAIL_DEFAULT);
+                let script = docker::logs_script(container_id, tail)?;
+                let response = self.runtime.block_on(self.ssh.exec(
+                    session_id,
+                    None,
+                    &script,
+                    false,
+                    Some(docker::LOGS_TIMEOUT.as_secs()),
+                ))?;
+                let output = response
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(docker::logs_payload(output))
+            }
+            "docker/action" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let container_id = required_string(&params, "containerId")?;
+                docker::validate_container_id(container_id)?;
+                let action = docker::parse_action(required_string(&params, "action")?)?;
+                // 只读连接直接拒绝：动作会改变远端容器状态。
+                self.runtime
+                    .block_on(self.ssh.ensure_writable(session_id))?;
+                let command = docker::action_command(action, container_id);
+                // 执行前写审计（意图行）：即使 sidecar 中途退出，账本上也留
+                // 有一条记录；失败时补一行带错误详情的失败行。
+                docker::audit_action_intent(&self.ssh.data_dir(), &command);
+                let started = std::time::Instant::now();
+                let plain = self.runtime.block_on(self.ssh.exec(
+                    session_id,
+                    None,
+                    &command,
+                    false,
+                    Some(docker::ACTION_TIMEOUT.as_secs()),
+                ))?;
+                let exit_code = plain.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
+                let output = plain
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if exit_code == 0 {
+                    return Ok(json!({ "success": true, "output": output }));
+                }
+                let failure = |error: String| {
+                    docker::audit_action_failure(
+                        &self.ssh.data_dir(),
+                        &command,
+                        &error,
+                        started.elapsed().as_millis() as u64,
+                    );
+                    error
+                };
+                if docker::is_daemon_permission_failure(exit_code, &output) {
+                    // daemon socket 权限失败是唯一允许回落 sudo 的失败形态：
+                    // 其余失败重试可能把半执行的动作应用两次。回落走与
+                    // ssh/exec 同一条 Quick Sudo 管线（编排凭据、use_pty、
+                    // keepalive 全部复用），连接级 sudoers 白名单同语义生效。
+                    self.runtime
+                        .block_on(self.ssh.ensure_sudo_allowed(session_id, &command))?;
+                    return match self.runtime.block_on(self.ssh.exec(
+                        session_id,
+                        None,
+                        &command,
+                        true,
+                        Some(docker::ACTION_TIMEOUT.as_secs()),
+                    )) {
+                        Ok(sudo_response) => {
+                            let sudo_output = sudo_response
+                                .get("output")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            Ok(json!({ "success": true, "output": sudo_output }))
+                        }
+                        Err(error) => Err(failure(docker::sudo_fallback_error(error))),
+                    };
+                }
+                Err(failure(format!(
+                    "docker {} failed (exit {}): {}",
+                    action.as_str(),
+                    exit_code,
+                    output
+                )))
             }
             "ssh/processes/list" => {
                 let session_id = required_string(&params, "sessionId")?;
