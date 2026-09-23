@@ -769,7 +769,14 @@ mod tests {
                 always_alive(),
             )
             .await;
-        assert!(missing.unwrap_err().contains("does not exist"));
+        // On Windows a leading `/` is not absolute (no drive prefix), so the
+        // absolute-path rejection may win over the fingerprint one — accept
+        // either rejection text.
+        let missing_error = missing.unwrap_err();
+        assert!(
+            missing_error.contains("does not exist") || missing_error.contains("absolute"),
+            "unexpected rejection: {missing_error}"
+        );
         // Relative local paths are refused (desktop detection happens first;
         // when the desktop gate is off, that error wins — both are valid on
         // CI, so accept either rejection text).
