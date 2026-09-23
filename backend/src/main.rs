@@ -560,6 +560,32 @@ impl Plugin {
                     .block_on(sftp_ext::touch(&self.ssh, session_id, path))?;
                 Ok(json!({ "success": true }))
             }
+            // 符号链接三命令：创建/读取指向/改指向。写操作走 ensure_writable
+            // 只读门禁（对齐 sftp/chmod）；target 允许相对路径（symlink 语义）。
+            "sftp/symlink-create" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let target = required_string(&params, "target")?;
+                let link_path = required_string(&params, "linkPath")?;
+                self.runtime.block_on(sftp_ext::symlink_create(
+                    &self.ssh, session_id, target, link_path,
+                ))?;
+                Ok(json!({ "success": true }))
+            }
+            "sftp/symlink-read" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let link_path = required_string(&params, "linkPath")?;
+                self.runtime
+                    .block_on(sftp_ext::symlink_read(&self.ssh, session_id, link_path))
+            }
+            "sftp/symlink-update" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let link_path = required_string(&params, "linkPath")?;
+                let target = required_string(&params, "target")?;
+                self.runtime.block_on(sftp_ext::symlink_update(
+                    &self.ssh, session_id, link_path, target,
+                ))?;
+                Ok(json!({ "success": true }))
+            }
             "sftp/write" => {
                 let session_id = required_string(&params, "sessionId")?;
                 let remote_path = required_string(&params, "remotePath")?;

@@ -285,6 +285,99 @@ pub async fn extract(
 }
 
 // ---------------------------------------------------------------------------
+// Symlinks
+// ---------------------------------------------------------------------------
+
+/// `sftp/symlink-create` — creates `link_path` pointing at `target`.
+/// `target` keeps its original form (absolute or relative): relative targets
+/// are the normal way to build relocatable links, so normalizing it would
+/// silently change what the link resolves to.
+pub async fn symlink_create(
+    runtime: &SshRuntime,
+    session_id: &str,
+    target: &str,
+    link_path: &str,
+) -> Result<(), String> {
+    runtime.ensure_writable(session_id).await?;
+    let target = clean_link_target(target)?;
+    let link_path = normalize_remote_path(link_path)?;
+    let sftp = runtime.sftp(session_id).await?;
+    // Spike result (russh-sftp 3.0.0, src/client/rawsession.rs:709 +
+    // protocol/symlink.rs): the wire order is (linkpath, targetpath), which is
+    // the *draft* order — but OpenSSH's server reads (target, linkpath) and
+    // pkg/sftp ships the swap for exactly this reason (packet.go, "the order
+    // ... was inadvertently reversed"). Calling with swapped arguments makes
+    // the link land on `link_path` pointing at `target` on OpenSSH and every
+    // OpenSSH-compatible sftp-server.
+    sftp.lock()
+        .await
+        .symlink(target.clone(), link_path.clone())
+        .await
+        .map_err(|error| format!("SFTP symlink-create failed: {error}"))?;
+    Ok(())
+}
+
+/// `sftp/symlink-read` — resolves `link_path` to its target string.
+pub async fn symlink_read(
+    runtime: &SshRuntime,
+    session_id: &str,
+    link_path: &str,
+) -> Result<Value, String> {
+    let link_path = normalize_remote_path(link_path)?;
+    let sftp = runtime.sftp(session_id).await?;
+    let target = sftp
+        .lock()
+        .await
+        .read_link(link_path.clone())
+        .await
+        .map_err(|error| format!("SFTP symlink-read failed: {error}"))?;
+    Ok(json!({ "linkPath": link_path, "target": target }))
+}
+
+/// `sftp/symlink-update` — repoints an existing symlink. SFTP v3 has no
+/// re-link primitive, so the update is read-compare, then remove + recreate;
+/// when the requested target already matches the call is a no-op.
+pub async fn symlink_update(
+    runtime: &SshRuntime,
+    session_id: &str,
+    link_path: &str,
+    target: &str,
+) -> Result<(), String> {
+    runtime.ensure_writable(session_id).await?;
+    let target = clean_link_target(target)?;
+    let link_path = normalize_remote_path(link_path)?;
+    let sftp = runtime.sftp(session_id).await?;
+    let session = sftp.lock().await;
+    if session
+        .read_link(link_path.clone())
+        .await
+        .map(|current| current == target)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    session
+        .remove_file(link_path.clone())
+        .await
+        .map_err(|error| format!("SFTP symlink-update could not remove the old link: {error}"))?;
+    // Same swapped-argument order as symlink_create (OpenSSH wire order).
+    session
+        .symlink(target, link_path)
+        .await
+        .map_err(|error| format!("SFTP symlink-update failed: {error}"))
+}
+
+/// Validates a symlink target: symlink targets travel verbatim inside the
+/// SFTP SYMLINK packet (no shell involved), so only NUL and emptiness are
+/// rejected; leading/trailing blanks are kept meaningful on purpose.
+fn clean_link_target(target: &str) -> Result<String, String> {
+    if target.is_empty() || target.contains('\0') {
+        return Err("Symlink target is empty or invalid".to_string());
+    }
+    Ok(target.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (pure, unit-testable)
 // ---------------------------------------------------------------------------
 
@@ -793,6 +886,21 @@ mod tests {
     fn join_remote_name_handles_the_root() {
         assert_eq!(join_remote_name("/", "a.txt"), "/a.txt");
         assert_eq!(join_remote_name("/tmp/up", "a.txt"), "/tmp/up/a.txt");
+    }
+
+    #[test]
+    fn clean_link_target_keeps_relative_paths_and_rejects_junk() {
+        // Relative targets are valid symlink semantics and must survive
+        // verbatim (no normalization, no shell quoting involved).
+        assert_eq!(
+            clean_link_target("../shared/data").unwrap(),
+            "../shared/data"
+        );
+        assert_eq!(clean_link_target("/abs/target").unwrap(), "/abs/target");
+        // A target that is only blanks is still a valid (if odd) name; only
+        // emptiness and NUL are protocol-level junk.
+        assert!(clean_link_target("").is_err());
+        assert!(clean_link_target("a\0b").is_err());
     }
 }
 
