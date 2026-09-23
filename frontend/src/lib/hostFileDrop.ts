@@ -19,7 +19,8 @@ export function planHostFileDrop(input: {
 }): HostFileDropTarget {
   if (!input.files || !input.connected || !input.canWrite) return { kind: "ignore" };
   if (input.sftpPaneOpen) return { kind: "sftp" };
-  if (canAcceptTerminalDrop({ connected: input.connected, canWrite: input.canWrite, transferBusy: input.terminalTransferBusy })) {
+  // 本入口已按 sftpPaneOpen 分流（上一行），到达此处的拖拽必属终端独占场景。
+  if (canAcceptTerminalDrop({ connected: input.connected, canWrite: input.canWrite, transferBusy: input.terminalTransferBusy, sftpPaneOpen: false })) {
     return { kind: "terminal" };
   }
   return { kind: "ignore" };

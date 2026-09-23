@@ -523,6 +523,29 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - `local/session/list` 供 webview 重载后接回仍活着的 shell；`workbench/close` 会回收该工作台的本地会话；sidecar 退出即全部终止（本地 PTY 生命周期 = sidecar 生命周期）。
 - 安全语义：入口为工作台显式按钮（未连接也可用；SSH 会话在连时经确认先关闭），无自动开启路径；manifest 权限集不变（复用 `host.binary`），本机命令执行能力与用户自身终端同级，无提权。
 - 偏好（`local/preferences/*` 白名单新增）：`localShell`（字符串 ≤200，空=自动探测）、`localShellIntegration`（布尔，缺省 true）。shell 选择器在工作台本地终端按钮旁的设置菜单（`local/shells/list` 发现 + 注入开关），徽标显示 `Local · <shell>`，重开按钮在本地会话存活时保持可用（restart 语义：关当前 → 按新偏好重开）。
+## 主机密钥确认通道(requestUserInput)
+
+首次连接(或主机密钥变更)时,sidecar 的确认请求按以下顺序选通道:
+
+1. **宿主弹窗(优先)**:宿主在 `plugin/initialize` 通过 `host.features` 广告
+   `host.requestUserInput`(点分形式,Host API 1.1 起)时,sidecar 直接调用
+   `host/requestUserInput`(字符串 id `plugin-N`,`echo: true`,`options:
+   accept/remember`,`timeoutSecs: 300`;title/prompt 超过宿主 200/2000 字符
+   上限时 sidecar 先行截断)。代码门控只按 `host.features` 列表判断,不校验
+   `hostApiVersion` 版本号。弹窗期间宿主暂停 `connection/test` /
+   `connection/connect` 的请求截止时间,连接表单里即可完成信任;sidecar 自身
+   的 connection/test 镜像预算若在弹窗挂起期间到期,会以"挑战等待 + 连接超时"
+   重臂一次(仅弹窗路径;Host API 1.0 路径预算不变)。
+2. **工作台事件(降级)**:宿主不支持(-32601)、参数被宿主拒绝(-32602)或无
+   可用弹窗面(-32001 且非 SDK 本地超时)时,仍发既有事件 `connection/challenge`,
+   由工作台 UI 应答(`connection/challenge/resolve`),语义与字段不变。
+3. **fail closed**:用户 cancel/timeout、宿主对请求不应答(SDK 本地 330s 超时,
+   `-32001` + "did not answer")、或其他错误——一律拒绝握手,不降级、不猜测。
+   弹窗应答仅 `action: "submit"` 且 `value` 为 `accept`/`remember` 才授信,
+   缺失/未知 value 一律视为拒绝。MCP 模式的 `auto_trust`(TOFU)行为不变。
+
+已知限制:Host API 1.0 宿主 + 工作台未打开(连接表单路径)仍无应答者,`connection/test`
+约 9s 后返回可读超时文案(0.4.78+ 缓解),文案在挑战已发出且未走弹窗路径时附指引。
 
 ## 主机密钥
 

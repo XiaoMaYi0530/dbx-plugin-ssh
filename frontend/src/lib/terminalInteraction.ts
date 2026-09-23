@@ -1,15 +1,54 @@
 /**
- * Terminal interaction gates and search persistence.
- *
- * Key routing and right-click behavior used to live here as ad-hoc resolvers;
- * they now come from the user-editable settings in `terminalBehavior.ts` and
- * `terminalHotkeys.ts`, so this module keeps only the pieces that are not
- * configurable: the drop gates and the search-option/seed helpers.
+ * Terminal interaction preferences (select-to-copy / right-click-to-paste).
+ * The toggle is a pure-frontend behavior (no sidecar involvement), so it
+ * persists in localStorage; "false" disables it, every other value (including
+ * a missing entry) keeps the historical default of enabled.
  */
+
+export type TerminalRightClickAction = "paste" | "menu";
+
+export function sanitizeSelectCopyEnabled(raw: string | null): boolean {
+  return raw !== "false";
+}
+
+/**
+ * Right-click semantics with the copy-on-select mode enabled: a plain
+ * right-click pastes straight from the clipboard (XShell/SecureCRT style),
+ * while Shift+right-click keeps the full context menu reachable.
+ */
+export function resolveTerminalRightClickAction(options: { selectCopy: boolean; shiftKey: boolean }): TerminalRightClickAction {
+  return options.selectCopy && !options.shiftKey ? "paste" : "menu";
+}
+
+export type TerminalKeyAction = "copy" | "paste" | "none";
+
+/**
+ * Keyboard shortcut routing inside the terminal (Windows Terminal/iTerm2
+ * style): Ctrl/Cmd+V and Ctrl/Cmd+Shift+V paste, Ctrl/Cmd+C copies when a
+ * selection exists and otherwise stays untouched so it keeps reaching the
+ * remote shell as SIGINT.
+ */
+export function resolveTerminalKeyAction(options: { mod: boolean; shiftKey: boolean; key: string; hasSelection: boolean }): TerminalKeyAction {
+  const key = options.key.toLowerCase();
+  if (options.mod && key === "v") return "paste";
+  if (options.mod && key === "c" && options.hasSelection) return "copy";
+  return "none";
+}
 
 /** Whether the browser runs on Apple hardware（Cmd 是主修饰键，electerm 同判定）。 */
 export function isApplePlatform(userAgent: string = navigator.userAgent): boolean {
   return /mac/i.test(userAgent);
+}
+
+/**
+ * 全选快捷键判定（electerm/iTerm2 同款）：Apple 平台 Cmd+A 直选，其余平台
+ * Ctrl+Shift+A。裸 Ctrl+A 永不命中——必须继续发给 readline 当"跳行首"。
+ */
+export function isTerminalSelectAllShortcut(options: { mod: boolean; shiftKey: boolean; metaKey: boolean; key: string; applePlatform: boolean }): boolean {
+  const key = options.key.toLowerCase();
+  if (key !== "a") return false;
+  if (options.mod && options.shiftKey) return true;
+  return options.applePlatform && options.metaKey;
 }
 
 export interface TerminalSearchOptions {
@@ -70,12 +109,14 @@ export function canAcceptFileDrop(options: { connected: boolean; canWrite: boole
 
 /**
  * Whether a file dropped onto the terminal pane can be uploaded right now.
- * The writable-session gate plus a file-transfer occupancy check: a running
- * protocol (ZMODEM or trzsz) owns the terminal data path so drops are
- * refused while one is busy.
+ * The writable-session gate, a file-transfer occupancy check (a running
+ * ZMODEM/trzsz protocol owns the terminal data path), and the pane-visibility
+ * rule: with the SFTP panel open the panel is the visible drop target (its
+ * directory is on screen), so the terminal refuses drops and points the user
+ * there instead of landing files in an invisible directory.
  */
-export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: boolean; transferBusy: boolean }): boolean {
-  return canAcceptFileDrop(options) && !options.transferBusy;
+export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: boolean; transferBusy: boolean; sftpPaneOpen: boolean }): boolean {
+  return canAcceptFileDrop(options) && !options.transferBusy && !options.sftpPaneOpen;
 }
 
 /**
@@ -91,4 +132,17 @@ export function normalizeDropTargetDir(raw: string): string | null {
   if (!trimmed.startsWith("/")) return trimmed;
   const collapsed = trimmed.replace(/\/+$/, "");
   return collapsed || "/";
+}
+
+/**
+ * 终端拖拽「当前目录」落点的解析顺序：shell 的 OSC 7/633 跟踪 cwd 优先（就
+ * 是用户说的"终端 cwd"），其次回落远端主目录（连接时已由 sftp/home 探测）；
+ * 主目录也拿不到（旧 sidecar）才用调用方兜底值。终端拖拽只在 SFTP 面板关闭
+ * 时接收，所以解析链里不再参考面板目录——它此刻不可见，落进去用户也看不到。
+ * 落点会在确认弹窗里完整展示，上传前看得到真实目标。
+ */
+export function resolveDropTargetDir(options: { terminalCwd?: string; sftpHome?: string; fallback: string }): string {
+  if (options.terminalCwd) return options.terminalCwd;
+  if (options.sftpHome && options.sftpHome !== "/") return options.sftpHome;
+  return options.fallback;
 }

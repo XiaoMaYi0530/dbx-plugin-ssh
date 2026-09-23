@@ -100,6 +100,7 @@ import {
   canAcceptTerminalDrop,
   canAcceptFileDrop,
   normalizeDropTargetDir,
+  resolveDropTargetDir,
   type TerminalSearchOptions,
 } from "./lib/terminalInteraction";
 import { planHostFileDrop } from "./lib/hostFileDrop";
@@ -604,6 +605,10 @@ const termSelectCopy = computed(() => terminalBehavior.value.copyOnSelect);
 // 终端快捷键绑定（对标 Tabby「Hotkeys」页）：平台默认 + 用户改写，单键持久化。
 const terminalHotkeys = ref<TerminalHotkeyBindings>(loadTerminalHotkeys(applePlatform));
 const followDirectory = ref(false);
+// 终端 shell 最近一次上报的 cwd（OSC 7 / OSC 633 Cwd，无论跟随开关是否打开
+// 都记录）：终端拖拽上传的「当前目录」落点解析靠它，避免误用 SFTP 面板的
+// 浏览目录（初始值 "/"，拼根路径会被服务器以权限拒绝）。
+const terminalCwd = ref("");
 const directoryTrackingSupported = ref<boolean | undefined>();
 const visibleColumns = ref<SftpColumn[]>([...DEFAULT_VISIBLE_COLUMNS]);
 /** 每列当前宽度（px）。 */
@@ -856,10 +861,15 @@ const searchMatchState = ref<TerminalSearchMatchState>("idle");
 const searchResultIndex = ref(0);
 const searchResultCount = ref(0);
 const pasteConfirm = ref<PasteConfirmation>();
-// 终端拖入文件的落点询问：null 表示取消；"cwd" 用 SFTP 当前目录（目录跟随
-// 开启时即 shell cwd）；{ dir } 是用户输入的目标目录（文件原名落其下）。
+// 终端拖入文件的落点询问：null 表示取消；"cwd" 用解析后的 shell/SFTP 当前
+// 目录（resolveDropTargetDir：终端 cwd 跟随 → SFTP home → 面板当前目录），
+// 弹窗展示解析结果；{ dir } 是用户输入的目标目录（文件原名落其下）。
 const dropUploadPrompt = ref<{ files: Array<{ name: string }> }>();
 const dropUploadTarget = ref<"cwd" | "custom">("cwd");
+// 拖拽落点解析：终端 cwd（OSC 7/633）优先，其次远端主目录，最后兜底面板目
+// 录——终端拖拽只在面板关闭时接收，面板目录此刻不可见，仅作旧 sidecar 兜底。
+// 弹窗展示的就是这里的解析结果。
+const dropCwdTarget = computed(() => resolveDropTargetDir({ terminalCwd: terminalCwd.value || undefined, sftpHome: sftpHomePath.value || undefined, fallback: currentPath.value }));
 const dropUploadPathInput = ref("");
 const dropUploadPathInputEl = ref<HTMLInputElement>();
 const terminalFontSize = ref(appearance.value.terminal.fontSize);
@@ -2529,6 +2539,7 @@ function applyCommandMarker(updates: Osc633StreamUpdates) {
   if (updates.lastCommandDuration !== undefined) commandMarker.durationMs = updates.lastCommandDuration;
   if (updates.cwd !== undefined) {
     commandMarker.cwd = updates.cwd;
+    if (updates.cwd) terminalCwd.value = updates.cwd;
     if (isLocalMode.value) localLastCwd.value = updates.cwd;
     // OSC 633 Cwd doubles as a directory-follow fallback when the backend could
     // not install OSC 7 tracking but the remote shell integration emits 633 frames.
@@ -2540,6 +2551,7 @@ function applyCommandMarker(updates: Osc633StreamUpdates) {
 
 function writeTerminalOutput(data: Uint8Array) {
   for (const path of directoryParser.push(data)) {
+    terminalCwd.value = path;
     if (followDirectory.value) void loadDirectory(path, true);
   }
   applyCommandMarker(commandMarkerParser.push(data));
@@ -6606,7 +6618,7 @@ async function handleHostFileDrop(files: Array<{ handleId: string; name: string;
       const choice = await askDropUploadTarget(files);
       terminal?.focus();
       if (choice === "cancel") return;
-      await uploadHandleFiles(files, choice === "cwd" ? undefined : choice.dir);
+      await uploadHandleFiles(files, choice === "cwd" ? dropCwdTarget.value : choice.dir);
     } else {
       await uploadHandleFiles(files);
       await loadDirectory();
@@ -7383,15 +7395,16 @@ function onSftpDragEnter(event: DragEvent) {
 
 function onTerminalDragEnter(event: DragEvent) {
   if (!event.dataTransfer?.types.includes("Files")) return;
-  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) return;
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value, sftpPaneOpen: sftpPaneOpen.value })) return;
   terminalDragActive.value = true;
 }
 
 function onTerminalDrop(event: DragEvent) {
   terminalDragActive.value = false;
-  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) {
-    // 拒绝不再静默：只读会话/断连/传输占用都给同一条提示。
-    showNotice(t("dropRefused"));
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value, sftpPaneOpen: sftpPaneOpen.value })) {
+    // 拒绝不再静默：面板打开时指引拖到面板（那里目录可见），其余（断连/
+    // 只读/传输占用）给同一条提示。
+    showNotice(t(sftpPaneOpen.value ? "terminalDropToPanel" : "dropRefused"));
     return;
   }
   // Files dropped on the terminal ask for a landing directory first: the
@@ -7407,7 +7420,7 @@ async function runTerminalDropUpload(files: File[]) {
   terminal?.focus();
   if (choice === "cancel") return;
   try {
-    await uploadLocalFiles(files, choice === "cwd" ? undefined : choice.dir);
+    await uploadLocalFiles(files, choice === "cwd" ? dropCwdTarget.value : choice.dir);
   } catch (cause) {
     showError(cause);
   }
@@ -11032,7 +11045,7 @@ onBeforeUnmount(() => {
         <label class="drop-option">
           <input v-model="dropUploadTarget" type="radio" name="drop-upload-target" value="cwd" />
           <span>{{ t("terminalDropPrompt.toCurrent") }}</span>
-          <code class="mono">{{ currentPath }}</code>
+          <code class="mono">{{ dropCwdTarget }}</code>
         </label>
         <label class="drop-option">
           <input v-model="dropUploadTarget" type="radio" name="drop-upload-target" value="custom" />
