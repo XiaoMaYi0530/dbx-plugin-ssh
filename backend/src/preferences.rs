@@ -15,6 +15,10 @@ const MAX_DOWNLOAD_DIR_LEN: usize = 512;
 
 const MAX_TIMESTAMP_FORMAT_LEN: usize = 64;
 
+/// 右键「在线搜索」引擎表原始文本（每行 name|url 模板）上限：12 行内短串足够，
+/// 更大的输入按坏输入截断（前端解析器同样有行数/长度上限）。
+const MAX_CTX_SEARCH_ENGINES_LEN: usize = 2048;
+
 pub fn store_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join(FILE_NAME)
 }
@@ -83,6 +87,12 @@ fn sanitize_timestamp_format(value: &Value) -> Option<String> {
     } else {
         cleaned
     })
+}
+
+/// 在线搜索引擎表原始文本：仅裁首尾空白并截断到上限；行级校验在前端解析器。
+fn sanitize_ctx_search_engines(value: &Value) -> Option<String> {
+    let text = value.as_str()?.trim();
+    Some(text.chars().take(MAX_CTX_SEARCH_ENGINES_LEN).collect())
 }
 
 /// Reads the raw preferences map; a missing or corrupted file yields an empty
@@ -197,6 +207,12 @@ pub fn load_preferences(data_dir: &Path) -> Value {
             "terminal_timestamp_format".to_string(),
             Value::String(format),
         );
+    }
+    if let Some(engines) = map
+        .get("ctx_search_engines")
+        .and_then(sanitize_ctx_search_engines)
+    {
+        prefs.insert("ctx_search_engines".to_string(), Value::String(engines));
     }
 
     Value::Object(prefs)
@@ -331,6 +347,11 @@ pub fn save_preferences(data_dir: &Path, params: &Value) -> Result<Value, String
             "terminal_timestamp_format".to_string(),
             Value::String(format),
         );
+    }
+    if let Some(value) = params.get("ctx_search_engines") {
+        let engines = sanitize_ctx_search_engines(value)
+            .ok_or_else(|| "ctx_search_engines must be a string".to_string())?;
+        map.insert("ctx_search_engines".to_string(), Value::String(engines));
     }
 
     let path = store_path(data_dir);
@@ -488,6 +509,33 @@ mod tests {
             &serde_json::json!({ "terminal_show_timestamps": "yes" })
         )
         .is_err());
+        // 在线搜索引擎表：trim + 超长截断；非字符串拒绝。
+        assert!(save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "ctx_search_engines": 7 })
+        )
+        .is_err());
+        save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "ctx_search_engines": "  Google|https://www.google.com/search?q=%s  " }),
+        )
+        .expect("save engines");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(
+            prefs["ctx_search_engines"],
+            "Google|https://www.google.com/search?q=%s"
+        );
+        let long = "x".repeat(MAX_CTX_SEARCH_ENGINES_LEN + 10);
+        save_preferences(
+            data_dir.path(),
+            &serde_json::json!({ "ctx_search_engines": long }),
+        )
+        .expect("save long engines");
+        let prefs = load_preferences(data_dir.path());
+        assert_eq!(
+            prefs["ctx_search_engines"].as_str().unwrap().chars().count(),
+            MAX_CTX_SEARCH_ENGINES_LEN
+        );
         // 格式串清洗：危险字符剔除、超长截断、清洗后为空回退默认。
         save_preferences(
             data_dir.path(),

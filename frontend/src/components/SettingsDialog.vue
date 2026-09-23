@@ -73,6 +73,8 @@ const props = defineProps<{
   actionLinks: ActionLinksSettings;
   /** 行号/时间戳 gutter 偏好（权威态在 App）：只读 + 上抛增量。 */
   gutter: GutterSettings;
+  /** 右键「在线搜索」引擎表原始文本（每行 name|url；权威态在 App，sidecar 持久化）。 */
+  ctxSearchEngines: string;
   /** 终端外观偏好（权威态在 App）：本组件只读 + 经 emits 上抛改动意图。 */
   appearance: TerminalAppearanceState;
   /** 用户保存的主题快照（内置预设由 lib 常量提供，不需经 props）。 */
@@ -127,6 +129,8 @@ const emit = defineEmits<{
   (e: "update:actionLinks", patch: { enabled?: boolean; matchers?: Partial<ActionLinkMatcherToggles> }): void;
   /** gutter 设置增量：App 侧归一化 + sidecar 持久化 + 即时挂/摘。 */
   (e: "update:gutter", patch: { showLineNumbers?: boolean; showTimestamps?: boolean; timestampFormat?: string }): void;
+  /** 在线搜索引擎表整表替换：App 侧解析 + sidecar 持久化。 */
+  (e: "update:ctxSearchEngines", value: string): void;
   (e: "apply-theme", theme: TerminalAppearanceProfile): void;
   (e: "save-theme", name: string): void;
   (e: "delete-theme", id: string): void;
@@ -1460,6 +1464,13 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <input class="mono" spellcheck="false" :maxlength="64" :placeholder="GUTTER_TIMESTAMP_DEFAULT_FORMAT" :value="gutter.timestampFormat" @change="updateGutterFormat(textFieldValue($event))" />
             </label>
             <p class="muted settings-note">{{ t("gutter.timestampFormatHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("ctxSearch.sectionTitle") }}</h3>
+            <p class="muted settings-note">{{ t("ctxSearch.hint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("ctxSearch.enginesLabel") }}</span>
+              <textarea class="mono" rows="4" spellcheck="false" :value="ctxSearchEngines" @change="emit('update:ctxSearchEngines', ($event.target as HTMLTextAreaElement).value)"></textarea>
+            </label>
 
             <p class="muted settings-note">{{ t("terminalBehavior.scopeNote") }}</p>
             <p class="muted settings-note">{{ t("terminalFont.movedHint") }}</p>

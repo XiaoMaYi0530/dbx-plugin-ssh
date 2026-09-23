@@ -268,6 +268,12 @@ import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator,
 import { Popover, PopoverAnchor, PopoverContent } from "./components/ui/popover";
 import { Dialog, DialogContent, DialogTitle } from "./components/ui/dialog";
 import SettingsDialog from "./components/SettingsDialog.vue";
+import TerminalContextMenu, {
+  buildSearchUrl,
+  DEFAULT_CTX_SEARCH_ENGINES_TEXT,
+  parseCtxSearchEnginesText,
+  type CtxSearchEngine,
+} from "./components/TerminalContextMenu.vue";
 import PortForwardDialog from "./components/PortForwardDialog.vue";
 import { ToastAction, ToastClose, ToastProvider, ToastRoot, ToastViewport } from "./components/ui/toast";
 
@@ -1865,7 +1871,11 @@ function createTerminal() {
   // IME reports printable keys as keyCode=229 (#5887/#6045/#6144 upstream).
   // The adapter runs before xterm's hidden textarea listeners and routes only
   // single-byte text outside real composition through the same PTY path.
-  disposeWebkitInputFallback = installMacWebkitInputFallback({ terminal, onData: routeTerminalData });
+  // 右键菜单打开时暂停直写捕获（P2-8）：菜单操作不该漏进 PTY。
+  disposeWebkitInputFallback = installMacWebkitInputFallback({ terminal, onData: (data) => {
+    if (terminalMenuOpen.value) return;
+    routeTerminalData(data);
+  } });
   // 选中复制（可在设置里关闭）：选择一变化即静默写入剪贴板，不弹提示。
   disposeSelectionCopy = terminal.onSelectionChange(() => {
     if (!termSelectCopy.value || !terminal?.hasSelection()) return;
@@ -1913,6 +1923,9 @@ function setWebglEnabled(next: boolean) {
  */
 function handleTerminalKey(event: KeyboardEvent) {
   if (event.type !== "keydown") return true;
+  // 右键菜单打开时暂停终端键盘捕获（P2-8）：按键归菜单导航，不落远端 shell
+  // （macOS 直写路径已在 onData 包装层同步暂停）。不取消浏览器默认动作。
+  if (terminalMenuOpen.value) return false;
   // xterm 的 false 只跳过终端处理，不会取消浏览器默认动作或冒泡。
   const consume = () => {
     event.preventDefault();
@@ -5234,6 +5247,7 @@ async function hydratePrefsOnce() {
       history_suggestions_enabled?: unknown;
       history_suggestion_min_chars?: unknown;
       history_suggestion_max_chars?: unknown;
+      ctx_search_engines?: unknown;
     }>("local/preferences/get", {});
     if (typeof prefs.downloadDir === "string") downloadDirState.value = prefs.downloadDir.trim();
     if (typeof prefs.downloadUseDefaultDir === "boolean") downloadUseDefaultState.value = prefs.downloadUseDefaultDir;
@@ -5256,6 +5270,8 @@ async function hydratePrefsOnce() {
     if (prefs.history_suggestions_enabled !== undefined) suggestionsEnabledState.value = prefs.history_suggestions_enabled === true;
     if (prefs.history_suggestion_min_chars !== undefined) suggestionMinCharsState.value = clampSuggestionMinChars(prefs.history_suggestion_min_chars);
     if (prefs.history_suggestion_max_chars !== undefined) suggestionMaxCharsState.value = clampSuggestionMaxChars(prefs.history_suggestion_max_chars);
+    // 在线搜索引擎表：键缺省保持默认 Google（ctxSearchEngines 解析对空/非法行鲁棒）。
+    if (typeof prefs.ctx_search_engines === "string") ctxSearchEnginesText.value = prefs.ctx_search_engines;
     cachePrefs();
   } catch {
     // 旧 sidecar：保留 localStorage 种子或默认。
@@ -7008,6 +7024,28 @@ function interceptTerminalPaste(event: ClipboardEvent) {
   const text = event.clipboardData?.getData("text/plain") || "";
   if (!text) return;
   void sendConfirmedPaste(text);
+}
+
+// —— 右键菜单「在线搜索」（IMPL_PLAN Task P2-8）——
+// 引擎表以原始文本持久化（sidecar preferences，allowlist 键 ctx_search_engines，
+// 每行 name|url 模板）；解析收口在 TerminalContextMenu.vue 的纯函数，非法行静默
+// 丢弃、解析永不失败（空表只是隐藏 Search online 项）。
+const ctxSearchEnginesText = ref(DEFAULT_CTX_SEARCH_ENGINES_TEXT);
+const ctxSearchEngines = computed(() => parseCtxSearchEnginesText(ctxSearchEnginesText.value));
+function updateCtxSearchEngines(text: string) {
+  ctxSearchEnginesText.value = text;
+  void persistTerminalFeaturePrefs({ ctx_search_engines: text });
+}
+function searchSelectionOnline(engine: CtxSearchEngine) {
+  terminalMenuOpen.value = false;
+  const query = terminal?.getSelection() || "";
+  if (!query) return;
+  const url = buildSearchUrl(engine, query);
+  if (!url) return;
+  // TODO(host): 宿主尚未提供 openExternal；待宿主开放后改为直接唤起系统浏览器。
+  // 当前兜底：把搜索链接复制进剪贴板并提示（失败走 sftp 错误条）。
+  copyTextToClipboard(url, "ctxSearch.linkCopied");
+  terminal?.focus();
 }
 
 async function sendConfirmedPaste(text: string) {
@@ -9656,9 +9694,19 @@ onBeforeUnmount(() => {
         </section>
       </section>
         </ContextMenuTrigger>
-        <ContextMenuContent>
-          <ContextMenuItem :disabled="!terminal?.hasSelection()" @select="copyTerminalSelection"><Copy />{{ t("terminalCopy") }}</ContextMenuItem>
-          <ContextMenuItem :disabled="!connected || terminalTransferBusy" @select="pasteTerminal"><ClipboardPaste />{{ t("terminalPaste") }}</ContextMenuItem>
+        <!-- P2-8：Copy/Paste/Search online/Close 由 TerminalContextMenu 承载；
+             插件自有菜单项经默认插槽保持在原有位置。 -->
+        <TerminalContextMenu
+          :open="terminalMenuOpen"
+          :has-selection="terminal?.hasSelection() ?? false"
+          :can-paste="connected && !terminalTransferBusy"
+          :engines="ctxSearchEngines"
+          :t="t"
+          @copy="copyTerminalSelection"
+          @paste="pasteTerminal"
+          @search="searchSelectionOnline"
+          @close="terminalMenuOpen = false"
+        >
           <!-- 本地终端最近命令（VS Code Run Recent Command 简化版）：
                依赖 shell integration 注入的 633;E 命令行。 -->
           <template v-if="isLocalMode && localRecentCommands.length">
@@ -9673,7 +9721,7 @@ onBeforeUnmount(() => {
           <ContextMenuSeparator />
           <ContextMenuItem :disabled="!connected || terminalTransferBusy || !canWrite" @select="chooseZmodem"><FileUp />{{ t("zmodemUpload") }}</ContextMenuItem>
           <ContextMenuItem :disabled="!connected || terminalTransferBusy || !canWrite" @select="chooseTrzszUpload"><FileUp />{{ t("trzszUpload") }}</ContextMenuItem>
-        </ContextMenuContent>
+        </TerminalContextMenu>
       </ContextMenu>
 
       <div v-if="sftpPaneOpen" class="divider" @pointerdown="startDividerDrag" />
@@ -10207,6 +10255,7 @@ onBeforeUnmount(() => {
       :apple-platform="applePlatform"
       :action-links="actionLinksSettings"
       :gutter="gutterSettings"
+      :ctx-search-engines="ctxSearchEnginesText"
       :appearance="terminalAppearanceState"
       :custom-themes="terminalAppearance.customThemes"
       :active-theme-id="activeAppearanceThemeId"
@@ -10224,6 +10273,7 @@ onBeforeUnmount(() => {
       @update-hotkeys="updateTerminalHotkeys"
       @update:action-links="updateActionLinksSettings"
       @update:gutter="updateGutterSettings"
+      @update:ctx-search-engines="updateCtxSearchEngines"
       @apply-font="(payload) => applyTerminalFontSettings(payload.family, payload.size)"
       @update-appearance="updateTerminalAppearance"
       @apply-theme="applyTerminalAppearanceTheme"
