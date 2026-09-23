@@ -1045,6 +1045,12 @@ impl Plugin {
             // sidecar 的 preferences.json 是唯一持久存储。固定键白名单。
             "local/preferences/get" => Ok(preferences::load_preferences(&plugin_data_dir())),
             "local/preferences/set" => preferences::save_preferences(&plugin_data_dir(), &params),
+            // 背景图（P2-9）：桌面形态落盘 <plugin_data_dir>/wallpaper（≤8MiB，
+            // png/jpeg/webp 魔数校验）；web/docker 形态 sidecar 存储不在本机时，
+            // 前端对 set 失败降级为仅本次会话内存态。
+            "local/wallpaper/get" => Ok(preferences::load_wallpaper(&plugin_data_dir())),
+            "local/wallpaper/set" => preferences::save_wallpaper(&plugin_data_dir(), &params),
+            "local/wallpaper/clear" => Ok(preferences::clear_wallpaper(&plugin_data_dir())),
             // 应用内目录选择器的本机浏览：只列目录（永不返回文件内容）；
             // drives 供 Windows「此电脑」盘符页，其他平台为空。
             "local/fs/browse" => {

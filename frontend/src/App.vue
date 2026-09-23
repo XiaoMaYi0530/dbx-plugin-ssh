@@ -891,6 +891,8 @@ const suggestionPrefsAdapter = {
 // 终端长期挂 renderer；回放弹窗保持 DOM 渲染，GIF 导出在导出期间给离屏
 // 终端临时挂载（取像素依赖 canvas），导出完随终端 dispose 释放 context。
 const webglEnabled = ref(loadWebglEnabled());
+// 背景图开启时强制回退 DOM 渲染器（见 rendererWebglEffective watch）。
+const rendererWebglEffective = computed(() => webglEnabled.value && !wallpaperActive.value);
 const webglRenderer = ref<WebglRendererLike | null>(null);
 // GPU 重置/驱动切换后有限次重建 renderer（Tabby 同款策略）：成功经
 // onRecovered 回填引用，偏好已关闭则放弃重建，预算耗尽静默留在 DOM 渲染。
@@ -1896,7 +1898,7 @@ function createTerminal() {
   terminalHost.value.addEventListener("mouseup", terminalMouseUpHandler);
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value);
-  if (webglEnabled.value) {
+  if (webglEnabled.value && !wallpaperActive.value) {
     webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon(), webglRecoveryOptions());
   }
   if (highlightEnabled.value) attachHighlightRender();
@@ -5248,7 +5250,11 @@ async function hydratePrefsOnce() {
       history_suggestion_min_chars?: unknown;
       history_suggestion_max_chars?: unknown;
       ctx_search_engines?: unknown;
+      wallpaper_enabled?: unknown;
+      wallpaper_opacity?: unknown;
     }>("local/preferences/get", {});
+    // 背景图本体与偏好同拉（旧 sidecar 无 wallpaper/* 时静默缺席）。
+    void loadWallpaperImage();
     if (typeof prefs.downloadDir === "string") downloadDirState.value = prefs.downloadDir.trim();
     if (typeof prefs.downloadUseDefaultDir === "boolean") downloadUseDefaultState.value = prefs.downloadUseDefaultDir;
     if (prefs.downloadConflictPolicy !== undefined) downloadConflictState.value = sanitizeConflictPolicy(prefs.downloadConflictPolicy);
@@ -5272,6 +5278,9 @@ async function hydratePrefsOnce() {
     if (prefs.history_suggestion_max_chars !== undefined) suggestionMaxCharsState.value = clampSuggestionMaxChars(prefs.history_suggestion_max_chars);
     // 在线搜索引擎表：键缺省保持默认 Google（ctxSearchEngines 解析对空/非法行鲁棒）。
     if (typeof prefs.ctx_search_engines === "string") ctxSearchEnginesText.value = prefs.ctx_search_engines;
+    // 背景图偏好：键缺省保持内存默认（关 / 45%）。
+    if (typeof prefs.wallpaper_enabled === "boolean") wallpaperEnabled.value = prefs.wallpaper_enabled;
+    if (prefs.wallpaper_opacity !== undefined) wallpaperOpacity.value = Math.min(90, Math.max(10, Math.round(Number(prefs.wallpaper_opacity) || 45)));
     cachePrefs();
   } catch {
     // 旧 sidecar：保留 localStorage 种子或默认。
@@ -7047,6 +7056,61 @@ function searchSelectionOnline(engine: CtxSearchEngine) {
   copyTextToClipboard(url, "ctxSearch.linkCopied");
   terminal?.focus();
 }
+
+// —— 背景图（IMPL_PLAN Task P2-9，对标 NyaTerm；MVP 简化）——
+// 图源权威态在 sidecar（local/wallpaper/get|set|clear，桌面端落盘
+// <plugin_data_dir>/wallpaper，≤8MiB png/jpeg/webp）；web/docker 形态 set 失败
+// （sidecar 存储不在本机）或旧 sidecar 无此方法时降级为仅本次会话内存态，
+// UI 有说明且不持久化。开关/透明度经 preferences allowlist 键持久化。
+const wallpaperEnabled = ref(false);
+// 百分比 10..=90（sidecar 侧钳制同口径），渲染时 /100。
+const wallpaperOpacity = ref(45);
+const wallpaperDataUrl = ref("");
+const wallpaperSessionOnly = ref(false);
+const wallpaperActive = computed(() => wallpaperEnabled.value && !!wallpaperDataUrl.value);
+async function loadWallpaperImage() {
+  try {
+    const result = await window.dbxPlugin.invoke<{ dataUrl?: string }>("local/wallpaper/get", {});
+    if (typeof result.dataUrl === "string") wallpaperDataUrl.value = result.dataUrl;
+  } catch {
+    // 旧 sidecar：背景图缺席，保持内存态。
+  }
+}
+async function setWallpaperImage(image: { base64: string; mime: string }) {
+  try {
+    const result = await window.dbxPlugin.invoke<{ dataUrl?: string }>("local/wallpaper/set", { imageBase64: image.base64 });
+    if (typeof result.dataUrl === "string") wallpaperDataUrl.value = result.dataUrl;
+    wallpaperSessionOnly.value = false;
+  } catch {
+    // web/docker 形态或旧 sidecar：仅本次会话内存态（mime 来自上传文件读取）。
+    wallpaperDataUrl.value = `data:${image.mime || "image/png"};base64,${image.base64}`;
+    wallpaperSessionOnly.value = true;
+  }
+}
+async function clearWallpaperImage() {
+  wallpaperSessionOnly.value = false;
+  wallpaperDataUrl.value = "";
+  try {
+    await window.dbxPlugin.invoke("local/wallpaper/clear", {});
+  } catch {
+    // 同 set：会话内存态已清，落盘态留待桌面形态下次清除。
+  }
+}
+function updateWallpaperEnabled(enabled: boolean) {
+  wallpaperEnabled.value = enabled;
+  void persistTerminalFeaturePrefs({ wallpaper_enabled: enabled });
+}
+function updateWallpaperOpacity(percent: number) {
+  wallpaperOpacity.value = Math.min(90, Math.max(10, Math.round(percent)));
+  void persistTerminalFeaturePrefs({ wallpaper_opacity: wallpaperOpacity.value });
+}
+// 背景图生效期强制 DOM 渲染器（P2-9）：WebGL 画布不透明，盖死背景层；关闭
+// 背景图后按用户 WebGL 开关恢复。复用现有 syncWebglRenderer 切换点。
+// （注册点必须在 wallpaperActive 定义之后：watch 首次求值会沿依赖链触达它。）
+watch(rendererWebglEffective, (next) => {
+  if (!terminal) return;
+  webglRenderer.value = syncWebglRenderer(terminal, next, webglRenderer.value, () => new WebglAddon(), webglRecoveryOptions());
+});
 
 async function sendConfirmedPaste(text: string) {
   // 粘贴文本变换的唯一收口：所有粘贴路径（原生 Ctrl+V、右键/菜单粘贴、中键粘贴）
@@ -9304,7 +9368,10 @@ onBeforeUnmount(() => {
     <section ref="paneContainer" :class="orderedPaneClass">
       <ContextMenu :open="terminalMenuOpen" @update:open="(open) => { if (!open) terminalMenuOpen = false; }">
         <ContextMenuTrigger as-child>
-      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+      <section class="terminal-pane" :class="{ 'drag-active': terminalDragActive, 'batch-bar-open': connected && batchBarOpen, 'marker-visible': commandMarker.installed, 'gutter-visible': gutterPaneVisible, 'wallpaper-active': wallpaperActive }" :style="[terminalBasis, gutterPaneStyle]" @contextmenu="showTerminalMenu" @dragenter.prevent="onTerminalDragEnter" @dragover.prevent @dragleave.self="terminalDragActive = false" @drop.prevent="onTerminalDrop($event)">
+        <!-- P2-9 背景图层：pointer-events:none 垫底（DOM 序先于 terminal-host），
+             透明度 0.1-0.9 由设置页滑杆控制；开启期间强制 DOM 渲染器透出本层。 -->
+        <div v-if="wallpaperActive" class="terminal-wallpaper" :style="{ backgroundImage: `url(${wallpaperDataUrl})`, opacity: wallpaperOpacity / 100 }" aria-hidden="true" />
         <!-- P1-3 行号/时间戳 gutter：绝对定位覆盖左缘 padding 环带（z-index 1，
              低于浮层 z-index 2），xterm 左 padding 随 --dbx-gutter-width 加宽，
              不遮文本；drop-overlay/搜索面板/诊断浮层定位不受影响。 -->
@@ -10256,6 +10323,9 @@ onBeforeUnmount(() => {
       :action-links="actionLinksSettings"
       :gutter="gutterSettings"
       :ctx-search-engines="ctxSearchEnginesText"
+      :wallpaper-enabled="wallpaperEnabled"
+      :wallpaper-opacity="wallpaperOpacity"
+      :wallpaper-session-only="wallpaperSessionOnly"
       :appearance="terminalAppearanceState"
       :custom-themes="terminalAppearance.customThemes"
       :active-theme-id="activeAppearanceThemeId"
@@ -10274,6 +10344,10 @@ onBeforeUnmount(() => {
       @update:action-links="updateActionLinksSettings"
       @update:gutter="updateGutterSettings"
       @update:ctx-search-engines="updateCtxSearchEngines"
+      @update:wallpaper-enabled="updateWallpaperEnabled"
+      @update:wallpaper-opacity="updateWallpaperOpacity"
+      @set-wallpaper-image="setWallpaperImage"
+      @clear-wallpaper="clearWallpaperImage"
       @apply-font="(payload) => applyTerminalFontSettings(payload.family, payload.size)"
       @update-appearance="updateTerminalAppearance"
       @apply-theme="applyTerminalAppearanceTheme"
@@ -10788,6 +10862,28 @@ body.resizing-col { cursor: col-resize !important; user-select: none; }
 .terminal-pane.gutter-visible .terminal-host :deep(.xterm) {
   padding-left: calc(var(--dbx-gutter-width, 0px) + var(--ssh-terminal-padding-left, 10px));
 }
+/* —— P2-9 背景图（对标 NyaTerm，MVP 简化）——
+   图层垫底（DOM 序先于 terminal-host，pointer-events 关）；开启期间 pane/
+   宿主/xterm 表面底色透明化（color-mix 保留一层底色防纯黑/纯白刺眼），
+   !important 压过 xterm 6.x 内联在 .xterm-scrollable-element 的主题背景。
+   开启期间渲染器强制回退 DOM（rendererWebglEffective），否则 WebGL 画布
+   不透明会盖死本层。 */
+.terminal-wallpaper {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  pointer-events: none;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+.terminal-pane.wallpaper-active { background: color-mix(in srgb, var(--ssh-terminal-background) 55%, transparent); }
+.terminal-pane.wallpaper-active .terminal-host { background: transparent; }
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm),
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm .xterm-viewport),
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm .xterm-scrollable-element),
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm .xterm-screen),
+.terminal-pane.wallpaper-active .terminal-host :deep(.xterm .xterm-rows) { background: transparent !important; }
 .action-link-hint {
   position: absolute;
   z-index: 3;
