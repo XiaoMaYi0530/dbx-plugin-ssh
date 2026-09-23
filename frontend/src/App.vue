@@ -101,6 +101,7 @@ import {
 } from "./lib/terminalInteraction";
 import { planHostFileDrop } from "./lib/hostFileDrop";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
+import { createOutputGate } from "./lib/terminalBackpressure";
 import { createTerminalInputQueue } from "./lib/terminalInputQueue";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
@@ -1102,8 +1103,38 @@ const selectedShellInjectable = computed<boolean | undefined>(() => {
 // reads `terminal` lazily so it also works across terminal recreation. The
 // write completion callback is the gutter timestamp capture point (P1-3): it
 // stamps the logical rows each merged batch actually produced.
+//
+// 大输出保护（IMPL_PLAN Task P2-7）：积压口径 = 已交给 xterm 但 write 回调尚未
+// 触发（还没解析完）的字节数。≥128KiB 进入 strained：合并批次按 32KiB 分帧写、
+// 挂起 gutter/关键词高亮/动作链接扫描；回落到 64KiB 以下自动恢复并补扫一次。
+const outputGate = createOutputGate();
+let outputInFlightBytes = 0;
+function settleOutputChunk(chunk: Uint8Array) {
+  outputInFlightBytes = Math.max(0, outputInFlightBytes - chunk.byteLength);
+  // 写入完成回调同时是模式复评点；恢复时挂起的扫描由 onOutputGateRelease 补上。
+  if (outputGate.feed(outputInFlightBytes) && outputGate.mode === "normal") onOutputGateRelease();
+  stampGutterWrittenRows();
+}
+function onOutputGateRelease() {
+  showNotice(t("backpressure.released"));
+  rescanHighlightViewport();
+  if (actionLinksEnabled.value && terminal) scheduleActionLinkScan(0, terminal.rows - 1);
+  scheduleGutterRecompute();
+}
 const terminalWriteThrottle: TerminalWriteThrottle = createTerminalWriteThrottle({
-  sink: (data) => terminal?.write(data, stampGutterWrittenRows),
+  sink: (data) => {
+    if (!terminal) return;
+    outputInFlightBytes += data.byteLength;
+    if (outputGate.feed(outputInFlightBytes) && outputGate.mode === "strained") {
+      showNotice(t("backpressure.engaged"));
+      scheduleGutterRecompute();
+    }
+    if (outputGate.mode === "strained") {
+      for (const frame of outputGate.write(data)) terminal.write(frame, () => settleOutputChunk(frame));
+    } else {
+      terminal.write(data, () => settleOutputChunk(data));
+    }
+  },
 });
 // #33/#71 快速输入丢字母的分层计数：keys(onData 实际路由到 PTY 的按键)、
 // sends(提交给宿主桥的帧)、acks(sidecar 确认收到的帧)、errors(桥拒绝)、
@@ -4224,6 +4255,8 @@ function rescanHighlightViewport() {
 
 function scheduleHighlightScan(start: number, end: number) {
   if (!terminal || !highlightEnabled.value || !compiledHighlightRules.value.length) return;
+  // 大输出保护生效期挂起扫描，恢复时由 onOutputGateRelease 补扫视口。
+  if (outputGate.mode === "strained") return;
   highlightPendingRange = highlightPendingRange
     ? { start: Math.min(highlightPendingRange.start, start), end: Math.max(highlightPendingRange.end, end) }
     : { start, end };
@@ -4407,6 +4440,8 @@ function hideActionLinkHint() {
 
 function scheduleActionLinkScan(start: number, end: number) {
   if (!terminal || !actionLinksEnabled.value) return;
+  // 大输出保护生效期挂起扫描，恢复时由 onOutputGateRelease 补扫视口。
+  if (outputGate.mode === "strained") return;
   actionLinkPendingRange = actionLinkPendingRange
     ? { start: Math.min(actionLinkPendingRange.start, start), end: Math.max(actionLinkPendingRange.end, end) }
     : { start, end };
@@ -4567,6 +4602,8 @@ function detachGutterListeners() {
 
 function scheduleGutterRecompute() {
   if (!isGutterActive()) return;
+  // 大输出保护生效期挂起重算（与下方积压跳帧同一目标，口径更早介入）。
+  if (outputGate.mode === "strained") return;
   if (gutterRafId) return;
   gutterRafId = window.requestAnimationFrame(runGutterRecompute);
 }
@@ -4576,6 +4613,7 @@ function runGutterRecompute() {
   const term = terminal;
   if (!term || !isGutterActive()) return;
   if (terminalWriteThrottle.pendingBytes > GUTTER_SUSPEND_PENDING_BYTES) return;
+  if (outputGate.mode === "strained") return;
   gutterCellHeight.value = getRenderCellHeight(term);
   const buffer = term.buffer.active;
   // 首视口行的像素起点 = xterm 元素的 padding-top（gutter 文本与画布行对齐）。
@@ -8855,6 +8893,9 @@ onBeforeUnmount(() => {
   window.clearTimeout(terminalBellFlashTimer);
   terminalBellFlash.value = false;
   terminalWriteThrottle.dispose();
+  // 终端重建/会话关闭：在途写入回调整体作废，保护态复位，避免旧积压误判。
+  outputInFlightBytes = 0;
+  outputGate.reset();
   detachHighlightRender();
   detachActionLinks();
   detachGutterListeners();
