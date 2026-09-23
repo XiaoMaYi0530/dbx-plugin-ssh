@@ -29,6 +29,7 @@ import {
   Copy,
   Download,
   Eraser,
+  ExternalLink,
   File as FileIcon,
   FilePlus,
   FileText,
@@ -43,6 +44,7 @@ import {
   Home,
   Info,
   KeyRound,
+  Link2,
   ListChecks,
   Loader2,
   Lock,
@@ -649,6 +651,23 @@ const sudoMode = ref(false);
 const archiveBusy = ref(false);
 const operationDialog = ref<"mkdir" | null>(null);
 const operationDraft = ref("");
+
+// —— 外部编辑器回传（P2-5，桌面端）：文件先经 sftp/download 落到
+// <下载目录>/remote-edit/<ts>/，watch/start 注册监听；编辑器保存经
+// watch/file-modified 事件回来弹确认，上传走 watch/upload（sidecar 从本机
+// 路径读字节、原子写回远端，写门禁与其他 SFTP 写一致）。
+const externalEditBusy = ref(false);
+const activeExternalWatch = ref<{ watchId: string; name: string; remotePath: string }>();
+const watchModifiedPrompt = ref<{ watchId: string; name: string } | null>(null);
+// 「总是上传」记住的 watchId：同一监听上的后续保存直接推回，不再逐次确认。
+const alwaysUploadWatches = new Set<string>();
+// —— 符号链接（P2-6）：新建/改指向小对话框 + 列表 tooltip 的 → target 缓存。
+// create 用 draft(链接名)+targetDraft(指向)；edit 复用 draft 承载指向。
+const symlinkDialog = ref<{ mode: "create" | "edit"; linkPath: string; name: string } | null>(null);
+const symlinkDraft = ref("");
+const symlinkTargetDraft = ref("");
+const symlinkSubmitting = ref(false);
+const linkTargets = ref<Record<string, string>>({});
 const deleteTarget = ref<SftpEntry>();
 const deleteSubmitting = ref(false);
 const renamingPath = ref("");
@@ -3181,6 +3200,14 @@ function handleEvent(event: DbxPluginEvent) {
     showNotice(t(payload.kind === "timeout" ? "triggerTimeout" : "triggerAnswered", { stage }));
     return;
   }
+  if (event.method === "watch/file-modified") {
+    const payload = event.params as { watchId?: string };
+    const watchId = String(payload.watchId || "");
+    if (watchId && watchId === activeExternalWatch.value?.watchId) {
+      handleWatchModified(watchId);
+    }
+    return;
+  }
   if (event.method === "sftp/upload/ack") {
     const taskId = String(event.params.taskId || "");
     const waiter = uploadAckWaiters.get(taskId);
@@ -3465,6 +3492,9 @@ async function afterSessionConnected() {
   if (followDirectory.value) await setDirectoryTracking(true);
   void refreshSftpHomePath();
   await Promise.all([loadDirectory(currentPath.value), restoreTransfers()]);
+  // 「在外部编辑器中打开」菜单项的可用性依赖本机落盘能力，连接后即探测
+  // （结果按工作台生命周期缓存，web/docker 为 false → 菜单项保持禁用）。
+  void probeLocalCapabilities();
   // 侧栏 tree tab 可见时补拉根节点（首连/重连后缓存仍为空的场景）。
   ensureSideTreeRoot();
   // After an auto-reconnect succeeds, tell the user the session is back and
@@ -3492,6 +3522,12 @@ async function closeSession(updateStatus = true) {
   terminalInputQueue.reset();
   reconnectPending.value = false;
   resetCommandMarker();
+  // 外部编辑器监听挂在会话上：断开前先停掉（后端 ssh/session/close 兜底）。
+  if (sessionId) {
+    void window.dbxPlugin.invoke("watch/stop-all", { sessionId }).catch(() => undefined);
+    if (activeExternalWatch.value) activeExternalWatch.value = undefined;
+    watchModifiedPrompt.value = null;
+  }
   if (sessionId) await window.dbxPlugin.invoke("ssh/session/close", { sessionId }).catch(() => undefined);
   if (updateStatus) {
     terminalState.value = "disconnected";
@@ -5168,7 +5204,7 @@ function onFileAreaContextMenu(event: MouseEvent) {
   blankMenu.value = true;
 }
 
-function blankMenuAction(action: "mkdir" | "newFile" | "upload" | "refresh") {
+function blankMenuAction(action: "mkdir" | "newFile" | "upload" | "refresh" | "symlink") {
   const menu = blankMenu.value;
   blankMenu.value = false;
   if (!menu) return;
@@ -5179,6 +5215,8 @@ function blankMenuAction(action: "mkdir" | "newFile" | "upload" | "refresh") {
   if (action === "mkdir") {
     operationDraft.value = "";
     operationDialog.value = "mkdir";
+  } else if (action === "symlink") {
+    beginSymlinkCreate();
   } else if (action === "upload") {
     void chooseUpload();
   } else {
@@ -5214,6 +5252,8 @@ async function loadDirectory(path = currentPath.value, fromTerminal = false) {
     // R3-P2-3：响应容错——非数组/畸形行走 sanitize（null entries → 空数组、
     // 缺 kind 的行降级为 file），单行坏数据不再让列表僵死或抛 pageerror。
     entries.value = sanitizeSftpEntries(result.entries);
+    linkTargets.value = {};
+    void hydrateLinkTargets(entries.value);
     currentPath.value = normalized;
     selectedPath.value = "";
     clearRowSelection();
@@ -6658,6 +6698,219 @@ function waitForUploadAck(taskId: string, nextOffset: number) {
     }, 30_000);
     uploadAckWaiters.set(taskId, { nextOffset, resolve, reject, timer });
   });
+}
+
+// —— 外部编辑器回传（P2-5）——
+// watch/file-modified 的确认策略：「总是上传」的记忆命中直接推回，否则弹
+// 确认框让用户逐次决定（上传一次 / 总是上传 / 取消）。
+function handleWatchModified(watchId: string) {
+  const name = activeExternalWatch.value?.name || "";
+  if (alwaysUploadWatches.has(watchId)) {
+    void uploadWatchedFile(watchId);
+    return;
+  }
+  watchModifiedPrompt.value = { watchId, name };
+}
+
+// watch/upload 由 sidecar 从 remote-edit 下载路径读字节、经 sftp/write 同款
+// 原子提交写回远端（写门禁 ensure_writable 在后端强制）。完成后刷新当前
+// 目录，让大小/修改时间立即反映编辑后的内容。
+async function uploadWatchedFile(watchId: string) {
+  if (externalEditBusy.value) return;
+  externalEditBusy.value = true;
+  watchModifiedPrompt.value = null;
+  try {
+    await window.dbxPlugin.invoke<{ remotePath: string; size: number }>("watch/upload", { watchId });
+    showNotice(t("sftpEdit.uploaded", { name: activeExternalWatch.value?.name || "" }));
+    // 刷新当前目录，让大小/修改时间立即反映编辑后的内容。
+    await loadDirectory();
+  } catch (cause) {
+    showError(cause, "sftp");
+  } finally {
+    externalEditBusy.value = false;
+  }
+}
+
+function dismissWatchModified() {
+  watchModifiedPrompt.value = null;
+}
+
+// 「总是上传」：记住本次监听的 watchId 后直接推回当前内容。
+function uploadWatchedFileAlways() {
+  const prompt = watchModifiedPrompt.value;
+  if (!prompt) return;
+  alwaysUploadWatches.add(prompt.watchId);
+  void uploadWatchedFile(prompt.watchId);
+}
+
+/** 本地路径拼接（下载目录 + remote-edit 子目录），兼容结尾分隔符。 */
+function joinLocalPath(dir: string, suffix: string): string {
+  return `${dir.replace(/[\\/]+$/, "")}/${suffix.replace(/^\/+/, "")}`;
+}
+
+/** 精简单文件下载（外部编辑专用）：saveToLocal 直落 `downloadDir`，冲突直接
+ * 覆盖（目录带时间戳不会撞名），完成后返回 sidecar 落盘的绝对路径。 */
+async function downloadForExternalEdit(entry: SftpEntry, downloadDir: string): Promise<string | undefined> {
+  if (!session.value || entry.kind !== "file") return undefined;
+  openTransferPanel();
+  const info = await window.dbxPlugin.invoke<DownloadInfo>("sftp/download/start", {
+    sessionId: session.value.sessionId,
+    remotePath: pathFromUri(entry.uri),
+    saveToLocal: true,
+    downloadDir,
+    conflict: "overwrite",
+  });
+  transferTasks[info.taskId] = { taskId: info.taskId, sessionId: session.value.sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued", joinedAt: Date.now() };
+  try {
+    let offset = 0;
+    while (offset < info.size) {
+      await waitWhilePaused(info.taskId);
+      const chunkPromise = waitForDownloadChunk(info.taskId, offset);
+      const nextPromise = window.dbxPlugin.invoke<{ length: number; eof: boolean }>("sftp/download/next", { taskId: info.taskId, offset });
+      // 取消经 chunk waiter 中断；吞掉在途请求的 rejection 以免变成 unhandled。
+      nextPromise.catch(() => undefined);
+      const result = await nextPromise;
+      await chunkPromise;
+      offset += result.length;
+      const task = transferTasks[info.taskId];
+      if (task) {
+        task.status = "running";
+        task.transferred = offset;
+      }
+      if (result.eof) break;
+    }
+    const finish = await window.dbxPlugin.invoke<{ localPath?: string }>("sftp/download/finish", { taskId: info.taskId });
+    cancelledTransferTasks.delete(info.taskId);
+    const task = transferTasks[info.taskId];
+    if (task) {
+      task.status = "completed";
+      task.transferred = info.size;
+      if (finish?.localPath) task.localPath = finish.localPath;
+    }
+    return finish?.localPath;
+  } catch (cause) {
+    const waiter = downloadChunkWaiters.get(info.taskId);
+    if (waiter) {
+      window.clearTimeout(waiter.timer);
+      downloadChunkWaiters.delete(info.taskId);
+    }
+    await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: info.taskId }).catch(() => undefined);
+    throw cause;
+  }
+}
+
+/** 「在外部编辑器中打开」：下载 → watch/start → 系统默认程序打开 → 通知。
+ * 仅桌面端可用（web/docker 的 sidecar 不在本机，无法监听也无法回传）。 */
+async function openInExternalEditor(entry: SftpEntry) {
+  fileMenu.value = undefined;
+  if (!session.value || externalEditBusy.value) return;
+  const local = await probeLocalCapabilities();
+  if (!local?.canSaveLocal) {
+    showNotice(t("sftpEdit.desktopOnly"));
+    return;
+  }
+  externalEditBusy.value = true;
+  try {
+    const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+    const dir = joinLocalPath(loadDownloadDir() || local.downloadsDir, `remote-edit/${stamp}`);
+    const localPath = await downloadForExternalEdit(entry, dir);
+    if (!localPath || !session.value) return;
+    const remotePath = pathFromUri(entry.uri);
+    const watch = await window.dbxPlugin.invoke<{ watchId: string }>("watch/start", {
+      sessionId: session.value.sessionId,
+      remotePath,
+      localPath,
+    });
+    alwaysUploadWatches.delete(watch.watchId);
+    activeExternalWatch.value = { watchId: watch.watchId, name: entry.name, remotePath };
+    // 宿主 local/open 校验该路径确为本插件完成的下载（防任意路径打开）。
+    try {
+      await window.dbxPlugin.invoke("local/open", { path: localPath });
+    } catch {
+      await window.dbxPlugin.invoke("local/reveal", { path: localPath });
+    }
+    copyTextToClipboard(localPath, "sftpEdit.pathCopied");
+    showNotice(t("sftpEdit.watching", { name: entry.name }));
+  } catch (cause) {
+    showError(cause, "sftp");
+  } finally {
+    externalEditBusy.value = false;
+  }
+}
+
+// —— 符号链接（P2-6）——
+function beginSymlinkCreate() {
+  if (!session.value) return;
+  symlinkDraft.value = "";
+  symlinkTargetDraft.value = "";
+  symlinkDialog.value = { mode: "create", linkPath: "", name: "" };
+}
+
+function beginSymlinkEdit(entry: SftpEntry) {
+  if (!session.value) return;
+  symlinkDraft.value = linkTargets.value[entry.uri] || "";
+  symlinkDialog.value = { mode: "edit", linkPath: pathFromUri(entry.uri), name: entry.name };
+}
+
+/** 新建/改指向共用提交：create 走 sftp/symlink-create（target 允许相对路径），
+ * edit 先 readlink 比对避免无谓的删建（后端也会 no-op 兜底）。 */
+async function commitSymlink() {
+  const dialog = symlinkDialog.value;
+  const isCreate = dialog?.mode === "create";
+  const name = isCreate ? symlinkDraft.value.trim() : dialog?.name || "";
+  const target = (isCreate ? symlinkTargetDraft.value : symlinkDraft.value).trim();
+  if (!session.value || !dialog || !target || symlinkSubmitting.value) return;
+  if (isCreate && !name) return;
+  symlinkSubmitting.value = true;
+  try {
+    if (isCreate) {
+      await window.dbxPlugin.invoke("sftp/symlink-create", {
+        sessionId: session.value.sessionId,
+        target,
+        linkPath: joinRemote(currentPath.value, name),
+      });
+    } else {
+      await window.dbxPlugin.invoke("sftp/symlink-update", {
+        sessionId: session.value.sessionId,
+        linkPath: dialog.linkPath,
+        target,
+      });
+      linkTargets.value = { ...linkTargets.value, [`sftp:${dialog.linkPath}`]: target };
+    }
+    symlinkDialog.value = null;
+    await loadDirectory();
+  } catch (cause) {
+    showError(cause, "sftp");
+  } finally {
+    symlinkSubmitting.value = false;
+  }
+}
+
+/** symlink 行的 tooltip：`→ target`（target 由列表加载后的只读解析填充）。 */
+function linkTargetTitle(entry: SftpEntry): string | undefined {
+  if (entry.kind !== "symlink") return undefined;
+  const target = linkTargets.value[entry.uri];
+  return target ? `→ ${target}` : undefined;
+}
+
+/** 列表加载后解析 symlink 条目的指向（只读 readlink，并发、失败静默——
+ * 悬空链接也照常显示，tooltip 缺失只是没有 target 文案）。 */
+async function hydrateLinkTargets(list: SftpEntry[]) {
+  const sessionId = session.value?.sessionId;
+  if (!sessionId) return;
+  const links = list.filter((entry) => entry.kind === "symlink").slice(0, 50);
+  if (!links.length) return;
+  const next = { ...linkTargets.value };
+  await Promise.allSettled(
+    links.map(async (entry) => {
+      const result = await window.dbxPlugin.invoke<{ target?: string }>("sftp/symlink-read", {
+        sessionId,
+        linkPath: pathFromUri(entry.uri),
+      });
+      if (result?.target) next[entry.uri] = result.target;
+    }),
+  );
+  linkTargets.value = next;
 }
 
 // 本机落盘能力探测（sidecar local/capabilities）：宿主缺 fileTransfer API 时，
@@ -8767,6 +9020,8 @@ const modalOpenStates = computed(() => [
   chmodTarget.value,
   newFileDialog.value,
   operationDialog.value,
+  symlinkDialog.value !== null,
+  watchModifiedPrompt.value !== null,
   commandOpen.value,
   profilesOpen.value,
   auditOpen.value,
@@ -10197,7 +10452,7 @@ onBeforeUnmount(() => {
                     @keydown.escape.stop="renamingPath = ''"
                     @blur="commitRename(entry)"
                   />
-                  <span v-else>{{ entry.name }}</span>
+                  <span v-else :title="linkTargetTitle(entry)">{{ entry.name }}</span>
                 </span>
                 <span v-if="visibleColumns.includes('size')" class="numeric">{{ entry.kind === "file" ? formatBytes(entry.size) : "" }}</span>
                 <span v-if="visibleColumns.includes('modified')">{{ formatModified(entry.modifiedAt) }}</span>
@@ -10220,6 +10475,11 @@ onBeforeUnmount(() => {
                 <template v-else-if="fileMenu">
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @select="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</ContextMenuItem>
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'file' || fileMenu.entry.kind === 'directory'" @select="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</ContextMenuItem>
+                  <!-- 外部编辑器回传（P2-5，桌面端）：web/docker 的 sidecar 不在本机，
+                       监听与回传都不可用，localCanSave 未探测到前也保持禁用。 -->
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file'" :disabled="!canWrite || !localCanSave || externalEditBusy" @select="openInExternalEditor(fileMenu.entry)"><ExternalLink />{{ t("sftpEdit.openExternal") }}</ContextMenuItem>
+                  <!-- 符号链接改指向（P2-6）：读取现有 target 预填后 update。 -->
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'symlink'" :disabled="!canWrite" @select="beginSymlinkEdit(fileMenu.entry)"><Link2 />{{ t("symlink.editAction") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="beginRename(fileMenu.entry)"><Pencil />{{ t("rename") }}</ContextMenuItem>
                   <ContextMenuItem @select="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</ContextMenuItem>
@@ -10238,6 +10498,7 @@ onBeforeUnmount(() => {
                 <template v-else>
                   <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('mkdir')"><FolderPlus />{{ t("newFolder") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('newFile')"><FilePlus />{{ t("sftpNewFile.action") }}</ContextMenuItem>
+                  <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('symlink')"><Link2 />{{ t("symlink.createAction") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!connected || !canWrite" @select="blankMenuAction('upload')"><FileUp />{{ t("upload") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!connected || loadingFiles" @select="blankMenuAction('refresh')"><RefreshCw />{{ t("refresh") }}</ContextMenuItem>
                 </template>
@@ -10297,6 +10558,35 @@ onBeforeUnmount(() => {
         <header><DialogTitle>{{ t("newFolder") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="operationDialog = null"><X /></button></header>
         <input v-model="operationDraft" autofocus @keydown.enter="createDirectory" />
         <footer><button @click="operationDialog = null">{{ t("cancel") }}</button><button class="primary-button" :disabled="!operationDraft.trim()" @click="createDirectory">{{ t("confirm") }}</button></footer>      </DialogContent>
+    </Dialog>
+
+    <!-- 符号链接新建/改指向（P2-6）：target 允许相对路径（symlink 语义），
+         编辑模式预填当前指向；改指向后端 readlink 比对做 no-op 兜底。 -->
+    <Dialog :open="symlinkDialog !== null" @update:open="(open) => { if (!open) symlinkDialog = null; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="symlinkDialog">
+        <header><DialogTitle>{{ symlinkDialog.mode === "edit" ? t("symlink.editTitle", { name: symlinkDialog.name }) : t("symlink.createTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="symlinkDialog = null"><X /></button></header>
+        <p v-if="symlinkDialog.mode === 'edit'" class="muted mono">{{ symlinkDialog.linkPath }}</p>
+        <input v-if="symlinkDialog.mode === 'create'" v-model="symlinkDraft" autofocus :placeholder="t('symlink.namePlaceholder')" @keydown.enter="commitSymlink" />
+        <input v-if="symlinkDialog.mode === 'create'" v-model="symlinkTargetDraft" class="mono" spellcheck="false" :placeholder="t('symlink.targetPlaceholder')" @keydown.enter="commitSymlink" />
+        <input v-else v-model="symlinkDraft" class="mono" spellcheck="false" autofocus :placeholder="t('symlink.targetPlaceholder')" @keydown.enter="commitSymlink" />
+        <p class="muted">{{ t("symlink.hint") }}</p>
+        <footer><button @click="symlinkDialog = null">{{ t("cancel") }}</button><button class="primary-button" :disabled="(symlinkDialog.mode === 'create' ? !symlinkDraft.trim() || !symlinkTargetDraft.trim() : !symlinkDraft.trim()) || symlinkSubmitting" @click="commitSymlink"><Loader2 v-if="symlinkSubmitting" class="spinning" />{{ t("confirm") }}</button></footer>
+        </template>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 外部编辑器保存回传确认（P2-5）：上传一次 / 总是上传（记住 watchId）/ 取消。 -->
+    <Dialog :open="watchModifiedPrompt !== null" @update:open="(open) => { if (!open) dismissWatchModified(); }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("sftpEdit.modifiedTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="dismissWatchModified"><X /></button></header>
+        <p class="sftp-dialog-hint">{{ t("sftpEdit.modifiedMessage", { name: watchModifiedPrompt?.name || "" }) }}</p>
+        <footer>
+          <button @click="dismissWatchModified">{{ t("cancel") }}</button>
+          <button :disabled="externalEditBusy" @click="uploadWatchedFileAlways">{{ t("sftpEdit.alwaysUpload") }}</button>
+          <button class="primary-button" :disabled="externalEditBusy" @click="uploadWatchedFile(watchModifiedPrompt?.watchId || '')"><Loader2 v-if="externalEditBusy" class="spinning" />{{ t("sftpEdit.uploadOnce") }}</button>
+        </footer>
+      </DialogContent>
     </Dialog>
 
     <Dialog :open="commandOpen" @update:open="(open) => { if (!open) commandOpen = false; }">

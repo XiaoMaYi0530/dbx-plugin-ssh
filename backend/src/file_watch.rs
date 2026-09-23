@@ -40,6 +40,10 @@ pub const SUPPRESS_WINDOW: Duration = Duration::from_secs(2);
 /// fingerprint is the only misfire guard, and hashing a huge file on every
 /// save would hurt more than a missed upload prompt.
 pub const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
+/// `watch/upload` refuses files above this size: the round-trip is buffered
+/// in memory on purpose (single atomic commit), so multi-GB editor saves must
+/// go through the regular upload slot instead.
+pub const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Async session-liveness probe injected from main.rs: the watcher cannot
 /// reach into the SSH session table directly (module boundaries), so each
@@ -189,6 +193,11 @@ struct WatchPump {
 
 struct WatchEntry {
     session_id: String,
+    /// Identity snapshot from `watch/start`: the pump event payload and
+    /// `watch/upload` both read the pair from here, so the workbench only
+    /// ever has to remember the watchId.
+    local_path: PathBuf,
+    remote_path: String,
     /// Keeping the notify watcher alive is what keeps events flowing; dropping
     /// it (registry removal) is also how the pump task learns to stop.
     _watcher: notify::RecommendedWatcher,
@@ -284,6 +293,8 @@ impl WatchRuntime {
             watch_id.clone(),
             WatchEntry {
                 session_id: session_id.clone(),
+                local_path: local_path.clone(),
+                remote_path: remote_path.clone(),
                 _watcher: watcher,
             },
         );
@@ -395,6 +406,51 @@ impl WatchRuntime {
         } else {
             Err("Watch was not found".to_string())
         }
+    }
+
+    /// `watch/upload` — pushes the current on-disk bytes of a watched file
+    /// back to its remote path. The workbench cannot read local files by path
+    /// (the host file-transfer bridge only exposes user-picked handles), so
+    /// the sidecar — which downloaded the file into `remote-edit/` in the
+    /// first place — reads the bytes and streams them through the same atomic
+    /// temporary-file commit as `sftp/write` (permissions preserved). The
+    /// write gate (`ensure_writable`) applies exactly as for any other SFTP
+    /// write; the watchId proves the file came from this plugin's own
+    /// download, so no arbitrary local path ever crosses the bridge.
+    pub async fn upload_back(
+        &self,
+        ssh: &crate::ssh::SshRuntime,
+        watch_id: &str,
+    ) -> Result<Value, String> {
+        let (session_id, local_path, remote_path) = {
+            let watches = self.watches.read().await;
+            let entry = watches
+                .get(watch_id)
+                .ok_or_else(|| "Watch was not found".to_string())?;
+            (
+                entry.session_id.clone(),
+                entry.local_path.clone(),
+                entry.remote_path.clone(),
+            )
+        };
+        let data = std::fs::read(&local_path).map_err(|error| {
+            format!(
+                "Could not read watched file '{}': {error}",
+                local_path.display()
+            )
+        })?;
+        if data.len() as u64 > MAX_UPLOAD_BYTES {
+            return Err(format!(
+                "Watched file '{}' is larger than the {} MiB watch-upload limit; upload it manually instead",
+                local_path.display(),
+                MAX_UPLOAD_BYTES / (1024 * 1024)
+            ));
+        }
+        crate::sftp_ext::write_bytes(ssh, &session_id, &remote_path, &data).await?;
+        Ok(json!({
+            "remotePath": remote_path,
+            "size": data.len(),
+        }))
     }
 
     /// `watch/stop-all` (and the `ssh/session/close` hook) — drops every
@@ -516,7 +572,10 @@ mod tests {
         // 长度差异保证 classify_change 判定稳定（不依赖文件系统时间精度）。
         write_file(&path, b"before");
         let baseline = file_fingerprint(&path).expect("fingerprint");
-        write_file(&path, b"after!!");
+        // The gap keeps the two snapshots on distinct millisecond mtimes so
+        // the classification exercises the sha branch, not the mtime one.
+        std::thread::sleep(Duration::from_millis(10));
+        write_file(&path, b"after!");
         let current = file_fingerprint(&path).expect("fingerprint");
         assert_eq!(
             classify_change(&Some(baseline), &Some(current)),
@@ -574,29 +633,9 @@ mod tests {
     async fn start_watch(
         runtime: &WatchRuntime,
         dir: &tempfile::TempDir,
-        session_id: &str,
-        remote_path: &str,
-        publisher: &Arc<CollectingPublisher>,
-    ) -> String {
-        start_watch_file(
-            runtime,
-            dir,
-            session_id,
-            remote_path,
-            "watched.txt",
-            publisher,
-        )
-        .await
-    }
-
-    /// 多文件变体：dedup key 含 local path，同一 session 的不同文件各自持有一个
-    /// watcher——测试需要不同的本地文件名来构造这种场景。
-    async fn start_watch_file(
-        runtime: &WatchRuntime,
-        dir: &tempfile::TempDir,
-        session_id: &str,
-        remote_path: &str,
         file_name: &str,
+        session_id: &str,
+        remote_path: &str,
         publisher: &Arc<CollectingPublisher>,
     ) -> String {
         let path = dir.path().join(file_name);
@@ -621,12 +660,36 @@ mod tests {
         let runtime = WatchRuntime::with_tunables(tunables());
         let dir = tempfile::tempdir().expect("tempdir");
         let publisher = Arc::new(CollectingPublisher::default());
-        let first = start_watch(&runtime, &dir, "sess-1", "/remote/a.txt", &publisher).await;
-        let second = start_watch(&runtime, &dir, "sess-1", "/remote/a.txt", &publisher).await;
+        let first = start_watch(
+            &runtime,
+            &dir,
+            "watched.txt",
+            "sess-1",
+            "/remote/a.txt",
+            &publisher,
+        )
+        .await;
+        let second = start_watch(
+            &runtime,
+            &dir,
+            "watched.txt",
+            "sess-1",
+            "/remote/a.txt",
+            &publisher,
+        )
+        .await;
         assert_ne!(first, second);
         assert_eq!(runtime.live_count().await, 1, "dedup keeps one watcher");
         // A different session owns a separate watcher for the same file.
-        let _third = start_watch(&runtime, &dir, "sess-2", "/remote/a.txt", &publisher).await;
+        let _third = start_watch(
+            &runtime,
+            &dir,
+            "watched.txt",
+            "sess-2",
+            "/remote/a.txt",
+            &publisher,
+        )
+        .await;
         assert_eq!(runtime.live_count().await, 2);
     }
 
@@ -635,22 +698,46 @@ mod tests {
         let runtime = WatchRuntime::with_tunables(tunables());
         let dir = tempfile::tempdir().expect("tempdir");
         let publisher = Arc::new(CollectingPublisher::default());
-        let watch_id = start_watch(&runtime, &dir, "sess-1", "/remote/a.txt", &publisher).await;
+        let watch_id = start_watch(
+            &runtime,
+            &dir,
+            "watched.txt",
+            "sess-1",
+            "/remote/a.txt",
+            &publisher,
+        )
+        .await;
         runtime.stop(&watch_id).await.expect("stop");
         assert_eq!(runtime.live_count().await, 0);
         assert!(runtime.stop(&watch_id).await.is_err(), "double stop errors");
 
-        let _a = start_watch(&runtime, &dir, "sess-1", "/remote/a.txt", &publisher).await;
-        let _b = start_watch_file(
+        let _a = start_watch(
             &runtime,
             &dir,
+            "watched.txt",
             "sess-1",
-            "/remote/b.txt",
-            "watched-b.txt",
+            "/remote/a.txt",
             &publisher,
         )
         .await;
-        let _c = start_watch(&runtime, &dir, "sess-2", "/remote/a.txt", &publisher).await;
+        let _b = start_watch(
+            &runtime,
+            &dir,
+            "other.txt",
+            "sess-1",
+            "/remote/b.txt",
+            &publisher,
+        )
+        .await;
+        let _c = start_watch(
+            &runtime,
+            &dir,
+            "watched.txt",
+            "sess-2",
+            "/remote/a.txt",
+            &publisher,
+        )
+        .await;
         assert_eq!(runtime.stop_session("sess-1").await, 2);
         assert_eq!(runtime.live_count().await, 1, "other sessions survive");
         assert_eq!(runtime.stop_session("sess-1").await, 0, "idempotent");
@@ -704,8 +791,15 @@ mod tests {
         let runtime = WatchRuntime::with_tunables(tunables());
         let dir = tempfile::tempdir().expect("tempdir");
         let publisher = Arc::new(CollectingPublisher::default());
-        let _watch_id =
-            start_watch(&runtime, &dir, "sess-e2e", "/remote/e2e.txt", &publisher).await;
+        let _watch_id = start_watch(
+            &runtime,
+            &dir,
+            "watched.txt",
+            "sess-e2e",
+            "/remote/e2e.txt",
+            &publisher,
+        )
+        .await;
 
         // Past the 10ms suppression window: rewrite with new content.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -756,6 +850,7 @@ mod tests {
         let _watch_id = start_watch_with_probe(
             &runtime,
             &dir,
+            "watched.txt",
             "sess-dead",
             "/remote/dead.txt",
             &publisher,
@@ -776,12 +871,13 @@ mod tests {
     async fn start_watch_with_probe(
         runtime: &WatchRuntime,
         dir: &tempfile::TempDir,
+        file_name: &str,
         session_id: &str,
         remote_path: &str,
         publisher: &Arc<CollectingPublisher>,
         probe: SessionProbe,
     ) -> String {
-        let path = dir.path().join("watched.txt");
+        let path = dir.path().join(file_name);
         write_file(&path, b"start");
         let response = runtime
             .start(
@@ -804,8 +900,15 @@ mod tests {
         let runtime = WatchRuntime::with_tunables(tunables());
         let dir = tempfile::tempdir().expect("tempdir");
         let publisher = Arc::new(CollectingPublisher::default());
-        let _watch_id =
-            start_watch(&runtime, &dir, "sess-del", "/remote/del.txt", &publisher).await;
+        let _watch_id = start_watch(
+            &runtime,
+            &dir,
+            "watched.txt",
+            "sess-del",
+            "/remote/del.txt",
+            &publisher,
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         std::fs::remove_file(dir.path().join("watched.txt")).expect("remove");
         // Touch the parent so watchers that only see directory-level events
