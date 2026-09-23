@@ -40,6 +40,10 @@ pub const SUPPRESS_WINDOW: Duration = Duration::from_secs(2);
 /// fingerprint is the only misfire guard, and hashing a huge file on every
 /// save would hurt more than a missed upload prompt.
 pub const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
+/// `watch/upload` refuses files above this size: the round-trip is buffered
+/// in memory on purpose (single atomic commit), so multi-GB editor saves must
+/// go through the regular upload slot instead.
+pub const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Async session-liveness probe injected from main.rs: the watcher cannot
 /// reach into the SSH session table directly (module boundaries), so each
@@ -189,6 +193,11 @@ struct WatchPump {
 
 struct WatchEntry {
     session_id: String,
+    /// Identity snapshot from `watch/start`: the pump event payload and
+    /// `watch/upload` both read the pair from here, so the workbench only
+    /// ever has to remember the watchId.
+    local_path: PathBuf,
+    remote_path: String,
     /// Keeping the notify watcher alive is what keeps events flowing; dropping
     /// it (registry removal) is also how the pump task learns to stop.
     _watcher: notify::RecommendedWatcher,
@@ -284,6 +293,8 @@ impl WatchRuntime {
             watch_id.clone(),
             WatchEntry {
                 session_id: session_id.clone(),
+                local_path: local_path.clone(),
+                remote_path: remote_path.clone(),
                 _watcher: watcher,
             },
         );
@@ -395,6 +406,51 @@ impl WatchRuntime {
         } else {
             Err("Watch was not found".to_string())
         }
+    }
+
+    /// `watch/upload` — pushes the current on-disk bytes of a watched file
+    /// back to its remote path. The workbench cannot read local files by path
+    /// (the host file-transfer bridge only exposes user-picked handles), so
+    /// the sidecar — which downloaded the file into `remote-edit/` in the
+    /// first place — reads the bytes and streams them through the same atomic
+    /// temporary-file commit as `sftp/write` (permissions preserved). The
+    /// write gate (`ensure_writable`) applies exactly as for any other SFTP
+    /// write; the watchId proves the file came from this plugin's own
+    /// download, so no arbitrary local path ever crosses the bridge.
+    pub async fn upload_back(
+        &self,
+        ssh: &crate::ssh::SshRuntime,
+        watch_id: &str,
+    ) -> Result<Value, String> {
+        let (session_id, local_path, remote_path) = {
+            let watches = self.watches.read().await;
+            let entry = watches
+                .get(watch_id)
+                .ok_or_else(|| "Watch was not found".to_string())?;
+            (
+                entry.session_id.clone(),
+                entry.local_path.clone(),
+                entry.remote_path.clone(),
+            )
+        };
+        let data = std::fs::read(&local_path).map_err(|error| {
+            format!(
+                "Could not read watched file '{}': {error}",
+                local_path.display()
+            )
+        })?;
+        if data.len() as u64 > MAX_UPLOAD_BYTES {
+            return Err(format!(
+                "Watched file '{}' is larger than the {} MiB watch-upload limit; upload it manually instead",
+                local_path.display(),
+                MAX_UPLOAD_BYTES / (1024 * 1024)
+            ));
+        }
+        crate::sftp_ext::write_bytes(ssh, &session_id, &remote_path, &data).await?;
+        Ok(json!({
+            "remotePath": remote_path,
+            "size": data.len(),
+        }))
     }
 
     /// `watch/stop-all` (and the `ssh/session/close` hook) — drops every

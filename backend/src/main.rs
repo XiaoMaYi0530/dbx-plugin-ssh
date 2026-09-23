@@ -658,6 +658,14 @@ impl Plugin {
                 let stopped = self.runtime.block_on(self.watcher.stop_session(session_id));
                 Ok(json!({ "success": true, "stopped": stopped }))
             }
+            // 把被监听文件的当前磁盘字节推回远端：sidecar 从 remote-edit 下载
+            // 路径读字节（宿主桥没有按路径读本地文件的能力），走 sftp/write
+            // 同款原子落盘；写门禁 ensure_writable 与其他 SFTP 写完全一致。
+            "watch/upload" => {
+                let watch_id = required_string(&params, "watchId")?;
+                self.runtime
+                    .block_on(self.watcher.upload_back(&self.ssh, watch_id))
+            }
             "sftp/copy" => {
                 let session_id = self.filesystem_session(&params)?;
                 self.runtime.block_on(sftp_copy::run(

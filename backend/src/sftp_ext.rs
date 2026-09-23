@@ -145,8 +145,23 @@ pub async fn write_file(
     path: &str,
     data_base64: &str,
 ) -> Result<(), String> {
-    runtime.ensure_writable(session_id).await?;
     let data = decode_direct_write_payload(data_base64)?;
+    // write_bytes runs the write gate (ensure_writable) — no second check here.
+    write_bytes(runtime, session_id, path, &data).await
+}
+
+/// In-memory variant of [`write_file`] shared with the watcher round-trip
+/// (`watch/upload`): the bytes are already sidecar-resident, so no base64
+/// detour and no 4 MiB direct-write cap applies here — the caller owns the
+/// size policy. Stages through `.dbx-part-<uuid>` and renames atomically,
+/// preserving the target's permission bits (issue #37).
+pub async fn write_bytes(
+    runtime: &SshRuntime,
+    session_id: &str,
+    path: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    runtime.ensure_writable(session_id).await?;
     let sftp = runtime.sftp(session_id).await?;
     let path = normalize_remote_path(path)?;
     let task_id = Uuid::new_v4().to_string();
@@ -157,7 +172,7 @@ pub async fn write_file(
             .create(temporary.clone())
             .await
             .map_err(sftp_error)?;
-        if let Err(error) = file.write_all(&data).await {
+        if let Err(error) = file.write_all(data).await {
             drop(file);
             let _ = session.remove_file(temporary.clone()).await;
             return Err(format!("SFTP write failed: {error}"));
