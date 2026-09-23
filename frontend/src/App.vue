@@ -7512,7 +7512,14 @@ async function initialize() {
     // bootRestore: 宿主启动恢复 tab 时会异步重放 connect（见 queryStore
     // reconnectRestoredPluginTabs），首个 ssh/session/open 可能先于它落地，
     // inactive 错误在该路径下参与有界重试。
-    else await openSession(false, true);
+    else {
+      // Dock 连接面板（§8.3）：宿主创建面板条目时不像 tab 流程那样先
+      // ensureConnected/repush，sidecar 里没有这条连接，首个 ssh/session/open
+      // 必然 inactive 失败、只能靠用户手点重连。先请宿主重开连接（宿主侧
+      // 会推送凭据并建连）再 open，panel 之外不受影响（tab 已有前置推送）。
+      if (panelSurface.value) await requestHostReopenConnection();
+      await openSession(false, true);
+    }
   }
 }
 
@@ -8017,17 +8024,10 @@ onBeforeUnmount(() => {
           <span class="record-countdown-number" :key="recordCountdown">{{ recordCountdown }}</span>
           <span class="record-countdown-hint">{{ t("recordingCountdownHint") }}</span>
         </div>
-        <div v-if="!isLocalMode && !localShellRestored && terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
-          <!-- Dock panel surface: a minimal spinner line instead of the full connect card. -->
-          <div v-if="panelSurface" class="panel-connecting" data-panel-connecting>
-            <Loader2 class="spinning" />
-            <span>{{ terminalState === 'connecting' ? t('sessionStatus.connecting') : t('disconnected') }}</span>
-            <span v-if="terminalErrorFriendly || terminalError" class="panel-connecting-error">{{ terminalErrorFriendly || terminalError }}</span>
-            <button v-if="terminalState !== 'connecting'" class="link-button" @click="startConnect">{{ t('connectCard.connect') }}</button>
-            <button v-if="terminalState === 'connecting'" class="link-button" @click="cancelConnect">{{ t('connectCard.cancel') }}</button>
-          </div>
+        <!-- Dock panel surface: no loading overlay at all — the panel shows the
+             terminal area as-is while connecting. -->
+        <div v-if="!panelSurface && !isLocalMode && !localShellRestored && terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
           <ConnectingCard
-            v-else
             :locale="locale"
             :name="connection.name || connectionIdentity"
             :identity="connectionIdentity"
