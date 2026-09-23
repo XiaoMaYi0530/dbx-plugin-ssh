@@ -3392,3 +3392,6 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 
 - **feel（P2-7/8/9）✅ 完成**：大输出保护背压 gate（128KiB 触发/64KiB 恢复/32KiB 分帧 + 扫描挂起 + 七语提示）、终端右键菜单 + 选中文本在线搜索（引擎可配，openExternal 缺失降级复制链接）、背景图（local/wallpaper/* + 魔数校验 + WebGL 挂起强制 DOM 渲染 + 透明化）。三增量 commit（b197767/a1bd975/6c04daf），817 前端 + 649 后端全绿。已集成（bf91fb5，零冲突）。
 - W2b 剩余：watcher（P2-5/6）、panels（P2-1/2 前端）进行中；两者合入后跑 e2e UI 审查并收口 M2。
+
+- **panels（P2-1/2 前端）✅ 完成**：OtpPanel（验证码倒计时/扫码导入/绑定管理/发送到终端）+ ImportWizard（三步向导/脱敏预览/主密码处理），827→852 前端全绿。SideNavPanel 冲突为机制性（docker 与 panels 各建额外 tab 状态机）——融合为统一 extraTab（"otp"|"import"|"docker"），App.vue 持久化契约不变。已集成（2e3b018）。
+- W2b 仅剩 watcher（P2-5/6）进行中；合入后 e2e UI 审查收口 M2。
