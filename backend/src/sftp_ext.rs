@@ -2,6 +2,7 @@
 #![allow(dead_code)] // entry points are wired in main.rs; see the snippet at the bottom
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -9,7 +10,7 @@ use base64::Engine as _;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
@@ -282,6 +283,213 @@ pub async fn extract(
         )
         .await?;
     check_exec_success(&outcome, "extract")
+}
+
+// ---------------------------------------------------------------------------
+// Symbolic links (IMPL_PLAN v2 P2-6)
+// ---------------------------------------------------------------------------
+// Spike conclusion: russh-sftp 3.0.0 exposes the SYMLINK/READLINK packets
+// natively (`SftpSession::symlink(linkpath, targetpath)` and
+// `SftpSession::read_link(path)`), so no exec-channel `ln -s` fallback and no
+// shell quoting are needed — arguments travel as SFTP string fields.
+
+/// `sftp/symlink-create {sessionId, target, linkPath}` — creates `linkPath`
+/// pointing at `target` (relative targets are kept verbatim, like `ln -s`).
+/// Refuses to clobber an existing entry; write-gated like `sftp/chmod`.
+pub async fn symlink_create(
+    runtime: &SshRuntime,
+    session_id: &str,
+    target: &str,
+    link_path: &str,
+) -> Result<(), String> {
+    runtime.ensure_writable(session_id).await?;
+    let target = clean_symlink_arg(target, "Link target")?;
+    let link_path = normalize_remote_path(&clean_symlink_arg(link_path, "Link path")?)?;
+    let sftp = runtime.sftp(session_id).await?;
+    let session = sftp.lock().await;
+    if session.symlink_metadata(link_path.clone()).await.is_ok() {
+        return Err(format!("'{link_path}' already exists; remove it first"));
+    }
+    session.symlink(link_path, target).await.map_err(sftp_error)
+}
+
+/// `sftp/symlink-read {sessionId, linkPath} -> {target}` — read-only.
+pub async fn symlink_read(
+    runtime: &SshRuntime,
+    session_id: &str,
+    link_path: &str,
+) -> Result<Value, String> {
+    let sftp = runtime.sftp(session_id).await?;
+    let link_path = normalize_remote_path(&clean_symlink_arg(link_path, "Link path")?)?;
+    let target = sftp
+        .lock()
+        .await
+        .read_link(link_path)
+        .await
+        .map_err(sftp_error)?;
+    Ok(json!({ "target": target }))
+}
+
+/// `sftp/symlink-update {sessionId, linkPath, target}` — re-points an existing
+/// symlink: readlink first (refuses non-symlinks), then delete + recreate
+/// because SFTP has no in-place retarget. A failure between the two steps can
+/// leave a dangling link — acceptable, the old target is already gone.
+pub async fn symlink_update(
+    runtime: &SshRuntime,
+    session_id: &str,
+    link_path: &str,
+    target: &str,
+) -> Result<(), String> {
+    runtime.ensure_writable(session_id).await?;
+    let target = clean_symlink_arg(target, "Link target")?;
+    let link_path = normalize_remote_path(&clean_symlink_arg(link_path, "Link path")?)?;
+    let sftp = runtime.sftp(session_id).await?;
+    let session = sftp.lock().await;
+    session
+        .read_link(link_path.clone())
+        .await
+        .map_err(|_| format!("'{link_path}' is not a symbolic link"))?;
+    session
+        .remove_file(link_path.clone())
+        .await
+        .map_err(sftp_error)?;
+    session.symlink(link_path, target).await.map_err(sftp_error)
+}
+
+/// Validates a symlink argument (link path or target): non-empty after trim,
+/// free of NUL and line-break bytes. Those bytes are never legal in SFTP path
+/// strings and rejecting them up front keeps logs/dialogs well-formed.
+fn clean_symlink_arg(value: &str, label: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    if trimmed.contains('\0') {
+        return Err(format!("{label} must not contain NUL bytes"));
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err(format!("{label} must not contain line breaks"));
+    }
+    Ok(trimmed.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Remote-edit round-trip upload (`sftp/upload-local`)
+// ---------------------------------------------------------------------------
+// The `watch/file-modified` flow hands a local copy out under
+// `<downloads>/remote-edit/`; this call pushes it back. Without a gate this
+// would be an arbitrary local-file read primitive, so uploads are accepted
+// only for files that canonicalize beneath the watcher's remote-edit root.
+
+/// Cap for one `sftp/upload-local` round-trip. Deliberately well below the
+/// streaming-transfer limit (16 GiB): an accidental watcher upload should fail
+/// fast instead of inching along for hours.
+pub const MAX_UPLOAD_LOCAL_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Copy buffer for the streaming local→SFTP push.
+const UPLOAD_LOCAL_CHUNK: usize = 128 * 1024;
+
+/// `sftp/upload-local {sessionId, localPath, remotePath} -> {path, size}` —
+/// pushes a watcher-delivered local file back to the remote path, staged via
+/// `.dbx-part-<uuid>` + atomic rename like `sftp/write`.
+pub async fn upload_watched_file(
+    runtime: &SshRuntime,
+    session_id: &str,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<Value, String> {
+    runtime.ensure_writable(session_id).await?;
+    let local =
+        validate_remote_edit_path(Path::new(local_path.trim()), &runtime.data_dir(), |key| {
+            std::env::var_os(key)
+        })?;
+    let size = tokio::fs::metadata(&local)
+        .await
+        .map_err(|error| format!("Local file '{}' is unreadable: {error}", local.display()))?
+        .len();
+    if size > MAX_UPLOAD_LOCAL_SIZE {
+        return Err(format!(
+            "Remote-edit uploads are limited to {MAX_UPLOAD_LOCAL_SIZE} bytes"
+        ));
+    }
+    let remote_path = normalize_remote_path(remote_path)?;
+    let sftp = runtime.sftp(session_id).await?;
+    let task_id = Uuid::new_v4().to_string();
+    let (temporary, backup) = direct_write_paths(&remote_path, &task_id);
+    {
+        let session = sftp.lock().await;
+        let mut file = session
+            .create(temporary.clone())
+            .await
+            .map_err(sftp_error)?;
+        let mut reader = match tokio::fs::File::open(&local).await {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = session.remove_file(temporary.clone()).await;
+                return Err(format!(
+                    "Local file '{}' is unreadable: {error}",
+                    local.display()
+                ));
+            }
+        };
+        let mut buffer = vec![0u8; UPLOAD_LOCAL_CHUNK];
+        loop {
+            let read = match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    drop(file);
+                    let _ = session.remove_file(temporary.clone()).await;
+                    return Err(format!(
+                        "Local file '{}' read failed: {error}",
+                        local.display()
+                    ));
+                }
+            };
+            if let Err(error) = file.write_all(&buffer[..read]).await {
+                drop(file);
+                let _ = session.remove_file(temporary.clone()).await;
+                return Err(format!("SFTP write failed: {error}"));
+            }
+        }
+        if let Err(error) = file.flush().await {
+            drop(file);
+            let _ = session.remove_file(temporary.clone()).await;
+            return Err(format!("SFTP write flush failed: {error}"));
+        }
+    }
+    commit_temporary_file(&sftp, &temporary, &remote_path, &backup).await?;
+    Ok(json!({ "path": remote_path, "size": size }))
+}
+
+/// Security gate: the local file must exist and canonicalize beneath
+/// `<downloads>/remote-edit/`. Both sides are canonicalized (macOS hands out
+/// `/var` vs `/private/var` through `$HOME` vs `canonicalize`), and a missing
+/// remote-edit root means nothing the watcher produced can live there. The
+/// env lookup is injected so tests can pin the downloads root to a tempdir.
+fn validate_remote_edit_path(
+    local_path: &Path,
+    data_dir: &Path,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if !local_path.is_absolute() {
+        return Err("localPath must be an absolute path".to_string());
+    }
+    let canonical = local_path.canonicalize().map_err(|error| {
+        format!(
+            "Local file '{}' does not exist: {error}",
+            local_path.display()
+        )
+    })?;
+    let downloads = crate::local_downloads::downloads_base_dir(lookup, data_dir);
+    let root = downloads.join("remote-edit");
+    let root = root
+        .canonicalize()
+        .map_err(|_| "Local file is not inside the remote-edit directory".to_string())?;
+    if !canonical.starts_with(&root) {
+        return Err("Only files inside the remote-edit directory can be uploaded".to_string());
+    }
+    Ok(canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +1001,97 @@ mod tests {
     fn join_remote_name_handles_the_root() {
         assert_eq!(join_remote_name("/", "a.txt"), "/a.txt");
         assert_eq!(join_remote_name("/tmp/up", "a.txt"), "/tmp/up/a.txt");
+    }
+
+    // ---- symlink argument validation ----
+
+    #[test]
+    fn clean_symlink_arg_trims_and_accepts_relative_targets() {
+        assert_eq!(
+            clean_symlink_arg("  ../lib/libssl.so  ", "Link target").unwrap(),
+            "../lib/libssl.so"
+        );
+        assert_eq!(
+            clean_symlink_arg("/etc/alternatives/java", "Link path").unwrap(),
+            "/etc/alternatives/java"
+        );
+    }
+
+    #[test]
+    fn clean_symlink_arg_rejects_empty_nul_and_line_breaks() {
+        assert!(clean_symlink_arg("", "Link target").is_err());
+        assert!(clean_symlink_arg("   ", "Link path").is_err());
+        assert!(clean_symlink_arg("a\0b", "Link target").is_err());
+        assert!(clean_symlink_arg("a\nb", "Link path").is_err());
+        assert!(clean_symlink_arg("a\r\nb", "Link target").is_err());
+        let error = clean_symlink_arg("", "Link target").unwrap_err();
+        assert!(error.contains("Link target"), "{error}");
+    }
+
+    // ---- remote-edit upload gate ----
+
+    /// Pins the downloads base dir to `base` via the injected lookup, then
+    /// lays out `<base>/remote-edit/<ts>/notes.txt` plus an outside file —
+    /// the same shape the watcher hands out in production.
+    fn remote_edit_gate(base: &Path, path: &Path) -> Result<PathBuf, String> {
+        validate_remote_edit_path(path, base, |key| {
+            if key == crate::local_downloads::DOWNLOAD_DIR_ENV {
+                Some(std::ffi::OsString::from(base.to_path_buf()))
+            } else {
+                std::env::var_os(key)
+            }
+        })
+    }
+
+    fn write_remote_edit_fixture(dir: &tempfile::TempDir) -> PathBuf {
+        let root = dir.path().join("remote-edit");
+        let session = root.join("1700000000000");
+        std::fs::create_dir_all(&session).expect("mkdir remote-edit/<ts>");
+        std::fs::write(session.join("notes.txt"), b"edited").expect("write file");
+        std::fs::write(dir.path().join("outside.txt"), b"nope").expect("write outside");
+        root
+    }
+
+    #[test]
+    fn remote_edit_gate_accepts_files_under_the_watch_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = write_remote_edit_fixture(&dir);
+        let watched = root.join("1700000000000").join("notes.txt");
+        let resolved = remote_edit_gate(dir.path(), &watched).expect("watched file accepted");
+        assert!(resolved.ends_with("notes.txt"));
+        // A stale-but-similar path still resolves through the canonical form.
+        let nested = root
+            .join("1700000000000")
+            .join("..")
+            .join("1700000000000")
+            .join("notes.txt");
+        assert!(remote_edit_gate(dir.path(), &nested).is_ok());
+    }
+
+    #[test]
+    fn remote_edit_gate_rejects_outside_relative_and_missing_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = write_remote_edit_fixture(&dir);
+        // Sibling of the remote-edit root.
+        let error = remote_edit_gate(dir.path(), &dir.path().join("outside.txt")).unwrap_err();
+        assert!(error.contains("remote-edit"), "{error}");
+        // A file whose root component merely shares the name.
+        let decoy = dir.path().join("remote-edit-evil").join("notes.txt");
+        std::fs::create_dir_all(decoy.parent().unwrap()).expect("mkdir decoy");
+        std::fs::write(&decoy, b"nope").expect("write decoy");
+        assert!(remote_edit_gate(dir.path(), &decoy).is_err());
+        // Relative paths and missing files are refused outright.
+        assert!(remote_edit_gate(dir.path(), Path::new("relative/notes.txt")).is_err());
+        assert!(remote_edit_gate(dir.path(), &root.join("gone.txt")).is_err());
+        // A missing remote-edit root can never host a legitimate file.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let orphan = empty.path().join("remote-edit").join("1").join("f.txt");
+        assert!(remote_edit_gate(empty.path(), &orphan).is_err());
+    }
+
+    #[test]
+    fn upload_local_size_cap_is_bounded() {
+        assert_eq!(MAX_UPLOAD_LOCAL_SIZE, 256 * 1024 * 1024);
     }
 }
 

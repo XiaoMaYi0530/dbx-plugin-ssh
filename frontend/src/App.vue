@@ -43,6 +43,7 @@ import {
   Home,
   Info,
   KeyRound,
+  Link2,
   ListChecks,
   Loader2,
   Lock,
@@ -649,6 +650,12 @@ const sudoMode = ref(false);
 const archiveBusy = ref(false);
 const operationDialog = ref<"mkdir" | null>(null);
 const operationDraft = ref("");
+// 符号链接对话框（P2-6）：create = 在 dir 下新建链接；edit = 改写既有链接指向。
+// 两模式共用一个 Dialog：create 多一个名称输入，edit 打开时先 sftp/symlink-read 预填。
+const symlinkDialog = ref<{ mode: "create" | "edit"; linkPath: string; name: string }>();
+const symlinkNameDraft = ref("");
+const symlinkTargetDraft = ref("");
+const symlinkSubmitting = ref(false);
 const deleteTarget = ref<SftpEntry>();
 const deleteSubmitting = ref(false);
 const renamingPath = ref("");
@@ -5168,7 +5175,7 @@ function onFileAreaContextMenu(event: MouseEvent) {
   blankMenu.value = true;
 }
 
-function blankMenuAction(action: "mkdir" | "newFile" | "upload" | "refresh") {
+function blankMenuAction(action: "mkdir" | "newFile" | "symlink" | "upload" | "refresh") {
   const menu = blankMenu.value;
   blankMenu.value = false;
   if (!menu) return;
@@ -5181,6 +5188,8 @@ function blankMenuAction(action: "mkdir" | "newFile" | "upload" | "refresh") {
     operationDialog.value = "mkdir";
   } else if (action === "upload") {
     void chooseUpload();
+  } else if (action === "symlink") {
+    openSymlinkCreateDialog(currentPath.value);
   } else {
     openNewFileDialog();
   }
@@ -6313,6 +6322,76 @@ async function createNewFile() {
     showError(cause);
   } finally {
     newFileSubmitting.value = false;
+  }
+}
+
+// —— 符号链接（P2-6）：新建 / 编辑指向。对话框见模板 symlinkDialog。——
+function openSymlinkCreateDialog(dir: string) {
+  fileMenu.value = undefined;
+  if (!connected.value || !canWrite.value) return;
+  symlinkDialog.value = { mode: "create", linkPath: dir, name: "" };
+  symlinkNameDraft.value = "";
+  symlinkTargetDraft.value = "";
+}
+
+/** 编辑既有链接：先读当前指向预填；读失败（悬空链接外的错误）即整单取消。 */
+async function openSymlinkEditDialog(entry: SftpEntry) {
+  fileMenu.value = undefined;
+  if (!connected.value || !canWrite.value) return;
+  const sessionId = session.value?.sessionId;
+  if (!sessionId) return;
+  const linkPath = pathFromUri(entry.uri);
+  symlinkDialog.value = { mode: "edit", linkPath, name: entry.name };
+  symlinkTargetDraft.value = "";
+  symlinkSubmitting.value = true;
+  try {
+    const result = await window.dbxPlugin.invoke<{ target: string }>("sftp/symlink-read", {
+      sessionId,
+      linkPath,
+    });
+    symlinkTargetDraft.value = result.target;
+  } catch (cause) {
+    symlinkDialog.value = undefined;
+    showError(cause);
+  } finally {
+    symlinkSubmitting.value = false;
+  }
+}
+
+async function confirmSymlinkDialog() {
+  const dialog = symlinkDialog.value;
+  const sessionId = session.value?.sessionId;
+  const target = symlinkTargetDraft.value.trim();
+  if (!sessionId || !dialog || !target || symlinkSubmitting.value) return;
+  if (dialog.mode === "create" && !symlinkNameDraft.value.trim()) return;
+  symlinkSubmitting.value = true;
+  try {
+    if (dialog.mode === "create") {
+      const name = symlinkNameDraft.value.trim();
+      await window.dbxPlugin.invoke("sftp/symlink-create", {
+        sessionId,
+        target,
+        linkPath: joinRemote(dialog.linkPath, name),
+      });
+      showNotice(t("symlink.created", { name }));
+    } else {
+      await window.dbxPlugin.invoke("sftp/symlink-update", {
+        sessionId,
+        linkPath: dialog.linkPath,
+        target,
+      });
+      showNotice(t("symlink.updated", { name: dialog.name }));
+    }
+    const parent = dialog.mode === "create" ? dialog.linkPath : parentPath(dialog.linkPath);
+    symlinkDialog.value = undefined;
+    await loadDirectory();
+    // 树缓存同样受影响：新建落在已展开目录内 / 编辑改变树内条目指向。
+    const parentNode = findTreeNode(sftpTree.value, parent);
+    if (parentNode) parentNode.loaded = false;
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    symlinkSubmitting.value = false;
   }
 }
 
@@ -8767,6 +8846,7 @@ const modalOpenStates = computed(() => [
   chmodTarget.value,
   newFileDialog.value,
   operationDialog.value,
+  symlinkDialog.value !== undefined,
   commandOpen.value,
   profilesOpen.value,
   auditOpen.value,
@@ -8900,6 +8980,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
   }
   if (operationDialog.value) {
     operationDialog.value = null;
+    return;
+  }
+  if (symlinkDialog.value) {
+    symlinkDialog.value = undefined;
     return;
   }
   if (commandOpen.value) {
@@ -10220,6 +10304,9 @@ onBeforeUnmount(() => {
                 <template v-else-if="fileMenu">
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @select="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</ContextMenuItem>
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'file' || fileMenu.entry.kind === 'directory'" @select="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</ContextMenuItem>
+                  <!-- P2-6 符号链接：目录内新建 / symlink 条目改指向（侧栏树只有目录节点，两项都挂文件区菜单）。 -->
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'symlink'" @select="openSymlinkEditDialog(fileMenu.entry)"><Link2 />{{ t("symlink.editAction") }}</ContextMenuItem>
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'directory'" :disabled="!canWrite" @select="openSymlinkCreateDialog(pathFromUri(fileMenu.entry.uri))"><Link2 />{{ t("symlink.createAction") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="beginRename(fileMenu.entry)"><Pencil />{{ t("rename") }}</ContextMenuItem>
                   <ContextMenuItem @select="copySelectedEntries('copy')"><Copy />{{ t("sftpCopy.copy") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="copySelectedEntries('cut')"><Scissors />{{ t("sftpCopy.cut") }}</ContextMenuItem>
@@ -10234,10 +10321,11 @@ onBeforeUnmount(() => {
                   <ContextMenuSeparator />
                   <ContextMenuItem variant="destructive" :disabled="!canWrite" @select="deleteTarget = fileMenu.entry"><Trash2 />{{ t("delete") }}</ContextMenuItem>
                 </template>
-                <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 上传文件 / 刷新 -->
+                <!-- 文件列表空白处右键：新建文件夹 / 新建文件 / 新建符号链接 / 上传文件 / 刷新 -->
                 <template v-else>
                   <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('mkdir')"><FolderPlus />{{ t("newFolder") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('newFile')"><FilePlus />{{ t("sftpNewFile.action") }}</ContextMenuItem>
+                  <ContextMenuItem :disabled="!canWrite" @select="blankMenuAction('symlink')"><Link2 />{{ t("symlink.createAction") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!connected || !canWrite" @select="blankMenuAction('upload')"><FileUp />{{ t("upload") }}</ContextMenuItem>
                   <ContextMenuItem :disabled="!connected || loadingFiles" @select="blankMenuAction('refresh')"><RefreshCw />{{ t("refresh") }}</ContextMenuItem>
                 </template>
@@ -10297,6 +10385,20 @@ onBeforeUnmount(() => {
         <header><DialogTitle>{{ t("newFolder") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="operationDialog = null"><X /></button></header>
         <input v-model="operationDraft" autofocus @keydown.enter="createDirectory" />
         <footer><button @click="operationDialog = null">{{ t("cancel") }}</button><button class="primary-button" :disabled="!operationDraft.trim()" @click="createDirectory">{{ t("confirm") }}</button></footer>      </DialogContent>
+    </Dialog>
+
+    <!-- 符号链接（P2-6）：create = 名称 + 指向；edit = 只改指向（打开时已预填） -->
+    <Dialog :open="!!symlinkDialog" @update:open="(open) => { if (!open) symlinkDialog = undefined; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="symlinkDialog">
+        <header><DialogTitle>{{ symlinkDialog.mode === "create" ? t("symlink.createTitle") : t("symlink.editTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="symlinkDialog = undefined"><X /></button></header>
+        <p v-if="symlinkDialog.mode === 'create'" class="muted">{{ t("symlink.createHint", { dir: symlinkDialog.linkPath }) }}</p>
+        <p v-else class="muted">{{ t("symlink.editHint", { name: symlinkDialog.name }) }}</p>
+        <input v-if="symlinkDialog.mode === 'create'" v-model="symlinkNameDraft" autofocus spellcheck="false" :placeholder="t('symlink.namePlaceholder')" @keydown.enter="confirmSymlinkDialog" />
+        <input v-model="symlinkTargetDraft" class="mono" spellcheck="false" :placeholder="t('symlink.targetPlaceholder')" @keydown.enter="confirmSymlinkDialog" />
+        <footer><button @click="symlinkDialog = undefined">{{ t("cancel") }}</button><button class="primary-button" :disabled="!symlinkTargetDraft.trim() || (symlinkDialog.mode === 'create' && !symlinkNameDraft.trim()) || symlinkSubmitting" @click="confirmSymlinkDialog"><Loader2 v-if="symlinkSubmitting" class="spinning" />{{ t("confirm") }}</button></footer>
+        </template>
+      </DialogContent>
     </Dialog>
 
     <Dialog :open="commandOpen" @update:open="(open) => { if (!open) commandOpen = false; }">
