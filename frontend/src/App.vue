@@ -458,6 +458,10 @@ const uploadInput = ref<HTMLInputElement>();
 const zmodemInput = ref<HTMLInputElement>();
 const trzszInput = ref<HTMLInputElement>();
 const hostContext = ref<Record<string, unknown>>({});
+// Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
+// and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
+// Declared early: the batch bar / sftp pane initializers below must know the surface at setup time.
+const panelSurface = computed(() => hostContext.value.surface === "panel");
 // 宿主未下发 appearance 前的兜底：DBX `.dark` 规范令牌。
 const appearance = ref(resolveAppearance());
 const terminalState = ref<"connecting" | "connected" | "disconnected" | "error">("connecting");
@@ -648,7 +652,10 @@ function loadBatchBarOpen(): boolean {
   }
 }
 
-const batchBarOpen = ref(loadBatchBarOpen());
+// Dock panel surface keeps the bar closed unconditionally: the panel is a single
+// focused terminal, and the sandbox has no localStorage so the persisted
+// default (open) would otherwise win.
+const batchBarOpen = ref(panelSurface.value ? false : loadBatchBarOpen());
 const batchTargetsOpen = ref(false);
 const batchLoading = ref(false);
 const batchSending = ref(false);
@@ -943,9 +950,6 @@ const isLocalMode = computed(() => localSession.value !== null);
 // SSH-only toolbar actions and display branches gate on it, decoupled from session existence.
 const localShellRestored = ref(false);
 const localUiMode = computed(() => isLocalMode.value || localShellRestored.value);
-// Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
-// and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
-const panelSurface = computed(() => hostContext.value.surface === "panel");
 // —— 本地终端偏好（sidecar preferences.json 持久化；iframe 沙箱无 localStorage）——
 // shell 空串 = 跟随自动探测；integration 缺省开。
 const localShellPref = ref("");
@@ -1179,7 +1183,9 @@ function restoreUiState() {
   currentPath.value = typeof state.sftpPath === "string" ? normalizeRemotePath(state.sftpPath) : "/";
   splitRatio.value = typeof state.splitRatio === "number" && state.splitRatio >= 35 && state.splitRatio <= 80 ? state.splitRatio : 58;
   paneOrder.value = state.paneOrder === "sftp-left" ? "sftp-left" : "terminal-left";
-  sftpPaneOpen.value = resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
+  // Dock panel surface: the SFTP pane stays closed (no auto-list/auto-connect);
+  // users who want SFTP open the workbench tab.
+  sftpPaneOpen.value = panelSurface.value ? false : resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
   followDirectory.value = state.followDirectory === true;
   sudoMode.value = state.sudoMode === true && canWrite.value;
   // 一次性迁移：六列默认上线前的旧偏好重置为全开（之后用户自定义照常持久化）。
@@ -7745,7 +7751,7 @@ onBeforeUnmount(() => {
         </label>
         <span class="toolbar-separator" aria-hidden="true" />
         <button v-if="!localUiMode" class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
-        <button v-if="!localUiMode" class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
+        <button v-if="!localUiMode && !panelSurface" class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
         <div v-if="!localUiMode">
           <Popover :open="quickMenuOpen" @update:open="(open) => { if (!open) quickMenuOpen = false; }">
             <PopoverAnchor as-child>
@@ -8012,7 +8018,16 @@ onBeforeUnmount(() => {
           <span class="record-countdown-hint">{{ t("recordingCountdownHint") }}</span>
         </div>
         <div v-if="!isLocalMode && !localShellRestored && terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
+          <!-- Dock panel surface: a minimal spinner line instead of the full connect card. -->
+          <div v-if="panelSurface" class="panel-connecting" data-panel-connecting>
+            <Loader2 class="spinning" />
+            <span>{{ terminalState === 'connecting' ? t('sessionStatus.connecting') : t('disconnected') }}</span>
+            <span v-if="terminalErrorFriendly || terminalError" class="panel-connecting-error">{{ terminalErrorFriendly || terminalError }}</span>
+            <button v-if="terminalState !== 'connecting'" class="link-button" @click="startConnect">{{ t('connectCard.connect') }}</button>
+            <button v-if="terminalState === 'connecting'" class="link-button" @click="cancelConnect">{{ t('connectCard.cancel') }}</button>
+          </div>
           <ConnectingCard
+            v-else
             :locale="locale"
             :name="connection.name || connectionIdentity"
             :identity="connectionIdentity"

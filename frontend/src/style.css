@@ -246,6 +246,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 }
 .terminal-overlay { position: absolute; z-index: 2; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 24px; background: var(--ssh-terminal-background); color: var(--muted-foreground); text-align: center; }
 .terminal-overlay p { margin: 0; font-size: 12px; }
+/* Dock panel surface（§8.3）：完整连接卡片换成一行极简加载态（转圈 + 状态 + 错误/操作）。 */
+.panel-connecting { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 10px; font-size: 12px; }
+.panel-connecting .spinning { width: 16px; height: 16px; }
+.panel-connecting-error { max-width: 60%; overflow: hidden; color: var(--destructive); text-overflow: ellipsis; white-space: nowrap; }
 
 /* Termius 风格连接卡片：挂在 .terminal-overlay（原连接中遮罩）内。
    三段式——头部（服务器徽章 + 名称 + Show logs）、中段进度线（左服务器端点
