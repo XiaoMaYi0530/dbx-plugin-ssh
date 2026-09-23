@@ -2629,31 +2629,134 @@ for (const locale of Object.keys(uploadBridgeMessages)) {
 
 // 拖拽上传门禁的拒绝提示（终端/SFTP 面板/宿主级拖入三条链路共用）：未连接、
 // 只读会话或传输协议占用终端时，拒绝要有反馈而不是静默吞掉。
+// terminalDropToPanel 是面板打开时终端拖入的专属指引：面板是可见落点，
+// 终端不再接收拖拽，提示用户拖到面板而不是落进看不见的目录。
 const dropGateMessages: Record<string, Record<string, string>> = {
   "zh-CN": {
     dropRefused: "已忽略拖入的文件：会话未连接、为只读或正在传输中",
+    terminalDropToPanel: "SFTP 面板已打开：请把文件拖到 SFTP 面板上传",
   },
   "zh-TW": {
     dropRefused: "已忽略拖入的檔案：工作階段未連線、為唯讀或正在傳輸中",
+    terminalDropToPanel: "SFTP 面板已開啟：請把檔案拖到 SFTP 面板上傳",
   },
   en: {
     dropRefused: "Dropped files ignored: the session is not connected, is read-only, or a transfer is in progress",
+    terminalDropToPanel: "The SFTP panel is open — drop files onto the SFTP panel to upload",
   },
   es: {
     dropRefused: "Archivos soltados ignorados: la sesión no está conectada, es de solo lectura o hay una transferencia en curso",
+    terminalDropToPanel: "El panel SFTP está abierto: suelta los archivos en el panel SFTP para subirlos",
   },
   it: {
     dropRefused: "File rilasciati ignorati: la sessione non è connessa, è in sola lettura o è in corso un trasferimento",
+    terminalDropToPanel: "Il pannello SFTP è aperto: rilascia i file sul pannello SFTP per caricarli",
   },
   ja: {
     dropRefused: "ドロップされたファイルを無視しました：セッションが未接続、読み取り専用、または転送中です",
+    terminalDropToPanel: "SFTP パネルが開いています：ファイルは SFTP パネルにドロップしてアップロードしてください",
   },
   "pt-BR": {
     dropRefused: "Arquivos soltados ignorados: a sessão não está conectada, é somente leitura ou há uma transferência em andamento",
+    terminalDropToPanel: "O painel SFTP está aberto — solte os arquivos no painel SFTP para enviá-los",
   },
 };
 for (const locale of Object.keys(dropGateMessages)) {
   supplemental[locale] = { ...(supplemental[locale] ?? {}), ...dropGateMessages[locale] };
+}
+
+// errors.* 命名空间：App.vue/sftpErrors.ts 里 t("errors.*") 引用的错误文案。
+// 此前整个命名空间从未入表，横幅原样回显 key（拖拽上传权限拒绝曾把
+// "errors.permissionDenied" 直接展示给用户）。errors.localFileShortRead 已在
+// uploadBridgeMessages 补过，此处不重复；workbench 为产品术语，各语保留原文。
+const errorMessages: Record<string, Record<string, string>> = {
+  "zh-CN": {
+    "errors.permissionDenied": "服务器拒绝了操作：当前账号对该路径没有权限",
+    "errors.remoteNotFound": "远端路径不存在，可能已被移动或删除",
+    "errors.uploadAckTimeout": "上传已停滞：服务器不再确认已传输的数据",
+    "errors.sessionChanged": "操作期间 SSH 会话已切换，请在当前会话上重试",
+    "errors.hostBridgeMissing": "该操作需要 DBX 工作台桥接，当前环境不可用",
+    "errors.workbenchDetached": "工作台在传输完成前已断开",
+    "errors.downloadChunkLength": "下载已中止：服务器返回的数据块长度异常",
+    "errors.downloadChunkTimeout": "下载已中止：服务器停止发送数据",
+    "errors.downloadEmptyChunk": "下载已中止：服务器返回了空数据块",
+    "errors.probeOutput": "延迟测量失败：探针响应异常",
+  },
+  "zh-TW": {
+    "errors.permissionDenied": "伺服器拒絕了操作：目前帳號對該路徑沒有權限",
+    "errors.remoteNotFound": "遠端路徑不存在，可能已被移動或刪除",
+    "errors.uploadAckTimeout": "上傳已停滯：伺服器不再確認已傳輸的資料",
+    "errors.sessionChanged": "操作期間 SSH 會話已切換，請在目前會話上重試",
+    "errors.hostBridgeMissing": "此操作需要 DBX 工作台橋接，目前環境無法使用",
+    "errors.workbenchDetached": "工作台在傳輸完成前已斷線",
+    "errors.downloadChunkLength": "下載已中止：伺服器傳回的資料區塊長度異常",
+    "errors.downloadChunkTimeout": "下載已中止：伺服器停止傳送資料",
+    "errors.downloadEmptyChunk": "下載已中止：伺服器傳回了空資料區塊",
+    "errors.probeOutput": "延遲測量失敗：探測回應異常",
+  },
+  en: {
+    "errors.permissionDenied": "The server denied the operation: this account does not have permission for that path.",
+    "errors.remoteNotFound": "The remote path does not exist; it may have been moved or deleted.",
+    "errors.uploadAckTimeout": "The upload stalled: the server stopped acknowledging transferred data.",
+    "errors.sessionChanged": "The SSH session changed during the operation; retry on the current session.",
+    "errors.hostBridgeMissing": "This action needs the DBX workbench bridge, which is not available in this environment.",
+    "errors.workbenchDetached": "The workbench was detached before the transfer finished.",
+    "errors.downloadChunkLength": "Download aborted: the server returned a chunk with an unexpected length.",
+    "errors.downloadChunkTimeout": "Download aborted: the server stopped sending data.",
+    "errors.downloadEmptyChunk": "Download aborted: the server returned an empty chunk.",
+    "errors.probeOutput": "Latency check failed: unexpected probe response.",
+  },
+  es: {
+    "errors.permissionDenied": "El servidor denegó la operación: esta cuenta no tiene permisos sobre esa ruta.",
+    "errors.remoteNotFound": "La ruta remota no existe; puede haberse movido o eliminado.",
+    "errors.uploadAckTimeout": "La subida se detuvo: el servidor dejó de confirmar los datos transferidos.",
+    "errors.sessionChanged": "La sesión SSH cambió durante la operación; reintenta en la sesión actual.",
+    "errors.hostBridgeMissing": "Esta acción requiere el puente del workbench de DBX, no disponible en este entorno.",
+    "errors.workbenchDetached": "El workbench se desconectó antes de terminar la transferencia.",
+    "errors.downloadChunkLength": "Descarga abortada: el servidor devolvió un bloque con una longitud inesperada.",
+    "errors.downloadChunkTimeout": "Descarga abortada: el servidor dejó de enviar datos.",
+    "errors.downloadEmptyChunk": "Descarga abortada: el servidor devolvió un bloque vacío.",
+    "errors.probeOutput": "Fallo al medir la latencia: respuesta de sonda inesperada.",
+  },
+  it: {
+    "errors.permissionDenied": "Il server ha negato l'operazione: questo account non ha i permessi su quel percorso.",
+    "errors.remoteNotFound": "Il percorso remoto non esiste; potrebbe essere stato spostato o eliminato.",
+    "errors.uploadAckTimeout": "Il caricamento si è bloccato: il server ha smesso di confermare i dati trasferiti.",
+    "errors.sessionChanged": "La sessione SSH è cambiata durante l'operazione; riprova nella sessione corrente.",
+    "errors.hostBridgeMissing": "Questa azione richiede il bridge del workbench DBX, non disponibile in questo ambiente.",
+    "errors.workbenchDetached": "Il workbench è stato scollegato prima del termine del trasferimento.",
+    "errors.downloadChunkLength": "Download interrotto: il server ha restituito un blocco con una lunghezza inattesa.",
+    "errors.downloadChunkTimeout": "Download interrotto: il server ha smesso di inviare dati.",
+    "errors.downloadEmptyChunk": "Download interrotto: il server ha restituito un blocco vuoto.",
+    "errors.probeOutput": "Misurazione della latenza non riuscita: risposta della sonda inattesa.",
+  },
+  ja: {
+    "errors.permissionDenied": "サーバーが操作を拒否しました：このアカウントにはそのパスへの権限がありません",
+    "errors.remoteNotFound": "リモートパスが存在しません。移動または削除された可能性があります",
+    "errors.uploadAckTimeout": "アップロードが停止しました：サーバーが転送済みデータの確認を返さなくなりました",
+    "errors.sessionChanged": "操作中に SSH セッションが切り替わりました。現在のセッションで再試行してください",
+    "errors.hostBridgeMissing": "この操作には DBX ワークベンチブリッジが必要ですが、この環境では利用できません",
+    "errors.workbenchDetached": "ワークベンチが転送の完了前に切断されました",
+    "errors.downloadChunkLength": "ダウンロードを中止しました：サーバーから想定外の長さのチャンクが返されました",
+    "errors.downloadChunkTimeout": "ダウンロードを中止しました：サーバーがデータの送信を停止しました",
+    "errors.downloadEmptyChunk": "ダウンロードを中止しました：サーバーから空のチャンクが返されました",
+    "errors.probeOutput": "レイテンシ測定に失敗しました：プローブの応答が想定外です",
+  },
+  "pt-BR": {
+    "errors.permissionDenied": "O servidor negou a operação: esta conta não tem permissão sobre esse caminho.",
+    "errors.remoteNotFound": "O caminho remoto não existe; pode ter sido movido ou excluído.",
+    "errors.uploadAckTimeout": "O envio parou: o servidor deixou de confirmar os dados transferidos.",
+    "errors.sessionChanged": "A sessão SSH mudou durante a operação; tente novamente na sessão atual.",
+    "errors.hostBridgeMissing": "Esta ação requer a ponte do workbench do DBX, indisponível neste ambiente.",
+    "errors.workbenchDetached": "O workbench foi desconectado antes do término da transferência.",
+    "errors.downloadChunkLength": "Download abortado: o servidor devolveu um bloco com comprimento inesperado.",
+    "errors.downloadChunkTimeout": "Download abortado: o servidor parou de enviar dados.",
+    "errors.downloadEmptyChunk": "Download abortado: o servidor devolveu um bloco vazio.",
+    "errors.probeOutput": "Falha ao medir a latência: resposta de sonda inesperada.",
+  },
+};
+for (const locale of Object.keys(errorMessages)) {
+  supplemental[locale] = { ...(supplemental[locale] ?? {}), ...errorMessages[locale] };
 }
 
 /** Dev/test helper: flattens a nested message table into dotted `a.b` keys. */
