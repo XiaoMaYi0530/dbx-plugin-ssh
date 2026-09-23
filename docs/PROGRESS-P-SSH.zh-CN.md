@@ -3420,4 +3420,5 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
   1. **X11 转发实现**：按 spike 报告路线（request_x11 + server_channel_open_x11 显式 gate + DISPLAY unix/TCP 桥接 + 假 MIT-MAGIC-COOKIE 校验）；偏好键 `x11_forwarding`（默认关，read_only 禁用）；零新增依赖。
   2. **串口会话**：serialport 4（依赖评审：MIT/Apache 双许可）+ `serial_session.rs`（仿 telnet 先例：ports/start/write/close/list）+ SerialConnectDialog 前端入口；若 Linux CI 需 libudev-dev 允许改 workflow 一处。
 - 维持人工门：VNC（引擎选型+帧通道压测）、RDP（vendored fork 链+CredSSP 评审）、真机验收、PR 合入。
+- 执行备注：首轮两 agent 因 API 网络瞬断（TLS 连接断开）失败且无产出丢失（worktree 仍在基线），已原样重试派发；cron 看护继续。
 - M4 完成判据：两分支合入 integration、全量验证绿（基线 cargo 696 / vitest 861 只增不减）、e2e 回归、push 后 CI 十一门 success。
