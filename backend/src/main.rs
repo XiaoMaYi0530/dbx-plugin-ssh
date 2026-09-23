@@ -32,6 +32,7 @@ mod ssh_algorithms;
 mod sudo_allowlist;
 mod sudo_fs;
 mod sudo_profiles;
+mod telnet_session;
 mod transfer_history;
 mod triggers;
 mod vault;
@@ -58,6 +59,7 @@ struct Plugin {
     runtime: Runtime,
     ssh: Arc<SshRuntime>,
     local: Arc<local_terminal::LocalTerminalRuntime>,
+    telnet: Arc<telnet_session::TelnetSessionRuntime>,
     mcp: Arc<mcp::McpState>,
 }
 
@@ -72,6 +74,7 @@ impl Plugin {
             mcp: Arc::new(mcp::McpState::shared(ssh.clone())),
             ssh,
             local: Arc::new(local_terminal::LocalTerminalRuntime::new()),
+            telnet: Arc::new(telnet_session::TelnetSessionRuntime::new()),
         })
     }
 
@@ -406,14 +409,61 @@ impl Plugin {
             "local/shells/list" => Ok(self.local.shells()),
             // PR-A4 generic launch-options contract: picker entries for the dock "+".
             "local/terminal/launch-options" => Ok(self.local.launch_options()),
+            // Telnet 会话（明文协议，P2-3）：入口在 SSH 工作台工具栏，用户显
+            // 式点击才会创建。IAC 协商/NAWS/Expect 自动登录见 telnet_session.rs；
+            // 输入走 `telnet/terminal/in/{id}` 二进制通道，输出走
+            // `telnet/terminal/out/{id}`，生命周期事件 `telnet/session/state`。
+            "telnet/start" => {
+                let request: telnet_session::TelnetStartRequest = parse(params)?;
+                self.runtime
+                    .block_on(self.telnet.start(request, emitter.clone()))
+            }
+            // `telnet/write` JSON 兜底（键盘主路径是二进制通道）。
+            "telnet/write" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let data_base64 = required_string(&params, "dataBase64")?;
+                let data = telnet_session::decode_write_payload(data_base64)?;
+                self.telnet.write_input(session_id, data)?;
+                Ok(json!({ "success": true }))
+            }
+            "telnet/resize" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let cols = required_u32(&params, "cols")?;
+                let rows = required_u32(&params, "rows")?;
+                self.runtime
+                    .block_on(self.telnet.resize(session_id, cols, rows))?;
+                Ok(json!({ "success": true }))
+            }
+            "telnet/replay" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let after_sequence = params
+                    .get("afterSequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let replay = self.runtime.block_on(self.telnet.replay(
+                    session_id,
+                    after_sequence,
+                    emitter,
+                ))?;
+                Ok(replay)
+            }
+            "telnet/close" => {
+                let session_id = required_string(&params, "sessionId")?;
+                self.runtime.block_on(self.telnet.close(session_id))?;
+                Ok(json!({ "success": true }))
+            }
+            "telnet/list" => Ok(self.runtime.block_on(self.telnet.list())),
             "workbench/close" => {
                 let workbench_id = required_string(&params, "workbenchId")?;
                 self.runtime
                     .block_on(self.ssh.close_workbench(workbench_id))?;
-                // Local shells belong to the closing tab too; a webview reload
-                // never calls this, so live shells stay reattachable there.
+                // Local shells and Telnet sessions belong to the closing tab
+                // too; a webview reload never calls this, so live sessions
+                // stay reattachable there.
                 self.runtime
                     .block_on(self.local.close_workbench(workbench_id));
+                self.runtime
+                    .block_on(self.telnet.close_workbench(workbench_id));
                 Ok(json!({ "success": true }))
             }
             "ssh/host-key/resolve" | "connection/challenge/resolve" => {
@@ -1290,6 +1340,26 @@ impl PluginHandler for Plugin {
             }
             emitter.event(
                 "local/terminal/inputAck",
+                json!({ "sessionId": session_id, "sequence": sequence }),
+            )?;
+            return Ok(());
+        }
+        if let Some(session_id) = channel.strip_prefix("telnet/terminal/in/") {
+            let (sequence, payload) = match decode_sequenced_input(&data) {
+                Ok(split) => split,
+                Err(error) => return Err(to_plugin_error(error)),
+            };
+            if let Err(error) = self.telnet.write_input(session_id, payload) {
+                // Mirror the SSH/local branches: without an event the tab
+                // keeps looking alive while every keystroke is swallowed.
+                let _ = emitter.event(
+                    "telnet/terminal/error",
+                    json!({ "sessionId": session_id, "error": error }),
+                );
+                return Err(to_plugin_error(error));
+            }
+            emitter.event(
+                "telnet/terminal/inputAck",
                 json!({ "sessionId": session_id, "sequence": sequence }),
             )?;
             return Ok(());
