@@ -363,6 +363,12 @@ pub fn save_preferences(data_dir: &Path, params: &Value) -> Result<Value, String
             )),
         );
     }
+    if let Some(value) = params.get("x11_forwarding") {
+        let enabled = value
+            .as_bool()
+            .ok_or_else(|| "x11_forwarding must be a boolean".to_string())?;
+        map.insert("x11_forwarding".to_string(), Value::Bool(enabled));
+    }
     if let Some(value) = params.get("transfer_duplicate_policy") {
         let policy = sanitize_conflict_policy(value).ok_or_else(|| {
             "transfer_duplicate_policy must be rename, ask or overwrite".to_string()

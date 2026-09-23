@@ -50,6 +50,31 @@ import type { TerminalHotkeyBindings } from "../lib/terminalHotkeys";
 import { type ActionLinkMatcherToggles, type ActionLinksSettings } from "../lib/actionLinksMatcher";
 import { GUTTER_TIMESTAMP_DEFAULT_FORMAT, type GutterSettings } from "../lib/terminalGutter";
 
+/** X11 转发偏好（P3-3）：组件内自治读写 sidecar 偏好——即时生效语义
+ * （新会话才启用），不走 props/emit（App 无需感知）。 */
+const x11Enabled = ref(false);
+const x11ReadOnlyNote = ref(false);
+
+async function loadX11Preference() {
+  try {
+    const prefs = await window.dbxPlugin?.invoke<{ x11_forwarding?: unknown }>("local/preferences/get", {});
+    x11Enabled.value = prefs?.x11_forwarding === true;
+  } catch {
+    x11Enabled.value = false;
+  }
+}
+
+async function setX11Enabled(next: boolean) {
+  x11Enabled.value = next;
+  try {
+    await window.dbxPlugin?.invoke("local/preferences/set", { x11_forwarding: next });
+  } catch {
+    x11Enabled.value = !next;
+  }
+}
+
+void loadX11Preference();
+
 const props = defineProps<{
   open: boolean;
   profilesOpen: boolean;
@@ -1531,6 +1556,14 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
 
             <p class="muted settings-note">{{ t("terminalBehavior.scopeNote") }}</p>
             <p class="muted settings-note">{{ t("terminalFont.movedHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("x11.sectionTitle") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <Switch :model-value="x11Enabled" size="sm" @update:model-value="setX11Enabled(Boolean($event))" />
+              <span>{{ t("x11.enabled") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("x11.enabledHint") }}</p>
+            <p v-if="x11ReadOnlyNote" class="muted settings-note">{{ t("x11.readOnlyNote") }}</p>
 
             <h3 class="settings-section-title">{{ t("suggestions.settingsTitle") }}</h3>
             <label class="settings-field settings-switch-row">
