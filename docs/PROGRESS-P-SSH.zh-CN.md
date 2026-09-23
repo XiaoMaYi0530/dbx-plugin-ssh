@@ -3371,3 +3371,12 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 - **mock 夹具**：mockDbxHost 的 `ssh/metrics` 补 `gpu`/`npu` sections（双 A100 + 910B4/310P3 + 计算进程），供监控卡片视觉验证。
 - **验证**：cargo 595 / vitest 792 / vue-tsc 0 / build 过；e2e 七场景截图（连接、设置区、双列 gutter、建议浮层、Downloads 传输设置、GPU/NPU 卡片、动作链接下划线）经 visual-judge 终审 7/7 pass；详见 TEST_MATRIX「M1」节。
 - **遗留**：GPU/NPU 真机冒烟（需有卡主机）、Windows ConPTY gutter、DBX 桌面宿主手测（M1 里程碑 PR 前人工）。
+
+
+## M2 W2a（2026-09-23）
+
+- 三 agent 并行：`parity-otp`（OTP 库，625→修复接线后 625）、`parity-import`（617）、`parity-telnet`（611）。
+- 集成修复：ssh.rs 自动应答调用点对齐 `take_connection_totp_key(data_dir,…)`；main.rs 补齐 otp/* 七个协议方法（agent 超时中断在注册前）；clippy dead_code/复杂类型三处整理。
+- telnet 分支因 Cargo.lock 冲突 break 漏 merge，补并（无冲突）。
+- 全量：cargo **663** / vitest **792** / vue-tsc 0 / build 过（ui/ 含 Telnet 入口重生成）；Telnet 入口 e2e（确认对话框）验证。
+- 依赖评审：rqrr 0.9、image 0.25（png/jpeg/bmp/webp 裁剪）、zip 2、encoding_rs 0.8、sha3 0.10、cbc 0.9、aes 0.8、pbkdf2 0.12——均为 MIT/Apache 双许可主流 crate（以 docs.rs 为准），用途见 CHANGELOG；notify 0.6 由 W2b 引入，待其 PR 一并评审。
