@@ -3,8 +3,10 @@
 // quick（快捷路径）双 tab，可收起为窄条再展开；tab 与收缩状态由 App.vue 持久化
 // 到 localStorage。行右键统一上抛 node-context（打开 / 复制路径 / 复制文件名 /
 // 压缩），由 App.vue 弹菜单。
-import { ChevronsLeft, ChevronsRight, Folder, FolderTree, Home, RefreshCw, Star } from "@lucide/vue";
+import { computed, ref } from "vue";
+import { ChevronsLeft, ChevronsRight, Container, Folder, FolderTree, Home, RefreshCw, Star } from "@lucide/vue";
 import DirTree from "./DirTree.vue";
+import DockerPanel from "./DockerPanel.vue";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 import type { DirTreeNode } from "../lib/sftpDirTree";
 
@@ -15,7 +17,7 @@ export interface SftpSideQuickPath {
   home?: boolean;
 }
 
-defineProps<{
+const props = defineProps<{
   tab: "tree" | "quick";
   collapsed: boolean;
   treeRoot: DirTreeNode | null;
@@ -33,24 +35,40 @@ const emit = defineEmits<{
   (event: "node-context", payload: { path: string }): void;
 }>();
 
+// —— Docker 面板入口（Task P2-4 追加块）—————————————————————
+// docker tab 状态归本组件本地持有：App.vue 的 sftpSideTab 状态机与
+// localStorage 持久化仍是 tree/quick 二值，docker 激活时不上抛 update:tab，
+// 切回 tree/quick 时恢复上抛。DockerPanel 自行解析会话（ssh/sessions/list）。
+const dockerActive = ref(false);
+const tabValue = computed(() => (dockerActive.value ? "docker" : props.tab));
+
 function onTreeContext(payload: { node: DirTreeNode }) {
   emit("node-context", { path: payload.node.path });
 }
 
 function onTabChange(value: string | number) {
+  if (value === "docker") {
+    dockerActive.value = true;
+    return;
+  }
+  dockerActive.value = false;
   emit("update:tab", value as "tree" | "quick");
 }
 </script>
 
 <template>
   <div v-if="!collapsed" class="sftp-side-panel">
-    <Tabs :model-value="tab" class="sftp-side-tabs" @update:model-value="onTabChange">
+    <Tabs :model-value="tabValue" class="sftp-side-tabs" @update:model-value="onTabChange">
       <TabsList class="sftp-side-tab-list">
         <TabsTrigger value="tree" class="sftp-side-tab" :title="t('sftpSide.tree')">
           <FolderTree />
         </TabsTrigger>
         <TabsTrigger value="quick" class="sftp-side-tab" :title="t('sftpQuickPath.title')">
           <Star />
+        </TabsTrigger>
+        <!-- Docker 面板入口（Task P2-4 追加块） -->
+        <TabsTrigger value="docker" class="sftp-side-tab" :title="t('docker.title')">
+          <Container />
         </TabsTrigger>
       </TabsList>
       <span class="sftp-side-spacer" />
@@ -62,8 +80,10 @@ function onTabChange(value: string | number) {
       </button>
     </Tabs>
     <div class="sftp-side-body">
+      <!-- Docker 面板（Task P2-4 追加块）：激活时接管 body -->
+      <DockerPanel v-if="dockerActive" :t="t" />
       <DirTree
-        v-if="tab === 'tree' && treeRoot"
+        v-else-if="tab === 'tree' && treeRoot"
         :nodes="[treeRoot]"
         :depth="0"
         :current-path="currentPath"
