@@ -68,7 +68,8 @@ jobs:
       - name: Install native dependencies
         # libdbus-1-dev / nasm 已移除：secret-service（dbus）在 Linux 被 cfg
         # 门控掉（走 keyfile 层），nasm 只服务 aws-lc-sys 的 MSVC 预置对象路径。
-        run: sudo apt-get update && sudo apt-get install -y pkg-config
+        # libudev-dev：serialport 4 的 Linux 后端经 libudev-sys 枚举端口。
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -122,7 +123,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -205,7 +206,7 @@ jobs:
         # musl-tools 提供 musl-gcc（aws-lc-sys 在 musl target 下仍要编 C）。
         # libdbus-1-dev / nasm 已移除：Linux 不走 secret-service，nasm 仅服务
         # aws-lc-sys 的 MSVC 预置对象路径。
-        run: sudo apt-get update && sudo apt-get install -y pkg-config musl-tools
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev musl-tools
       - uses: pnpm/action-setup@v4
         with:
           version: 11.24.0
