@@ -3380,3 +3380,12 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 - telnet 分支因 Cargo.lock 冲突 break 漏 merge，补并（无冲突）。
 - 全量：cargo **663** / vitest **792** / vue-tsc 0 / build 过（ui/ 含 Telnet 入口重生成）；Telnet 入口 e2e（确认对话框）验证。
 - 依赖评审：rqrr 0.9、image 0.25（png/jpeg/bmp/webp 裁剪）、zip 2、encoding_rs 0.8、sha3 0.10、cbc 0.9、aes 0.8、pbkdf2 0.12——均为 MIT/Apache 双许可主流 crate（以 docs.rs 为准），用途见 CHANGELOG；notify 0.6 由 W2b 引入，待其 PR 一并评审。
+
+
+## M2 W2b 进度（cron 看护中，2026-09-23）
+
+- **docker（P2-4）✅ 完成**：agent 全栈交付（docker.rs 676 行 + MCP docker_list/docker_action + DockerPanel.vue + SideNavPanel tab），只读门/审计/Quick Sudo 回退全接入；`docker/list|logs|action` + 白名单 + id hex 门；"在终端打开"为剪贴板降级（App.vue 禁改约束），升级点记遗留。集成零冲突，ui/ 重生成。
+- watcher（P2-5/6）进行中：file_watch.rs 已落盘，notify 接入。
+- feel（P2-7/8/9）进行中：大输出保护 gate（b197767）、右键在线搜索（a1bd975）已 commit，背景图进行中。
+- panels（P2-1/2 前端）进行中。
+- W2b 全部合入后统一跑 e2e UI 审查与 push。
