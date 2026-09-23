@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use dbx_plugin_sdk::{PluginEmitter, PluginError};
+use dbx_plugin_sdk::{
+    host_client, PluginEmitter, PluginError, UserInputAnswer, UserInputOption, UserInputPrompt,
+    HOST_REQUEST_USER_INPUT_FEATURE, HOST_REQUEST_USER_INPUT_METHOD,
+};
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::agent::{client::AgentClient, AgentIdentity};
 use russh::keys::ssh_key::HashAlg;
@@ -282,15 +285,73 @@ const AGENT_APPROVAL_MAX_SECS: u64 = 300;
 /// clamped 10–300 by design for any future configurability).
 const MCP_CONFIRM_TIMEOUT_SECS: u64 = 120;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptDecision {
     pub accept: bool,
     pub remember: bool,
 }
 
-#[derive(Clone, Default)]
+/// Whether the attached DBX host advertised the Host API 1.1 user-input
+/// dialog. The host sends the dot form; the slash form appears in docs, so
+/// accept both when gating.
+fn host_supports_user_input() -> bool {
+    host_client()
+        .map(|client| {
+            client.supports(HOST_REQUEST_USER_INPUT_FEATURE)
+                || client.supports(HOST_REQUEST_USER_INPUT_METHOD)
+        })
+        .unwrap_or(false)
+}
+
+/// Seam between the broker and Host API 1.1; tests script it instead of a
+/// live host process.
+pub(crate) trait HostPromptGateway: Send + Sync {
+    fn supports_request_user_input(&self) -> bool;
+    fn request_user_input(&self, prompt: &UserInputPrompt) -> Result<UserInputAnswer, PluginError>;
+}
+
+struct SdkHostPromptGateway;
+
+impl HostPromptGateway for SdkHostPromptGateway {
+    fn supports_request_user_input(&self) -> bool {
+        host_supports_user_input()
+    }
+
+    fn request_user_input(&self, prompt: &UserInputPrompt) -> Result<UserInputAnswer, PluginError> {
+        match host_client() {
+            Some(client) => client.request_user_input(prompt),
+            None => Err(PluginError::new(
+                -32000,
+                "Host API is unavailable: the plugin server is not running",
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct PromptBroker {
     pending: Arc<AsyncMutex<HashMap<String, PendingPrompt>>>,
+    gateway: Arc<dyn HostPromptGateway>,
+    /// Set whenever a confirmation was raised, whichever channel served it;
+    /// `connection/test` reads it to make its timeout guidance truthful.
+    pub(super) challenge_raised: Arc<AtomicBool>,
+    /// Sticky mark that the Host API 1.1 dialog took (or is still taking)
+    /// this challenge: `connection/test` extends its mirrored dial budget
+    /// once while a dialog may still be open. Degradable failures clear it
+    /// again before the workbench fallback, so hosts without a working
+    /// dialog keep the short 1.0-style budget.
+    pub(super) host_dialog_used: Arc<AtomicBool>,
+}
+
+impl Default for PromptBroker {
+    fn default() -> Self {
+        Self {
+            pending: Arc::new(AsyncMutex::new(HashMap::new())),
+            gateway: Arc::new(SdkHostPromptGateway),
+            challenge_raised: Arc::new(AtomicBool::new(false)),
+            host_dialog_used: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 struct PendingPrompt {
@@ -299,7 +360,30 @@ struct PendingPrompt {
 }
 
 impl PromptBroker {
-    // 参数就是 host-key 挑战事件的载荷字段，一一对应而非可归组的耦合。
+    /// Test-only seam injection; production brokers use `Default`.
+    #[cfg(test)]
+    pub(crate) fn with_gateway(gateway: Arc<dyn HostPromptGateway>) -> Self {
+        Self {
+            gateway,
+            ..Self::default()
+        }
+    }
+
+    /// One clear entry for both sticky challenge marks so every new probe
+    /// starts from a clean slate.
+    pub(crate) fn clear_challenge_raised(&self) {
+        self.challenge_raised.store(false, Ordering::Relaxed);
+        self.host_dialog_used.store(false, Ordering::Relaxed);
+    }
+
+    pub(crate) fn challenge_was_raised(&self) -> bool {
+        self.challenge_raised.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn host_dialog_was_used(&self) -> bool {
+        self.host_dialog_used.load(Ordering::Relaxed)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
@@ -311,6 +395,146 @@ impl PromptBroker {
         operation_id: &str,
         emitter: &PluginEmitter,
     ) -> Option<PromptDecision> {
+        if self.gateway.supports_request_user_input() {
+            match self
+                .request_via_host(host, port, &key_type, &fingerprint)
+                .await
+            {
+                Ok(decision) => return decision,
+                // Host predates the dialog (-32601), rejects the parameters
+                // (-32602, e.g. an over-limit field) or no dialog surface is
+                // mounted (-32001 without the SDK's own timeout wording): the
+                // workbench event may still reach a UI.
+                Err(error) if Self::host_prompt_unavailable(&error) => {}
+                // Anything else — including the SDK's own -32001 "did not
+                // answer" timeout — must fail closed instead of stacking
+                // another 300s wait on top.
+                Err(_) => return None,
+            }
+        }
+        self.request_via_workbench(
+            host,
+            port,
+            key_type,
+            fingerprint,
+            connection_id,
+            operation_id,
+            emitter,
+        )
+        .await
+    }
+
+    /// The gateway call blocks until the user answers, so it runs on the
+    /// blocking pool: the dispatch worker stays free and the enclosing
+    /// `connection/test` budget can observe the wait and re-arm while the
+    /// dialog is open (the host pauses its own RPC deadline meanwhile).
+    async fn request_via_host(
+        &self,
+        host: &str,
+        port: u16,
+        key_type: &str,
+        fingerprint: &str,
+    ) -> Result<Option<PromptDecision>, PluginError> {
+        self.challenge_raised.store(true, Ordering::Relaxed);
+        // The host caps the title at 200 and the prompt at 2000 chars; a
+        // near-limit FQDN shrinks here instead of coming back as -32602
+        // (which would only fall back to the workbench event anyway).
+        let title: String = format!("SSH host key — {host}:{port}")
+            .chars()
+            .take(200)
+            .collect();
+        let prompt_text: String = format!(
+            "The authenticity of host {host}:{port} can't be established.\n\
+             Key type: {key_type}\n\
+             SHA-256 fingerprint: {fingerprint}\n\
+             Trust this host and continue connecting?"
+        )
+        .chars()
+        .take(2000)
+        .collect();
+        let prompt = UserInputPrompt::choice(
+            prompt_text,
+            vec![
+                UserInputOption {
+                    value: "accept".to_string(),
+                    label: "Trust once".to_string(),
+                },
+                UserInputOption {
+                    value: "remember".to_string(),
+                    label: "Trust and remember".to_string(),
+                },
+            ],
+        )
+        .with_title(title)
+        .with_timeout_secs(HOST_KEY_CHALLENGE_WAIT.as_secs());
+        // Mark before parking on the answer: `connection/test` re-arms its
+        // budget on this flag while the dialog is still open. A degradable
+        // failure clears it again below, so the workbench fallback keeps the
+        // short 1.0-style budget.
+        self.host_dialog_used.store(true, Ordering::Relaxed);
+        let gateway = Arc::clone(&self.gateway);
+        let answer =
+            match tokio::task::spawn_blocking(move || gateway.request_user_input(&prompt)).await {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(error)) => {
+                    if Self::host_prompt_unavailable(&error) {
+                        self.host_dialog_used.store(false, Ordering::Relaxed);
+                    }
+                    return Err(error);
+                }
+                // The blocking task died without an answer; fail closed like any
+                // other non-degradable gateway failure.
+                Err(error) => {
+                    return Err(PluginError::new(
+                        -32000,
+                        format!("host dialog task failed: {error}"),
+                    ));
+                }
+            };
+        Ok(Some(
+            match (answer.action.as_str(), answer.value.as_deref()) {
+                // Only an explicit accept/remember value grants trust; a missing
+                // or unknown value (and any non-submit action) is a rejection:
+                // never guess.
+                ("submit", Some("accept")) => PromptDecision {
+                    accept: true,
+                    remember: false,
+                },
+                ("submit", Some("remember")) => PromptDecision {
+                    accept: true,
+                    remember: true,
+                },
+                _ => PromptDecision {
+                    accept: false,
+                    remember: false,
+                },
+            },
+        ))
+    }
+
+    /// Errors that mean "no usable dialog surface" rather than "no answer":
+    /// the workbench event may still reach a human. -32601 unknown method
+    /// (host predates Host API 1.1), -32602 invalid params, and -32001 when
+    /// it is not the SDK's own "did not answer" timeout.
+    fn host_prompt_unavailable(error: &PluginError) -> bool {
+        error.code == -32601
+            || error.code == -32602
+            || (error.code == -32001 && !error.message.contains("did not answer"))
+    }
+
+    // 参数就是 host-key 挑战事件的载荷字段，一一对应而非可归组的耦合。
+    #[allow(clippy::too_many_arguments)]
+    async fn request_via_workbench(
+        &self,
+        host: &str,
+        port: u16,
+        key_type: String,
+        fingerprint: String,
+        connection_id: &str,
+        operation_id: &str,
+        emitter: &PluginEmitter,
+    ) -> Option<PromptDecision> {
+        self.challenge_raised.store(true, Ordering::Relaxed);
         let challenge_id = Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(
@@ -643,14 +867,45 @@ fn test_dial_budget_secs(connect_timeout_secs: u64, explicit: bool) -> u64 {
     deadline.saturating_sub(1).max(1)
 }
 
+/// Re-arm decision for the `connection/test` budget once it elapsed: a host
+/// dialog keeps the probe parked past the mirrored dial budget, so when the
+/// dialog path is serving the challenge the budget extends once by the
+/// challenge wait plus the connect timeout. Every other timeout (1.0 hosts,
+/// workbench fallback, already-extended window) returns `None` and keeps the
+/// readable error. Callers fold the already-extended state into
+/// `dialog_used` so the extension can only arm a single time.
+fn next_test_budget(connect_timeout_secs: u64, dialog_used: bool) -> Option<u64> {
+    dialog_used.then(|| {
+        HOST_KEY_CHALLENGE_WAIT
+            .as_secs()
+            .saturating_add(connect_timeout_secs)
+    })
+}
+
 /// Actionable `connection/test` timeout: the cryptic host RPC-timeout
 /// message gave no remedy; this names the effective budget (flagged as the
-/// host default when the field was absent) plus the user-side fix.
-fn test_timeout_message(host: &str, port: u16, budget_secs: u64, host_default: bool) -> String {
+/// host default when the field was absent) plus the user-side fix. When a
+/// host-key confirmation was raised during the probe, the challenge note is
+/// appended in addition to the timeout-setting remedy — and only when the
+/// dialog path did not serve the challenge, so the "update DBX" advice stays
+/// truthful for 1.0 hosts.
+fn test_timeout_message(
+    host: &str,
+    port: u16,
+    budget_secs: u64,
+    host_default: bool,
+    challenge_raised: bool,
+) -> String {
     let source = if host_default { " (host default)" } else { "" };
-    format!(
+    let mut message = format!(
         "SSH connection to {host}:{port} timed out after {budget_secs} seconds{source}. Increase 'SSH timeout' under Advanced options and retry."
-    )
+    );
+    if challenge_raised {
+        message.push_str(
+            " A host-key confirmation was raised but went unanswered; connect once from the SSH workbench to trust this host, or update DBX to 0.6.17+ so the confirmation can appear here.",
+        );
+    }
+    message
 }
 
 /// Key-exchange-only probe handler (tiny-rdm's CheckHostKey equivalent):
@@ -1676,6 +1931,7 @@ impl SshRuntime {
         operation_id: &str,
         emitter: PluginEmitter,
     ) -> Result<(), String> {
+        self.prompts.clear_challenge_raised();
         // 宿主对 connection/test 有 RPC 截止（有效连接超时），截止一到直接
         // 杀掉请求、用户只看到费解的宿主超时文案——sidecar 必须在截止前
         // 作答，因此拨号预算按宿主截止对齐并留 1s 余量。
@@ -1684,18 +1940,42 @@ impl SshRuntime {
             connection.connect_timeout_explicit,
         );
         let probe = self.connect_authenticated(connection, operation_id, Some(emitter));
-        let (handle, jumps) =
-            match tokio::time::timeout(Duration::from_secs(budget_secs), probe).await {
-                Ok(result) => result?,
+        tokio::pin!(probe);
+        let mut budget_secs = budget_secs;
+        let mut extended = false;
+        let connected = loop {
+            match tokio::time::timeout(Duration::from_secs(budget_secs), probe.as_mut()).await {
+                Ok(result) => break result,
                 Err(_elapsed) => {
-                    return Err(test_timeout_message(
-                        &connection.runtime_host,
-                        connection.runtime_port,
-                        budget_secs,
-                        !connection.connect_timeout_explicit,
-                    ));
+                    // 弹窗路径会把探针停在等待用户作答上:镜像拨号预算到期时
+                    // 若弹窗已接管本次挑战,以"挑战等待 + 连接超时"重臂一次;
+                    // 其余超时(1.0 宿主、工作台降级、扩展窗耗尽)保持现行可
+                    // 读超时文案,行为不变。
+                    let dialog_used = !extended && self.prompts.host_dialog_was_used();
+                    match next_test_budget(connection.connect_timeout_secs, dialog_used) {
+                        Some(next_budget) => {
+                            budget_secs = next_budget;
+                            extended = true;
+                        }
+                        None => {
+                            // 挑战指引只在挑战已发出且未走弹窗路径时附加:
+                            // "update DBX" 对 1.0 宿主是真的,对 1.1 弹窗路径
+                            // 会误导。
+                            let challenge_clause = self.prompts.challenge_was_raised()
+                                && !self.prompts.host_dialog_was_used();
+                            return Err(test_timeout_message(
+                                &connection.runtime_host,
+                                connection.runtime_port,
+                                budget_secs,
+                                !connection.connect_timeout_explicit,
+                                challenge_clause,
+                            ));
+                        }
+                    }
                 }
-            };
+            }
+        };
+        let (handle, jumps) = connected?;
         handle
             .disconnect(
                 Disconnect::ByApplication,
@@ -7412,6 +7692,25 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
     }
 
     #[test]
+    fn next_test_budget_extends_once_for_dialog_path() {
+        // Without a host dialog in play the probe keeps the current readable
+        // timeout error (1.0 hosts, workbench fallback, exhausted extension).
+        assert_eq!(next_test_budget(9, false), None);
+        assert_eq!(next_test_budget(29, false), None);
+        // Dialog in flight: one extension by the challenge wait plus the
+        // connect timeout.
+        assert_eq!(
+            next_test_budget(9, true),
+            Some(HOST_KEY_CHALLENGE_WAIT.as_secs() + 9)
+        );
+        // A zero stored connect timeout must not shrink the window.
+        assert_eq!(
+            next_test_budget(0, true),
+            Some(HOST_KEY_CHALLENGE_WAIT.as_secs())
+        );
+    }
+
+    #[test]
     fn classify_entry_kind_maps_wire_types() {
         // Directories stay directories; only `kind === "directory"` renders a
         // folder icon in the UI.
@@ -7425,12 +7724,12 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
 
     #[test]
     fn test_timeout_message_names_budget_source_and_remedy() {
-        let explicit = test_timeout_message("dbx-ssh-test", 22, 29, false);
+        let explicit = test_timeout_message("dbx-ssh-test", 22, 29, false, false);
         assert_eq!(
             explicit,
             "SSH connection to dbx-ssh-test:22 timed out after 29 seconds. Increase 'SSH timeout' under Advanced options and retry."
         );
-        let fallback = test_timeout_message("dbx-ssh-test", 22, 9, true);
+        let fallback = test_timeout_message("dbx-ssh-test", 22, 9, true, false);
         assert!(
             fallback.contains("timed out after 9 seconds (host default)"),
             "{fallback}"
@@ -7439,6 +7738,17 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
             fallback.contains("Increase 'SSH timeout' under Advanced options"),
             "{fallback}"
         );
+    }
+
+    #[test]
+    fn test_timeout_message_names_pending_host_key_confirmation() {
+        let base = test_timeout_message("h", 22, 9, true, false);
+        assert!(base.contains("timed out after 9 seconds (host default)"));
+        assert!(base.contains("Increase 'SSH timeout'"));
+
+        let with_challenge = test_timeout_message("h", 22, 9, false, true);
+        assert!(with_challenge.contains("host-key confirmation"));
+        assert!(!with_challenge.contains("(host default)"));
     }
 
     #[test]
@@ -9411,6 +9721,433 @@ matrix-ed25519";
                 ..Default::default()
             };
             assert!(preserved_target_permissions(&target).is_none());
+        }
+    }
+
+    mod host_key_prompt {
+        use super::*;
+        use dbx_plugin_sdk::{PluginTransport, UserInputAnswer, UserInputPrompt};
+        use std::sync::atomic::Ordering;
+
+        struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn events(sink: &Arc<Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
+            String::from_utf8(sink.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        }
+
+        fn emitter_for_test() -> (PluginEmitter, Arc<Mutex<Vec<u8>>>) {
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            (
+                dbx_plugin_sdk::PluginEmitter::for_tests(
+                    Arc::new(Mutex::new(Box::new(SharedSink(sink.clone())))),
+                    PluginTransport::JsonLines,
+                ),
+                sink,
+            )
+        }
+
+        struct ScriptedGateway {
+            supports: bool,
+            answer: Mutex<Result<UserInputAnswer, PluginError>>,
+            prompts_seen: Mutex<Vec<serde_json::Value>>,
+        }
+
+        impl ScriptedGateway {
+            fn supports() -> Self {
+                Self {
+                    supports: true,
+                    answer: Mutex::new(Ok(UserInputAnswer {
+                        action: "submit".into(),
+                        value: Some("remember".into()),
+                    })),
+                    prompts_seen: Mutex::new(Vec::new()),
+                }
+            }
+            fn without_feature() -> Self {
+                Self {
+                    supports: false,
+                    answer: Mutex::new(Ok(UserInputAnswer {
+                        action: "submit".into(),
+                        value: None,
+                    })),
+                    prompts_seen: Mutex::new(Vec::new()),
+                }
+            }
+            fn answering(answer: Result<UserInputAnswer, PluginError>) -> Self {
+                Self {
+                    supports: true,
+                    answer: Mutex::new(answer),
+                    prompts_seen: Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        impl HostPromptGateway for ScriptedGateway {
+            fn supports_request_user_input(&self) -> bool {
+                self.supports
+            }
+            fn request_user_input(
+                &self,
+                prompt: &UserInputPrompt,
+            ) -> Result<UserInputAnswer, PluginError> {
+                self.prompts_seen
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(prompt).unwrap());
+                self.answer.lock().unwrap().clone()
+            }
+        }
+
+        const HOST: &str = "server.example.com";
+        const FINGERPRINT: &str = "SHA256:abcdefgh";
+
+        async fn challenge_via(
+            broker: &PromptBroker,
+            emitter: &PluginEmitter,
+        ) -> Option<PromptDecision> {
+            broker
+                .request(
+                    HOST,
+                    22,
+                    "ssh-ed25519".into(),
+                    FINGERPRINT.into(),
+                    "conn-1",
+                    "op-1",
+                    emitter,
+                )
+                .await
+        }
+
+        #[tokio::test]
+        async fn host_dialog_submit_remember_maps_to_accept_and_remember() {
+            let gateway = Arc::new(ScriptedGateway::supports());
+            let broker = PromptBroker::with_gateway(gateway.clone());
+            let (emitter, sink) = emitter_for_test();
+
+            let decision = challenge_via(&broker, &emitter).await;
+
+            assert_eq!(
+                decision,
+                Some(PromptDecision {
+                    accept: true,
+                    remember: true
+                })
+            );
+            assert!(events(&sink)
+                .iter()
+                .all(|event| event["method"] != "connection/challenge"));
+            let prompt = gateway.prompts_seen.lock().unwrap()[0].clone();
+            assert_eq!(prompt["options"][0]["value"], "accept");
+            assert_eq!(prompt["options"][1]["value"], "remember");
+            assert!(prompt["prompt"].as_str().unwrap().contains(FINGERPRINT));
+            assert!(broker.challenge_was_raised());
+            // The dialog took the challenge: connection/test may extend its
+            // budget for exactly this probe.
+            assert!(broker.host_dialog_was_used());
+        }
+
+        #[tokio::test]
+        async fn host_dialog_accept_maps_to_accept_without_remember() {
+            let gateway = Arc::new(ScriptedGateway::answering(Ok(UserInputAnswer {
+                action: "submit".into(),
+                value: Some("accept".into()),
+            })));
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, _sink) = emitter_for_test();
+            assert_eq!(
+                challenge_via(&broker, &emitter).await,
+                Some(PromptDecision {
+                    accept: true,
+                    remember: false
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn host_dialog_cancel_and_timeout_reject_fail_closed() {
+            for action in ["cancel", "timeout"] {
+                let gateway = Arc::new(ScriptedGateway::answering(Ok(UserInputAnswer {
+                    action: action.into(),
+                    value: None,
+                })));
+                let broker = PromptBroker::with_gateway(gateway);
+                let (emitter, sink) = emitter_for_test();
+                assert_eq!(
+                    challenge_via(&broker, &emitter).await,
+                    Some(PromptDecision {
+                        accept: false,
+                        remember: false
+                    })
+                );
+                assert!(events(&sink)
+                    .iter()
+                    .all(|event| event["method"] != "connection/challenge"));
+            }
+        }
+
+        #[tokio::test]
+        async fn host_without_feature_falls_back_to_workbench_event() {
+            let gateway = Arc::new(ScriptedGateway::without_feature());
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, sink) = emitter_for_test();
+
+            let pending = tokio::spawn({
+                let broker = broker.clone();
+                let emitter = emitter.clone();
+                async move {
+                    broker
+                        .request(
+                            HOST,
+                            22,
+                            "ssh-ed25519".into(),
+                            FINGERPRINT.into(),
+                            "conn-1",
+                            "op-1",
+                            &emitter,
+                        )
+                        .await
+                }
+            });
+            // 降级路径必须发出既有事件载荷(workbench 依赖 challengeId/kind 字段)。
+            let mut challenge_id = None;
+            for _ in 0..200 {
+                if let Some(event) = events(&sink)
+                    .into_iter()
+                    .find(|event| event["method"] == "connection/challenge")
+                {
+                    challenge_id =
+                        Some(event["params"]["challengeId"].as_str().unwrap().to_string());
+                    assert_eq!(event["params"]["kind"], "host-key");
+                    assert_eq!(event["params"]["fingerprint"], FINGERPRINT);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let challenge_id = challenge_id.expect("legacy challenge event must be emitted");
+            broker
+                .resolve(
+                    &challenge_id,
+                    "op-1",
+                    PromptDecision {
+                        accept: true,
+                        remember: true,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pending.await.unwrap(),
+                Some(PromptDecision {
+                    accept: true,
+                    remember: true
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn no_ui_error_falls_back_to_workbench_event() {
+            let gateway = Arc::new(ScriptedGateway::answering(Err(PluginError::new(
+                -32001,
+                "no user interface is attached",
+            ))));
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, sink) = emitter_for_test();
+            let pending = tokio::spawn({
+                let broker = broker.clone();
+                let emitter = emitter.clone();
+                async move {
+                    broker
+                        .request(
+                            HOST,
+                            22,
+                            "ssh-ed25519".into(),
+                            FINGERPRINT.into(),
+                            "conn-1",
+                            "op-1",
+                            &emitter,
+                        )
+                        .await
+                }
+            });
+            let mut challenge_id = None;
+            for _ in 0..200 {
+                if let Some(event) = events(&sink)
+                    .into_iter()
+                    .find(|event| event["method"] == "connection/challenge")
+                {
+                    challenge_id =
+                        Some(event["params"]["challengeId"].as_str().unwrap().to_string());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            broker
+                .resolve(
+                    &challenge_id.expect("fallback event"),
+                    "op-1",
+                    PromptDecision {
+                        accept: false,
+                        remember: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pending.await.unwrap(),
+                Some(PromptDecision {
+                    accept: false,
+                    remember: false
+                })
+            );
+            // A degradable failure fell back to the workbench event: the
+            // dialog must not keep the extended test budget armed.
+            assert!(!broker.host_dialog_was_used());
+        }
+
+        #[tokio::test]
+        async fn host_dialog_marks_used_and_degraded_fallback_does_not() {
+            // 粘性标志的语义:弹窗真正接管挑战时置位(connection/test 据此重臂
+            // 预算);可降级错误回落 legacy 前必须清零,1.0 宿主保持短预算。
+            let gateway = Arc::new(ScriptedGateway::answering(Err(PluginError::new(
+                -32601,
+                "method not found",
+            ))));
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, sink) = emitter_for_test();
+            let pending = tokio::spawn({
+                let broker = broker.clone();
+                let emitter = emitter.clone();
+                async move {
+                    broker
+                        .request(
+                            HOST,
+                            22,
+                            "ssh-ed25519".into(),
+                            FINGERPRINT.into(),
+                            "conn-1",
+                            "op-1",
+                            &emitter,
+                        )
+                        .await
+                }
+            });
+            let mut challenge_id = None;
+            for _ in 0..200 {
+                if let Some(event) = events(&sink)
+                    .into_iter()
+                    .find(|event| event["method"] == "connection/challenge")
+                {
+                    challenge_id =
+                        Some(event["params"]["challengeId"].as_str().unwrap().to_string());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // Once the legacy event is out, the dialog flag must already be
+            // cleared again.
+            assert!(!broker.host_dialog_was_used());
+            broker
+                .resolve(
+                    &challenge_id.expect("fallback event"),
+                    "op-1",
+                    PromptDecision {
+                        accept: true,
+                        remember: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pending.await.unwrap(),
+                Some(PromptDecision {
+                    accept: true,
+                    remember: false
+                })
+            );
+            assert!(!broker.host_dialog_was_used());
+        }
+
+        #[tokio::test]
+        async fn host_silence_fails_closed_without_fallback() {
+            // SDK 本地超时的错误以 -32001 + "did not answer" 表达;此时再降级会
+            // 把总等待拖到 630s,必须直接拒绝。
+            let gateway = Arc::new(ScriptedGateway::answering(Err(PluginError::new(
+                -32001,
+                "Host did not answer 'host/requestUserInput' in time",
+            ))));
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, sink) = emitter_for_test();
+            assert_eq!(challenge_via(&broker, &emitter).await, None);
+            assert!(events(&sink)
+                .iter()
+                .all(|event| event["method"] != "connection/challenge"));
+        }
+
+        #[tokio::test]
+        async fn host_dialog_submit_without_known_value_rejects_fail_closed() {
+            // Only an explicit accept/remember value grants trust: a missing
+            // or unknown value (host sent action=submit with nothing usable)
+            // must be a rejection, never a guess.
+            for value in [None, Some("maybe".to_string())] {
+                let gateway = Arc::new(ScriptedGateway::answering(Ok(UserInputAnswer {
+                    action: "submit".into(),
+                    value,
+                })));
+                let broker = PromptBroker::with_gateway(gateway);
+                let (emitter, sink) = emitter_for_test();
+                assert_eq!(
+                    challenge_via(&broker, &emitter).await,
+                    Some(PromptDecision {
+                        accept: false,
+                        remember: false
+                    })
+                );
+                assert!(events(&sink)
+                    .iter()
+                    .all(|event| event["method"] != "connection/challenge"));
+            }
+        }
+
+        #[tokio::test]
+        async fn challenge_raised_flag_clears_between_probes() {
+            let gateway = Arc::new(ScriptedGateway::supports());
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, _sink) = emitter_for_test();
+            broker.challenge_raised.store(true, Ordering::Relaxed);
+            broker.clear_challenge_raised();
+            let _ = challenge_via(&broker, &emitter).await;
+            assert!(broker.challenge_was_raised());
+            assert!(broker.host_dialog_was_used());
+            broker.clear_challenge_raised();
+            // One clear entry resets both sticky challenge marks so the next
+            // probe starts from a clean slate.
+            assert!(!broker.challenge_was_raised());
+            assert!(!broker.host_dialog_was_used());
+        }
+
+        #[test]
+        fn challenge_flag_clears_between_probes() {
+            let gateway = Arc::new(ScriptedGateway::without_feature());
+            let broker = PromptBroker::with_gateway(gateway);
+            broker
+                .challenge_raised
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            broker.clear_challenge_raised();
+            assert!(!broker.challenge_was_raised());
         }
     }
 }
