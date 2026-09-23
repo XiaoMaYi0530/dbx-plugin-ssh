@@ -488,10 +488,9 @@ pub(crate) async fn bridge_channel(
             .await
             .map_err(&connect_error)?;
         let mut stream = channel.into_stream();
-        let (up, down) =
-            tokio::io::copy_bidirectional(&mut stream, &mut { local })
-                .await
-                .map_err(|error| format!("X11: bridge error: {error}"))?;
+        let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut { local })
+            .await
+            .map_err(|error| format!("X11: bridge error: {error}"))?;
         tracing_bridge_stats(up, down);
         return Ok(());
     }
