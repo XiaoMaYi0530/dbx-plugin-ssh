@@ -3406,7 +3406,7 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 
 ### M3 遗留清单（需人工决策或后续轮次）
 
-1. watcher/symlink 的**前端接线未做**（watcher agent 超时，仅 backend 落地）：SFTP 右键"在外部编辑器打开"+ `watch/file-modified` 确认上传 + `sftp/symlink-*` 对话框——待 np3 轮。
+1. **watcher/symlink 全栈 ✅ 完成（M3 轮，739301e）**：watcher agent 实际完成了全部五段增量——自死锁修复（dedup guard 跨 await 取写锁，agent 独立定位）、symlink 三命令（russh-sftp 原生 symlink/readlink，**wire 序 (linkpath,targetpath) 与 OpenSSH (target,linkpath) 反转已在对齐处交换参数**）、`watch/upload` 回传通道（remote-edit 路径读字节 → ensure_writable → 64MiB 上限 → .dbx-part 原子提交）、前端全量接线（右键"在外部编辑器打开"、file-modified 三选确认、symlink 对话框、tooltip）。遗留：单文件 MVP（多文件并行编辑需排队扩展）、FSEvents/inotify 真机联调、外部编辑器全链路真机手测。
 2. X11 转发 spike ✅ 完成（docs/SPIKE_X11_FORWARDING.zh-CN.md）：russh 0.62 三能力全部可行（request_x11 公开 API / server_channel_open_x11 回调需显式 gate / direct-tcpip 兜底受 X server 监听限制），推荐路线 channel_open_session→request_x11→回调校验→DISPLAY 桥接，估算 4.5-6.5 人日——**建议进 M4，排核心 parity 之后**（人工排期决策项）。
 3. 串口（serialport 依赖评审）、VNC（vnc 引擎选型+帧通道压测）——依赖评审通过后派发。
 4. RDP：vendored fork 链维护计划 + CredSSP 安全评审清单——人工评审门，未派发。
