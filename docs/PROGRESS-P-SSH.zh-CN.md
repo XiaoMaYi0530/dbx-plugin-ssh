@@ -3395,3 +3395,20 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 
 - **panels（P2-1/2 前端）✅ 完成**：OtpPanel（验证码倒计时/扫码导入/绑定管理/发送到终端）+ ImportWizard（三步向导/脱敏预览/主密码处理），827→852 前端全绿。SideNavPanel 冲突为机制性（docker 与 panels 各建额外 tab 状态机）——融合为统一 extraTab（"otp"|"import"|"docker"），App.vue 持久化契约不变。已集成（2e3b018）。
 - W2b 仅剩 watcher（P2-5/6）进行中；合入后 e2e UI 审查收口 M2。
+
+
+## M2 收口（2026-09-24）
+
+- **W2b 全部合入**：docker（6cccd71）/ watcher backend（7b3cdde）/ panels（2e3b018）/ feel（bf91fb5）。
+- **集成修复**：watcher 测试 helper 共享本地文件导致 dedup 互顶（多文件变体修复）；`fingerprint_detects_content_change` 同毫秒同长度写入误判 Same（fixture 改长度差异）；SideNavPanel 机制性冲突统一为 extraTab（"otp"|"import"|"docker"），App.vue 持久化契约不变；watcher main.rs 冲突两侧保留（telnet+watcher runtime 共存）。
+- **e2e UI**：Docker/OTP/Import 三面板截图（五 tab 导航、空态、三步向导、来源卡、本地存储注记），visual-judge **3/3 pass 可交付**。
+- **全量**：backend cargo **690** / clippy 0 / fmt 干净；frontend vitest **852** / vue-tsc 0 / build 过（ui/ 重生成）。
+
+### M3 遗留清单（需人工决策或后续轮次）
+
+1. watcher/symlink 的**前端接线未做**（watcher agent 超时，仅 backend 落地）：SFTP 右键"在外部编辑器打开"+ `watch/file-modified` 确认上传 + `sftp/symlink-*` 对话框——待 np3 轮。
+2. X11 转发 spike（russh 0.62 x11 API 验证）——待 np3 轮。
+3. 串口（serialport 依赖评审）、VNC（vnc 引擎选型+帧通道压测）——依赖评审通过后派发。
+4. RDP：vendored fork 链维护计划 + CredSSP 安全评审清单——人工评审门，未派发。
+5. 真机验收：GPU/NPU（nvidia-smi/npu-smi 主机）、Docker 主机、Windows ConPTY gutter、DBX 桌面端到端——人工项。
+6. Docker 面板"在终端打开"升级为事件直填输入行（需 App.vue 通道开放）。

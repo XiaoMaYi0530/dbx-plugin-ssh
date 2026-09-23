@@ -512,9 +512,11 @@ mod tests {
     fn fingerprint_detects_content_change() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("watched.txt");
+        // 两次写入刻意用不同长度：同毫秒内完成时 mtime 短路无法区分，
+        // 长度差异保证 classify_change 判定稳定（不依赖文件系统时间精度）。
         write_file(&path, b"before");
         let baseline = file_fingerprint(&path).expect("fingerprint");
-        write_file(&path, b"after!");
+        write_file(&path, b"after!!");
         let current = file_fingerprint(&path).expect("fingerprint");
         assert_eq!(
             classify_change(&Some(baseline), &Some(current)),
@@ -576,7 +578,28 @@ mod tests {
         remote_path: &str,
         publisher: &Arc<CollectingPublisher>,
     ) -> String {
-        let path = dir.path().join("watched.txt");
+        start_watch_file(
+            runtime,
+            dir,
+            session_id,
+            remote_path,
+            "watched.txt",
+            publisher,
+        )
+        .await
+    }
+
+    /// 多文件变体：dedup key 含 local path，同一 session 的不同文件各自持有一个
+    /// watcher——测试需要不同的本地文件名来构造这种场景。
+    async fn start_watch_file(
+        runtime: &WatchRuntime,
+        dir: &tempfile::TempDir,
+        session_id: &str,
+        remote_path: &str,
+        file_name: &str,
+        publisher: &Arc<CollectingPublisher>,
+    ) -> String {
+        let path = dir.path().join(file_name);
         write_file(&path, b"start");
         let response = runtime
             .start(
@@ -618,7 +641,15 @@ mod tests {
         assert!(runtime.stop(&watch_id).await.is_err(), "double stop errors");
 
         let _a = start_watch(&runtime, &dir, "sess-1", "/remote/a.txt", &publisher).await;
-        let _b = start_watch(&runtime, &dir, "sess-1", "/remote/b.txt", &publisher).await;
+        let _b = start_watch_file(
+            &runtime,
+            &dir,
+            "sess-1",
+            "/remote/b.txt",
+            "watched-b.txt",
+            &publisher,
+        )
+        .await;
         let _c = start_watch(&runtime, &dir, "sess-2", "/remote/a.txt", &publisher).await;
         assert_eq!(runtime.stop_session("sess-1").await, 2);
         assert_eq!(runtime.live_count().await, 1, "other sessions survive");

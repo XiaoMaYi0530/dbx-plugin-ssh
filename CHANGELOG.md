@@ -6,6 +6,23 @@ This file records user-facing changes for DBX SSH Terminal. Unless noted otherwi
 
 ## [Unreleased]
 
+### 新增 / Added（M2 W2b）
+
+- **Docker 管理面板**：`docker/list|logs|action`（白名单 start/stop/restart/kill/rm + 容器 ID hex 门 + 只读连接拒绝 + 审计日志前后落笔）；sudo 回退走 Quick Sudo 管线（密码只走 stdin）；MCP 新增 `docker_list`（只读）与 `docker_action`（destructive 提示）；侧栏面板含 10s 轮询（3 连败停轮询）、日志抽屉、rm/kill 确认框、"在终端打开"剪贴板降级。
+  **Docker management panel:** allow-listed container actions with hex-id gate, read-only refusal and audit trail; sudo fallback via the Quick Sudo pipeline; MCP tools; side panel with polling, log drawer and destructive-action confirms.
+- **watcher 文件自动回传（桌面端）**：`watch/start|stop|stop-all`（notify 非递归 + 会话去重表 + 500ms 去抖 + 启动 2s 抑制窗），len/mtime/SHA256 三元指纹确认内容真变才广播 `watch/file-modified`；会话关闭自动回收。
+  **File watcher (desktop):** notify-based non-recursive watches with session dedup, 500ms debounce, 2s suppression window and len/mtime/SHA256 fingerprints — `watch/file-modified` only fires on real content changes.
+- **OTP 面板**：条目列表 + TOTP 倒计时环形（reused 提示）、HOTP 生成（counter+1 持久化）、扫码导入（图片 base64 → `otp/import-qr` 预填）、新增/编辑（secret 遮蔽，编辑留空保留旧密钥）、连接绑定、发送验证码到终端。
+  **OTP panel:** entry list with countdown, HOTP generation, QR import, masked editing, connection bindings and send-to-terminal.
+- **导入向导**：三步流程（来源 → 文件+主密码 → 脱敏预览勾选入库），WindTerm 主密码缺失的可读提示，"保存在插件本机，不进 DBX 连接库"注记。
+  **Import wizard:** three-step flow with masked preview, readable WindTerm master-password prompt and a local-storage notice.
+- **终端大输出保护**：写入积压 ≥128KiB 进入 strained（32KiB 分帧、挂起 gutter/高亮扫描），<64KiB 恢复；七语提示。
+  **Large-output protection:** write backlog ≥128KiB strains the terminal (32KiB framing, gutter/highlight scans suspended) until <64KiB; localized notice.
+- **终端右键菜单 + 选中文本在线搜索**：Copy/Paste/搜索引擎列表（可配 `ctx_search_engines`，%s 模板）；宿主 openExternal 缺失时降级复制链接。
+  **Terminal context menu + online search:** copy/paste and configurable search engines (`ctx_search_engines`); falls back to copying the link until the host ships openExternal.
+- **背景图**：`local/wallpaper/get|set|clear`（≤8MiB，png/jpeg/webp 魔数校验，tmp+rename 原子写）；Appearance 设置开关 + 透明度滑杆；开启时挂起 WebGL 回退 DOM 渲染。
+  **Wallpaper:** validated get/set/clear protocol, Appearance toggle with opacity slider; enabling suspends WebGL in favour of DOM rendering.
+
 ### 新增 / Added（M2 W2a）
 
 - **OTP 中心化库**：TOTP/HOTP 算法（RFC 4226/6238 向量单测）、`otpauth://` 解析、二维码扫码导入（`rqrr`+`image`，新依赖）、条目库（secret 经 vault 加密落盘）、连接绑定、跨路径共享的 TOTP 防重放缓存；登录/sudo 自动应答取码新增「绑定条目」来源（连接 `totp_secret` 优先级不变）。MCP 无新增工具（`otp/*` 为 workbench 内部协议）。
