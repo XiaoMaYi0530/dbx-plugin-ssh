@@ -170,6 +170,10 @@ impl Clock for SystemClock {
 pub struct Tunables {
     pub debounce: Duration,
     pub suppress: Duration,
+    /// `Some(true)` short-circuits the desktop probe (`local_downloads::can_save_local`)
+    /// so the watcher suite runs on CI runners without desktop download dirs;
+    /// `None` keeps the production env probe.
+    pub desktop_gate_override: Option<bool>,
 }
 
 impl Tunables {
@@ -177,6 +181,7 @@ impl Tunables {
         Self {
             debounce: DEBOUNCE,
             suppress: SUPPRESS_WINDOW,
+            desktop_gate_override: None,
         }
     }
 }
@@ -235,7 +240,11 @@ impl WatchRuntime {
         publisher: Arc<dyn EventPublisher>,
         probe: SessionProbe,
     ) -> Result<Value, String> {
-        if !crate::local_downloads::can_save_local(|key| std::env::var_os(key)) {
+        let desktop_ok = self
+            .tunables
+            .desktop_gate_override
+            .unwrap_or_else(|| crate::local_downloads::can_save_local(|key| std::env::var_os(key)));
+        if !desktop_ok {
             return Err(
                 "File watching is only available on desktop — open the file from a local download instead"
                     .to_string(),
@@ -627,6 +636,7 @@ mod tests {
         Tunables {
             debounce: Duration::from_millis(20),
             suppress: Duration::from_millis(10),
+            desktop_gate_override: Some(true),
         }
     }
 
