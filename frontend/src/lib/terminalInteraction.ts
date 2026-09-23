@@ -1,9 +1,12 @@
 /**
  * Terminal interaction preferences (select-to-copy / right-click-to-paste).
  * The toggle is a pure-frontend behavior (no sidecar involvement), so it
- * persists in localStorage; "false" disables it, every other value (including
- * a missing entry) keeps the historical default of enabled.
+ * persists via pluginStore (host host.storage → guarded localStorage →
+ * memory); "false" disables it, every other value (including a missing
+ * entry) keeps the historical default of enabled.
  */
+
+import { pluginStore } from "./pluginStore";
 
 export type TerminalRightClickAction = "paste" | "menu";
 
@@ -82,9 +85,9 @@ export function sanitizeSearchOptions(raw: string | null): TerminalSearchOptions
 
 export function persistSearchOptions(options: TerminalSearchOptions): void {
   try {
-    window.localStorage.setItem(TERMINAL_SEARCH_OPTIONS_KEY, JSON.stringify(options));
+    pluginStore.setItem(TERMINAL_SEARCH_OPTIONS_KEY, JSON.stringify(options));
   } catch {
-    // localStorage unavailable: the toggles stay session-scoped.
+    // Store unavailable: the toggles stay session-scoped.
   }
 }
 

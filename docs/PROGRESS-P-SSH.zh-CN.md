@@ -3323,3 +3323,61 @@ OpenSSH 服务端未验证）；`-D`/映射持久化（跨会话记忆表单）�
 - **验证**：sidecar 单测 13 例、vitest 524 例全绿；容器 smoke 新增冲突
   （重复 + 通配）与探测（回环存在）用例全过；浏览器 fixture 验收非法主
   机提示/冲突提示/网卡选取回填三交互。
+
+### 前端持久化迁移 host.storage（2026-09-24）
+
+- **背景**：工作台 iframe 是 sandbox="allow-scripts"（opaque origin），
+  localStorage 访问即抛 SecurityError——所有前端 UI 偏好键在真机上全部
+  静默失效（偏好只活到当前会话结束）。宿主 Host API 1.2 起提供
+  window.dbxPlugin.storage（get/set/delete，能力位 capabilities.storage，
+  manifest 需声明 host.storage 权限），桌面端落 plugin-data/<id>/
+  ui-storage.json。迁移走 shared/frontend/pluginStorage 适配器（与 files
+  插件同一公共层），通道降级：宿主桥 storage → guarded localStorage
+  （web 直连/dev/老宿主）→ 内存（仅当前会话）；读全部同步（启动水合 +
+  写穿缓存），调用点保持 getItem/setItem/removeItem 语义，零 async 改造；
+  宿主档水合时对 localStorage 旧值做一次性惰性搬家。
+- **改动**：新增 `frontend/src/lib/pluginStore.ts`（键集合声明 + store
+  单例）；App.vue 全部迁键调用点 `window.localStorage.*` →
+  `pluginStore.*`（键名不变）；`lib/terminalWebgl.ts`/`lib/terminalFont.ts`
+  的 `defaultStorage()` 与 `lib/terminalInteraction.ts` 的
+  `persistSearchOptions` 默认存储改走 pluginStore（显式注入 storage 仍为
+  测试口）；`main.ts` 挂载前 `await pluginStore.ready`；`env.d.ts` 内联
+  capabilities/storage 声明；mockDbxHost 补 storage mock + 
+  capabilities.storage（镜像真实桥：get 未命中 null、set(undefined)→null、
+  内存 Map），`?render=dom` 的 webgl 种子改写 pluginStore 实例（直写
+  localStorage 会被水合时序吃掉）；manifest permissions 增加
+  "host.storage"（版本号未动）。
+- **迁移键清单**（12 个，进 pluginStore）：`sftp-path-history`、
+  `ssh-command-history`、`ssh-sftp-pane-open`、`ssh-sftp-side-tab`、
+  `ssh-sftp-side-collapsed`、`ssh-terminal-select-copy`、
+  `ssh-keyword-highlight`、`ssh-batch-bar-open`、
+  `ssh-terminal-search-options`、`ssh-terminal-webgl`、
+  `ssh-terminal-font-size`、`ssh-terminal-font-family`。
+- **不迁键清单**（保持直读 localStorage 原样）：
+  - `ssh-download-directory` / `ssh-download-use-default-dir` /
+    `ssh-download-conflict-policy`：权威在 sidecar preferences.json
+    （`local/preferences/*`），localStorage 仅作 web 浏览器直连场景的
+    同步缓存（App.vue cachePrefs/hydratePrefs），迁走反而出现双权威。
+  - `ssh-quick-commands`：已迁 sidecar 全局存储，localStorage 旧键仅作
+    一次性迁移种子（loadQuickCommands/hydrateQuickCommands），残留键
+    保持原样不动（web 缓存/死键语义不变）。
+- **spec 修复**：TerminalSearchPanel.spec.ts 的播种/断言从全局
+  localStorage 改走 pluginStore 实例（happy-dom 下 store 模块导入时即
+  完成水合，之后直改 localStorage 读不到缓存值）；新增
+  `lib/pluginStorage.spec.ts` 薄 spec（锁定迁键清单 + 排除 sidecar 类
+  键、node 环境 channel==="memory"、注入桥水合/写穿回路）。
+- **验证**：`vue-tsc --noEmit` 0 错；`vitest run` 65 文件 569 用例全绿。
+- **回归面提示**：真机（DBX 桌面宿主 opaque origin）需复验偏好读写——
+  首装迁移（localStorage 旧值搬家）、面板/侧栏/字体/WebGL/高亮/命令条
+  开关跨重启保持、web 直连与 dev fixture（?render=dom、mock=1 形态）
+  行为不回归；老宿主（Host API < 1.2）自动降级 guarded localStorage，
+  行为等同迁移前。
+
+- **mock 兜底语义修正（收尾统一改动）**：storage mock 初版为纯内存 Map，
+  页面刷新即丢，背离真实宿主（web 宿主由顶层 localStorage 兜底、桌面端落
+  `plugin-data/<id>/ui-storage.json`）——ldap ui_test walkthrough 的
+  「expanding the compact bar … persists」用例即因此失败（用例 109 行裸
+  localStorage 断言，且 walkthrough 共用 page 导致后续 builder 用例连坐，
+  一度 30/35）。统一改为 localStorage 兜底（键名不变；字符串值原样、对象
+  JSON 编码；opaque origin 不可用时退化内存），dev/`?mock=1` 恢复刷新持久化，
+  walkthrough 断言无需改动；修正后 本插件 vitest 65 文件 569 用例复验全绿（?render=dom 的 webgl 种子走 pluginStore 语义不变）。
