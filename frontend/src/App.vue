@@ -133,7 +133,7 @@ import {
 } from "./lib/sftpBookmarks";
 import { browseCommandHistory, commandInputAction, isPersistableCommand, pushCommandHistory, sanitizeCommandHistory } from "./lib/commandHistory";
 import { filterQuickCommands, normalizeQuickCommands, QUICK_COMMANDS_LIMIT, quickCommandText, type QuickCommand } from "./lib/quickCommands";
-import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
+import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, normalizeLocalBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
 import { readPluginMode, readPluginShell, resolveWorkbenchId } from "./lib/pluginContext";
 import { clampFontSize } from "./lib/terminalZoom";
@@ -665,6 +665,14 @@ const batchDraft = ref("");
 const batchError = ref("");
 const batchSummary = ref<BatchSendSummary>();
 const batchQuickPickId = ref("");
+// hostContext 由 initialize() 异步填充，panelSurface 在 setup 时还是 false——
+// 初始门控永远打不中（这就是"批量命令条关不掉"的根因）。改为响应式强制：
+// panel 成立即收批量条、关 SFTP 窗格（无窗格即无目录列表/SFTP 流量）。
+watch(panelSurface, (panel) => {
+  if (!panel) return;
+  batchBarOpen.value = false;
+  sftpPaneOpen.value = false;
+}, { immediate: true });
 // 保存为快速命令的内联名称态（保存走 ssh/quickCommands/save，全局共享）。
 const batchSaveMode = ref(false);
 const batchSaveName = ref("");
@@ -6097,12 +6105,22 @@ async function refreshBatchTargets() {
   batchError.value = "";
   try {
     const response = await window.dbxPlugin.invoke<{ sessions: unknown }>("ssh/sessions/list");
-    batchTargets.value = normalizeBatchTargets(response.sessions);
-    // 剔除已关闭会话；选择为空时默认只预选当前会话（批量写入影响所有被选主机，宁缺毋滥）。
+    // 批量目标包含本地终端：同是"向 PTY 键盘写入"，发送阶段按通道分流。
+    let targets = normalizeBatchTargets(response.sessions);
+    try {
+      const local = await window.dbxPlugin.invoke<{ sessions?: unknown }>("local/session/list", {}, { timeoutMs: 5000 });
+      targets = [...targets, ...normalizeLocalBatchTargets(local?.sessions)];
+    } catch {
+      // 旧 sidecar 无本地会话能力：只保留 SSH 目标。
+    }
+    batchTargets.value = targets;
+    // 剔除已关闭会话；选择为空时默认只预选当前会话（本地面板预选本地会话；
+    // 批量写入影响所有被选主机，宁缺毋滥）。
     const known = new Set(batchTargets.value.map((target) => target.sessionId));
     batchSelected.value = batchSelected.value.filter((id) => known.has(id));
+    const currentSessionId = session.value?.sessionId ?? localSession.value?.sessionId;
     if (!batchSelected.value.length) {
-      batchSelected.value = session.value?.sessionId && known.has(session.value.sessionId) ? [session.value.sessionId] : [];
+      batchSelected.value = currentSessionId && known.has(currentSessionId) ? [currentSessionId] : [];
     }
   } catch (cause) {
     batchTargets.value = [];
@@ -6170,11 +6188,25 @@ async function sendBatchCommand() {
   batchError.value = "";
   batchSummary.value = undefined;
   try {
-    const response = await window.dbxPlugin.invoke<{ results: unknown }>("ssh/terminal/batchInput", {
-      sessionIds: batchSelected.value,
-      command,
-    });
-    batchSummary.value = summarizeBatchResults(response.results);
+    // 目标按通道分流：SSH 走 sidecar 批量写入；本地终端复用输入队列（同一
+    // 序号框架，保持与键入一致的顺序语义），命令补 \r 回车与键入等价。
+    const selectedSet = new Set(batchSelected.value);
+    const sshIds = batchTargets.value.filter((target) => !target.local && selectedSet.has(target.sessionId)).map((target) => target.sessionId);
+    const localIds = batchTargets.value.filter((target) => target.local && selectedSet.has(target.sessionId)).map((target) => target.sessionId);
+    const results: unknown[] = [];
+    if (sshIds.length) {
+      const response = await window.dbxPlugin.invoke<{ results: unknown }>("ssh/terminal/batchInput", { sessionIds: sshIds, command });
+      if (Array.isArray(response.results)) results.push(...response.results);
+    }
+    for (const sessionId of localIds) {
+      try {
+        terminalInputQueue.enqueue(sessionId, new TextEncoder().encode(`${command}\r`));
+        results.push({ sessionId, success: true });
+      } catch (cause) {
+        results.push({ sessionId, success: false, error: cause instanceof Error ? cause.message : String(cause) });
+      }
+    }
+    batchSummary.value = summarizeBatchResults(results);
     if (batchSummary.value.sent) {
       // 发送成功即清空输入与下拉选中（对齐原弹窗语义），命令入历史供 ↑↓ 回选。
       commandHistory.value = pushCommandHistory(commandHistory.value, command);
