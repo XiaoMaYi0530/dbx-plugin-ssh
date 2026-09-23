@@ -63,6 +63,7 @@ import {
   Siren,
   Square,
   SquarePlus,
+  SquarePen,
   ListPlus,
   SquareTerminal,
   Star,
@@ -3211,6 +3212,11 @@ function handleEvent(event: DbxPluginEvent) {
     return;
   }
   if (event.method === "sftp/transfer/progress") updateTransfer(event.params);
+  // 外部编辑器保存（sidecar 指纹确认后）：弹三选回传确认（P2-5）。
+  if (event.method === "watch/file-modified") {
+    onRemoteEditModified(event.params as unknown as RemoteEditPayload);
+    return;
+  }
 }
 
 function updateTransfer(params: Record<string, unknown>) {
@@ -3499,7 +3505,12 @@ async function closeSession(updateStatus = true) {
   terminalInputQueue.reset();
   reconnectPending.value = false;
   resetCommandMarker();
-  if (sessionId) await window.dbxPlugin.invoke("ssh/session/close", { sessionId }).catch(() => undefined);
+  if (sessionId) {
+    // 外部编辑器 watcher 属于该会话：先停监听再关会话（后端 ssh/session/close
+    // 还有一次兜底；这里显式调用保证断开即静默，不再向已关闭的工作台弹提示）。
+    await window.dbxPlugin.invoke("watch/stop-all", { sessionId }).catch(() => undefined);
+    await window.dbxPlugin.invoke("ssh/session/close", { sessionId }).catch(() => undefined);
+  }
   if (updateStatus) {
     terminalState.value = "disconnected";
     terminalError.value = t("disconnected");
@@ -6395,6 +6406,135 @@ async function confirmSymlinkDialog() {
   }
 }
 
+// —— 外部编辑器回传（P2-5 前端半）：下载到 <下载目录>/remote-edit/<ts>/ →
+// watch/start 监听本地副本 → 编辑器保存后 sidecar 推 watch/file-modified →
+// 三选确认后经 sftp/upload-local 原位覆盖回传（写入门禁在后端 ensure_writable，
+// 只读连接的拒绝随错误提示冒泡）。 ——
+interface RemoteEditPayload {
+  watchId: string;
+  sessionId: string;
+  localPath: string;
+  remotePath: string;
+}
+const remoteEditPrompt = ref<RemoteEditPayload>();
+const remoteEditBusy = ref(false);
+// "总是上传"只在本次会话内记住（远端路径 → 跳过确认直接回传）。
+const remoteEditAlways = new Set<string>();
+const remoteEditOpening = ref(false);
+
+/** 本地路径拼接（remote-edit 落盘目录）：统一正斜杠，sidecar PathBuf 接受。 */
+function joinLocalPath(base: string, ...parts: string[]): string {
+  return [base.replace(/[\\/]+$/, ""), ...parts].join("/");
+}
+
+/** watch/file-modified 事件入口：非当前会话忽略；"总是上传"已记住则直接回传。 */
+function onRemoteEditModified(payload: RemoteEditPayload) {
+  if (payload.sessionId !== session.value?.sessionId) return;
+  if (remoteEditAlways.has(payload.remotePath)) {
+    void uploadRemoteEdit(payload);
+    return;
+  }
+  remoteEditPrompt.value = payload;
+}
+
+async function uploadRemoteEdit(payload: RemoteEditPayload) {
+  if (!session.value || remoteEditBusy.value) return;
+  remoteEditBusy.value = true;
+  try {
+    await window.dbxPlugin.invoke<{ path: string; size: number }>("sftp/upload-local", {
+      sessionId: session.value.sessionId,
+      localPath: payload.localPath,
+      remotePath: payload.remotePath,
+    });
+    showNotice(t("remoteEdit.uploaded", { name: remoteBasename(payload.remotePath) }));
+    await loadDirectory();
+  } catch (cause) {
+    showError(cause);
+  } finally {
+    remoteEditBusy.value = false;
+  }
+}
+
+function resolveRemoteEditPrompt(action: "once" | "always" | "cancel") {
+  const payload = remoteEditPrompt.value;
+  remoteEditPrompt.value = undefined;
+  if (!payload || action === "cancel" || remoteEditBusy.value) return;
+  if (action === "always") remoteEditAlways.add(payload.remotePath);
+  void uploadRemoteEdit(payload);
+}
+
+/** 文件行右键「在外部编辑器中打开」（仅桌面端）：独立时间戳目录避免两次
+ *  打开的 watcher 基线互串；完成后注册 watch/start 并把本地路径复制到剪贴板。 */
+async function openInExternalEditor(entry: SftpEntry) {
+  fileMenu.value = undefined;
+  const sessionId = session.value?.sessionId;
+  if (!sessionId || remoteEditOpening.value || entry.kind !== "file") return;
+  const local = await probeLocalCapabilities();
+  if (!local?.canSaveLocal) return;
+  const remotePath = pathFromUri(entry.uri);
+  remoteEditOpening.value = true;
+  openTransferPanel();
+  let info: DownloadInfo | undefined;
+  try {
+    const editDir = joinLocalPath(local.downloadsDir, "remote-edit", String(Date.now()));
+    info = await window.dbxPlugin.invoke<DownloadInfo>("sftp/download/start", {
+      sessionId,
+      remotePath,
+      saveToLocal: true,
+      downloadDir: editDir,
+    });
+    transferTasks[info.taskId] = { taskId: info.taskId, sessionId, direction: "download", fileName: info.fileName, size: info.size, transferred: 0, status: "queued", joinedAt: Date.now() };
+    let offset = 0;
+    while (offset < info.size) {
+      await waitWhilePaused(info.taskId);
+      const chunkPromise = waitForDownloadChunk(info.taskId, offset);
+      const nextPromise = window.dbxPlugin.invoke<{ length: number; eof: boolean }>("sftp/download/next", { taskId: info.taskId, offset });
+      // 取消经分块等待器打断；吞掉在途请求的拒绝避免未处理 rejection。
+      nextPromise.catch(() => undefined);
+      const result = await nextPromise;
+      const chunk = await chunkPromise;
+      if (chunk.byteLength !== result.length) throw new Error(t("errors.downloadChunkLength"));
+      if (!result.eof && result.length === 0) throw new Error(t("errors.downloadEmptyChunk"));
+      // saveToLocal：字节已在 sidecar 侧写入暂存文件，这里只跟进进度。
+      offset += chunk.byteLength;
+      const task = transferTasks[info.taskId];
+      if (task) {
+        task.status = "running";
+        task.transferred = offset;
+      }
+      if (result.eof) break;
+    }
+    const finishResult = await window.dbxPlugin.invoke<{ localPath?: string }>("sftp/download/finish", { taskId: info.taskId });
+    const localPath = finishResult?.localPath;
+    cancelledTransferTasks.delete(info.taskId);
+    const task = transferTasks[info.taskId];
+    if (task) {
+      task.status = "completed";
+      task.transferred = info.size;
+      if (localPath) task.localPath = localPath;
+    }
+    if (!localPath) throw new Error(t("remoteEdit.downloadFailed"));
+    await window.dbxPlugin.invoke("watch/start", { sessionId, remotePath, localPath });
+    copyTextToClipboard(localPath, "remoteEdit.pathCopied");
+    showNotice(t("remoteEdit.opened", { name: entry.name }), [
+      { label: t("openDownloadedFile"), run: () => void openTransferTarget(localPath) },
+    ]);
+  } catch (cause) {
+    if (info) {
+      const waiter = downloadChunkWaiters.get(info.taskId);
+      if (waiter) {
+        window.clearTimeout(waiter.timer);
+        downloadChunkWaiters.delete(info.taskId);
+      }
+      await window.dbxPlugin.invoke("sftp/transfer/cancel", { taskId: info.taskId }).catch(() => undefined);
+    }
+    // 失败闭环：横幅带「重试」，按原入口完整重跑（重新下载 + 注册监听）。
+    showError(cause, "sftp", () => void openInExternalEditor(entry));
+  } finally {
+    remoteEditOpening.value = false;
+  }
+}
+
 async function openAttributes(entry: SftpEntry) {
   const sessionId = session.value?.sessionId;
   if (!sessionId) return;
@@ -8722,6 +8862,8 @@ function showFileMenu(event: MouseEvent, entry: SftpEntry) {
   blankMenu.value = false;
   sideMenu.value = undefined;
   transferHistoryMenu.value = undefined;
+  // 「在外部编辑器中打开」的显隐依赖 localCanSave；首次右键时并行探测（幂等）。
+  void probeLocalCapabilities();
 }
 
 function showTransferHistoryMenu(event: MouseEvent, entry: TransferHistoryEntry) {
@@ -8847,6 +8989,7 @@ const modalOpenStates = computed(() => [
   newFileDialog.value,
   operationDialog.value,
   symlinkDialog.value !== undefined,
+  remoteEditPrompt.value !== undefined,
   commandOpen.value,
   profilesOpen.value,
   auditOpen.value,
@@ -8984,6 +9127,10 @@ function onDocumentKeydown(event: KeyboardEvent) {
   }
   if (symlinkDialog.value) {
     symlinkDialog.value = undefined;
+    return;
+  }
+  if (remoteEditPrompt.value) {
+    remoteEditPrompt.value = undefined;
     return;
   }
   if (commandOpen.value) {
@@ -10304,6 +10451,8 @@ onBeforeUnmount(() => {
                 <template v-else-if="fileMenu">
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'directory' || fileMenu.entry.kind === 'file'" @select="openEntry(fileMenu.entry)"><Folder v-if="fileMenu.entry.kind === 'directory'" /><FileText v-else />{{ fileMenu.entry.kind === "directory" ? t("openFolder") : t("preview") }}</ContextMenuItem>
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'file' || fileMenu.entry.kind === 'directory'" @select="downloadEntry(fileMenu.entry)"><Download />{{ t("download") }}</ContextMenuItem>
+                  <!-- P2-5 外部编辑器（仅桌面端 localCanSave；web/docker 无本地文件系统隐藏） -->
+                  <ContextMenuItem v-if="fileMenu.entry.kind === 'file' && localCanSave" :disabled="remoteEditOpening" @select="openInExternalEditor(fileMenu.entry)"><SquarePen />{{ t("remoteEdit.openAction") }}</ContextMenuItem>
                   <!-- P2-6 符号链接：目录内新建 / symlink 条目改指向（侧栏树只有目录节点，两项都挂文件区菜单）。 -->
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'symlink'" @select="openSymlinkEditDialog(fileMenu.entry)"><Link2 />{{ t("symlink.editAction") }}</ContextMenuItem>
                   <ContextMenuItem v-if="fileMenu.entry.kind === 'directory'" :disabled="!canWrite" @select="openSymlinkCreateDialog(pathFromUri(fileMenu.entry.uri))"><Link2 />{{ t("symlink.createAction") }}</ContextMenuItem>
@@ -10397,6 +10546,21 @@ onBeforeUnmount(() => {
         <input v-if="symlinkDialog.mode === 'create'" v-model="symlinkNameDraft" autofocus spellcheck="false" :placeholder="t('symlink.namePlaceholder')" @keydown.enter="confirmSymlinkDialog" />
         <input v-model="symlinkTargetDraft" class="mono" spellcheck="false" :placeholder="t('symlink.targetPlaceholder')" @keydown.enter="confirmSymlinkDialog" />
         <footer><button @click="symlinkDialog = undefined">{{ t("cancel") }}</button><button class="primary-button" :disabled="!symlinkTargetDraft.trim() || (symlinkDialog.mode === 'create' && !symlinkNameDraft.trim()) || symlinkSubmitting" @click="confirmSymlinkDialog"><Loader2 v-if="symlinkSubmitting" class="spinning" />{{ t("confirm") }}</button></footer>
+        </template>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 外部编辑器保存回传（P2-5）：上传一次 / 总是上传（本次会话记住）/ 取消 -->
+    <Dialog :open="!!remoteEditPrompt" @update:open="(open) => { if (!open) remoteEditPrompt = undefined; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <template v-if="remoteEditPrompt">
+        <header><DialogTitle>{{ t("remoteEdit.promptTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="remoteEditPrompt = undefined"><X /></button></header>
+        <p class="muted">{{ t("remoteEdit.promptMessage", { name: remoteBasename(remoteEditPrompt.remotePath) }) }}</p>
+        <footer>
+          <button @click="resolveRemoteEditPrompt('cancel')">{{ t("cancel") }}</button>
+          <button :disabled="remoteEditBusy" @click="resolveRemoteEditPrompt('always')"><Save />{{ t("remoteEdit.always") }}</button>
+          <button class="primary-button" :disabled="remoteEditBusy" @click="resolveRemoteEditPrompt('once')"><Loader2 v-if="remoteEditBusy" class="spinning" /><FileUp v-else />{{ t("remoteEdit.once") }}</button>
+        </footer>
         </template>
       </DialogContent>
     </Dialog>
