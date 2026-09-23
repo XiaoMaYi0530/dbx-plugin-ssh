@@ -1194,7 +1194,8 @@ function restoreUiState() {
   // Dock panel surface: the SFTP pane stays closed (no auto-list/auto-connect);
   // users who want SFTP open the workbench tab.
   sftpPaneOpen.value = panelSurface.value ? false : resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
-  followDirectory.value = state.followDirectory === true;
+  // Dock panel surface：目录跟随是 SFTP 域能力，面板一律关闭。
+  followDirectory.value = panelSurface.value ? false : state.followDirectory === true;
   sudoMode.value = state.sudoMode === true && canWrite.value;
   // 一次性迁移：六列默认上线前的旧偏好重置为全开（之后用户自定义照常持久化）。
   const legacyColumns = state.visibleColumns != null && state.columnsV2 !== true;
@@ -2749,7 +2750,8 @@ async function afterSessionConnected() {
   if (reconnectWasPending) {
     reconnectWasPending = false;
     const restored = describeReconnectRestoredNotice({ wasReconnecting: true, path: currentPath.value });
-    if (restored) showNotice(t(restored.key, restored.values));
+    // Dock panel surface：目录提示属 SFTP/目录跟随域，面板里不弹。
+    if (restored && !panelSurface.value) showNotice(t(restored.key, restored.values));
   }
 }
 
