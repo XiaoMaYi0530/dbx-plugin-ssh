@@ -23,6 +23,45 @@ export function resolveTerminalRightClickAction(options: { selectCopy: boolean; 
   return options.selectCopy && !options.shiftKey ? "paste" : "menu";
 }
 
+export const TERMINAL_COPY_CACHE_MAX_LENGTH = 200_000;
+
+export interface TerminalCopyCache {
+  get(): string;
+  set(text: string): void;
+  clear(): void;
+}
+
+/**
+ * 插件视图内的复制副本：沙箱 iframe 里系统剪贴板读链必然断（宿主桥缺失 +
+ * opaque origin 被 Permissions Policy 拒绝），右键粘贴的降级链依赖这份
+ * 副本。选中复制、菜单复制、远端 OSC 52 写剪贴板都写入这里；超长只保留
+ * 尾部，空写入不覆盖上一次有效副本。
+ */
+export function createTerminalCopyCache(maxLength: number = TERMINAL_COPY_CACHE_MAX_LENGTH): TerminalCopyCache {
+  let cached = "";
+  return {
+    get: () => cached,
+    set(text: string): void {
+      if (!text) return;
+      cached = text.length > maxLength ? text.slice(text.length - maxLength) : text;
+    },
+    clear(): void {
+      cached = "";
+    },
+  };
+}
+
+/**
+ * 右键粘贴的取文优先级：系统剪贴板（宿主可读时）→ 插件视图复制副本 →
+ * 终端当前选区。空白（空格/缩进）是合法粘贴内容，只有空串视为"没有来源"。
+ */
+export function resolveTerminalPasteText(options: { clipboardText?: string | null; cachedText?: string | null; selectionText?: string | null }): string | null {
+  for (const candidate of [options.clipboardText, options.cachedText, options.selectionText]) {
+    if (candidate) return candidate;
+  }
+  return null;
+}
+
 export type TerminalKeyAction = "copy" | "paste" | "none";
 
 /**

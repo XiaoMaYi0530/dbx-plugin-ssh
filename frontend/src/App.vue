@@ -87,7 +87,9 @@ import {
 import { Osc7DirectoryParser } from "./lib/terminalDirectoryTracking";
 import { handleOsc52ClipboardWrite, handleTerminalColorQuery } from "./lib/terminalOsc";
 import {
+  createTerminalCopyCache,
   resolveTerminalKeyAction,
+  resolveTerminalPasteText,
   resolveTerminalRightClickAction,
   sanitizeSearchOptions,
   sanitizeSelectCopyEnabled,
@@ -511,6 +513,8 @@ const sftpTree = ref<DirTreeNode>(createTreeRoot("/", "/"));
 const sftpHomePath = ref("");
 // 选中复制 + 右键粘贴（终端交互偏好，全局生效，切换即持久化）。
 const termSelectCopy = ref(loadSelectCopyEnabled());
+// 沙箱宿主读不到系统剪贴板：右键粘贴的降级链靠这份插件视图内的复制副本。
+const terminalCopyCache = createTerminalCopyCache();
 const followDirectory = ref(false);
 // 终端 shell 最近一次上报的 cwd（OSC 7 / OSC 633 Cwd，无论跟随开关是否打开
 // 都记录）：终端拖拽上传的「当前目录」落点解析靠它，避免误用 SFTP 面板的
@@ -1427,7 +1431,11 @@ function createTerminal() {
   terminal.loadAddon(new ImageAddon({ pixelLimit: 33_554_432 }));
   registerOscColorQueryHandlers();
   osc52Disposable = terminal.parser.registerOscHandler(52, (data) =>
-    handleOsc52ClipboardWrite(data, (text) => writeClipboardText(text, clipboardDeps())),
+    handleOsc52ClipboardWrite(data, (text) => {
+      // 远端主动写剪贴板同样进插件视图副本，供沙箱宿主的右键粘贴降级。
+      terminalCopyCache.set(text);
+      return writeClipboardText(text, clipboardDeps());
+    }),
   );
   terminal.attachCustomKeyEventHandler(handleTerminalKey);
   searchAddon.onDidChangeResults(({ resultCount, resultIndex }) => {
@@ -1457,9 +1465,13 @@ function createTerminal() {
   // single-byte text outside real composition through the same PTY path.
   disposeWebkitInputFallback = installMacWebkitInputFallback({ terminal, onData: routeTerminalData });
   // 选中复制（可在设置里关闭）：选择一变化即静默写入剪贴板，不弹提示。
+  // 系统剪贴板写链可能整体失败（沙箱 iframe），插件视图副本必须照记——
+  // 右键粘贴在宿主读链断掉时靠它兜底。
   disposeSelectionCopy = terminal.onSelectionChange(() => {
     if (!termSelectCopy.value || !terminal?.hasSelection()) return;
-    void writeClipboardText(terminal.getSelection(), clipboardDeps()).catch(() => undefined);
+    const selection = terminal.getSelection();
+    terminalCopyCache.set(selection);
+    void writeClipboardText(selection, clipboardDeps()).catch(() => undefined);
   });
   // 捕获阶段的 paste 监听：拦截 Ctrl+V 之外的所有粘贴路径（浏览器右键菜单等），
   // 统一走风险确认后再写入终端。
@@ -5326,6 +5338,7 @@ function clipboardDeps(): ClipboardDeps {
 async function copyTerminalSelection() {
   const text = terminal?.getSelection() || "";
   if (!text) return;
+  terminalCopyCache.set(text);
   try {
     await writeClipboardText(text, clipboardDeps());
     showNotice(t("terminalCopied"));
@@ -5338,14 +5351,25 @@ async function copyTerminalSelection() {
 
 async function pasteTerminal() {
   terminalMenuOpen.value = false;
+  let clipboardText: string | null = null;
+  let clipboardReadBlocked = false;
   try {
-    const text = await readClipboardText(clipboardDeps());
-    await sendConfirmedPaste(text || "");
+    clipboardText = await readClipboardText(clipboardDeps());
   } catch {
-    // 读剪贴板全链失败（宿主桥缺失 + 沙箱拒绝）：引导走原生 paste 快捷键。
+    // 宿主桥缺失 + 沙箱拒绝读：降级到插件视图内的复制副本（选中复制、
+    // 菜单复制、远端 OSC 52 都会写入），XShell 式「选中→右键」因此闭环。
+    clipboardReadBlocked = true;
+  }
+  const text = clipboardReadBlocked
+    ? resolveTerminalPasteText({ cachedText: terminalCopyCache.get(), selectionText: terminal?.getSelection() || null })
+    : clipboardText || null;
+  if (!text) {
+    // 无任何可用来源：引导走原生 paste 快捷键（Ctrl+V 走 paste 事件，不依赖读权限）。
     showError(new Error(t("terminalPasteUseShortcut")), "terminal");
     terminal?.focus();
+    return;
   }
+  await sendConfirmedPaste(text);
 }
 
 function interceptTerminalPaste(event: ClipboardEvent) {

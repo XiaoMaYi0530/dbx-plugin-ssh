@@ -3381,3 +3381,33 @@ OpenSSH 服务端未验证）；`-D`/映射持久化（跨会话记忆表单）�
   一度 30/35）。统一改为 localStorage 兜底（键名不变；字符串值原样、对象
   JSON 编码；opaque origin 不可用时退化内存），dev/`?mock=1` 恢复刷新持久化，
   walkthrough 断言无需改动；修正后 本插件 vitest 65 文件 569 用例复验全绿（?render=dom 的 webgl 种子走 pluginStore 语义不变）。
+
+### §8.17 修复：右键粘贴在真实宿主无效果——插件视图复制副本降级链（纯前端轮，2026-09-24）
+
+用户报告「选中复制 · 右键粘贴」开关在 DBX 真机没有效果。定位结论：功能
+本体早已实现并随 0.4.88 出货（bundle 特征串可证），真机失效的根因是沙箱
+iframe 的剪贴板读边界——右键粘贴走 `readClipboardText` 三级降级（宿主桥
+`window.dbxPlugin.clipboard` 现网宿主不提供 + opaque origin 被
+Permissions Policy 拒绝 `navigator.clipboard.readText`），读链必然断，
+只会弹「请用 Ctrl+V」toast；而功能验收全在 mock/浏览器环境做（mock 宿主
+补了 clipboard 桩），真机剪贴板链路从未被覆盖。
+
+修复（纯前端，零协议改动）：
+
+- `lib/terminalInteraction.ts`：新增 `createTerminalCopyCache`（插件视图
+  内的复制副本，200k 字符尾部截断，空写入不覆盖上一次有效副本）与
+  `resolveTerminalPasteText`（取文优先级：系统剪贴板 → 视图副本 → 终端
+  当前选区；空白是合法候选，仅空串视为无来源）。
+- App.vue：三处复制入口（选中复制 onSelectionChange、菜单/快捷键
+  `copyTerminalSelection`、远端 OSC 52 写剪贴板）都写入视图副本——系统
+  剪贴板写链失败也照记；`pasteTerminal` 只在「读链确认被拒」时降级到
+  副本/当前选区，宿主可读剪贴板时仍以系统剪贴板为准（含空）。XShell 式
+  「选中 → 右键」在沙箱宿主从此闭环；多行/危险命令仍过既有粘贴确认。
+- 单测 +3（降级链优先级、空白候选语义、缓存截断/空写不清除），vitest
+  全绿；typecheck/build 过（ui/index.html 同步再生成，CI 的 freshness
+  门禁依赖提交产物）。
+
+剩余风险：真机「选中 → 右键」闭环已由降级链保证，但系统剪贴板本身（跨
+应用复制粘贴）仍受宿主沙箱限制——写链靠 execCommand 兜底（未在真机证
+实），读链无解（Ctrl/Cmd+V 原生 paste 事件不受影响）；宿主侧若未来提供
+clipboard Host API，`clipboardDeps()` 无需改动即可接管。
