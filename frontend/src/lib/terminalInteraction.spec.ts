@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canAcceptFileDrop, canAcceptTerminalDrop, isApplePlatform, isTerminalSelectAllShortcut, normalizeDropTargetDir, resolveTerminalKeyAction, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
+import { canAcceptFileDrop, canAcceptTerminalDrop, isApplePlatform, isTerminalSelectAllShortcut, normalizeDropTargetDir, resolveDropTargetDir, resolveTerminalKeyAction, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
 
 describe("terminal interaction preferences (select-to-copy / right-click-paste)", () => {
   it("defaults select-to-copy to enabled and only honors an explicit 'false'", () => {
@@ -90,10 +90,14 @@ describe("terminal search seed from selection", () => {
 
 describe("terminal drop acceptance", () => {
   it("requires a connected, writable session with no file transfer protocol owning the stream", () => {
-    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: false })).toBe(true);
-    expect(canAcceptTerminalDrop({ connected: false, canWrite: true, transferBusy: false })).toBe(false);
-    expect(canAcceptTerminalDrop({ connected: true, canWrite: false, transferBusy: false })).toBe(false);
-    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: true })).toBe(false);
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: false, sftpPaneOpen: false })).toBe(true);
+    expect(canAcceptTerminalDrop({ connected: false, canWrite: true, transferBusy: false, sftpPaneOpen: false })).toBe(false);
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: false, transferBusy: false, sftpPaneOpen: false })).toBe(false);
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: true, sftpPaneOpen: false })).toBe(false);
+  });
+
+  it("refuses terminal drops while the SFTP panel is open (the panel is the visible drop target)", () => {
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: false, sftpPaneOpen: true })).toBe(false);
   });
 });
 
@@ -103,7 +107,7 @@ describe("shared file drop gate", () => {
     expect(canAcceptFileDrop({ connected: false, canWrite: true })).toBe(false);
     expect(canAcceptFileDrop({ connected: true, canWrite: false })).toBe(false);
     // terminal gate degrades to the shared gate when nothing owns the stream
-    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: false })).toBe(canAcceptFileDrop({ connected: true, canWrite: true }));
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: false, sftpPaneOpen: false })).toBe(canAcceptFileDrop({ connected: true, canWrite: true }));
   });
 });
 
@@ -124,5 +128,25 @@ describe("terminal drop prompt target directory", () => {
   it("keeps ordinary paths and inner slashes untouched", () => {
     expect(normalizeDropTargetDir("/var/log")).toBe("/var/log");
     expect(normalizeDropTargetDir("  /home/user/uploads  ")).toBe("/home/user/uploads");
+  });
+});
+
+describe("terminal drop default target resolution", () => {
+  it("uses the shell cwd tracked via OSC 7/633 whenever it is known", () => {
+    expect(resolveDropTargetDir({ terminalCwd: "/home/u/work", sftpHome: "/home/u", fallback: "/var/data" })).toBe("/home/u/work");
+    // Tracked cwd wins even when it differs from the remote home.
+    expect(resolveDropTargetDir({ terminalCwd: "/tmp", sftpHome: "/home/u", fallback: "/" })).toBe("/tmp");
+  });
+
+  it("falls back to the remote home when the shell cwd was never reported", () => {
+    // 面板关闭时 SFTP 目录不可见，未跟踪到 shell cwd（未发 OSC 7/633）就落主目录。
+    expect(resolveDropTargetDir({ terminalCwd: undefined, sftpHome: "/home/u", fallback: "/var/data" })).toBe("/home/u");
+    expect(resolveDropTargetDir({ terminalCwd: "", sftpHome: "/home/u", fallback: "/" })).toBe("/home/u");
+  });
+
+  it("keeps the caller's fallback when no better source exists (old sidecar, no home probe)", () => {
+    expect(resolveDropTargetDir({ terminalCwd: undefined, sftpHome: undefined, fallback: "/var/data" })).toBe("/var/data");
+    expect(resolveDropTargetDir({ terminalCwd: undefined, sftpHome: undefined, fallback: "/" })).toBe("/");
+    expect(resolveDropTargetDir({ terminalCwd: "", sftpHome: "/", fallback: "/" })).toBe("/");
   });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import appVueSource from "../App.vue?raw";
+import sftpErrorsSource from "./sftpErrors?raw";
 import { Osc7DirectoryParser, parseOsc7Path } from "./terminalDirectoryTracking";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay } from "./terminalReconnect";
 import { advanceBatchProgress, batchProgressPercent, createBatchProgress } from "./sftpBatchProgress";
@@ -194,6 +195,38 @@ describe("workbench localization", () => {
         expect(actual, `${locale}.${key} placeholders drift from en`).toEqual(expected);
       }
     }
+  });
+
+  it("resolves every errors.* key referenced by the app in all seven locales", () => {
+    // errors.* 全部走 supplemental 表；漏译会让横幅原样回显 key（拖拽上传
+    // 权限拒绝曾把 "errors.permissionDenied" 直接展示给用户）。反向提取
+    // App.vue / sftpErrors.ts 里的 t("errors.*") 字面量，新 key 漏补即在
+    // 此处红，防止同类问题复发。
+    const keys = new Set<string>();
+    for (const source of [appScript, sftpErrorsSource]) {
+      for (const match of source.matchAll(/\bt\("errors\.[A-Za-z0-9.]+"/g)) {
+        keys.add(match[0].slice(3, -1));
+      }
+    }
+    expect([...keys].sort()).toEqual([
+      "errors.downloadChunkLength",
+      "errors.downloadChunkTimeout",
+      "errors.downloadEmptyChunk",
+      "errors.hostBridgeMissing",
+      "errors.localFileShortRead",
+      "errors.permissionDenied",
+      "errors.probeOutput",
+      "errors.remoteNotFound",
+      "errors.sessionChanged",
+      "errors.uploadAckTimeout",
+      "errors.workbenchDetached",
+    ]);
+    for (const locale of locales) {
+      for (const key of keys) expect(workbenchMessage(locale, key), `${locale} missing ${key}`).not.toBe(key);
+    }
+    // 中文块必须是真实翻译而不是英文回退。
+    expect(workbenchMessage("zh-CN", "errors.permissionDenied")).not.toBe(workbenchMessage("en", "errors.permissionDenied"));
+    expect(workbenchMessage("ja", "errors.remoteNotFound")).not.toBe(workbenchMessage("en", "errors.remoteNotFound"));
   });
 });
 

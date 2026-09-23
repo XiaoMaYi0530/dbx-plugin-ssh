@@ -109,12 +109,14 @@ export function canAcceptFileDrop(options: { connected: boolean; canWrite: boole
 
 /**
  * Whether a file dropped onto the terminal pane can be uploaded right now.
- * The writable-session gate plus a file-transfer occupancy check: a running
- * protocol (ZMODEM or trzsz) owns the terminal data path so drops are
- * refused while one is busy.
+ * The writable-session gate, a file-transfer occupancy check (a running
+ * ZMODEM/trzsz protocol owns the terminal data path), and the pane-visibility
+ * rule: with the SFTP panel open the panel is the visible drop target (its
+ * directory is on screen), so the terminal refuses drops and points the user
+ * there instead of landing files in an invisible directory.
  */
-export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: boolean; transferBusy: boolean }): boolean {
-  return canAcceptFileDrop(options) && !options.transferBusy;
+export function canAcceptTerminalDrop(options: { connected: boolean; canWrite: boolean; transferBusy: boolean; sftpPaneOpen: boolean }): boolean {
+  return canAcceptFileDrop(options) && !options.transferBusy && !options.sftpPaneOpen;
 }
 
 /**
@@ -130,4 +132,17 @@ export function normalizeDropTargetDir(raw: string): string | null {
   if (!trimmed.startsWith("/")) return trimmed;
   const collapsed = trimmed.replace(/\/+$/, "");
   return collapsed || "/";
+}
+
+/**
+ * 终端拖拽「当前目录」落点的解析顺序：shell 的 OSC 7/633 跟踪 cwd 优先（就
+ * 是用户说的"终端 cwd"），其次回落远端主目录（连接时已由 sftp/home 探测）；
+ * 主目录也拿不到（旧 sidecar）才用调用方兜底值。终端拖拽只在 SFTP 面板关闭
+ * 时接收，所以解析链里不再参考面板目录——它此刻不可见，落进去用户也看不到。
+ * 落点会在确认弹窗里完整展示，上传前看得到真实目标。
+ */
+export function resolveDropTargetDir(options: { terminalCwd?: string; sftpHome?: string; fallback: string }): string {
+  if (options.terminalCwd) return options.terminalCwd;
+  if (options.sftpHome && options.sftpHome !== "/") return options.sftpHome;
+  return options.fallback;
 }

@@ -98,6 +98,7 @@ import {
   canAcceptTerminalDrop,
   canAcceptFileDrop,
   normalizeDropTargetDir,
+  resolveDropTargetDir,
   type TerminalSearchOptions,
 } from "./lib/terminalInteraction";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
@@ -510,6 +511,10 @@ const sftpHomePath = ref("");
 // 选中复制 + 右键粘贴（终端交互偏好，全局生效，切换即持久化）。
 const termSelectCopy = ref(loadSelectCopyEnabled());
 const followDirectory = ref(false);
+// 终端 shell 最近一次上报的 cwd（OSC 7 / OSC 633 Cwd，无论跟随开关是否打开
+// 都记录）：终端拖拽上传的「当前目录」落点解析靠它，避免误用 SFTP 面板的
+// 浏览目录（初始值 "/"，拼根路径会被服务器以权限拒绝）。
+const terminalCwd = ref("");
 const directoryTrackingSupported = ref<boolean | undefined>();
 const visibleColumns = ref<SftpColumn[]>([...DEFAULT_VISIBLE_COLUMNS]);
 /** 每列当前宽度（px）。 */
@@ -733,10 +738,15 @@ const searchMatchState = ref<TerminalSearchMatchState>("idle");
 const searchResultIndex = ref(0);
 const searchResultCount = ref(0);
 const pasteConfirm = ref<PasteConfirmation>();
-// 终端拖入文件的落点询问：null 表示取消；"cwd" 用 SFTP 当前目录（目录跟随
-// 开启时即 shell cwd）；{ dir } 是用户输入的目标目录（文件原名落其下）。
+// 终端拖入文件的落点询问：null 表示取消；"cwd" 用解析后的 shell/SFTP 当前
+// 目录（见 resolveDropTargetDir，弹窗展示解析结果）；{ dir } 是用户输入的
+// 目标目录（文件原名落其下）。
 const dropUploadPrompt = ref<{ files: File[] }>();
 const dropUploadTarget = ref<"cwd" | "custom">("cwd");
+// 拖拽落点解析：终端 cwd（OSC 7/633）优先，其次远端主目录，最后兜底面板目
+// 录——终端拖拽只在面板关闭时接收，面板目录此刻不可见，仅作旧 sidecar 兜底。
+// 弹窗展示的就是这里的解析结果。
+const dropCwdTarget = computed(() => resolveDropTargetDir({ terminalCwd: terminalCwd.value || undefined, sftpHome: sftpHomePath.value || undefined, fallback: currentPath.value }));
 const dropUploadPathInput = ref("");
 const dropUploadPathInputEl = ref<HTMLInputElement>();
 const terminalFontSize = ref(appearance.value.terminal.fontSize);
@@ -1726,6 +1736,7 @@ function applyCommandMarker(updates: Osc633StreamUpdates) {
   if (updates.lastCommandDuration !== undefined) commandMarker.durationMs = updates.lastCommandDuration;
   if (updates.cwd !== undefined) {
     commandMarker.cwd = updates.cwd;
+    if (updates.cwd) terminalCwd.value = updates.cwd;
     // OSC 633 Cwd doubles as a directory-follow fallback when the backend could
     // not install OSC 7 tracking but the remote shell integration emits 633 frames.
     if (followDirectory.value && directoryTrackingSupported.value === false && updates.cwd) {
@@ -1736,6 +1747,7 @@ function applyCommandMarker(updates: Osc633StreamUpdates) {
 
 function writeTerminalOutput(data: Uint8Array) {
   for (const path of directoryParser.push(data)) {
+    terminalCwd.value = path;
     if (followDirectory.value) void loadDirectory(path, true);
   }
   applyCommandMarker(commandMarkerParser.push(data));
@@ -4715,14 +4727,14 @@ async function chooseUpload() {
   }
 }
 
-async function uploadHandleFiles(files: Array<{ handleId: string; name: string; size: number }>) {
+async function uploadHandleFiles(files: Array<{ handleId: string; name: string; size: number }>, targetDir?: string) {
   if (!window.dbxPlugin.fileTransfer || !files.length) return;
   await runWithConcurrency(files, 3, async (file) => {
       try {
         await uploadSource(file.name, file.size, async (offset, length) => {
           const result = await window.dbxPlugin.fileTransfer!.read(file.handleId, offset, length);
           return window.dbxPlugin.decodeBase64(result.dataBase64);
-        });
+        }, undefined, targetDir);
       } catch (cause) {
         // 桥接读盘错误转成可理解的提示；uploadSource 已补 upload-read-failed 代码，
         // 终端拖入路径（同函数）的 showError 也会显示这条友好文案。
@@ -5235,15 +5247,16 @@ function onSftpDragEnter(event: DragEvent) {
 
 function onTerminalDragEnter(event: DragEvent) {
   if (!event.dataTransfer?.types.includes("Files")) return;
-  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) return;
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value, sftpPaneOpen: sftpPaneOpen.value })) return;
   terminalDragActive.value = true;
 }
 
 function onTerminalDrop(event: DragEvent) {
   terminalDragActive.value = false;
-  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value })) {
-    // 拒绝不再静默：只读会话/断连/传输占用都给同一条提示。
-    showNotice(t("dropRefused"));
+  if (!canAcceptTerminalDrop({ connected: connected.value, canWrite: canWrite.value, transferBusy: terminalTransferBusy.value, sftpPaneOpen: sftpPaneOpen.value })) {
+    // 拒绝不再静默：面板打开时指引拖到面板（那里目录可见），其余（断连/
+    // 只读/传输占用）给同一条提示。
+    showNotice(t(sftpPaneOpen.value ? "terminalDropToPanel" : "dropRefused"));
     return;
   }
   // Files dropped on the terminal ask for a landing directory first: the
@@ -5259,7 +5272,7 @@ async function runTerminalDropUpload(files: File[]) {
   terminal?.focus();
   if (choice === "cancel") return;
   try {
-    await uploadLocalFiles(files, choice === "cwd" ? undefined : choice.dir);
+    await uploadLocalFiles(files, choice === "cwd" ? dropCwdTarget.value : choice.dir);
   } catch (cause) {
     showError(cause);
   }
@@ -7031,8 +7044,9 @@ async function initialize() {
       return;
     }
     // 拖入文件同样走宿主桥读盘（issue #83/#79）：桥故障时与工具栏上传一致回退
-    // 原生选择器重挑，而不是只报错走死。
-    void uploadHandleFiles(files)
+    // 原生选择器重挑，而不是只报错走死。面板关闭时与终端拖拽同规则：落终端
+    // cwd；面板打开时落面板当前目录（默认行为，目录在用户眼前）。
+    void uploadHandleFiles(files, sftpPaneOpen.value ? undefined : dropCwdTarget.value)
       .then(() => loadDirectory())
       .catch((cause) => {
         if (isHostBridgeReadFailure(cause)) fallbackToNativeUploadPicker();
@@ -8501,7 +8515,7 @@ onBeforeUnmount(() => {
         <label class="drop-option">
           <input v-model="dropUploadTarget" type="radio" name="drop-upload-target" value="cwd" />
           <span>{{ t("terminalDropPrompt.toCurrent") }}</span>
-          <code class="mono">{{ currentPath }}</code>
+          <code class="mono">{{ dropCwdTarget }}</code>
         </label>
         <label class="drop-option">
           <input v-model="dropUploadTarget" type="radio" name="drop-upload-target" value="custom" />
