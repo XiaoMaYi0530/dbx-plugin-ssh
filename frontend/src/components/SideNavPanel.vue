@@ -3,8 +3,13 @@
 // quick（快捷路径）双 tab，可收起为窄条再展开；tab 与收缩状态由 App.vue 持久化
 // 到 localStorage。行右键统一上抛 node-context（打开 / 复制路径 / 复制文件名 /
 // 压缩），由 App.vue 弹菜单。
-import { ChevronsLeft, ChevronsRight, Folder, FolderTree, Home, RefreshCw, Star } from "@lucide/vue";
+// P2-1 追加：otp（OTP 验证码）面板内聚 tab。它是纯面板内状态（不进 App.vue
+// 的持久化协议，App.vue 的 setSftpSideTab 契约保持 "tree" | "quick" 不变），
+// 由本组件内部 extraTab 记忆当前激活项。
+import { computed, ref } from "vue";
+import { ChevronsLeft, ChevronsRight, Folder, FolderTree, Home, KeyRound, RefreshCw, Star } from "@lucide/vue";
 import DirTree from "./DirTree.vue";
+import OtpPanel from "./OtpPanel.vue";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 import type { DirTreeNode } from "../lib/sftpDirTree";
 
@@ -15,7 +20,9 @@ export interface SftpSideQuickPath {
   home?: boolean;
 }
 
-defineProps<{
+type ExtraSideTab = "otp";
+
+const props = defineProps<{
   tab: "tree" | "quick";
   collapsed: boolean;
   treeRoot: DirTreeNode | null;
@@ -33,6 +40,10 @@ const emit = defineEmits<{
   (event: "node-context", payload: { path: string }): void;
 }>();
 
+/** 面板内聚 tab（otp/import）；null = 回落到 App.vue 持久化的 tree/quick。 */
+const extraTab = ref<ExtraSideTab | null>(null);
+const activeTab = computed(() => extraTab.value ?? props.tab);
+
 function onTreeContext(payload: { node: DirTreeNode }) {
   emit("node-context", { path: payload.node.path });
 }
@@ -40,17 +51,31 @@ function onTreeContext(payload: { node: DirTreeNode }) {
 function onTabChange(value: string | number) {
   emit("update:tab", value as "tree" | "quick");
 }
+
+/** tree/quick 走原持久化协议并清掉内聚 tab；otp 只记在面板内部。 */
+function onTabsChange(value: string | number) {
+  const next = String(value);
+  if (next === "otp") {
+    extraTab.value = next;
+    return;
+  }
+  extraTab.value = null;
+  onTabChange(value);
+}
 </script>
 
 <template>
   <div v-if="!collapsed" class="sftp-side-panel">
-    <Tabs :model-value="tab" class="sftp-side-tabs" @update:model-value="onTabChange">
+    <Tabs :model-value="activeTab" class="sftp-side-tabs" @update:model-value="onTabsChange">
       <TabsList class="sftp-side-tab-list">
         <TabsTrigger value="tree" class="sftp-side-tab" :title="t('sftpSide.tree')">
           <FolderTree />
         </TabsTrigger>
         <TabsTrigger value="quick" class="sftp-side-tab" :title="t('sftpQuickPath.title')">
           <Star />
+        </TabsTrigger>
+        <TabsTrigger value="otp" class="sftp-side-tab" :title="t('otpPanel.title')">
+          <KeyRound />
         </TabsTrigger>
       </TabsList>
       <span class="sftp-side-spacer" />
@@ -63,7 +88,7 @@ function onTabChange(value: string | number) {
     </Tabs>
     <div class="sftp-side-body">
       <DirTree
-        v-if="tab === 'tree' && treeRoot"
+        v-if="activeTab === 'tree' && treeRoot"
         :nodes="[treeRoot]"
         :depth="0"
         :current-path="currentPath"
@@ -72,7 +97,7 @@ function onTabChange(value: string | number) {
         @open="emit('navigate', $event.path)"
         @context="onTreeContext"
       />
-      <div v-else-if="tab === 'quick'" class="sftp-side-quick">
+      <div v-else-if="activeTab === 'quick'" class="sftp-side-quick">
         <button
           v-for="qp in quickPaths"
           :key="qp.path"
@@ -87,6 +112,7 @@ function onTabChange(value: string | number) {
           <span>{{ qp.label }}</span>
         </button>
       </div>
+      <OtpPanel v-else-if="activeTab === 'otp'" :t="t" />
     </div>
   </div>
   <div v-else class="sftp-side-rail">
