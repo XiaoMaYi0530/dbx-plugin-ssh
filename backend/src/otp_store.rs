@@ -462,7 +462,9 @@ pub fn bound_totp(connection_id: &str) -> Option<BoundTotp> {
 
 /// 共享防重放缓存：`entry_id -> (code, time_step, period)`。`otp/generate`
 /// 与自动应答回落共用——同一窗口的码只发一次。
-static WINDOW_CODES: OnceLock<Mutex<HashMap<String, (String, u64, u64)>>> = OnceLock::new();
+/// 共享防重放缓存：entry_id -> (最近发出的码, time_step, period)。
+type WindowCache = HashMap<String, (String, u64, u64)>;
+static WINDOW_CODES: OnceLock<Mutex<WindowCache>> = OnceLock::new();
 
 fn window_codes() -> &'static Mutex<HashMap<String, (String, u64, u64)>> {
     WINDOW_CODES.get_or_init(|| Mutex::new(HashMap::new()))
