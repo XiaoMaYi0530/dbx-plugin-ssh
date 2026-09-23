@@ -260,7 +260,12 @@ jobs:
             chmod +x "$shim_dir/cargo"
             export PATH="$shim_dir:$PATH"
           fi
+          # 不设 DBX_PLUGIN_SDK_ROOT 时 npm 包装器会注入 CLI 自带 sdk-root，
+          # vendored SDK（shared/sdk/）的本地修复进不了出货 sidecar——指向垫片。
+          export DBX_PLUGIN_SDK_ROOT="$(bash scripts/sdk_root_shim.sh)"
           dbx-plugin package .
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" scripts/verify_packaged_sdk.py
       # 出货把关一：包内 Linux 二进制必须全静态（glibc 地板修复）。
       - name: Verify packaged linux binary is statically linked
         if: matrix.os == 'linux'

@@ -1,4 +1,5 @@
-// 终端 WebGL 加速纯逻辑单测：偏好持久化、attach 三路径、开关幂等切换。
+// 终端 WebGL 加速纯逻辑单测：偏好持久化、attach 三路径、开关幂等切换、
+// context-loss 有限预算重建。
 import { describe, expect, it, vi } from "vitest";
 import {
   attachWebglRenderer,
@@ -126,5 +127,136 @@ describe("syncWebglRenderer", () => {
     const second = syncWebglRenderer(terminal, true, first, create);
     expect(second).toBe(addon);
     expect(terminal.loaded).toHaveLength(1);
+  });
+});
+
+// 每次 create 产出独立 addon 的工厂 + 手动触发的延迟调度器（重建走 setTimeout，
+// 单测里手动 flush 保证确定性）。
+function fakeAddonFactory(options: { failAfter?: number } = {}) {
+  const created: Array<WebglRendererLike & { fireContextLoss(): void }> = [];
+  return {
+    created,
+    create: () => {
+      if (options.failAfter !== undefined && created.length >= options.failAfter) {
+        throw new Error("no webgl context");
+      }
+      let contextLossCallback: (() => void) | null = null;
+      const addon: WebglRendererLike & { fireContextLoss(): void } = {
+        dispose() {},
+        onContextLoss(callback: () => void) {
+          contextLossCallback = callback;
+          return { dispose() {} };
+        },
+        fireContextLoss() {
+          contextLossCallback?.();
+        },
+      };
+      created.push(addon);
+      return addon;
+    },
+  };
+}
+
+function manualScheduler() {
+  const pending: Array<() => void> = [];
+  return {
+    pending,
+    schedule: (callback: () => void) => {
+      pending.push(callback);
+      return pending.length;
+    },
+    cancel: () => {},
+    flush() {
+      for (const callback of pending.splice(0)) callback();
+    },
+  };
+}
+
+describe("attachWebglRenderer context-loss recovery", () => {
+  it("recreates the renderer after a context loss and reports the new addon", () => {
+    const terminal = fakeTerminal();
+    const factory = fakeAddonFactory();
+    const timer = manualScheduler();
+    const recovered: unknown[] = [];
+    const first = attachWebglRenderer(terminal, factory.create, {
+      schedule: timer.schedule,
+      onRecovered: (addon) => recovered.push(addon),
+    });
+    expect(first).toBe(factory.created[0]);
+
+    first!.fireContextLoss();
+    expect(timer.pending).toHaveLength(1);
+    timer.flush();
+
+    expect(recovered).toEqual([factory.created[1]]);
+    expect(terminal.loaded).toEqual([factory.created[0], factory.created[1]]);
+  });
+
+  it("exhausts the retry budget silently when the context stays gone", () => {
+    const terminal = fakeTerminal();
+    const factory = fakeAddonFactory({ failAfter: 1 });
+    const timer = manualScheduler();
+    const recovered: unknown[] = [];
+    const first = attachWebglRenderer(terminal, factory.create, {
+      schedule: timer.schedule,
+      onRecovered: (addon) => recovered.push(addon),
+    });
+
+    first!.fireContextLoss();
+    timer.flush();
+    timer.flush();
+    expect(recovered).toEqual([]);
+    expect(terminal.loaded).toEqual([first]);
+    // 预算（默认 2 次重建）耗尽后不再排新尝试。
+    expect(timer.pending).toHaveLength(0);
+  });
+
+  it("skips recreation when the preference was switched off before the retry fires", () => {
+    const terminal = fakeTerminal();
+    const factory = fakeAddonFactory();
+    const timer = manualScheduler();
+    let enabled = true;
+    const first = attachWebglRenderer(terminal, factory.create, {
+      schedule: timer.schedule,
+      enabled: () => enabled,
+    });
+
+    first!.fireContextLoss();
+    enabled = false;
+    timer.flush();
+
+    expect(factory.created).toEqual([first]);
+    expect(terminal.loaded).toEqual([first]);
+  });
+
+  it("a recovered renderer carries its own decremented budget", () => {
+    const terminal = fakeTerminal();
+    const factory = fakeAddonFactory();
+    const timer = manualScheduler();
+    const first = attachWebglRenderer(terminal, factory.create, {
+      schedule: timer.schedule,
+      retries: 2,
+    });
+
+    first!.fireContextLoss();
+    timer.flush();
+    factory.created[1].fireContextLoss();
+    timer.flush();
+    expect(terminal.loaded).toHaveLength(3);
+
+    factory.created[2].fireContextLoss();
+    expect(timer.pending).toHaveLength(0);
+  });
+
+  it("syncWebglRenderer forwards recovery options on toggle-on attach", () => {
+    const terminal = fakeTerminal();
+    const factory = fakeAddonFactory();
+    const timer = manualScheduler();
+    const attached = syncWebglRenderer(terminal, true, null, factory.create, {
+      schedule: timer.schedule,
+    });
+
+    attached!.fireContextLoss();
+    expect(timer.pending).toHaveLength(1);
   });
 });

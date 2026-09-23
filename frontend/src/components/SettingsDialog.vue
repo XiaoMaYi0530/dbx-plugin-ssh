@@ -1,0 +1,949 @@
+<script setup lang="ts">
+// 设置弹窗（从 App.vue 抽出的独立组件）：承载设置主弹窗与 quick sudo 配置档
+// 管理弹窗，两者共用同一份 sudoProfiles/profileDraft 草稿状态。连接级设置
+// （ssh/settings/get|set）、配置档（sudo/profiles/*）、已知主机
+// （ssh/knownHosts/*）、本机密钥发现（keys/discover）、MCP 限速
+// （mcp/settings/*）经全局 window.dbxPlugin.invoke 直调；下载偏好与终端偏好
+// （WebGL/选中复制/终端字体）的权威态在宿主 App——下载偏好经 downloadPrefs
+// 适配器读写，终端偏好经 props 下发 + emits 上抛。
+import { computed, reactive, ref, watch } from "vue";
+import { FolderOpen, KeyRound, Loader2, Pencil, Plus, ShieldCheck, Trash2, X } from "@lucide/vue";
+import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
+import { Switch } from "./ui/switch";
+import { AGENT_MODES, sanitizeRememberedCommands } from "../lib/agentTerminal";
+import { clampFontSize, TERMINAL_FONT_MAX, TERMINAL_FONT_MIN } from "../lib/terminalZoom";
+import { loadTerminalFontOverride } from "../lib/terminalFont";
+import { MIB, mibField, settingsErrorOf, type DiscoveredKey, type KnownHostEntry, type McpSizeSettings, type SshSettings, type SudoProfileView } from "../lib/settingsModel";
+import { DOWNLOAD_CONFLICT_POLICIES, type DownloadConflictPolicy } from "../lib/downloadPrefs";
+
+const props = defineProps<{
+  open: boolean;
+  profilesOpen: boolean;
+  sessionId?: string;
+  /** 终端当前生效字号（缩放链路在 App，设置页字号草稿以它为初始回显）。 */
+  terminalFontSize: number;
+  /** 宿主主题终端基准字号（「恢复默认」回到该值）。 */
+  hostFontSize: number;
+  localDownloadDir: string;
+  localCanSave: boolean;
+  webglEnabled: boolean;
+  termSelectCopy: boolean;
+  /** 下载偏好的读写适配器（权威态与 sidecar preferences 同步在 App）。 */
+  downloadPrefs: {
+    loadDir(): string;
+    loadUseDefault(): boolean;
+    loadConflict(): DownloadConflictPolicy;
+    persistDir(value: string): void;
+    persistUseDefault(value: boolean): void;
+    persistConflict(value: DownloadConflictPolicy): void;
+  };
+  t: (key: string, values?: Record<string, string | number>) => string;
+}>();
+
+const emit = defineEmits<{
+  (e: "update:open", value: boolean): void;
+  (e: "update:profilesOpen", value: boolean): void;
+  (e: "notice", message: string): void;
+  (e: "error", cause: unknown): void;
+  (e: "browse-download-dir"): void;
+  (e: "update:webgl", value: boolean): void;
+  (e: "toggle-select-copy"): void;
+  (e: "apply-font", payload: { family: string | null; size: number }): void;
+}>();
+
+const t = props.t;
+
+const SETTINGS_CATEGORIES = [
+  { id: "sudo", labelKey: "settingsNav.sudo" },
+  { id: "agent", labelKey: "agentTerminalSection" },
+  { id: "transfer", labelKey: "downloadSettings.title" },
+  { id: "terminal", labelKey: "settingsNav.terminal" },
+  { id: "security", labelKey: "settingsNav.security" },
+  { id: "mcp", labelKey: "mcpLimits.title" },
+] as const;
+type SettingsCategory = (typeof SETTINGS_CATEGORIES)[number]["id"];
+const settingsCategory = ref<SettingsCategory>("sudo");
+
+function onSettingsCategoryChange(value: string | number) {
+  settingsCategory.value = value as SettingsCategory;
+}
+
+// reka Select 不接受空串 option value（空串 = 未选中占位）；空值选项用哨兵值双向映射。
+const SELECT_EMPTY_SENTINEL = "__empty__";
+const settingsLoading = ref(false);
+const settingsLoadFailed = ref(false);
+const settingsSaving = ref(false);
+const settingsMeta = ref<SshSettings>();
+const settingsDraft = reactive({
+  quickSudo: true,
+  sudoUsePty: false,
+  sudoPassword: "",
+  totpSecret: "",
+  authFlowMode: "password_then_otp",
+  passwordPromptHint: "",
+  totpPromptHint: "",
+  quickSudoProfileId: "",
+  agentTerminalMode: "off",
+  rememberedCommands: [] as string[],
+});
+const downloadDirDraft = ref("");
+const downloadUseDefaultDraft = ref(props.downloadPrefs.loadUseDefault());
+const downloadConflictDraft = ref<DownloadConflictPolicy>("rename");
+// 全局 quick sudo 配置：列表与编辑表单状态（密钥只在提交时发送）。设置弹窗
+// 内联 section 与独立 profiles 弹窗共存复用同一份状态。
+const sudoProfiles = ref<SudoProfileView[]>([]);
+const sudoProfilesLoading = ref(false);
+const sudoProfilesError = ref("");
+const profilesInlineOpen = ref(false);
+const profileEditing = ref(false);
+const profileSaving = ref(false);
+const profileDraftHadPassword = ref(false);
+const profileDraftHadTotp = ref(false);
+const profileDraft = reactive({
+  id: "",
+  name: "",
+  sudoPassword: "",
+  totpSecret: "",
+  authFlowMode: "password_then_otp",
+  passwordPromptHint: "",
+  totpPromptHint: "",
+  sudoUsePty: false,
+});
+const boundProfile = computed(
+  () => sudoProfiles.value.find((profile) => profile.id === settingsDraft.quickSudoProfileId),
+);
+const knownHosts = ref<KnownHostEntry[]>([]);
+const knownHostsLoading = ref(false);
+const knownHostsError = ref("");
+const localKeys = ref<DiscoveredKey[]>([]);
+const localKeysLoading = ref(false);
+const localKeysError = ref("");
+const mcpDraft = reactive({ readMiB: "", uploadMiB: "", downloadMiB: "", permissionMode: "autonomous", connectionScope: "" });
+const mcpLoading = ref(false);
+const mcpError = ref("");
+const mcpSaving = ref(false);
+const mcpInputsValid = computed(() => [mcpDraft.readMiB, mcpDraft.uploadMiB, mcpDraft.downloadMiB]
+  .every((value) => /^\d+$/.test(value.trim()) && Number.parseInt(value.trim(), 10) > 0));
+
+// AI 终端同步模式下拉随档位变化的说明文案（off/auto/strict 三键 hint）。
+const agentTerminalModeHint = computed(() => t(
+  settingsDraft.agentTerminalMode === "auto" ? "agentTerminalAutoHint"
+  : settingsDraft.agentTerminalMode === "strict" ? "agentTerminalStrictHint"
+  : "agentTerminalOffHint",
+));
+
+// 终端字体设置控件态（issue #31）：预设等宽字体 + 跟随宿主 + 自定义；哨兵值
+// 只作选择器键使用，不会作为字体串写入（写入前映射回 null/真实字体串）。
+const TERMINAL_FONT_FOLLOW_HOST = "__follow-host__";
+const TERMINAL_FONT_CUSTOM = "__custom__";
+const TERMINAL_FONT_PRESETS: Array<{ value: string; label: string }> = [
+  { value: "'JetBrains Mono', Consolas, monospace", label: "JetBrains Mono" },
+  { value: "'Cascadia Code', 'Cascadia Mono', monospace", label: "Cascadia Code" },
+  { value: "'Fira Code', monospace", label: "Fira Code" },
+  { value: "'Source Code Pro', monospace", label: "Source Code Pro" },
+  { value: "Menlo, Monaco, monospace", label: "Menlo" },
+  { value: "Consolas, 'Courier New', monospace", label: "Consolas" },
+  { value: "'DejaVu Sans Mono', monospace", label: "DejaVu Sans Mono" },
+  { value: "monospace", label: "monospace" },
+];
+const terminalFontFamilyChoice = ref(TERMINAL_FONT_FOLLOW_HOST);
+const terminalFontCustomDraft = ref("");
+const terminalFontSizeDraft = ref(String(props.terminalFontSize));
+
+// 字体控件回显当前覆盖态：初始化与应用/恢复默认后都会刷新，避免草稿漂移。
+function syncFontControls(family: string | null, size: number) {
+  if (!family) {
+    terminalFontFamilyChoice.value = TERMINAL_FONT_FOLLOW_HOST;
+    terminalFontCustomDraft.value = "";
+  } else if (TERMINAL_FONT_PRESETS.some((preset) => preset.value === family)) {
+    terminalFontFamilyChoice.value = family;
+    terminalFontCustomDraft.value = "";
+  } else {
+    terminalFontFamilyChoice.value = TERMINAL_FONT_CUSTOM;
+    terminalFontCustomDraft.value = family;
+  }
+  terminalFontSizeDraft.value = String(size);
+}
+syncFontControls(loadTerminalFontOverride().fontFamily, props.terminalFontSize);
+
+// 设置页字体族下拉：跟随宿主/预设即时应用并持久化；选「自定义」时仅展开
+// 输入框，待输入 @change 再应用（applyTerminalFontFromControls）。
+function onTerminalFontFamilyChoice(choice: string) {
+  terminalFontFamilyChoice.value = choice;
+  if (choice === TERMINAL_FONT_CUSTOM) return;
+  applyTerminalFont(choice === TERMINAL_FONT_FOLLOW_HOST ? null : choice, props.terminalFontSize);
+}
+
+function applyTerminalFontFromControls() {
+  let family: string | null;
+  if (terminalFontFamilyChoice.value === TERMINAL_FONT_CUSTOM) {
+    const custom = terminalFontCustomDraft.value.trim();
+    family = custom.length > 0 ? custom : null; // 空自定义视作跟随宿主
+  } else if (terminalFontFamilyChoice.value === TERMINAL_FONT_FOLLOW_HOST) {
+    family = null;
+  } else {
+    family = terminalFontFamilyChoice.value;
+  }
+  const parsed = Number(terminalFontSizeDraft.value);
+  const size = Number.isFinite(parsed) && parsed > 0 ? clampFontSize(parsed, 0) : props.hostFontSize;
+  applyTerminalFont(family, size);
+}
+
+// 恢复默认：清掉用户设置（连字号键一起删），回到宿主基准。
+function resetTerminalFont() {
+  applyTerminalFont(null, props.hostFontSize);
+}
+
+/// 应用用户字体设置：应用侧（App）负责落到 xterm、持久化与 toast。
+function applyTerminalFont(family: string | null, size: number) {
+  emit("apply-font", { family, size });
+  syncFontControls(family, size);
+}
+
+async function reloadSettings() {
+  downloadDirDraft.value = props.downloadPrefs.loadDir();
+  downloadUseDefaultDraft.value = props.downloadPrefs.loadUseDefault();
+  downloadConflictDraft.value = props.downloadPrefs.loadConflict();
+  if (settingsLoading.value || settingsSaving.value) return;
+  settingsLoading.value = true;
+  settingsLoadFailed.value = false;
+  settingsMeta.value = undefined;
+  // 每次打开都回到收起态，并丢弃上次遗留的内联编辑草稿：
+  // 主「保存」会串行提交未保存的 profile 编辑，不能把陈旧草稿静默入库。
+  profilesInlineOpen.value = false;
+  cancelProfileEdit();
+  void loadKnownHosts();
+  void loadLocalKeys();
+  void loadMcpSettings();
+  void loadSudoProfiles();
+  try {
+    // revealSecrets: 预填已存原值（原始凭据串），避免只能看到"已配置"占位。
+    const meta = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/get", { sessionId: props.sessionId, revealSecrets: true });
+    settingsMeta.value = meta;
+    settingsDraft.quickSudo = meta.quickSudo;
+    settingsDraft.sudoUsePty = meta.sudoUsePty;
+    settingsDraft.authFlowMode = meta.authFlowMode || "password_then_otp";
+    settingsDraft.passwordPromptHint = meta.passwordPromptHint || "";
+    settingsDraft.totpPromptHint = meta.totpPromptHint || "";
+    settingsDraft.quickSudoProfileId = meta.quickSudoProfileId || "";
+    const agentMode = meta.agentTerminalMode;
+    settingsDraft.agentTerminalMode = agentMode && (AGENT_MODES as readonly string[]).includes(agentMode) ? agentMode : "off";
+    settingsDraft.rememberedCommands = sanitizeRememberedCommands(meta.rememberedCommands);
+    settingsDraft.sudoPassword = meta.sudoPassword || "";
+    settingsDraft.totpSecret = meta.totpSecret || "";
+  } catch {
+    settingsLoadFailed.value = true;
+  } finally {
+    settingsLoading.value = false;
+  }
+}
+
+watch(() => props.open, (open) => {
+  if (open) void reloadSettings();
+});
+
+watch(() => props.profilesOpen, (open) => {
+  if (!open) return;
+  profileEditing.value = false;
+  resetProfileDraft();
+  void loadSudoProfiles();
+});
+
+async function loadSudoProfiles() {
+  sudoProfilesLoading.value = true;
+  sudoProfilesError.value = "";
+  try {
+    const result = await window.dbxPlugin.invoke<{ profiles: SudoProfileView[] }>("sudo/profiles/list", {});
+    sudoProfiles.value = result.profiles;
+  } catch (cause) {
+    sudoProfiles.value = [];
+    sudoProfilesError.value = settingsErrorOf(cause);
+  } finally {
+    sudoProfilesLoading.value = false;
+  }
+}
+
+function flowModeLabel(mode: string) {
+  if (mode === "off") return t("flowOff");
+  if (mode === "password_only") return t("flowOnly");
+  if (mode === "password_plus_otp") return t("flowPlusOtp");
+  return t("flowThenOtp");
+}
+
+function profileSummary(profile: SudoProfileView) {
+  return [
+    `${t("settingsSudoPassword")}: ${profile.sudoPasswordSet ? t("settingsConfigured") : "—"}`,
+    `${t("settingsTotp")}: ${profile.totpConfigured ? t("settingsConfigured") : "—"}`,
+    t("settingsFlowMode") + ": " + flowModeLabel(profile.authFlowMode),
+    profile.sudoUsePty ? t("settingsUsePty") : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function resetProfileDraft() {
+  profileDraft.id = "";
+  profileDraft.name = "";
+  profileDraft.sudoPassword = "";
+  profileDraft.totpSecret = "";
+  profileDraft.authFlowMode = "password_then_otp";
+  profileDraft.passwordPromptHint = "";
+  profileDraft.totpPromptHint = "";
+  profileDraft.sudoUsePty = false;
+  profileDraftHadPassword.value = false;
+  profileDraftHadTotp.value = false;
+}
+
+function startProfileCreate() {
+  resetProfileDraft();
+  profileEditing.value = true;
+}
+
+function startProfileEdit(profile: SudoProfileView) {
+  resetProfileDraft();
+  profileDraft.id = profile.id;
+  profileDraft.name = profile.name;
+  profileDraft.authFlowMode = profile.authFlowMode || "password_then_otp";
+  profileDraft.passwordPromptHint = profile.passwordPromptHint || "";
+  profileDraft.totpPromptHint = profile.totpPromptHint || "";
+  profileDraft.sudoUsePty = profile.sudoUsePty;
+  profileDraftHadPassword.value = profile.sudoPasswordSet;
+  profileDraftHadTotp.value = profile.totpConfigured;
+  profileEditing.value = true;
+  // 回显已存原值供编辑（工作台专用 reveal 方法；失败保持占位提示）。
+  if (profile.sudoPasswordSet || profile.totpConfigured) {
+    const editingId = profile.id;
+    void window.dbxPlugin
+      .invoke<{ profile: { sudoPassword?: string; totpSecret?: string } }>("sudo/profiles/reveal", { id: editingId })
+      .then((revealed) => {
+        if (profileEditing.value && profileDraft.id === editingId) {
+          profileDraft.sudoPassword = revealed.profile?.sudoPassword || "";
+          profileDraft.totpSecret = revealed.profile?.totpSecret || "";
+        }
+      })
+      .catch(() => undefined);
+  }
+}
+
+async function saveProfileDraft() {
+  if (profileSaving.value) return;
+  const name = profileDraft.name.trim();
+  if (!name) {
+    sudoProfilesError.value = t("profilesNameRequired");
+    return;
+  }
+  profileSaving.value = true;
+  sudoProfilesError.value = "";
+  try {
+    const payload: Record<string, unknown> = {
+      authFlowMode: profileDraft.authFlowMode,
+      passwordPromptHint: profileDraft.passwordPromptHint,
+      totpPromptHint: profileDraft.totpPromptHint,
+      sudoUsePty: profileDraft.sudoUsePty,
+    };
+    if (profileDraft.id) payload.id = profileDraft.id;
+    payload.name = name;
+    if (profileDraft.sudoPassword) payload.sudoPassword = profileDraft.sudoPassword;
+    if (profileDraft.totpSecret.trim()) payload.totpSecret = profileDraft.totpSecret;
+    await window.dbxPlugin.invoke("sudo/profiles/save", payload);
+    profileEditing.value = false;
+    resetProfileDraft();
+    await loadSudoProfiles();
+    await refreshSettingsMeta();
+    emit("notice", t("profilesSaved"));
+  } catch (cause) {
+    sudoProfilesError.value = settingsErrorOf(cause);
+  } finally {
+    profileSaving.value = false;
+  }
+}
+
+async function removeProfile(profile: SudoProfileView) {
+  if (!window.confirm(t("profilesDeleteConfirm", { name: profile.name }))) return;
+  try {
+    await window.dbxPlugin.invoke("sudo/profiles/delete", { id: profile.id });
+    if (settingsDraft.quickSudoProfileId === profile.id) settingsDraft.quickSudoProfileId = "";
+    await loadSudoProfiles();
+    await refreshSettingsMeta();
+    emit("notice", t("profilesDeleted"));
+  } catch (cause) {
+    sudoProfilesError.value = settingsErrorOf(cause);
+  }
+}
+
+/// 取消内联 profile 编辑：关表单并清空草稿/错误（独立 profiles 弹窗、
+/// 设置弹窗内联 section 与 Esc 关闭链共用同一语义）。
+function cancelProfileEdit() {
+  profileEditing.value = false;
+  resetProfileDraft();
+  sudoProfilesError.value = "";
+}
+
+/// 全局配置或其绑定变化后，刷新设置弹窗的只读摘要（会话内即时生效）。
+async function refreshSettingsMeta() {
+  if (!props.open || !props.sessionId) return;
+  try {
+    settingsMeta.value = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/get", { sessionId: props.sessionId });
+  } catch {
+    // 摘要刷新失败不打断主流程；重新打开设置时会再次加载。
+  }
+}
+
+async function loadKnownHosts() {
+  knownHostsLoading.value = true;
+  knownHostsError.value = "";
+  try {
+    const result = await window.dbxPlugin.invoke<{ entries: KnownHostEntry[] }>("ssh/knownHosts/list", {});
+    knownHosts.value = result.entries;
+  } catch (cause) {
+    knownHosts.value = [];
+    knownHostsError.value = settingsErrorOf(cause);
+  } finally {
+    knownHostsLoading.value = false;
+  }
+}
+
+async function removeKnownHost(entry: KnownHostEntry) {
+  if (!window.confirm(t("knownHosts.removeConfirm", { host: `${entry.host}:${entry.port}` }))) return;
+  try {
+    await window.dbxPlugin.invoke("ssh/knownHosts/remove", { host: entry.host, port: entry.port });
+    emit("notice", t("knownHosts.removed", { host: `${entry.host}:${entry.port}` }));
+  } catch (cause) {
+    knownHostsError.value = settingsErrorOf(cause);
+  } finally {
+    await loadKnownHosts();
+  }
+}
+
+async function loadLocalKeys() {
+  localKeysLoading.value = true;
+  localKeysError.value = "";
+  try {
+    const result = await window.dbxPlugin.invoke<{ keys: DiscoveredKey[] }>("keys/discover", {});
+    localKeys.value = result.keys.map((key) => ({ ...key, hasPassphrase: key.hasPassphrase ?? key.has_passphrase === true }));
+  } catch (cause) {
+    localKeys.value = [];
+    localKeysError.value = settingsErrorOf(cause);
+  } finally {
+    localKeysLoading.value = false;
+  }
+}
+
+async function loadMcpSettings() {
+  mcpLoading.value = true;
+  mcpError.value = "";
+  try {
+    const result = await window.dbxPlugin.invoke<McpSizeSettings>("mcp/settings/get", {});
+    mcpDraft.readMiB = mibField(result.maxReadBytes);
+    mcpDraft.uploadMiB = mibField(result.maxUploadBytes);
+    mcpDraft.downloadMiB = mibField(result.maxDownloadBytes);
+    // §1.3 新字段：旧 sidecar 不回时用默认（autonomous / 空=不限）。
+    mcpDraft.permissionMode = result.execPermissionMode === "confirm" ? "confirm" : "autonomous";
+    mcpDraft.connectionScope = Array.isArray(result.connectionScope) ? result.connectionScope.join("\n") : "";
+  } catch (cause) {
+    mcpError.value = settingsErrorOf(cause);
+  } finally {
+    mcpLoading.value = false;
+  }
+}
+
+async function saveMcpSettings() {
+  if (!mcpInputsValid.value || mcpSaving.value) return;
+  mcpSaving.value = true;
+  mcpError.value = "";
+  try {
+    await window.dbxPlugin.invoke("mcp/settings/set", {
+      maxReadBytes: Number.parseInt(mcpDraft.readMiB.trim(), 10) * MIB,
+      maxUploadBytes: Number.parseInt(mcpDraft.uploadMiB.trim(), 10) * MIB,
+      maxDownloadBytes: Number.parseInt(mcpDraft.downloadMiB.trim(), 10) * MIB,
+      // §1.3 MCP 权限档 + 连接作用域（每行一条，trim 去空后提交；旧 sidecar
+      // 不识别新字段时整体报错，经 mcpError 容错展示）。
+      execPermissionMode: mcpDraft.permissionMode === "confirm" ? "confirm" : "autonomous",
+      connectionScope: mcpDraft.connectionScope.split("\n").map((line) => line.trim()).filter(Boolean),
+    });
+    emit("notice", t("mcpLimits.saved"));
+  } catch (cause) {
+    mcpError.value = settingsErrorOf(cause);
+  } finally {
+    mcpSaving.value = false;
+  }
+}
+
+/**
+ * 一次保存链（设置弹窗主按钮）：① 未保存的 profile 编辑 → ② 连接设置 →
+ * ③ MCP 限速。各步独立容错——saveProfileDraft/saveMcpSettings 内部已把失败
+ * 写入 sudoProfilesError/mcpError 并展示，单步失败不阻断其余步骤；
+ * MCP 表单非法时保持现有校验提示、静默跳过提交。
+ */
+async function saveSettings() {
+  if (!props.sessionId || settingsSaving.value || settingsLoading.value || settingsLoadFailed.value || !settingsMeta.value) return;
+  settingsSaving.value = true;
+  try {
+    props.downloadPrefs.persistDir(downloadDirDraft.value);
+    props.downloadPrefs.persistUseDefault(downloadUseDefaultDraft.value);
+    props.downloadPrefs.persistConflict(downloadConflictDraft.value);
+    if (profileEditing.value) await saveProfileDraft();
+    const updates: Record<string, unknown> = {
+      quickSudo: settingsDraft.quickSudo,
+      sudoUsePty: settingsDraft.sudoUsePty,
+      authFlowMode: settingsDraft.authFlowMode,
+      passwordPromptHint: settingsDraft.passwordPromptHint,
+      totpPromptHint: settingsDraft.totpPromptHint,
+      quickSudoProfileId: settingsDraft.quickSudoProfileId,
+      agentTerminalMode: settingsDraft.agentTerminalMode,
+      rememberedCommands: sanitizeRememberedCommands(settingsDraft.rememberedCommands),
+    };
+    if (settingsDraft.sudoPassword) updates.sudoPassword = settingsDraft.sudoPassword;
+    if (settingsDraft.totpSecret.trim()) updates.totpSecret = settingsDraft.totpSecret;
+    const meta = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/set", { sessionId: props.sessionId, ...updates });
+    settingsMeta.value = meta;
+    settingsDraft.sudoPassword = "";
+    settingsDraft.totpSecret = "";
+    await saveMcpSettings();
+    emit("notice", t("settingsSaved"));
+  } catch (cause) {
+    emit("error", cause);
+  } finally {
+    settingsSaving.value = false;
+  }
+}
+
+async function clearStoredSecrets() {
+  if (!props.sessionId || settingsSaving.value || settingsLoading.value || settingsLoadFailed.value || !settingsMeta.value) return;
+  try {
+    const meta = await window.dbxPlugin.invoke<SshSettings>("ssh/settings/set", {
+      sessionId: props.sessionId,
+      sudoPassword: "",
+      totpSecret: "",
+    });
+    settingsMeta.value = meta;
+    emit("notice", t("settingsSecretsCleared"));
+  } catch (cause) {
+    emit("error", cause);
+  }
+}
+
+/// Esc 分层退出：先关编辑表单，再收起配置档 section；返回 false 表示已到
+/// 最底层，调用方（App Esc 链）应关闭整个弹窗。
+function consumeInlineEsc(): boolean {
+  if (profilesInlineOpen.value && profileEditing.value) {
+    cancelProfileEdit();
+    return true;
+  }
+  if (profilesInlineOpen.value) {
+    profilesInlineOpen.value = false;
+    return true;
+  }
+  return false;
+}
+
+/// 下载询问弹窗勾选「设为默认」/目录选择器回填后，App 同步设置页草稿
+/// （弹窗开着也能立即看到）。
+function setDownloadDirDraft(dir: string) {
+  downloadDirDraft.value = dir;
+}
+
+function setDownloadUseDefaultDraft(value: boolean) {
+  downloadUseDefaultDraft.value = value;
+}
+
+function shortFingerprint(fingerprint: string) {
+  if (fingerprint.length <= 20) return fingerprint;
+  return `${fingerprint.slice(0, 17)}…`;
+}
+
+defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft });
+</script>
+
+<template>
+    <!-- 设置主弹窗 -->
+    <Dialog :open="open" @update:open="(value) => emit('update:open', value)">
+      <DialogContent class="modal settings-modal settings-nav-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("settings") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="emit('update:open', false)"><X /></button></header>
+        <div class="settings-body">
+          <div v-if="settingsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+          <div v-else-if="settingsLoadFailed" class="task-error" role="alert">
+            {{ t("settingsLoadFailed") }}
+            <button class="link-button" @click="reloadSettings">{{ t("refresh") }}</button>
+          </div>
+          <template v-else>
+          <div class="settings-layout">
+            <nav class="settings-nav" aria-label="settings categories">
+              <Tabs :model-value="settingsCategory" orientation="vertical" class="settings-nav-tabs" @update:model-value="onSettingsCategoryChange">
+                <TabsList class="settings-nav-list">
+                  <TabsTrigger v-for="cat in SETTINGS_CATEGORIES" :key="cat.id" :value="cat.id" class="settings-nav-item">{{ t(cat.labelKey) }}</TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </nav>
+            <div class="settings-content">
+            <div v-show="settingsCategory === 'sudo'" class="settings-pane">
+            <label class="settings-field">
+              <span>{{ t("settingsCredentialSource") }}</span>
+              <span class="credential-source-row">
+                <Select :model-value="settingsDraft.quickSudoProfileId || SELECT_EMPTY_SENTINEL" @update:model-value="(v) => (settingsDraft.quickSudoProfileId = v === SELECT_EMPTY_SENTINEL ? '' : String(v))">
+                  <SelectTrigger size="xs" class="credential-source-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem :value="SELECT_EMPTY_SENTINEL">{{ t("profileSourceConnection") }}</SelectItem>
+                    <SelectItem v-for="profile in sudoProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}</SelectItem>
+                  </SelectContent>
+                </Select>
+                <!-- 内联管理入口：展开/收起下方配置档 section，不再跳独立弹窗（工具栏 KeyRound 仍保留独立弹窗）。 -->
+                <button class="link-button" :aria-expanded="profilesInlineOpen" @click="profilesInlineOpen = !profilesInlineOpen">{{ t("profilesManage") }}</button>
+              </span>
+            </label>
+            <p v-if="boundProfile" class="muted settings-note">{{ t("profilesBoundSummary", { name: boundProfile.name }) }} · {{ profileSummary(boundProfile) }}</p>
+            <!-- 内联 quick sudo 配置档管理：列表 + 新增/编辑同表单状态
+                 （sudoProfiles/profileDraft/... 与独立 profiles 弹窗共用），主「保存」串行提交。 -->
+            <section v-if="profilesInlineOpen" class="profiles-inline">
+              <h3 class="settings-section-title">{{ t("profilesTitle") }}</h3>
+              <p class="muted">{{ t("profilesHint") }}</p>
+              <div v-if="sudoProfilesLoading && !sudoProfiles.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+              <div v-else-if="!sudoProfiles.length" class="empty compact">{{ t("profilesEmpty") }}</div>
+              <ul v-else class="settings-list">
+                <li v-for="profile in sudoProfiles" :key="profile.id">
+                  <div class="settings-list-main">
+                    <strong>{{ profile.name }}</strong>
+                    <span class="muted">{{ profileSummary(profile) }}</span>
+                  </div>
+                  <span class="settings-list-actions">
+                    <button class="icon-button" :title="t('profilesEdit')" @click="startProfileEdit(profile)"><Pencil /></button>
+                    <button class="icon-button" :title="t('profilesDelete')" @click="removeProfile(profile)"><Trash2 /></button>
+                  </span>
+                </li>
+              </ul>
+              <p class="muted">{{ t("profilesLimit", { count: sudoProfiles.length, limit: 20 }) }}</p>
+              <button v-if="!profileEditing" class="link-button" @click="startProfileCreate">{{ t("profilesAdd") }}</button>
+              <template v-if="profileEditing">
+                <h4 class="settings-section-title">{{ profileDraft.id ? t("profilesEdit") : t("profilesAdd") }}</h4>
+                <label class="settings-field">
+                  <span>{{ t("profilesName") }}</span>
+                  <input v-model="profileDraft.name" spellcheck="false" :placeholder="t('profilesNamePlaceholder')" />
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("profilesPassword") }}</span>
+                  <input v-model="profileDraft.sudoPassword" type="password" autocomplete="off" :placeholder="profileDraftHadPassword ? t('profilesPasswordKeep') : t('settingsSudoPasswordPlaceholder')" />
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("settingsTotp") }}</span>
+                  <textarea v-model="profileDraft.totpSecret" rows="2" spellcheck="false" :placeholder="profileDraftHadTotp ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("settingsFlowMode") }}</span>
+                  <Select :model-value="profileDraft.authFlowMode" @update:model-value="(v) => (profileDraft.authFlowMode = String(v))">
+                    <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="off">{{ t("flowOff") }}</SelectItem>
+                      <SelectItem value="password_then_otp">{{ t("flowThenOtp") }}</SelectItem>
+                      <SelectItem value="password_plus_otp">{{ t("flowPlusOtp") }}</SelectItem>
+                      <SelectItem value="password_only">{{ t("flowOnly") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("settingsPasswordHint") }}</span>
+                  <input v-model="profileDraft.passwordPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+                </label>
+                <label class="settings-field">
+                  <span>{{ t("settingsTotpHint") }}</span>
+                  <input v-model="profileDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+                </label>
+                <label class="quick-sudo-control">
+                  <Switch v-model="profileDraft.sudoUsePty" size="sm" />
+                  <span>{{ t("settingsUsePty") }}</span>
+                </label>
+                <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
+                <footer class="profiles-form-actions">
+                  <button @click="cancelProfileEdit">{{ t("cancel") }}</button>
+                  <button class="primary-button" :disabled="profileSaving || !profileDraft.name.trim()" @click="saveProfileDraft"><Loader2 v-if="profileSaving" class="spinning" />{{ t("save") }}</button>
+                </footer>
+              </template>
+            </section>
+            <label class="quick-sudo-control">
+              <Switch v-model="settingsDraft.quickSudo" size="sm" />
+              <span>{{ t("settingsQuickSudo") }}</span>
+            </label>
+            <template v-if="!boundProfile">
+            <label class="settings-field">
+              <span>{{ t("settingsSudoPassword") }}</span>
+              <input v-model="settingsDraft.sudoPassword" type="password" autocomplete="off" :placeholder="settingsMeta?.sudoPasswordSet ? t('settingsConfigured') : t('settingsSudoPasswordPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsTotp") }}</span>
+              <textarea v-model="settingsDraft.totpSecret" rows="2" spellcheck="false" :placeholder="settingsMeta?.totpConfigured ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsFlowMode") }}</span>
+              <Select :model-value="settingsDraft.authFlowMode" @update:model-value="(v) => (settingsDraft.authFlowMode = String(v))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="off">{{ t("flowOff") }}</SelectItem>
+                  <SelectItem value="password_then_otp">{{ t("flowThenOtp") }}</SelectItem>
+                  <SelectItem value="password_plus_otp">{{ t("flowPlusOtp") }}</SelectItem>
+                  <SelectItem value="password_only">{{ t("flowOnly") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <p class="muted settings-note">{{ t("settingsFlowHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("settingsPasswordHint") }}</span>
+              <input v-model="settingsDraft.passwordPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsTotpHint") }}</span>
+              <input v-model="settingsDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+            </label>
+            <label class="quick-sudo-control">
+              <Switch v-model="settingsDraft.sudoUsePty" size="sm" />
+              <span>{{ t("settingsUsePty") }}</span>
+            </label>
+            </template>
+            <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }} <button class="link-button" @click="loadSudoProfiles">{{ t("refresh") }}</button></p>
+            <p class="muted settings-note">{{ t("settingsNote") }}</p>
+            </div>
+
+            <div v-show="settingsCategory === 'agent'" class="settings-pane">
+            <h3 class="settings-section-title">{{ t("agentTerminalSection") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("agentTerminalMode") }}</span>
+              <Select :model-value="settingsDraft.agentTerminalMode" @update:model-value="(v) => (settingsDraft.agentTerminalMode = String(v))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="mode in AGENT_MODES" :key="mode" :value="mode">{{ t(`agentTerminal${mode === "off" ? "Off" : mode === "auto" ? "Auto" : "Strict"}`) }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <p class="muted settings-note">{{ agentTerminalModeHint }}</p>
+            <div class="settings-remembered">
+              <h4 class="settings-section-title">{{ t("settingsRemembered.section") }}</h4>
+              <label class="settings-field"><span>{{ t("settingsRemembered.label") }}</span></label>
+              <p v-if="!settingsDraft.rememberedCommands.length" class="muted settings-note">{{ t("settingsRemembered.empty") }}</p>
+              <ul v-else class="remembered-list">
+                <li v-for="(line, index) in settingsDraft.rememberedCommands" :key="`${index}-${line}`" class="remembered-row">
+                  <code class="mono remembered-line">{{ line }}</code>
+                  <button class="link-button" type="button" @click="settingsDraft.rememberedCommands.splice(index, 1)">{{ t("settingsRemembered.remove") }}</button>
+                </li>
+              </ul>
+              <p class="muted settings-note">{{ t("settingsRemembered.hint") }}</p>
+            </div>
+            </div>
+
+            <div v-show="settingsCategory === 'transfer'" class="settings-pane">
+            <h3 class="settings-section-title">{{ t("downloadSettings.title") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("downloadSettings.directory") }}</span>
+              <span class="settings-dir-row">
+                <input v-model="downloadDirDraft" class="mono" spellcheck="false" :placeholder="localDownloadDir || t('downloadSettings.default')" />
+                <button v-if="localCanSave" type="button" class="browse-button" :title="t('downloadSettings.browse')" :aria-label="t('downloadSettings.browse')" @click="emit('browse-download-dir')"><FolderOpen /></button>
+              </span>
+            </label>
+            <label class="settings-field settings-switch-row">
+              <Switch v-model="downloadUseDefaultDraft" size="sm" />
+              <span>{{ t("downloadSettings.useDefaultDir") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("downloadSettings.useDefaultDirHint") }}</p>
+            <h3 class="settings-section-title">{{ t("downloadSettings.conflictTitle") }}</h3>
+            <label v-for="policy in DOWNLOAD_CONFLICT_POLICIES" :key="policy" class="settings-field settings-radio-row">
+              <input v-model="downloadConflictDraft" type="radio" name="download-conflict-policy" :value="policy" />
+              <span>{{ t(`downloadSettings.conflict.${policy}`) }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("downloadSettings.conflictHint") }}</p>
+            <p class="muted settings-note">{{ t("downloadSettings.hint") }}</p>
+            </div>
+
+            <div v-show="settingsCategory === 'terminal'" class="settings-pane">
+            <h3 class="settings-section-title">{{ t("webglSection") }}</h3>
+            <label class="settings-field settings-switch-row">
+              <Switch size="sm" :model-value="webglEnabled" @update:model-value="(value) => emit('update:webgl', value === true)" />
+              <span>{{ t("webglLabel") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("webglHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("terminalSelectCopy.section") }}</h3>
+            <label class="quick-sudo-control">
+              <Switch size="sm" :model-value="termSelectCopy" @update:model-value="emit('toggle-select-copy')" />
+              <span>{{ t("terminalSelectCopy.label") }}</span>
+            </label>
+            <p class="muted settings-note">{{ t("terminalSelectCopy.hint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("terminalFont.title") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("terminalFont.family") }}</span>
+              <Select :model-value="terminalFontFamilyChoice" @update:model-value="(v) => onTerminalFontFamilyChoice(String(v))">
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem :value="TERMINAL_FONT_FOLLOW_HOST">{{ t("terminalFont.followHost") }}</SelectItem>
+                  <SelectItem v-for="preset in TERMINAL_FONT_PRESETS" :key="preset.value" :value="preset.value" class="terminal-font-option" :style="{ fontFamily: preset.value }">{{ preset.label }}</SelectItem>
+                  <SelectItem :value="TERMINAL_FONT_CUSTOM">{{ t("terminalFont.custom") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <label v-if="terminalFontFamilyChoice === TERMINAL_FONT_CUSTOM" class="settings-field">
+              <span>{{ t("terminalFont.custom") }}</span>
+              <input v-model="terminalFontCustomDraft" class="mono" spellcheck="false" :placeholder="t('terminalFont.customPlaceholder')" @change="applyTerminalFontFromControls" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("terminalFont.size") }}</span>
+              <input v-model="terminalFontSizeDraft" type="number" :min="TERMINAL_FONT_MIN" :max="TERMINAL_FONT_MAX" step="1" @change="applyTerminalFontFromControls" />
+            </label>
+            <button type="button" @click="resetTerminalFont">{{ t("terminalFont.reset") }}</button>
+            </div>
+
+          <div v-show="settingsCategory === 'security'" class="settings-pane">
+          <h3 class="settings-section-title">{{ t("knownHosts.title") }}</h3>
+          <div v-if="knownHostsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+          <p v-else-if="knownHostsError" class="task-error">{{ knownHostsError }} <button class="link-button" @click="loadKnownHosts">{{ t("refresh") }}</button></p>
+          <div v-else-if="!knownHosts.length" class="empty compact">{{ t("knownHosts.empty") }}</div>
+          <ul v-else class="settings-list">
+            <li v-for="(entry, index) in knownHosts" :key="`${entry.host}:${entry.port}:${entry.keyType}:${index}`">
+              <div class="settings-list-main">
+                <strong class="mono">{{ entry.host }}:{{ entry.port }}</strong>
+                <span class="muted">{{ entry.keyType }} · <span class="mono" :title="entry.fingerprint">{{ shortFingerprint(entry.fingerprint) }}</span></span>
+              </div>
+              <button class="icon-button" :title="t('delete')" @click="removeKnownHost(entry)"><Trash2 /></button>
+            </li>
+          </ul>
+
+          <h3 class="settings-section-title">{{ t("keysPanel.title") }}</h3>
+          <div v-if="localKeysLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+          <p v-else-if="localKeysError" class="task-error">{{ localKeysError }} <button class="link-button" @click="loadLocalKeys">{{ t("refresh") }}</button></p>
+          <div v-else-if="!localKeys.length" class="empty compact">{{ t("keysPanel.empty") }}</div>
+          <ul v-else class="settings-list">
+            <li v-for="key in localKeys" :key="key.path">
+              <div class="settings-list-main">
+                <strong class="mono" :title="key.path">{{ key.path }}</strong>
+                <span class="muted">{{ key.algorithm }} · <span class="mono" :title="key.fingerprint">{{ shortFingerprint(key.fingerprint) }}</span><template v-if="key.hasPassphrase"> · {{ t("keysPanel.hasPassphrase") }}</template></span>
+              </div>
+              <KeyRound class="settings-key-icon" />
+            </li>
+          </ul>
+          <p class="muted settings-note">{{ t("keysPanel.hint") }}</p>
+          </div>
+
+          <div v-show="settingsCategory === 'mcp'" class="settings-pane">
+          <h3 class="settings-section-title">{{ t("mcpLimits.title") }}</h3>
+          <div v-if="mcpLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+          <template v-else>
+            <div class="mcp-limits">
+              <label class="settings-field">
+                <span>{{ t("mcpLimits.read") }}</span>
+                <input v-model="mcpDraft.readMiB" type="number" min="1" step="1" inputmode="numeric" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("mcpLimits.upload") }}</span>
+                <input v-model="mcpDraft.uploadMiB" type="number" min="1" step="1" inputmode="numeric" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("mcpLimits.download") }}</span>
+                <input v-model="mcpDraft.downloadMiB" type="number" min="1" step="1" inputmode="numeric" />
+              </label>
+            </div>
+            <label class="settings-field">
+              <span>{{ t("mcpSettings.permissionMode") }}</span>
+              <Select :model-value="mcpDraft.permissionMode" @update:model-value="(v) => (mcpDraft.permissionMode = String(v))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="autonomous">{{ t("mcpSettings.permissionModeAutonomous") }}</SelectItem>
+                  <SelectItem value="confirm">{{ t("mcpSettings.permissionModeConfirm") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <p v-if="mcpDraft.permissionMode === 'confirm'" class="muted settings-note">{{ t("mcpSettings.permissionModeConfirmHint") }}</p>
+            <label class="settings-field">
+              <span>{{ t("mcpSettings.connectionScope") }}</span>
+              <textarea v-model="mcpDraft.connectionScope" rows="3" class="mono" spellcheck="false" :placeholder="t('mcpSettings.connectionScopeHint')" />
+            </label>
+            <p v-if="!mcpInputsValid" class="task-error">{{ t("mcpLimits.invalid") }}</p>
+            <p v-if="mcpError" class="task-error">{{ mcpError }} <button class="link-button" @click="loadMcpSettings">{{ t("refresh") }}</button></p>
+            <!-- 独立「保存」链接已并入底部主「保存」串行链（saveSettings）。 -->
+          </template>
+          </div>
+            </div>
+          </div>
+          </template>
+
+        </div>
+        <footer>
+          <button :disabled="settingsLoading || settingsLoadFailed || settingsSaving || (!settingsMeta?.sudoPasswordSet && !settingsMeta?.totpConfigured)" @click="clearStoredSecrets"><Trash2 />{{ t("settingsClearSecrets") }}</button>
+          <button @click="emit('update:open', false)">{{ t("close") }}</button>
+          <button class="primary-button" :disabled="settingsLoading || settingsLoadFailed || settingsSaving || !settingsMeta" @click="saveSettings"><Loader2 v-if="settingsSaving" class="spinning" />{{ t("settingsSave") }}</button>
+        </footer>
+      </DialogContent>
+    </Dialog>
+
+    <!-- quick sudo 配置档管理弹窗（工具栏 KeyRound 入口；与内联 section 共用草稿状态） -->
+    <Dialog :open="profilesOpen" @update:open="(value) => emit('update:profilesOpen', value)">
+      <DialogContent class="modal settings-modal profiles-modal" @escape-key-down.prevent>
+        <header><DialogTitle>{{ t("profilesTitle") }}</DialogTitle><button :title="t('close')" class="icon-button" @click="emit('update:profilesOpen', false)"><X /></button></header>
+        <div class="settings-body">
+          <p class="muted">{{ t("profilesHint") }}</p>
+          <div class="profiles-toolbar">
+            <span class="profiles-count muted">{{ t("profilesLimit", { count: sudoProfiles.length, limit: 20 }) }}</span>
+            <button v-if="!profileEditing" class="primary-button profiles-add" @click="startProfileCreate"><Plus />{{ t("profilesAdd") }}</button>
+          </div>
+          <div class="profiles-content">
+            <div v-if="sudoProfilesLoading && !sudoProfiles.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+            <div v-else-if="!sudoProfiles.length" class="profiles-empty"><ShieldCheck /><p>{{ t("profilesEmpty") }}</p></div>
+            <ul v-else class="settings-list profiles-list">
+              <li v-for="profile in sudoProfiles" :key="profile.id">
+                <div class="settings-list-main">
+                  <strong>{{ profile.name }}</strong>
+                  <span class="muted">{{ profileSummary(profile) }}</span>
+                </div>
+                <span class="settings-list-actions">
+                  <button class="icon-button" :title="t('profilesEdit')" @click="startProfileEdit(profile)"><Pencil /></button>
+                  <button class="icon-button" :title="t('profilesDelete')" @click="removeProfile(profile)"><Trash2 /></button>
+                </span>
+              </li>
+            </ul>
+          </div>
+
+          <template v-if="profileEditing">
+            <h3 class="settings-section-title">{{ profileDraft.id ? t("profilesEdit") : t("profilesAdd") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("profilesName") }}</span>
+              <input v-model="profileDraft.name" spellcheck="false" :placeholder="t('profilesNamePlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("profilesPassword") }}</span>
+              <input v-model="profileDraft.sudoPassword" type="password" autocomplete="off" :placeholder="profileDraftHadPassword ? t('profilesPasswordKeep') : t('settingsSudoPasswordPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsTotp") }}</span>
+              <textarea v-model="profileDraft.totpSecret" rows="2" spellcheck="false" :placeholder="profileDraftHadTotp ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsFlowMode") }}</span>
+              <Select :model-value="profileDraft.authFlowMode" @update:model-value="(v) => (profileDraft.authFlowMode = String(v))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="password_then_otp">{{ t("flowThenOtp") }}</SelectItem>
+                  <SelectItem value="password_plus_otp">{{ t("flowPlusOtp") }}</SelectItem>
+                  <SelectItem value="password_only">{{ t("flowOnly") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsPasswordHint") }}</span>
+              <input v-model="profileDraft.passwordPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+            </label>
+            <label class="settings-field">
+              <span>{{ t("settingsTotpHint") }}</span>
+              <input v-model="profileDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+            </label>
+            <label class="quick-sudo-control">
+              <Switch v-model="profileDraft.sudoUsePty" size="sm" />
+              <span>{{ t("settingsUsePty") }}</span>
+            </label>
+            <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
+            <footer class="profiles-form-actions">
+              <button @click="cancelProfileEdit">{{ t("cancel") }}</button>
+              <button class="primary-button" :disabled="profileSaving || !profileDraft.name.trim()" @click="saveProfileDraft"><Loader2 v-if="profileSaving" class="spinning" />{{ t("save") }}</button>
+            </footer>
+          </template>
+        </div>
+        <footer><button @click="emit('update:profilesOpen', false)">{{ t("close") }}</button></footer>
+      </DialogContent>
+    </Dialog>
+</template>

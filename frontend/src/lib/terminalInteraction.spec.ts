@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canAcceptTerminalDrop, normalizeDropTargetDir, resolveTerminalKeyAction, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
+import { canAcceptFileDrop, canAcceptTerminalDrop, isApplePlatform, isTerminalSelectAllShortcut, normalizeDropTargetDir, resolveTerminalKeyAction, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
 
 describe("terminal interaction preferences (select-to-copy / right-click-paste)", () => {
   it("defaults select-to-copy to enabled and only honors an explicit 'false'", () => {
@@ -28,6 +28,24 @@ describe("terminal keyboard shortcuts (copy/paste routing)", () => {
     expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "c", hasSelection: false })).toBe("none");
     // Plain Ctrl+Shift+C without the modifier is untouched.
     expect(resolveTerminalKeyAction({ mod: false, shiftKey: true, key: "c", hasSelection: true })).toBe("none");
+  });
+
+  it("routes select-all to Cmd+A on Apple platforms and Ctrl+Shift+A elsewhere", () => {
+    // Apple: bare Cmd+A selects; Ctrl+Shift+A also matches (harmless superset).
+    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: true, key: "a", applePlatform: true })).toBe(true);
+    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: true, metaKey: false, key: "a", applePlatform: true })).toBe(true);
+    // Non-Apple: bare Ctrl+A must reach readline (line start), only +Shift selects.
+    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: false, key: "a", applePlatform: false })).toBe(false);
+    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: true, metaKey: false, key: "a", applePlatform: false })).toBe(true);
+    // Meta+A on non-Apple (Super+A) is left to the desktop, and other keys never match.
+    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: true, key: "a", applePlatform: false })).toBe(false);
+    expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: true, key: "v", applePlatform: true })).toBe(false);
+  });
+
+  it("detects Apple platforms from the user agent", () => {
+    expect(isApplePlatform("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")).toBe(true);
+    expect(isApplePlatform("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")).toBe(false);
+    expect(isApplePlatform("Mozilla/5.0 (X11; Linux x86_64)")).toBe(false);
   });
 
   it("routes plain Ctrl/Cmd+C with a selection to copy (Windows Terminal / iTerm2 semantics)", () => {
@@ -76,6 +94,16 @@ describe("terminal drop acceptance", () => {
     expect(canAcceptTerminalDrop({ connected: false, canWrite: true, transferBusy: false })).toBe(false);
     expect(canAcceptTerminalDrop({ connected: true, canWrite: false, transferBusy: false })).toBe(false);
     expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: true })).toBe(false);
+  });
+});
+
+describe("shared file drop gate", () => {
+  it("is the writable-session gate every drop channel shares, without the terminal-occupancy term", () => {
+    expect(canAcceptFileDrop({ connected: true, canWrite: true })).toBe(true);
+    expect(canAcceptFileDrop({ connected: false, canWrite: true })).toBe(false);
+    expect(canAcceptFileDrop({ connected: true, canWrite: false })).toBe(false);
+    // terminal gate degrades to the shared gate when nothing owns the stream
+    expect(canAcceptTerminalDrop({ connected: true, canWrite: true, transferBusy: false })).toBe(canAcceptFileDrop({ connected: true, canWrite: true }));
   });
 });
 

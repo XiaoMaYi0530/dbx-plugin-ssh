@@ -10,7 +10,9 @@
 //   renderer；回放弹窗保持 DOM 渲染。GIF 导出在导出期间给离屏终端临时
 //   挂载（取像素必须有 canvas），导出完随终端 dispose 释放 context。
 // - context loss（GPU 重置/驱动切换）时 dispose renderer 回退 DOM 渲染，
-//   不重建、不报错——xterm DOM 渲染器始终在底层可用。
+//   不报错——xterm DOM 渲染器始终在底层可用。传入恢复选项的调用方（主终端）
+//   会在有限预算内重建 renderer（Tabby 同款策略），预算耗尽静默留在 DOM；
+//   不传选项保持旧行为（一次性 dispose，GIF 导出的离屏终端等短命场景）。
 // - 存储访问不得出现在默认参数位：宿主工作台 iframe 是
 //   sandbox="allow-scripts"（opaque origin），「访问 window.localStorage
 //   属性」本身就抛 SecurityError；默认参数在函数体 try 之外求值，写在
@@ -59,16 +61,74 @@ export interface WebglTerminalLike {
   loadAddon(addon: unknown): void;
 }
 
+/** context loss 后的有限预算重建选项；不传保持一次性 dispose 的旧行为。 */
+export interface WebglRecoveryOptions<T extends WebglRendererLike> {
+  /** 重建总预算（默认 2）：跨整个会话递减，预算耗尽后 context loss 只回退 DOM。 */
+  retries?: number;
+  /** 重建尝试前的延迟毫秒（默认 1000，给 GPU 重置留出恢复时间）。 */
+  delayMs?: number;
+  /** 替代 setTimeout 的延迟调度（单测注入手动调度器）；重建单次触发，无需取消句柄，偏好关闭走 enabled 谓词。 */
+  schedule?: (callback: () => void) => unknown;
+  /** 重建成功回调：调用方同步其持有的 renderer 引用（如 webglRenderer.value）。 */
+  onRecovered?: (addon: T) => void;
+  /** 返回 false 时放弃重建（偏好已被用户关闭）。 */
+  enabled?: () => boolean;
+}
+
 /**
  * 尝试给终端挂 WebGL renderer。构造或加载抛错（无 WebGL context 等）
  * 返回 null——调用方静默保持 DOM 渲染。挂载成功后监听 context loss，
  * 一旦丢失即 dispose 回退 DOM 渲染（xterm 会在原 canvas 上继续用
- * DOM 渲染器）。
+ * DOM 渲染器）；传入恢复选项时在延迟后按预算重建，成功经 onRecovered
+ * 交还调用方，重建后的 renderer 自带剩余预算的同类监听。
  */
 export function attachWebglRenderer<T extends WebglRendererLike>(
   terminal: WebglTerminalLike,
   createAddon: () => T,
+  options?: WebglRecoveryOptions<T>,
 ): T | null {
+  const retries = options?.retries ?? 2;
+  const delayMs = options?.delayMs ?? 1000;
+  const schedule =
+    options?.schedule ?? ((callback: () => void) => setTimeout(callback, delayMs));
+
+  function scheduleRecovery(remaining: number) {
+    if (remaining <= 0 || options?.enabled?.() === false) return;
+    schedule(() => {
+      if (options?.enabled?.() === false) return;
+      let created: T | null = null;
+      try {
+        created = createAddon();
+        terminal.loadAddon(created);
+      } catch {
+        // context 仍不可用：清理半初始化 addon，留待下一次（若有预算）。
+        try {
+          created?.dispose();
+        } catch {
+          /* noop */
+        }
+        created = null;
+      }
+      if (created) {
+        wireRecovery(created, remaining - 1);
+        options?.onRecovered?.(created);
+      } else {
+        scheduleRecovery(remaining - 1);
+      }
+    });
+  }
+
+  function wireRecovery(addon: T, remaining: number) {
+    addon.onContextLoss(() => {
+      try {
+        addon.dispose();
+      } catch {
+        /* noop */
+      }
+      scheduleRecovery(remaining);
+    });
+  }
+
   let created: T | null = null;
   try {
     created = createAddon();
@@ -83,13 +143,9 @@ export function attachWebglRenderer<T extends WebglRendererLike>(
     return null;
   }
   const addon = created;
-  addon.onContextLoss(() => {
-    try {
-      addon.dispose();
-    } catch {
-      /* noop */
-    }
-  });
+  // 初始挂载失败不重试（无 WebGL 是能力缺失，重试无意义）；只有成功挂载
+  // 后丢 context 才值得重建。无选项时 remaining=0，等价于一次性 dispose。
+  wireRecovery(addon, options ? retries : 0);
   return addon;
 }
 
@@ -102,10 +158,11 @@ export function syncWebglRenderer<T extends WebglRendererLike>(
   enabled: boolean,
   current: T | null,
   createAddon: () => T,
+  options?: WebglRecoveryOptions<T>,
 ): T | null {
   if (!enabled) {
     current?.dispose();
     return null;
   }
-  return current ?? attachWebglRenderer(terminal, createAddon);
+  return current ?? attachWebglRenderer(terminal, createAddon, options);
 }

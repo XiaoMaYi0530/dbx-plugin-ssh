@@ -18,6 +18,8 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 | `ssh/host-key/resolve` | 处理工作台内的主机密钥确认 |
 | `ssh/exec` | 在会话连接上执行远程命令，可选 Quick Sudo 提权 |
 | `ssh/exec/cancel` | 中止进行中的远程命令（按 `execId`） |
+| `ssh/forward/interfaces` | 本机网卡地址探测（供端口映射面板的监听地址选择器）：无参 → `{interfaces: [{name, addr, isLoopback}]}`，回环优先、v4 先于 v6、按 IP 去重；探测失败返回空数组（选择器隐藏，手输不受影响）。`if-addrs`（getifaddrs）实现，无会话依赖 |
+| `ssh/forward/list`、`ssh/forward/start`、`ssh/forward/stop` | 用户级端口映射（ssh(1) -L/-R，见「端口映射」节）：`list` 按 `{connectionId?}`/`{sessionId?}` 过滤返回 `{forwards: [row]}`；`start` `{sessionId, kind: "local"\|"remote", listenHost?, listenPort, targetHost, targetPort}`（`listenHost` 缺省 127.0.0.1；`listenPort: 0` 由本机/服务端挑选，`boundPort` 回报实际端口）→ `{forward: row}`；`stop` `{id}` → `{success, forward}`，未知 id 报错。row 字段 camelCase：`id/sessionId/connectionId/kind/listenHost/listenPort/boundPort/targetHost/targetPort/state("starting"\|"active"\|"stopped"\|"error")/error?/connectionsTotal/connectionsActive/bytesUp/bytesDown`。状态迁移发 `ssh/forward/state`（notify）`{id, sessionId, connectionId, state, error?}` |
 | `ssh/agent/resolve` | 处理 AI 终端同步执行的命令审批（按 `challengeId`，一次性；approve 可携 `command` 编辑后原文与 `remember: true` 记住标记，见「审批记忆」节） |
 | `ssh/alert/triage` | 告警分诊：异构告警 JSON/纯文本 → 结构化 + 分类 + 只读诊断命令清单（无需连接，从不执行；见「告警分诊」节） |
 | `ssh/audit/list` | 执行审计台账只读回放：`{limit?, beforeTs?}` → `{entries, truncated}`（见「执行审计」节） |
@@ -184,6 +186,16 @@ suggestions: [{command, purposeKey}]}`（字段钳制：title/message ≤2 KiB�
 - `external_config.jump_hosts`（最多 3 跳）定义跳板链：每跳包含 `host`、`port`（缺省 22）、`username`、`authentication`（`password` / `private-key` / `private-key-password` / `agent`）及对应凭据字段，可选 `totp_secret` / 提示词 / `auth_flow_mode`。配置跳板后整条链替换 runtime 隧道，末跳直连目标 `host:port`；每跳主机密钥独立校验，登录期 keyboard-interactive 2FA 同样生效。会话关闭时按序断开整条链。
 - 协议层 keepalive：russh 按 `keepalive_interval_secs`（连接表单字段，缺省 30 秒，0 关闭）周期发送带应答的 keepalive 全局请求（等效 OpenSSH `ServerAliveInterval`），连续 3 次无应答即判定连接死亡，终端转入断开态、由工作台重连；跳板链每跳同参。
 - 终端活动保活（`terminal_keepalive_secs`，连接表单字段，默认 0 关闭）：按配置间隔向交互终端 PTY 注入"空格+退格"（净零输入——空命令行不入 shell history，全屏程序内仅光标往返），用于对抗按键盘活动判空闲的服务器侧策略（`TMOUT`、堡垒机审计），协议层探测对此无效。解析侧钳制 5–3600 秒（`model.rs` `clamp_terminal_keepalive`）；仅作用于终端会话（MCP exec 通道不注入），会话关闭即随读写循环退出。`ssh/sessions/list` 以 `terminalKeepaliveSecs` 上报生效值。
+
+## 端口映射（-L / -R）
+
+用户级端口映射（对标 ssh(1) `-L`/`-R` 与 Xshell「隧道」面板；`-D` 动态转发刻意不做——宿主 dbx-core 已为数据库代拨内置动态隧道，见对标清单）。挂在当前连接的**工作台会话**上，会话关闭（`ssh/session/close`、连接断开）即整组清理：本地监听 abort、远端 `cancel-tcpip-forward` 撤销（句柄已死则跳过），注册表行随事件 `ssh/forward/state {state:"stopped"}` 下发后移除。映射为运行时状态，不落盘、不跨会话恢复。
+
+- **local（-L）**：sidecar 在客户端机器 `listen_host:listen_port` 起 TCP 监听；每条入站连接开一条 `direct-tcpip` 通道，由服务端拨 `target_host:target_port`。双向转发走 `copy_bidirectional`，按连接累计 `bytesUp/bytesDown`。
+- **remote（-R）**：sidecar 先向服务端发 `tcpip-forward` 全局请求（拒绝即 start 报错，`AllowTcpForwarding no` 的服务器在此处失败）；`listenPort: 0` 时由服务端挑选端口并以 `boundPort` 回报。服务端侧入站连接以 `forwarded-tcpip` 通道送达，sidecar 的客户端 handler 按连接维度的转发表（`(listen_host, bound_port) → target`，含归一化与通配端口回退匹配）在**客户端机器**拨目标地址并双向转发。停止时发 `cancel-tcpip-forward` 并摘除表项。
+- **输入校验与冲突预检**：listen/target 主机接受 IPv4、IPv6（`[...]` 括号剥除）与主机名标签；嵌入式端口/scheme（`host:8080`、`http://…`）、`999.1.1.1` 这类伪 IP、本地映射的 `*` 通配均拒绝（空 listenHost 缺省回环）。`start` 在 bind/`tcpip-forward` 之前做监听端点冲突预检：同方向、同显式端口（0 = 自动挑选永不冲突）、主机相同或任一侧通配（`*`/`0.0.0.0`/`::`/空）即报 `Listen endpoint … is already forwarded by mapping …`；local 作用于全部连接（同一台客户机），remote 作用于同连接（同一台服务器）。工作台面板同规则预检并在表单内联提示。
+- `stop` 语义：后台任务全部 abort（含已建立的转发连接），registry 立即摘除；对同一 id 重复 stop 报 `not found` 错误。已建立的映射在会话存活期间持续转发；映射生命周期 = 会话生命周期。
+- 事件 `ssh/forward/state` 为状态广播（starting/active/error/stopped），工作台面板（`PortForwardDialog.vue`，自订阅该事件）据此就地刷新；list 为准、事件为加速。
 
 ## 会话环境与会话命令（SetEnv / RemoteCommand）
 
@@ -511,6 +523,30 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - `local/session/list` 供 webview 重载后接回仍活着的 shell；`workbench/close` 会回收该工作台的本地会话；sidecar 退出即全部终止（本地 PTY 生命周期 = sidecar 生命周期）。
 - 安全语义：入口为工作台显式按钮（未连接也可用；SSH 会话在连时经确认先关闭），无自动开启路径；manifest 权限集不变（复用 `host.binary`），本机命令执行能力与用户自身终端同级，无提权。
 - 偏好（`local/preferences/*` 白名单新增）：`localShell`（字符串 ≤200，空=自动探测）、`localShellIntegration`（布尔，缺省 true）。shell 选择器在工作台本地终端按钮旁的设置菜单（`local/shells/list` 发现 + 注入开关），徽标显示 `Local · <shell>`，重开按钮在本地会话存活时保持可用（restart 语义：关当前 → 按新偏好重开）。
+
+## 主机密钥确认通道(requestUserInput)
+
+首次连接(或主机密钥变更)时,sidecar 的确认请求按以下顺序选通道:
+
+1. **宿主弹窗(优先)**:宿主在 `plugin/initialize` 通过 `host.features` 广告
+   `host.requestUserInput`(点分形式,Host API 1.1 起)时,sidecar 直接调用
+   `host/requestUserInput`(字符串 id `plugin-N`,`echo: true`,`options:
+   accept/remember`,`timeoutSecs: 300`;title/prompt 超过宿主 200/2000 字符
+   上限时 sidecar 先行截断)。代码门控只按 `host.features` 列表判断,不校验
+   `hostApiVersion` 版本号。弹窗期间宿主暂停 `connection/test` /
+   `connection/connect` 的请求截止时间,连接表单里即可完成信任;sidecar 自身
+   的 connection/test 镜像预算若在弹窗挂起期间到期,会以"挑战等待 + 连接超时"
+   重臂一次(仅弹窗路径;Host API 1.0 路径预算不变)。
+2. **工作台事件(降级)**:宿主不支持(-32601)、参数被宿主拒绝(-32602)或无
+   可用弹窗面(-32001 且非 SDK 本地超时)时,仍发既有事件 `connection/challenge`,
+   由工作台 UI 应答(`connection/challenge/resolve`),语义与字段不变。
+3. **fail closed**:用户 cancel/timeout、宿主对请求不应答(SDK 本地 330s 超时,
+   `-32001` + "did not answer")、或其他错误——一律拒绝握手,不降级、不猜测。
+   弹窗应答仅 `action: "submit"` 且 `value` 为 `accept`/`remember` 才授信,
+   缺失/未知 value 一律视为拒绝。MCP 模式的 `auto_trust`(TOFU)行为不变。
+
+已知限制:Host API 1.0 宿主 + 工作台未打开(连接表单路径)仍无应答者,`connection/test`
+约 9s 后返回可读超时文案(0.4.78+ 缓解),文案在挑战已发出且未走弹窗路径时附指引。
 
 ## 主机密钥
 

@@ -229,7 +229,12 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    内容其高亮块（如 Last login 的 IP）会浮到卡片遮罩之上。 */
 .terminal-host { position: absolute; z-index: 0; inset: 0; background: var(--ssh-terminal-background); }
 .terminal-host .xterm { height: 100%; padding: 5px 0 8px 10px; background: var(--ssh-terminal-background); }
-.terminal-host .xterm-viewport {
+/* 选择器必须压过 xterm 6.1-beta 的 `.xterm:not(.allow-transparency)
+   .xterm-viewport{background-color:#000}`（特异性 0,3,0）——6.0.0 时该规则
+   是 `.xterm .xterm-viewport`（0,2,0），靠导入顺序即可覆盖；升 beta 后特异性
+   变高，低特异性写法静默失效、padding 环带复现黑边。这里提到 .xterm .xterm-viewport
+   （同为 0,3,0），本文件在 xterm.css 之后导入，同特异性后者生效。 */
+.terminal-host .xterm .xterm-viewport {
   scrollbar-width: none !important;
   /* xterm 6：主题背景色改内联到 .xterm-scrollable-element（内容盒，避开了
      .xterm 的 padding），viewport 不再内联着色、保留库默认 #000，其矩形
@@ -413,6 +418,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .file-header button:nth-child(n + 2) { justify-content: flex-end; }
 .file-header span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-rows { min-height: 0; flex: 1; overflow: auto; }
+/* 文件列表是全局"隐藏滚动条"规则（*::-webkit-scrollbar{display:none}）的例外：
+   6 列超宽时需要常驻横向滚动条，否则用户不知道后面还有列。 */
+.file-rows { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--foreground) 25%, transparent) transparent; }
+.file-rows::-webkit-scrollbar { display: block; height: 10px; width: 10px; }
+.file-rows::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--foreground) 25%, transparent); border-radius: 5px; }
+.file-rows::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--foreground) 40%, transparent); }
+.file-rows::-webkit-scrollbar-track { background: transparent; }
 .file-row { width: 100%; height: 30px; border: 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent); border-radius: 0; background: transparent; text-align: left; color: var(--foreground); font-size: 12px; cursor: default; }
 .file-row:hover { background: color-mix(in srgb, var(--accent) 65%, transparent); }
 .file-row.selected, .file-row.selected:hover { background: var(--accent); color: var(--accent-foreground); }
@@ -910,3 +922,33 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .audit-outcome.error { color: var(--destructive); }
 .audit-outcome.ok { color: var(--success, var(--primary)); }
 .audit-gate { flex: 0 0 auto; color: var(--muted-foreground); }
+
+/* 端口映射管理弹窗（PortForwardDialog）：映射行 = 类型徽标 + 路由 + 状态 +
+   计数 + 停止；下方为添加表单（方向单选 + 监听/目标地址对）。 */
+.forwards-modal { width: min(760px, calc(100vw - 40px)); }
+.forwards-body { display: flex; flex-direction: column; gap: 14px; min-height: 200px; }
+.forwards-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow: auto; }
+.forward-row { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+.forward-kind { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 8px; font-size: 10px; color: var(--muted-foreground); }
+.forward-kind--remote { color: var(--warning, var(--foreground)); border-color: color-mix(in srgb, var(--warning, var(--border)) 45%, var(--border)); }
+.forward-kind--local { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.forward-route { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono-font, monospace); font-size: 12px; }
+.forward-state { flex: 0 0 auto; font-size: 11px; color: var(--muted-foreground); }
+.forward-state--active { color: var(--success, var(--primary)); }
+.forward-state--error { color: var(--destructive); }
+.forward-state--starting { color: var(--warning, var(--muted-foreground)); }
+.forward-stats { flex: 0 0 auto; font-size: 10px; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.forward-stop { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: none; background: none; color: var(--muted-foreground); cursor: pointer; }
+.forward-stop:hover:not(:disabled) { color: var(--destructive); }
+.forward-stop:disabled { opacity: 0.5; cursor: default; }
+.forward-stop svg { width: 13px; height: 13px; }
+.forward-form { border-top: 1px solid var(--border); padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.forward-form[disabled] { opacity: 0.55; }
+.forward-form-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.forward-form-kinds { gap: 16px; }
+.forward-kind-picker { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; cursor: pointer; }
+.forward-kind-picker input { margin: 0; }
+.forward-field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 220px; font-size: 11px; color: var(--muted-foreground); }
+.forward-field-pair { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 6px; }
+.forward-form-error { margin: 0; font-size: 11px; color: var(--destructive); }
+.forward-form footer { display: flex; justify-content: flex-end; }

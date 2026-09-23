@@ -2,11 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use dbx_plugin_sdk::{PluginEmitter, PluginError};
+use dbx_plugin_sdk::{
+    host_client, PluginEmitter, PluginError, UserInputAnswer, UserInputOption, UserInputPrompt,
+    HOST_REQUEST_USER_INPUT_FEATURE, HOST_REQUEST_USER_INPUT_METHOD,
+};
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::agent::{client::AgentClient, AgentIdentity};
 use russh::keys::ssh_key::HashAlg;
@@ -16,6 +19,7 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -28,6 +32,7 @@ use crate::audit_log;
 use crate::exec::{
     self, AuthFlowMode, ExecOutcome, Hints, SudoAuth, PLAIN_EXEC_TIMEOUT, SUDO_EXEC_TIMEOUT,
 };
+use crate::forward;
 use crate::highlight_rules;
 use crate::host_key::{HostKeyState, HostKeyVerifier};
 use crate::local_downloads;
@@ -280,15 +285,73 @@ const AGENT_APPROVAL_MAX_SECS: u64 = 300;
 /// clamped 10–300 by design for any future configurability).
 const MCP_CONFIRM_TIMEOUT_SECS: u64 = 120;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptDecision {
     pub accept: bool,
     pub remember: bool,
 }
 
-#[derive(Clone, Default)]
+/// Whether the attached DBX host advertised the Host API 1.1 user-input
+/// dialog. The host sends the dot form; the slash form appears in docs, so
+/// accept both when gating.
+fn host_supports_user_input() -> bool {
+    host_client()
+        .map(|client| {
+            client.supports(HOST_REQUEST_USER_INPUT_FEATURE)
+                || client.supports(HOST_REQUEST_USER_INPUT_METHOD)
+        })
+        .unwrap_or(false)
+}
+
+/// Seam between the broker and Host API 1.1; tests script it instead of a
+/// live host process.
+pub(crate) trait HostPromptGateway: Send + Sync {
+    fn supports_request_user_input(&self) -> bool;
+    fn request_user_input(&self, prompt: &UserInputPrompt) -> Result<UserInputAnswer, PluginError>;
+}
+
+struct SdkHostPromptGateway;
+
+impl HostPromptGateway for SdkHostPromptGateway {
+    fn supports_request_user_input(&self) -> bool {
+        host_supports_user_input()
+    }
+
+    fn request_user_input(&self, prompt: &UserInputPrompt) -> Result<UserInputAnswer, PluginError> {
+        match host_client() {
+            Some(client) => client.request_user_input(prompt),
+            None => Err(PluginError::new(
+                -32000,
+                "Host API is unavailable: the plugin server is not running",
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct PromptBroker {
     pending: Arc<AsyncMutex<HashMap<String, PendingPrompt>>>,
+    gateway: Arc<dyn HostPromptGateway>,
+    /// Set whenever a confirmation was raised, whichever channel served it;
+    /// `connection/test` reads it to make its timeout guidance truthful.
+    pub(super) challenge_raised: Arc<AtomicBool>,
+    /// Sticky mark that the Host API 1.1 dialog took (or is still taking)
+    /// this challenge: `connection/test` extends its mirrored dial budget
+    /// once while a dialog may still be open. Degradable failures clear it
+    /// again before the workbench fallback, so hosts without a working
+    /// dialog keep the short 1.0-style budget.
+    pub(super) host_dialog_used: Arc<AtomicBool>,
+}
+
+impl Default for PromptBroker {
+    fn default() -> Self {
+        Self {
+            pending: Arc::new(AsyncMutex::new(HashMap::new())),
+            gateway: Arc::new(SdkHostPromptGateway),
+            challenge_raised: Arc::new(AtomicBool::new(false)),
+            host_dialog_used: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 struct PendingPrompt {
@@ -297,7 +360,30 @@ struct PendingPrompt {
 }
 
 impl PromptBroker {
-    // 参数就是 host-key 挑战事件的载荷字段，一一对应而非可归组的耦合。
+    /// Test-only seam injection; production brokers use `Default`.
+    #[cfg(test)]
+    pub(crate) fn with_gateway(gateway: Arc<dyn HostPromptGateway>) -> Self {
+        Self {
+            gateway,
+            ..Self::default()
+        }
+    }
+
+    /// One clear entry for both sticky challenge marks so every new probe
+    /// starts from a clean slate.
+    pub(crate) fn clear_challenge_raised(&self) {
+        self.challenge_raised.store(false, Ordering::Relaxed);
+        self.host_dialog_used.store(false, Ordering::Relaxed);
+    }
+
+    pub(crate) fn challenge_was_raised(&self) -> bool {
+        self.challenge_raised.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn host_dialog_was_used(&self) -> bool {
+        self.host_dialog_used.load(Ordering::Relaxed)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
@@ -309,6 +395,146 @@ impl PromptBroker {
         operation_id: &str,
         emitter: &PluginEmitter,
     ) -> Option<PromptDecision> {
+        if self.gateway.supports_request_user_input() {
+            match self
+                .request_via_host(host, port, &key_type, &fingerprint)
+                .await
+            {
+                Ok(decision) => return decision,
+                // Host predates the dialog (-32601), rejects the parameters
+                // (-32602, e.g. an over-limit field) or no dialog surface is
+                // mounted (-32001 without the SDK's own timeout wording): the
+                // workbench event may still reach a UI.
+                Err(error) if Self::host_prompt_unavailable(&error) => {}
+                // Anything else — including the SDK's own -32001 "did not
+                // answer" timeout — must fail closed instead of stacking
+                // another 300s wait on top.
+                Err(_) => return None,
+            }
+        }
+        self.request_via_workbench(
+            host,
+            port,
+            key_type,
+            fingerprint,
+            connection_id,
+            operation_id,
+            emitter,
+        )
+        .await
+    }
+
+    /// The gateway call blocks until the user answers, so it runs on the
+    /// blocking pool: the dispatch worker stays free and the enclosing
+    /// `connection/test` budget can observe the wait and re-arm while the
+    /// dialog is open (the host pauses its own RPC deadline meanwhile).
+    async fn request_via_host(
+        &self,
+        host: &str,
+        port: u16,
+        key_type: &str,
+        fingerprint: &str,
+    ) -> Result<Option<PromptDecision>, PluginError> {
+        self.challenge_raised.store(true, Ordering::Relaxed);
+        // The host caps the title at 200 and the prompt at 2000 chars; a
+        // near-limit FQDN shrinks here instead of coming back as -32602
+        // (which would only fall back to the workbench event anyway).
+        let title: String = format!("SSH host key — {host}:{port}")
+            .chars()
+            .take(200)
+            .collect();
+        let prompt_text: String = format!(
+            "The authenticity of host {host}:{port} can't be established.\n\
+             Key type: {key_type}\n\
+             SHA-256 fingerprint: {fingerprint}\n\
+             Trust this host and continue connecting?"
+        )
+        .chars()
+        .take(2000)
+        .collect();
+        let prompt = UserInputPrompt::choice(
+            prompt_text,
+            vec![
+                UserInputOption {
+                    value: "accept".to_string(),
+                    label: "Trust once".to_string(),
+                },
+                UserInputOption {
+                    value: "remember".to_string(),
+                    label: "Trust and remember".to_string(),
+                },
+            ],
+        )
+        .with_title(title)
+        .with_timeout_secs(HOST_KEY_CHALLENGE_WAIT.as_secs());
+        // Mark before parking on the answer: `connection/test` re-arms its
+        // budget on this flag while the dialog is still open. A degradable
+        // failure clears it again below, so the workbench fallback keeps the
+        // short 1.0-style budget.
+        self.host_dialog_used.store(true, Ordering::Relaxed);
+        let gateway = Arc::clone(&self.gateway);
+        let answer =
+            match tokio::task::spawn_blocking(move || gateway.request_user_input(&prompt)).await {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(error)) => {
+                    if Self::host_prompt_unavailable(&error) {
+                        self.host_dialog_used.store(false, Ordering::Relaxed);
+                    }
+                    return Err(error);
+                }
+                // The blocking task died without an answer; fail closed like any
+                // other non-degradable gateway failure.
+                Err(error) => {
+                    return Err(PluginError::new(
+                        -32000,
+                        format!("host dialog task failed: {error}"),
+                    ));
+                }
+            };
+        Ok(Some(
+            match (answer.action.as_str(), answer.value.as_deref()) {
+                // Only an explicit accept/remember value grants trust; a missing
+                // or unknown value (and any non-submit action) is a rejection:
+                // never guess.
+                ("submit", Some("accept")) => PromptDecision {
+                    accept: true,
+                    remember: false,
+                },
+                ("submit", Some("remember")) => PromptDecision {
+                    accept: true,
+                    remember: true,
+                },
+                _ => PromptDecision {
+                    accept: false,
+                    remember: false,
+                },
+            },
+        ))
+    }
+
+    /// Errors that mean "no usable dialog surface" rather than "no answer":
+    /// the workbench event may still reach a human. -32601 unknown method
+    /// (host predates Host API 1.1), -32602 invalid params, and -32001 when
+    /// it is not the SDK's own "did not answer" timeout.
+    fn host_prompt_unavailable(error: &PluginError) -> bool {
+        error.code == -32601
+            || error.code == -32602
+            || (error.code == -32001 && !error.message.contains("did not answer"))
+    }
+
+    // 参数就是 host-key 挑战事件的载荷字段，一一对应而非可归组的耦合。
+    #[allow(clippy::too_many_arguments)]
+    async fn request_via_workbench(
+        &self,
+        host: &str,
+        port: u16,
+        key_type: String,
+        fingerprint: String,
+        connection_id: &str,
+        operation_id: &str,
+        emitter: &PluginEmitter,
+    ) -> Option<PromptDecision> {
+        self.challenge_raised.store(true, Ordering::Relaxed);
         let challenge_id = Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(
@@ -433,6 +659,11 @@ pub struct SshClient {
     operation_id: String,
     dial_deadline: Arc<DialDeadline>,
     connect_timeout: Duration,
+    /// Remote (-R) port mappings of this connection: `(listen_host,
+    /// bound_port) -> local dial target`. Populated by `ssh/forward/start`
+    /// and consulted by the forwarded-tcpip handler below; per-connection so
+    /// two servers can forward the same port independently.
+    remote_forwards: Arc<RemoteForwardTable>,
 }
 
 impl client::Handler for SshClient {
@@ -531,6 +762,50 @@ impl client::Handler for SshClient {
             }
         }
     }
+
+    /// Incoming `forwarded-tcpip` channel: the server accepted a connection
+    /// on a port this side registered with `tcpip-forward` (remote -R
+    /// mapping). The local dial target is looked up in this connection's
+    /// remote-forward table; the relay runs detached so the handler returns
+    /// immediately and the SSH reader is never blocked by user traffic.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let _ = originator_address;
+        let _ = originator_port;
+        let _ = session;
+        let target =
+            forward::lookup_remote_target(&self.remote_forwards, connected_address, connected_port);
+        let Some(target) = target else {
+            eprintln!(
+                "[ssh-forward] forwarded-tcpip {connected_address}:{connected_port} has no registered mapping; rejecting"
+            );
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        reply.accept().await;
+        // Dial from the client machine; on failure the channel is dropped,
+        // which the server surfaces as a closed connection to its client.
+        match TcpStream::connect((target.host.as_str(), target.port)).await {
+            Ok(tcp) => {
+                tokio::spawn(forward::relay_remote(target.entry, channel, tcp));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[ssh-forward] local dial {}:{} failed: {error}",
+                    target.host, target.port
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Verdict of a key-exchange-only host-key probe against the known_hosts
@@ -592,14 +867,45 @@ fn test_dial_budget_secs(connect_timeout_secs: u64, explicit: bool) -> u64 {
     deadline.saturating_sub(1).max(1)
 }
 
+/// Re-arm decision for the `connection/test` budget once it elapsed: a host
+/// dialog keeps the probe parked past the mirrored dial budget, so when the
+/// dialog path is serving the challenge the budget extends once by the
+/// challenge wait plus the connect timeout. Every other timeout (1.0 hosts,
+/// workbench fallback, already-extended window) returns `None` and keeps the
+/// readable error. Callers fold the already-extended state into
+/// `dialog_used` so the extension can only arm a single time.
+fn next_test_budget(connect_timeout_secs: u64, dialog_used: bool) -> Option<u64> {
+    dialog_used.then(|| {
+        HOST_KEY_CHALLENGE_WAIT
+            .as_secs()
+            .saturating_add(connect_timeout_secs)
+    })
+}
+
 /// Actionable `connection/test` timeout: the cryptic host RPC-timeout
 /// message gave no remedy; this names the effective budget (flagged as the
-/// host default when the field was absent) plus the user-side fix.
-fn test_timeout_message(host: &str, port: u16, budget_secs: u64, host_default: bool) -> String {
+/// host default when the field was absent) plus the user-side fix. When a
+/// host-key confirmation was raised during the probe, the challenge note is
+/// appended in addition to the timeout-setting remedy — and only when the
+/// dialog path did not serve the challenge, so the "update DBX" advice stays
+/// truthful for 1.0 hosts.
+fn test_timeout_message(
+    host: &str,
+    port: u16,
+    budget_secs: u64,
+    host_default: bool,
+    challenge_raised: bool,
+) -> String {
     let source = if host_default { " (host default)" } else { "" };
-    format!(
+    let mut message = format!(
         "SSH connection to {host}:{port} timed out after {budget_secs} seconds{source}. Increase 'SSH timeout' under Advanced options and retry."
-    )
+    );
+    if challenge_raised {
+        message.push_str(
+            " A host-key confirmation was raised but went unanswered; connect once from the SSH workbench to trust this host, or update DBX to 0.6.17+ so the confirmation can appear here.",
+        );
+    }
+    message
 }
 
 /// Key-exchange-only probe handler (tiny-rdm's CheckHostKey equivalent):
@@ -797,6 +1103,11 @@ impl ReplayBuffer {
         self.sequence
     }
 }
+
+/// Remote (-R) port mapping table for one connection, keyed by
+/// `(listen_host, bound_port)` and consulted by the SSH client handler when
+/// the server hands over a `forwarded-tcpip` channel.
+pub type RemoteForwardTable = Mutex<HashMap<(String, u32), forward::RelayTarget>>;
 
 /// `workbench_id` is kept with the session so attach can only restore the
 /// session that belongs to the same workbench. A different workbench must open
@@ -1125,6 +1436,13 @@ pub struct SshRuntime {
     agent_challenges: Mutex<HashMap<String, PendingChallenge>>,
     /// Monotonic session creation counter (see `SessionEntry::created_seq`).
     session_seq: AtomicU64,
+    /// Live user-facing port mappings (Xshell-style 端口映射, -L/-R):
+    /// forward id -> mapping row. Runtime-scoped on purpose; rows die with
+    /// their session so a closed SSH session cannot leave phantom ports.
+    forwards: forward::ForwardRegistry,
+    /// Per-connection `(listen_host, bound_port) -> dial target` tables the
+    /// forwarded-tcpip handler consults (see `SshClient::remote_forwards`).
+    remote_tables: Mutex<HashMap<String, Arc<RemoteForwardTable>>>,
     /// Trust-on-first-use for unknown host keys (MCP stdio mode).
     auto_trust: bool,
     pub prompts: PromptBroker,
@@ -1160,6 +1478,8 @@ impl SshRuntime {
             sudo_keepalive: Arc::new(Mutex::new(HashMap::new())),
             metrics_cache: Mutex::new(HashMap::new()),
             exec_tasks: Mutex::new(HashMap::new()),
+            forwards: forward::ForwardRegistry::default(),
+            remote_tables: Mutex::new(HashMap::new()),
             agent_modes: Mutex::new(agent_terminal::load_modes(&data_dir)),
             agent_challenges: Mutex::new(HashMap::new()),
             auto_trust: false,
@@ -1619,6 +1939,7 @@ impl SshRuntime {
         operation_id: &str,
         emitter: PluginEmitter,
     ) -> Result<(), String> {
+        self.prompts.clear_challenge_raised();
         // 宿主对 connection/test 有 RPC 截止（有效连接超时），截止一到直接
         // 杀掉请求、用户只看到费解的宿主超时文案——sidecar 必须在截止前
         // 作答，因此拨号预算按宿主截止对齐并留 1s 余量。
@@ -1627,18 +1948,42 @@ impl SshRuntime {
             connection.connect_timeout_explicit,
         );
         let probe = self.connect_authenticated(connection, operation_id, Some(emitter));
-        let (handle, jumps) =
-            match tokio::time::timeout(Duration::from_secs(budget_secs), probe).await {
-                Ok(result) => result?,
+        tokio::pin!(probe);
+        let mut budget_secs = budget_secs;
+        let mut extended = false;
+        let connected = loop {
+            match tokio::time::timeout(Duration::from_secs(budget_secs), probe.as_mut()).await {
+                Ok(result) => break result,
                 Err(_elapsed) => {
-                    return Err(test_timeout_message(
-                        &connection.runtime_host,
-                        connection.runtime_port,
-                        budget_secs,
-                        !connection.connect_timeout_explicit,
-                    ));
+                    // 弹窗路径会把探针停在等待用户作答上:镜像拨号预算到期时
+                    // 若弹窗已接管本次挑战,以"挑战等待 + 连接超时"重臂一次;
+                    // 其余超时(1.0 宿主、工作台降级、扩展窗耗尽)保持现行可
+                    // 读超时文案,行为不变。
+                    let dialog_used = !extended && self.prompts.host_dialog_was_used();
+                    match next_test_budget(connection.connect_timeout_secs, dialog_used) {
+                        Some(next_budget) => {
+                            budget_secs = next_budget;
+                            extended = true;
+                        }
+                        None => {
+                            // 挑战指引只在挑战已发出且未走弹窗路径时附加:
+                            // "update DBX" 对 1.0 宿主是真的,对 1.1 弹窗路径
+                            // 会误导。
+                            let challenge_clause = self.prompts.challenge_was_raised()
+                                && !self.prompts.host_dialog_was_used();
+                            return Err(test_timeout_message(
+                                &connection.runtime_host,
+                                connection.runtime_port,
+                                budget_secs,
+                                !connection.connect_timeout_explicit,
+                                challenge_clause,
+                            ));
+                        }
+                    }
                 }
-            };
+            }
+        };
+        let (handle, jumps) = connected?;
         handle
             .disconnect(
                 Disconnect::ByApplication,
@@ -1794,6 +2139,10 @@ impl SshRuntime {
         let verifier = Arc::new(HostKeyVerifier::new(self.known_hosts_path.clone()));
         let timeout = Duration::from_secs(connection.connect_timeout_secs);
         let dial_deadline = DialDeadline::start(timeout);
+        // The forwarded-tcpip handler needs the mapping table at dial time;
+        // remote forwards registered later on this connection insert into the
+        // same Arc, and the table dies with the connection's last session.
+        let remote_forwards = self.remote_table_for(&connection.id);
         let handler = SshClient {
             verifier,
             prompts: self.prompts.clone(),
@@ -1805,6 +2154,7 @@ impl SshRuntime {
             operation_id: operation_id.to_string(),
             dial_deadline: dial_deadline.clone(),
             connect_timeout: timeout,
+            remote_forwards,
         };
         let timeout_message = || {
             format!(
@@ -1975,7 +2325,211 @@ impl SshRuntime {
         Ok((Arc::new(handle), jumps.into_iter().map(Arc::new).collect()))
     }
 
+    /// Per-connection remote-forward table, created on first use. The dial
+    /// path hands the same Arc to the SSH client handler; remote forward
+    /// start inserts the rows the handler later matches against.
+    fn remote_table_for(&self, connection_id: &str) -> Arc<RemoteForwardTable> {
+        let mut tables = self
+            .remote_tables
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        tables
+            .entry(connection_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
+    }
+
+    /// `ssh/forward/list`: live mappings, optionally scoped to one connection
+    /// or session. Read-only — liveness counters update as relays come and go.
+    pub fn forward_list(&self, params: &Value) -> Value {
+        let connection_id = params.get("connectionId").and_then(Value::as_str);
+        let session_id = params.get("sessionId").and_then(Value::as_str);
+        let mut rows: Vec<Value> = self
+            .forwards
+            .rows()
+            .iter()
+            .filter(|entry| connection_id.is_none_or(|id| entry.connection_id == id))
+            .filter(|entry| session_id.is_none_or(|id| entry.session_id == id))
+            .map(|entry| entry.payload())
+            .collect();
+        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        json!({ "forwards": rows })
+    }
+
+    /// `ssh/forward/start`: validate, register, then arm the direction —
+    /// local binds the port before the mapping is reported active, remote
+    /// asks the server to listen first (a refusal removes the mapping again).
+    pub async fn forward_start(
+        &self,
+        params: &Value,
+        emitter: PluginEmitter,
+    ) -> Result<Value, String> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or("sessionId is required")?;
+        let session = self.session(session_id).await?;
+        let (kind, listen_host, listen_port, target_host, target_port) =
+            forward::parse_spec(params)?;
+        // Conflict pre-check ahead of bind/tcpip-forward, so a duplicate gets
+        // a naming error instead of a raw "address already in use" (local) or
+        // a server-side refusal (remote). Local endpoints collide on the one
+        // client machine — every connection; remote endpoints collide per
+        // server — same connection only.
+        if listen_port != 0 {
+            let conflicting = self.forwards.rows().into_iter().find(|row| {
+                row.kind == kind
+                    && (kind == forward::ForwardKind::Local
+                        || row.connection_id == session.connection_id)
+                    && forward::listen_endpoints_conflict(
+                        &listen_host,
+                        listen_port,
+                        &row.listen_host,
+                        row.listen_port,
+                    )
+            });
+            if let Some(row) = conflicting {
+                let endpoint = format!("{listen_host}:{listen_port}");
+                let existing = forward::describe(
+                    row.kind,
+                    &row.listen_host,
+                    row.listen_port,
+                    &row.target_host,
+                    row.target_port,
+                );
+                return Err(format!(
+                    "Listen endpoint {endpoint} is already forwarded by mapping {} ({existing})",
+                    row.id
+                ));
+            }
+        }
+        let entry = Arc::new(forward::ForwardEntry {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            connection_id: session.connection_id.clone(),
+            kind,
+            listen_host,
+            listen_port,
+            target_host,
+            target_port,
+            bound_port: AtomicU32::new(0),
+            state: Mutex::new(forward::ForwardState::Starting),
+            error: Mutex::new(None),
+            connections_total: AtomicU64::new(0),
+            connections_active: AtomicI64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
+            listener_task: Mutex::new(None),
+            relays: Mutex::new(Vec::new()),
+            emitter: Some(emitter),
+            stopping: AtomicBool::new(false),
+        });
+        self.forwards.insert(entry.clone());
+        match kind {
+            forward::ForwardKind::Local => {
+                if let Err(error) =
+                    forward::spawn_local_listener(entry.clone(), session.handle.clone()).await
+                {
+                    self.forwards.remove(&entry.id);
+                    return Err(error);
+                }
+            }
+            forward::ForwardKind::Remote => {
+                let bound = session
+                    .handle
+                    .tcpip_forward(&entry.listen_host, u32::from(entry.listen_port))
+                    .await;
+                let bound = match bound {
+                    Ok(port) => port,
+                    Err(error) => {
+                        self.forwards.remove(&entry.id);
+                        return Err(format!(
+                            "Server refused to listen on {}:{}: {error}",
+                            entry.listen_host, entry.listen_port
+                        ));
+                    }
+                };
+                let bound = u16::try_from(bound).unwrap_or(entry.listen_port.max(1));
+                entry.bound_port.store(u32::from(bound), Ordering::Relaxed);
+                let table = self.remote_table_for(&session.connection_id);
+                forward::register_remote_target(
+                    &table,
+                    &entry.listen_host,
+                    bound,
+                    &entry.target_host,
+                    entry.target_port,
+                    entry.clone(),
+                );
+            }
+        }
+        forward::set_state(&entry, forward::ForwardState::Active, None);
+        Ok(json!({ "forward": entry.payload() }))
+    }
+
+    /// `ssh/forward/stop`: tear the mapping down and report the final row.
+    pub async fn forward_stop(&self, id: &str) -> Result<Value, String> {
+        let entry = self
+            .forwards
+            .get(id)
+            .ok_or("Port mapping was not found or already stopped")?;
+        self.teardown_forward(&entry).await;
+        Ok(json!({ "success": true, "forward": entry.payload() }))
+    }
+
+    /// Tears one mapping down: background tasks aborted, remote listener
+    /// cancelled on the session's SSH handle (best effort — a dead session
+    /// cannot cancel anything and does not need to), table row removed, and
+    /// the registry drops the entry so a stopped id cannot be restarted into.
+    async fn teardown_forward(&self, entry: &Arc<forward::ForwardEntry>) {
+        forward::abort_tasks(entry);
+        if entry.kind == forward::ForwardKind::Remote {
+            let session = self.sessions.read().await.get(&entry.session_id).cloned();
+            if let Some(session) = session {
+                let port = entry.bound_port.load(Ordering::Relaxed);
+                let port = if port == 0 {
+                    u32::from(entry.listen_port)
+                } else {
+                    port
+                };
+                let _ = session
+                    .handle
+                    .cancel_tcpip_forward(&entry.listen_host, port)
+                    .await;
+            }
+            if let Some(table) = self
+                .remote_tables
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&entry.connection_id)
+            {
+                table
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .retain(|_, target| target.entry.id != entry.id);
+            }
+        }
+        self.forwards.remove(&entry.id);
+        forward::set_state(entry, forward::ForwardState::Stopped, None);
+    }
+
+    /// Session teardown: every mapping of the session dies with it. Called
+    /// from `close_session` while the session's SSH handle is still
+    /// resolvable, so remote listeners are cancelled on the way out.
+    pub async fn stop_session_forwards(&self, session_id: &str) {
+        for entry in self
+            .forwards
+            .rows()
+            .iter()
+            .filter(|row| row.session_id == session_id)
+        {
+            self.teardown_forward(entry).await;
+        }
+    }
+
     pub async fn close_session(&self, session_id: &str) -> Result<(), String> {
+        // Teardown runs while the session is still registered so remote
+        // listener cancellation can ride the (still open) SSH handle.
+        self.stop_session_forwards(session_id).await;
         let session = self
             .sessions
             .write()
@@ -2005,6 +2559,12 @@ impl SshRuntime {
             .any(|session| session.connection_id == connection_id);
         if !connection_has_sessions {
             self.stop_sudo_keepalive(&connection_id).await;
+            // No session left on the connection: the per-connection
+            // forwarded-tcpip table can never match again.
+            self.remote_tables
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&connection_id);
         }
         Ok(())
     }
@@ -6801,6 +7361,43 @@ async fn enrich_owner_names(
     }
 }
 
+/// 远程 `stat -c '%U %G' path` 查单个文件的 owner/group 名字。
+/// SFTP 协议默认只返回 uid/gid 数字，russh-sftp 的 `Metadata.user/group`
+/// 在服务器未开 `username@hostname` 扩展时为 None。此函数作为 stat 的
+/// fallback，失败/超时返回 (None, None)，调用方用数字兜底。
+pub(crate) async fn lookup_owner_group_names(
+    runtime: &SshRuntime,
+    session_id: &str,
+    path: &str,
+) -> (Option<String>, Option<String>) {
+    let session = match runtime.session(session_id).await {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let cmd = format!("stat -c '%U %G' -- {}", exec::shell_quote(path));
+    let output = match exec::exec_plain(
+        &session.handle,
+        &cmd,
+        Duration::from_secs(OWNER_LOOKUP_TIMEOUT_SECS),
+        &[],
+    )
+    .await
+    {
+        Ok(outcome) => outcome.output,
+        Err(_) => return (None, None),
+    };
+    let mut parts = output.split_whitespace();
+    let owner = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let group = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    (owner, group)
+}
+
 /// Parses `ls -l` output into `name -> (owner, group)`. Owner/group sit in
 /// fields 3/4 of every layout; the name start depends on whether the date
 /// collapsed into one epoch field (GNU `--time-style=+%s`, name from field 6)
@@ -7103,6 +7700,25 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
     }
 
     #[test]
+    fn next_test_budget_extends_once_for_dialog_path() {
+        // Without a host dialog in play the probe keeps the current readable
+        // timeout error (1.0 hosts, workbench fallback, exhausted extension).
+        assert_eq!(next_test_budget(9, false), None);
+        assert_eq!(next_test_budget(29, false), None);
+        // Dialog in flight: one extension by the challenge wait plus the
+        // connect timeout.
+        assert_eq!(
+            next_test_budget(9, true),
+            Some(HOST_KEY_CHALLENGE_WAIT.as_secs() + 9)
+        );
+        // A zero stored connect timeout must not shrink the window.
+        assert_eq!(
+            next_test_budget(0, true),
+            Some(HOST_KEY_CHALLENGE_WAIT.as_secs())
+        );
+    }
+
+    #[test]
     fn classify_entry_kind_maps_wire_types() {
         // Directories stay directories; only `kind === "directory"` renders a
         // folder icon in the UI.
@@ -7116,12 +7732,12 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
 
     #[test]
     fn test_timeout_message_names_budget_source_and_remedy() {
-        let explicit = test_timeout_message("dbx-ssh-test", 22, 29, false);
+        let explicit = test_timeout_message("dbx-ssh-test", 22, 29, false, false);
         assert_eq!(
             explicit,
             "SSH connection to dbx-ssh-test:22 timed out after 29 seconds. Increase 'SSH timeout' under Advanced options and retry."
         );
-        let fallback = test_timeout_message("dbx-ssh-test", 22, 9, true);
+        let fallback = test_timeout_message("dbx-ssh-test", 22, 9, true, false);
         assert!(
             fallback.contains("timed out after 9 seconds (host default)"),
             "{fallback}"
@@ -7130,6 +7746,17 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
             fallback.contains("Increase 'SSH timeout' under Advanced options"),
             "{fallback}"
         );
+    }
+
+    #[test]
+    fn test_timeout_message_names_pending_host_key_confirmation() {
+        let base = test_timeout_message("h", 22, 9, true, false);
+        assert!(base.contains("timed out after 9 seconds (host default)"));
+        assert!(base.contains("Increase 'SSH timeout'"));
+
+        let with_challenge = test_timeout_message("h", 22, 9, false, true);
+        assert!(with_challenge.contains("host-key confirmation"));
+        assert!(!with_challenge.contains("(host default)"));
     }
 
     #[test]
@@ -9102,6 +9729,433 @@ matrix-ed25519";
                 ..Default::default()
             };
             assert!(preserved_target_permissions(&target).is_none());
+        }
+    }
+
+    mod host_key_prompt {
+        use super::*;
+        use dbx_plugin_sdk::{PluginTransport, UserInputAnswer, UserInputPrompt};
+        use std::sync::atomic::Ordering;
+
+        struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn events(sink: &Arc<Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
+            String::from_utf8(sink.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        }
+
+        fn emitter_for_test() -> (PluginEmitter, Arc<Mutex<Vec<u8>>>) {
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            (
+                dbx_plugin_sdk::PluginEmitter::for_tests(
+                    Arc::new(Mutex::new(Box::new(SharedSink(sink.clone())))),
+                    PluginTransport::JsonLines,
+                ),
+                sink,
+            )
+        }
+
+        struct ScriptedGateway {
+            supports: bool,
+            answer: Mutex<Result<UserInputAnswer, PluginError>>,
+            prompts_seen: Mutex<Vec<serde_json::Value>>,
+        }
+
+        impl ScriptedGateway {
+            fn supports() -> Self {
+                Self {
+                    supports: true,
+                    answer: Mutex::new(Ok(UserInputAnswer {
+                        action: "submit".into(),
+                        value: Some("remember".into()),
+                    })),
+                    prompts_seen: Mutex::new(Vec::new()),
+                }
+            }
+            fn without_feature() -> Self {
+                Self {
+                    supports: false,
+                    answer: Mutex::new(Ok(UserInputAnswer {
+                        action: "submit".into(),
+                        value: None,
+                    })),
+                    prompts_seen: Mutex::new(Vec::new()),
+                }
+            }
+            fn answering(answer: Result<UserInputAnswer, PluginError>) -> Self {
+                Self {
+                    supports: true,
+                    answer: Mutex::new(answer),
+                    prompts_seen: Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        impl HostPromptGateway for ScriptedGateway {
+            fn supports_request_user_input(&self) -> bool {
+                self.supports
+            }
+            fn request_user_input(
+                &self,
+                prompt: &UserInputPrompt,
+            ) -> Result<UserInputAnswer, PluginError> {
+                self.prompts_seen
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(prompt).unwrap());
+                self.answer.lock().unwrap().clone()
+            }
+        }
+
+        const HOST: &str = "server.example.com";
+        const FINGERPRINT: &str = "SHA256:abcdefgh";
+
+        async fn challenge_via(
+            broker: &PromptBroker,
+            emitter: &PluginEmitter,
+        ) -> Option<PromptDecision> {
+            broker
+                .request(
+                    HOST,
+                    22,
+                    "ssh-ed25519".into(),
+                    FINGERPRINT.into(),
+                    "conn-1",
+                    "op-1",
+                    emitter,
+                )
+                .await
+        }
+
+        #[tokio::test]
+        async fn host_dialog_submit_remember_maps_to_accept_and_remember() {
+            let gateway = Arc::new(ScriptedGateway::supports());
+            let broker = PromptBroker::with_gateway(gateway.clone());
+            let (emitter, sink) = emitter_for_test();
+
+            let decision = challenge_via(&broker, &emitter).await;
+
+            assert_eq!(
+                decision,
+                Some(PromptDecision {
+                    accept: true,
+                    remember: true
+                })
+            );
+            assert!(events(&sink)
+                .iter()
+                .all(|event| event["method"] != "connection/challenge"));
+            let prompt = gateway.prompts_seen.lock().unwrap()[0].clone();
+            assert_eq!(prompt["options"][0]["value"], "accept");
+            assert_eq!(prompt["options"][1]["value"], "remember");
+            assert!(prompt["prompt"].as_str().unwrap().contains(FINGERPRINT));
+            assert!(broker.challenge_was_raised());
+            // The dialog took the challenge: connection/test may extend its
+            // budget for exactly this probe.
+            assert!(broker.host_dialog_was_used());
+        }
+
+        #[tokio::test]
+        async fn host_dialog_accept_maps_to_accept_without_remember() {
+            let gateway = Arc::new(ScriptedGateway::answering(Ok(UserInputAnswer {
+                action: "submit".into(),
+                value: Some("accept".into()),
+            })));
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, _sink) = emitter_for_test();
+            assert_eq!(
+                challenge_via(&broker, &emitter).await,
+                Some(PromptDecision {
+                    accept: true,
+                    remember: false
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn host_dialog_cancel_and_timeout_reject_fail_closed() {
+            for action in ["cancel", "timeout"] {
+                let gateway = Arc::new(ScriptedGateway::answering(Ok(UserInputAnswer {
+                    action: action.into(),
+                    value: None,
+                })));
+                let broker = PromptBroker::with_gateway(gateway);
+                let (emitter, sink) = emitter_for_test();
+                assert_eq!(
+                    challenge_via(&broker, &emitter).await,
+                    Some(PromptDecision {
+                        accept: false,
+                        remember: false
+                    })
+                );
+                assert!(events(&sink)
+                    .iter()
+                    .all(|event| event["method"] != "connection/challenge"));
+            }
+        }
+
+        #[tokio::test]
+        async fn host_without_feature_falls_back_to_workbench_event() {
+            let gateway = Arc::new(ScriptedGateway::without_feature());
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, sink) = emitter_for_test();
+
+            let pending = tokio::spawn({
+                let broker = broker.clone();
+                let emitter = emitter.clone();
+                async move {
+                    broker
+                        .request(
+                            HOST,
+                            22,
+                            "ssh-ed25519".into(),
+                            FINGERPRINT.into(),
+                            "conn-1",
+                            "op-1",
+                            &emitter,
+                        )
+                        .await
+                }
+            });
+            // 降级路径必须发出既有事件载荷(workbench 依赖 challengeId/kind 字段)。
+            let mut challenge_id = None;
+            for _ in 0..200 {
+                if let Some(event) = events(&sink)
+                    .into_iter()
+                    .find(|event| event["method"] == "connection/challenge")
+                {
+                    challenge_id =
+                        Some(event["params"]["challengeId"].as_str().unwrap().to_string());
+                    assert_eq!(event["params"]["kind"], "host-key");
+                    assert_eq!(event["params"]["fingerprint"], FINGERPRINT);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let challenge_id = challenge_id.expect("legacy challenge event must be emitted");
+            broker
+                .resolve(
+                    &challenge_id,
+                    "op-1",
+                    PromptDecision {
+                        accept: true,
+                        remember: true,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pending.await.unwrap(),
+                Some(PromptDecision {
+                    accept: true,
+                    remember: true
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn no_ui_error_falls_back_to_workbench_event() {
+            let gateway = Arc::new(ScriptedGateway::answering(Err(PluginError::new(
+                -32001,
+                "no user interface is attached",
+            ))));
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, sink) = emitter_for_test();
+            let pending = tokio::spawn({
+                let broker = broker.clone();
+                let emitter = emitter.clone();
+                async move {
+                    broker
+                        .request(
+                            HOST,
+                            22,
+                            "ssh-ed25519".into(),
+                            FINGERPRINT.into(),
+                            "conn-1",
+                            "op-1",
+                            &emitter,
+                        )
+                        .await
+                }
+            });
+            let mut challenge_id = None;
+            for _ in 0..200 {
+                if let Some(event) = events(&sink)
+                    .into_iter()
+                    .find(|event| event["method"] == "connection/challenge")
+                {
+                    challenge_id =
+                        Some(event["params"]["challengeId"].as_str().unwrap().to_string());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            broker
+                .resolve(
+                    &challenge_id.expect("fallback event"),
+                    "op-1",
+                    PromptDecision {
+                        accept: false,
+                        remember: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pending.await.unwrap(),
+                Some(PromptDecision {
+                    accept: false,
+                    remember: false
+                })
+            );
+            // A degradable failure fell back to the workbench event: the
+            // dialog must not keep the extended test budget armed.
+            assert!(!broker.host_dialog_was_used());
+        }
+
+        #[tokio::test]
+        async fn host_dialog_marks_used_and_degraded_fallback_does_not() {
+            // 粘性标志的语义:弹窗真正接管挑战时置位(connection/test 据此重臂
+            // 预算);可降级错误回落 legacy 前必须清零,1.0 宿主保持短预算。
+            let gateway = Arc::new(ScriptedGateway::answering(Err(PluginError::new(
+                -32601,
+                "method not found",
+            ))));
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, sink) = emitter_for_test();
+            let pending = tokio::spawn({
+                let broker = broker.clone();
+                let emitter = emitter.clone();
+                async move {
+                    broker
+                        .request(
+                            HOST,
+                            22,
+                            "ssh-ed25519".into(),
+                            FINGERPRINT.into(),
+                            "conn-1",
+                            "op-1",
+                            &emitter,
+                        )
+                        .await
+                }
+            });
+            let mut challenge_id = None;
+            for _ in 0..200 {
+                if let Some(event) = events(&sink)
+                    .into_iter()
+                    .find(|event| event["method"] == "connection/challenge")
+                {
+                    challenge_id =
+                        Some(event["params"]["challengeId"].as_str().unwrap().to_string());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // Once the legacy event is out, the dialog flag must already be
+            // cleared again.
+            assert!(!broker.host_dialog_was_used());
+            broker
+                .resolve(
+                    &challenge_id.expect("fallback event"),
+                    "op-1",
+                    PromptDecision {
+                        accept: true,
+                        remember: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pending.await.unwrap(),
+                Some(PromptDecision {
+                    accept: true,
+                    remember: false
+                })
+            );
+            assert!(!broker.host_dialog_was_used());
+        }
+
+        #[tokio::test]
+        async fn host_silence_fails_closed_without_fallback() {
+            // SDK 本地超时的错误以 -32001 + "did not answer" 表达;此时再降级会
+            // 把总等待拖到 630s,必须直接拒绝。
+            let gateway = Arc::new(ScriptedGateway::answering(Err(PluginError::new(
+                -32001,
+                "Host did not answer 'host/requestUserInput' in time",
+            ))));
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, sink) = emitter_for_test();
+            assert_eq!(challenge_via(&broker, &emitter).await, None);
+            assert!(events(&sink)
+                .iter()
+                .all(|event| event["method"] != "connection/challenge"));
+        }
+
+        #[tokio::test]
+        async fn host_dialog_submit_without_known_value_rejects_fail_closed() {
+            // Only an explicit accept/remember value grants trust: a missing
+            // or unknown value (host sent action=submit with nothing usable)
+            // must be a rejection, never a guess.
+            for value in [None, Some("maybe".to_string())] {
+                let gateway = Arc::new(ScriptedGateway::answering(Ok(UserInputAnswer {
+                    action: "submit".into(),
+                    value,
+                })));
+                let broker = PromptBroker::with_gateway(gateway);
+                let (emitter, sink) = emitter_for_test();
+                assert_eq!(
+                    challenge_via(&broker, &emitter).await,
+                    Some(PromptDecision {
+                        accept: false,
+                        remember: false
+                    })
+                );
+                assert!(events(&sink)
+                    .iter()
+                    .all(|event| event["method"] != "connection/challenge"));
+            }
+        }
+
+        #[tokio::test]
+        async fn challenge_raised_flag_clears_between_probes() {
+            let gateway = Arc::new(ScriptedGateway::supports());
+            let broker = PromptBroker::with_gateway(gateway);
+            let (emitter, _sink) = emitter_for_test();
+            broker.challenge_raised.store(true, Ordering::Relaxed);
+            broker.clear_challenge_raised();
+            let _ = challenge_via(&broker, &emitter).await;
+            assert!(broker.challenge_was_raised());
+            assert!(broker.host_dialog_was_used());
+            broker.clear_challenge_raised();
+            // One clear entry resets both sticky challenge marks so the next
+            // probe starts from a clean slate.
+            assert!(!broker.challenge_was_raised());
+            assert!(!broker.host_dialog_was_used());
+        }
+
+        #[test]
+        fn challenge_flag_clears_between_probes() {
+            let gateway = Arc::new(ScriptedGateway::without_feature());
+            let broker = PromptBroker::with_gateway(gateway);
+            broker
+                .challenge_raised
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            broker.clear_challenge_raised();
+            assert!(!broker.challenge_was_raised());
         }
     }
 }
