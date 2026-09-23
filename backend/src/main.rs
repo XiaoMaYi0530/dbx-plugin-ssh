@@ -688,30 +688,6 @@ impl Plugin {
                 ))?;
                 Ok(json!({ "success": true }))
             }
-            "sftp/symlink-create" => {
-                let session_id = required_string(&params, "sessionId")?;
-                let target = required_string(&params, "target")?;
-                let link_path = required_string(&params, "linkPath")?;
-                self.runtime.block_on(sftp_ext::symlink_create(
-                    &self.ssh, session_id, target, link_path,
-                ))?;
-                Ok(json!({ "success": true }))
-            }
-            "sftp/symlink-read" => {
-                let session_id = required_string(&params, "sessionId")?;
-                let link_path = required_string(&params, "linkPath")?;
-                self.runtime
-                    .block_on(sftp_ext::symlink_read(&self.ssh, session_id, link_path))
-            }
-            "sftp/symlink-update" => {
-                let session_id = required_string(&params, "sessionId")?;
-                let link_path = required_string(&params, "linkPath")?;
-                let target = required_string(&params, "target")?;
-                self.runtime.block_on(sftp_ext::symlink_update(
-                    &self.ssh, session_id, link_path, target,
-                ))?;
-                Ok(json!({ "success": true }))
-            }
             // 外部编辑器回传：把 watcher 交付的 remote-edit 本地文件推回远端。
             // 安全边界见 sftp_ext::validate_remote_edit_path —— 只收
             // <下载目录>/remote-edit/ 之下、经 canonicalize 校验的文件。

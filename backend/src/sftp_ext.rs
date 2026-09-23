@@ -698,15 +698,13 @@ fn check_exec_success(outcome: &Value, operation: &str) -> Result<(), String> {
     }
 }
 
-/// —— 外部编辑器回传上传（watch/upload 后端；remote-edit 目录防逃逸）——
-
+// —— 外部编辑器回传上传（watch/upload 后端；remote-edit 目录防逃逸）——
 pub const MAX_UPLOAD_LOCAL_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Copy buffer for the streaming local→SFTP push.
 const UPLOAD_LOCAL_CHUNK: usize = 128 * 1024;
 
-/// `sftp/upload-local {sessionId, localPath, remotePath} -> {path, size}` —
-
+// `sftp/upload-local {sessionId, localPath, remotePath} -> {path, size}` —
 fn validate_remote_edit_path(
     local_path: &Path,
     data_dir: &Path,
