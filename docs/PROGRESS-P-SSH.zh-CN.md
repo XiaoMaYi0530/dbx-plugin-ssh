@@ -3407,7 +3407,7 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 ### M3 遗留清单（需人工决策或后续轮次）
 
 1. watcher/symlink 的**前端接线未做**（watcher agent 超时，仅 backend 落地）：SFTP 右键"在外部编辑器打开"+ `watch/file-modified` 确认上传 + `sftp/symlink-*` 对话框——待 np3 轮。
-2. X11 转发 spike（russh 0.62 x11 API 验证）——待 np3 轮。
+2. X11 转发 spike ✅ 完成（docs/SPIKE_X11_FORWARDING.zh-CN.md）：russh 0.62 三能力全部可行（request_x11 公开 API / server_channel_open_x11 回调需显式 gate / direct-tcpip 兜底受 X server 监听限制），推荐路线 channel_open_session→request_x11→回调校验→DISPLAY 桥接，估算 4.5-6.5 人日——**建议进 M4，排核心 parity 之后**（人工排期决策项）。
 3. 串口（serialport 依赖评审）、VNC（vnc 引擎选型+帧通道压测）——依赖评审通过后派发。
 4. RDP：vendored fork 链维护计划 + CredSSP 安全评审清单——人工评审门，未派发。
 5. 真机验收：GPU/NPU（nvidia-smi/npu-smi 主机）、Docker 主机、Windows ConPTY gutter、DBX 桌面端到端——人工项。
