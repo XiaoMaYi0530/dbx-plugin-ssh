@@ -1,5 +1,4 @@
 mod agent_approvals;
-mod x11;
 mod agent_terminal;
 mod alert_triage;
 mod app_bridge;
@@ -39,6 +38,7 @@ mod telnet_session;
 mod transfer_history;
 mod triggers;
 mod vault;
+mod x11;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -72,6 +72,10 @@ impl Plugin {
         let data_dir = plugin_data_dir();
         let runtime =
             Runtime::new().map_err(|error| format!("Failed to create async runtime: {error}"))?;
+        otp_store::init_data_dir(&data_dir);
+        // Sidecar 启动即同步 X11 快速标志（重启会丢进程内状态）。
+        let prefs = preferences::load_preferences(&data_dir);
+        x11::set_enabled(prefs.get("x11_forwarding").and_then(Value::as_bool) == Some(true));
         let ssh = Arc::new(SshRuntime::new(data_dir));
         Ok(Self {
             runtime,
@@ -1303,7 +1307,15 @@ impl Plugin {
             // sandbox="allow-scripts"（opaque origin），localStorage 不可用，
             // sidecar 的 preferences.json 是唯一持久存储。固定键白名单。
             "local/preferences/get" => Ok(preferences::load_preferences(&plugin_data_dir())),
-            "local/preferences/set" => preferences::save_preferences(&plugin_data_dir(), &params),
+            "local/preferences/set" => {
+                let result = preferences::save_preferences(&plugin_data_dir(), &params);
+                // Keep the X11 fast-path flag in lockstep with the file.
+                let prefs = preferences::load_preferences(&plugin_data_dir());
+                x11::set_enabled(
+                    prefs.get("x11_forwarding").and_then(Value::as_bool) == Some(true),
+                );
+                result
+            }
             // 背景图（P2-9）：桌面形态落盘 <plugin_data_dir>/wallpaper（≤8MiB，
             // png/jpeg/webp 魔数校验）；web/docker 形态 sidecar 存储不在本机时，
             // 前端对 set 失败降级为仅本次会话内存态。

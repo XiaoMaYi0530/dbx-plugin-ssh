@@ -798,6 +798,42 @@ impl client::Handler for SshClient {
     /// mapping). The local dial target is looked up in this connection's
     /// remote-forward table; the relay runs detached so the handler returns
     /// immediately and the SSH reader is never blocked by user traffic.
+    async fn server_channel_open_x11(
+        &mut self,
+        mut channel: russh::Channel<russh::client::Msg>,
+        originator_address: &str,
+        originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let _ = originator_address;
+        let _ = originator_port;
+        let _ = session;
+        // Fail-closed: russh's default handler accepts every incoming x11
+        // channel; we only accept while this connection has X11 enabled and
+        // the gate is armed (spike report §3.4 — the security boundary).
+        if !crate::x11::enabled() {
+            eprintln!("[x11] incoming x11 channel rejected: forwarding disabled");
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        }
+        let Some((cookie, permit)) = crate::x11::try_admit_active() else {
+            eprintln!("[x11] incoming x11 channel rejected: forwarding disabled or not armed");
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        let _ = cookie; // the fake cookie was already given to the server via x11-req
+        reply.accept().await;
+        let target = crate::x11::current_display_target();
+        tokio::spawn(async move {
+            if let Err(error) = crate::x11::bridge_channel(channel, &target).await {
+                eprintln!("[x11] {error}");
+            }
+            drop(permit);
+        });
+        Ok(())
+    }
+
     async fn server_channel_open_forwarded_tcpip(
         &mut self,
         channel: russh::Channel<russh::client::Msg>,
@@ -1626,6 +1662,21 @@ impl SshRuntime {
         // ssh(1) order: PTY first, env next, shell/exec last. A refused
         // variable surfaces instead of half-configuring the session.
         exec::apply_connection_env(&mut channel, &connection.set_env).await?;
+        // X11 forwarding (OpenSSH -X parity): gated on the connection-scoped
+        // preference; a refused request only disables X11, never the shell.
+        if crate::x11::enabled_from(&self.data_dir) {
+            match crate::x11::arm_session() {
+                Ok(cookie_hex) => {
+                    if let Err(error) = channel
+                        .request_x11(true, false, crate::x11::X11_AUTH_PROTOCOL, cookie_hex, 0)
+                        .await
+                    {
+                        eprintln!("[x11] x11-req refused by server: {error}");
+                    }
+                }
+                Err(error) => eprintln!("[x11] cannot arm the forwarding gate: {error}"),
+            }
+        }
         if connection.remote_command.is_empty() {
             channel
                 .request_shell(true)

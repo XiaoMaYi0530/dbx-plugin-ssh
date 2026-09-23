@@ -99,7 +99,7 @@ pub(crate) fn parse_display(display: &str) -> Option<DisplayTarget> {
             server: DisplayServer::UnixSocket(PathBuf::from(host)),
         });
     }
-    let port = u16::try_from(6000u32.checked_add(number)?) .ok()?;
+    let port = u16::try_from(6000u32.checked_add(number)?).ok()?;
     Some(DisplayTarget {
         number,
         server: DisplayServer::TcpLoopback(port),
@@ -253,10 +253,18 @@ fn parse_xauthority(bytes: &[u8]) -> Vec<XauthRecord> {
     while let Some(family) = reader.u16() {
         // Each read borrows the reader, so own the bytes immediately to let
         // the next `bytes()` call take `&mut` again.
-        let Some(_address) = reader.bytes().map(<[u8]>::to_vec) else { break };
-        let Some(number) = reader.bytes().map(<[u8]>::to_vec) else { break };
-        let Some(name) = reader.bytes().map(<[u8]>::to_vec) else { break };
-        let Some(data) = reader.bytes().map(<[u8]>::to_vec) else { break };
+        let Some(_address) = reader.bytes().map(<[u8]>::to_vec) else {
+            break;
+        };
+        let Some(number) = reader.bytes().map(<[u8]>::to_vec) else {
+            break;
+        };
+        let Some(name) = reader.bytes().map(<[u8]>::to_vec) else {
+            break;
+        };
+        let Some(data) = reader.bytes().map(<[u8]>::to_vec) else {
+            break;
+        };
         records.push(XauthRecord {
             family,
             number: String::from_utf8_lossy(&number).into_owned(),
@@ -479,8 +487,9 @@ mod tests {
             let cookie = FakeCookie::generate().expect("CSPRNG");
             let hex = cookie.hex();
             assert_eq!(hex.len(), 32);
-            assert!(hex.bytes().all(|byte| byte.is_ascii_hexdigit()
-                && !byte.is_ascii_uppercase()));
+            assert!(hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
             assert!(seen.insert(hex.to_string()), "cookie repeated");
         }
     }
@@ -510,7 +519,12 @@ mod tests {
         let cookie = FakeCookie::generate().expect("CSPRNG");
         let expected_offset = 12 + pad4(X11_AUTH_PROTOCOL.len());
         for (byte_order, lsb) in [(0x6c_u8, true), (0x42, false)] {
-            let packet = setup_packet(byte_order, lsb, X11_AUTH_PROTOCOL.as_bytes(), cookie.bytes());
+            let packet = setup_packet(
+                byte_order,
+                lsb,
+                X11_AUTH_PROTOCOL.as_bytes(),
+                cookie.bytes(),
+            );
             assert_eq!(
                 inspect_setup(&packet, &cookie),
                 SetupInspection::Accept {
@@ -535,12 +549,12 @@ mod tests {
     #[test]
     fn inspect_setup_needs_the_whole_setup_block() {
         let cookie = FakeCookie::generate().expect("CSPRNG");
+        assert_eq!(inspect_setup(&[], &cookie), SetupInspection::Incomplete);
+        let packet = setup_packet(0x6c, true, X11_AUTH_PROTOCOL.as_bytes(), cookie.bytes());
         assert_eq!(
-            inspect_setup(&[], &cookie),
+            inspect_setup(&packet[..7], &cookie),
             SetupInspection::Incomplete
         );
-        let packet = setup_packet(0x6c, true, X11_AUTH_PROTOCOL.as_bytes(), cookie.bytes());
-        assert_eq!(inspect_setup(&packet[..7], &cookie), SetupInspection::Incomplete);
         assert_eq!(
             inspect_setup(&packet[..packet.len() - 1], &cookie),
             SetupInspection::Incomplete
@@ -559,25 +573,26 @@ mod tests {
             inspect_setup(&packet, &cookie),
             SetupInspection::Reject("X setup uses a different authorization protocol")
         );
-        let wrong_cookie = setup_packet(
-            0x6c,
-            true,
-            X11_AUTH_PROTOCOL.as_bytes(),
-            &[0u8; COOKIE_LEN],
-        );
+        let wrong_cookie =
+            setup_packet(0x6c, true, X11_AUTH_PROTOCOL.as_bytes(), &[0u8; COOKIE_LEN]);
         assert_eq!(
             inspect_setup(&wrong_cookie, &cookie),
             SetupInspection::Reject("X setup cookie does not match the issued fake cookie")
         );
-        let short_cookie =
-            setup_packet(0x42, false, X11_AUTH_PROTOCOL.as_bytes(), &[1u8; 8]);
+        let short_cookie = setup_packet(0x42, false, X11_AUTH_PROTOCOL.as_bytes(), &[1u8; 8]);
         assert_eq!(
             inspect_setup(&short_cookie, &cookie),
             SetupInspection::Reject("X setup carries an unexpected cookie length")
         );
     }
 
-    fn xauth_record(family: u16, address: &[u8], number: &str, name: &[u8], data: &[u8]) -> Vec<u8> {
+    fn xauth_record(
+        family: u16,
+        address: &[u8],
+        number: &str,
+        name: &[u8],
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&family.to_be_bytes());
         for field in [address, number.as_bytes(), name, data] {
@@ -618,10 +633,7 @@ mod tests {
         let records = parse_xauthority(&store);
         assert_eq!(records.len(), 3);
         assert_eq!(find_real_cookie(&records, 0), Some(data.to_vec()));
-        assert_eq!(
-            find_real_cookie(&records, 2),
-            Some(vec![5u8; COOKIE_LEN])
-        );
+        assert_eq!(find_real_cookie(&records, 2), Some(vec![5u8; COOKIE_LEN]));
         // A different authorization protocol name never matches.
         let wrong_name = parse_xauthority(&xauth_record(
             FAMILY_LOCAL,
@@ -645,15 +657,18 @@ mod tests {
             &[3u8; COOKIE_LEN],
         );
         // Append a record whose data field is cut short.
-        let mut torn = xauth_record(FAMILY_LOCAL, &[], "1", X11_AUTH_PROTOCOL.as_bytes(), &[4u8; 4]);
+        let mut torn = xauth_record(
+            FAMILY_LOCAL,
+            &[],
+            "1",
+            X11_AUTH_PROTOCOL.as_bytes(),
+            &[4u8; 4],
+        );
         torn.truncate(torn.len() - 2);
         store.extend_from_slice(&torn);
         let records = parse_xauthority(&store);
         assert_eq!(records.len(), 1);
-        assert_eq!(
-            find_real_cookie(&records, 0),
-            Some(vec![3u8; COOKIE_LEN])
-        );
+        assert_eq!(find_real_cookie(&records, 0), Some(vec![3u8; COOKIE_LEN]));
     }
 
     #[test]
@@ -698,5 +713,100 @@ mod tests {
         assert_eq!(pad4(1), 4);
         assert_eq!(pad4(4), 4);
         assert_eq!(pad4(18), 20);
+    }
+}
+
+// —— 会话接线（ssh.rs 消费）———————————————————————————————
+
+/// The gate of the most recent X11-enabled session (`armed()` output).
+/// `None` until a session turns X11 on; replaced on each re-arm.
+static ACTIVE_GATE: std::sync::OnceLock<Arc<X11Gate>> = std::sync::OnceLock::new();
+
+/// Arms a fresh gate for a session that turned X11 on; returns the fake
+/// cookie hex to send in `x11-req`.
+pub(crate) fn arm_session() -> Result<String, String> {
+    let (gate, hex) = X11Gate::armed()?;
+    let _ = ACTIVE_GATE.set(gate);
+    set_enabled(true);
+    Ok(hex)
+}
+
+/// Admission for `server_channel_open_x11`: only succeeds while a session
+/// has X11 armed and the per-connection bridge cap is not exhausted.
+pub(crate) fn try_admit_active() -> Option<(FakeCookie, BridgePermit)> {
+    ACTIVE_GATE.get().and_then(|gate| gate.try_admit())
+}
+
+/// Fast-path preference flag (mirrors `x11_forwarding` in preferences.json).
+/// The Handler consults this before touching the registry; the on-disk file
+/// stays the source of truth via [`enabled_from`].
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::SeqCst);
+}
+
+pub(crate) fn enabled() -> bool {
+    ENABLED.load(Ordering::SeqCst)
+}
+
+/// Reads `x11_forwarding` from the allowlisted preferences file.
+/// The display target for the current session: the `DISPLAY` environment
+/// variable parsed, falling back to the default unix socket (`:0`).
+pub(crate) fn current_display_target() -> DisplayTarget {
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    parse_display(&display).unwrap_or_else(|| unix_display(0))
+}
+
+pub(crate) fn enabled_from(data_dir: &Path) -> bool {
+    let text =
+        std::fs::read_to_string(crate::preferences::store_path(data_dir)).unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("x11_forwarding")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Bridges an accepted x11 channel into the local X server endpoint
+/// (unix socket first, TCP loopback fallback). Byte-for-byte relay: the X
+/// client's real-cookie setup packet travels untouched to the local server.
+pub(crate) async fn bridge_channel(
+    channel: russh::Channel<russh::client::Msg>,
+    target: &DisplayTarget,
+) -> Result<(), String> {
+    let connect_error = |error| format!("X11: cannot reach local display {target:?}: {error}");
+    match &target.server {
+        DisplayServer::UnixSocket(path) => {
+            let local = tokio::net::UnixStream::connect(path)
+                .await
+                .map_err(|error| connect_error(error))?;
+            let mut stream = channel.into_stream();
+            let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut { local })
+                .await
+                .map_err(|error| format!("X11: bridge error: {error}"))?;
+            tracing_bridge_stats(up, down);
+            Ok(())
+        }
+        DisplayServer::TcpLoopback(port) => {
+            let mut local = tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                .await
+                .map_err(|error| connect_error(error))?;
+            let mut stream = channel.into_stream();
+            let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut local)
+                .await
+                .map_err(|error| format!("X11: bridge error: {error}"))?;
+            tracing_bridge_stats(up, down);
+            Ok(())
+        }
+    }
+}
+
+fn tracing_bridge_stats(up: u64, down: u64) {
+    if up + down > 0 {
+        eprintln!("[x11] bridged {up}↑/{down}↓ bytes");
     }
 }
