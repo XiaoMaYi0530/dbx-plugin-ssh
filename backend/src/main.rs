@@ -24,6 +24,7 @@ mod otp;
 mod otp_store;
 mod preferences;
 mod quick_commands;
+mod serial_session;
 mod session_recording;
 mod sftp_bookmarks;
 mod sftp_copy;
@@ -62,6 +63,7 @@ struct Plugin {
     ssh: Arc<SshRuntime>,
     local: Arc<local_terminal::LocalTerminalRuntime>,
     telnet: Arc<telnet_session::TelnetSessionRuntime>,
+    serial: Arc<serial_session::SerialSessionRuntime>,
     mcp: Arc<mcp::McpState>,
     watcher: Arc<file_watch::WatchRuntime>,
 }
@@ -78,6 +80,7 @@ impl Plugin {
             ssh,
             local: Arc::new(local_terminal::LocalTerminalRuntime::new()),
             telnet: Arc::new(telnet_session::TelnetSessionRuntime::new()),
+            serial: Arc::new(serial_session::SerialSessionRuntime::new()),
             watcher: Arc::new(file_watch::WatchRuntime::new()),
         })
     }
@@ -485,6 +488,26 @@ impl Plugin {
                 Ok(json!({ "success": true }))
             }
             "telnet/list" => Ok(self.runtime.block_on(self.telnet.list())),
+            "serial/ports/list" => Ok(self.serial.list_ports()),
+            "serial/start" => {
+                let request: serial_session::SerialStartRequest = parse(params)?;
+                self.runtime
+                    .block_on(self.serial.start(request, emitter.clone()))
+            }
+            "serial/write" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let data_base64 = required_string(&params, "dataBase64")?;
+                let data = serial_session::decode_write_payload(data_base64)?;
+                let session = self.runtime.block_on(self.serial.session(session_id))?;
+                self.serial.write_input(&session, &data)?;
+                Ok(json!({ "success": true }))
+            }
+            "serial/close" => {
+                let session_id = required_string(&params, "sessionId")?;
+                self.runtime.block_on(self.serial.close(session_id))?;
+                Ok(json!({ "success": true }))
+            }
+            "serial/list" => Ok(self.runtime.block_on(self.serial.list())),
             "workbench/close" => {
                 let workbench_id = required_string(&params, "workbenchId")?;
                 self.runtime

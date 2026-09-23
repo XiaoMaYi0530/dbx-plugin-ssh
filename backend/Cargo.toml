@@ -55,6 +55,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # linux_inotify feature (the backend is unconditional there), macos_fsevent
 # is the macOS backend and crossbeam-channel is the default event plumbing.
 notify = "6"
+# Serial-port sessions (nyaterm-parity P3-2, src/serial_session.rs). 4.x is
+# the current generation (MIT OR Apache-2.0, actively maintained); default
+# features keep the Linux udev port enumerator, which links the system
+# libudev — glibc CI needs the libudev-dev apt package (ci.yml "Install
+# native dependencies").
+serialport = "4"
 
 [target.'cfg(windows)'.dependencies]
 pageant = "0.2"
