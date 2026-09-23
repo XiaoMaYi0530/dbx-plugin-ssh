@@ -3422,3 +3422,10 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 - 维持人工门：VNC（引擎选型+帧通道压测）、RDP（vendored fork 链+CredSSP 评审）、真机验收、PR 合入。
 - 执行备注：首轮两 agent 因 API 网络瞬断（TLS 连接断开）失败且无产出丢失（worktree 仍在基线），已原样重试派发；cron 看护继续。
 - M4 完成判据：两分支合入 integration、全量验证绿（基线 cargo 696 / vitest 861 只增不减）、e2e 回归、push 后 CI 十一门 success。
+
+
+## M4 进度（2026-09-24）
+
+- **X11 转发 ✅ 全栈完成并已合入（75c5219）**：x11.rs 残留兑现（DISPLAY 解析 7 形态/假 cookie/Xsetup 检查/.Xauthority/准入门，12 测试）+ ssh.rs 接线（request_x11 于 PTY/env 后发送；`server_channel_open_x11` 显式 fail-closed gate——russh 默认 accept 的安全边界）+ `x11_forwarding` 偏好（启动/读写三处同步快速标志）+ SettingsDialog 开关（组件内自治 RPC）+ 七语文案。真机 X server 联调记遗留。
+- **串口 backend ✅**（parity-serial 分支）：serialport 4（MIT/Apache）+ serial_session.rs（ports/start/write/close/list + Backspace 映射 + 读线程→帧通道）+ 协议注册。前端入口（SerialConnectDialog + App.vue 接线）派 np4-serial 重试 agent 补齐。
+- 执行备注：M4 首两轮后台 agent 因 API 网络瞬断失败（无产出丢失），已原样重试；X11 改由主会话直接完成。
