@@ -37,6 +37,7 @@ import {
   FolderOpen,
   FolderPlus,
   Gauge,
+  Globe,
   ImagePlay,
   History,
   Home,
@@ -268,6 +269,7 @@ import { Popover, PopoverAnchor, PopoverContent } from "./components/ui/popover"
 import { Dialog, DialogContent, DialogTitle } from "./components/ui/dialog";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import PortForwardDialog from "./components/PortForwardDialog.vue";
+import TelnetConnectDialog, { type TelnetConnectOptions } from "./components/TelnetConnectDialog.vue";
 import { ToastAction, ToastClose, ToastProvider, ToastRoot, ToastViewport } from "./components/ui/toast";
 
 interface SessionInfo {
@@ -1074,7 +1076,21 @@ const isLocalMode = computed(() => localSession.value !== null);
 // cleared. localUiMode = "local-terminal UI state" (running session or restored shell); SSH-only toolbar actions gate on it,
 // SSH-only toolbar actions and display branches gate on it, decoupled from session existence.
 const localShellRestored = ref(false);
-const localUiMode = computed(() => isLocalMode.value || localShellRestored.value);
+// Telnet 会话（P2-3）：与 SSH/本地终端同款互斥展示。并入 localUiMode 后，
+// 所有 SSH-only 工具栏分支对 Telnet 自动隐藏；Telnet 专属分支按 isTelnetMode
+// 优先接在既有 localSession 分支前面。
+const telnetSession = ref<{ sessionId: string; host: string; port: number } | null>(null);
+const telnetDialogOpen = ref(false);
+const telnetConfirmOpen = ref(false);
+const telnetState = ref<"idle" | "connecting" | "running" | "closed">("idle");
+const telnetError = ref("");
+const telnetLastSequence = ref(0);
+const telnetPendingFrames = new Map<number, { stream: number; data: Uint8Array }>();
+let telnetReplayInFlight = false;
+let telnetReplayNoProgress = 0;
+const isTelnetMode = computed(() => telnetSession.value !== null);
+const telnetTarget = computed(() => (telnetSession.value ? `${telnetSession.value.host}:${telnetSession.value.port}` : ""));
+const localUiMode = computed(() => isLocalMode.value || localShellRestored.value || isTelnetMode.value);
 // Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
 // and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
 const panelSurface = computed(() => hostContext.value.surface === "panel");
@@ -1129,6 +1145,11 @@ if (typeof window !== "undefined") {
 const terminalInputQueue = createTerminalInputQueue({
   send: (sessionId, payload) => {
     terminalDiag.sends += 1;
+    // Telnet 会话以 "telnet:" 前缀进同一串行队列（发送时按前缀拆通道，
+    // 避免异步间隙里模式切换串台）；本地/SSH 会话保持原通道不变。
+    if (sessionId.startsWith("telnet:")) {
+      return window.dbxPlugin.sendBinary(`telnet/terminal/in/${sessionId.slice("telnet:".length)}`, payload);
+    }
     return window.dbxPlugin.sendBinary(`ssh/terminal/in/${sessionId}`, payload);
   },
   onError: (cause) => {
@@ -1170,6 +1191,8 @@ const connected = computed(() => terminalState.value === "connected" && !!sessio
 const sessionStatus = computed<WorkbenchSessionStatus | "local">(() => (localUiMode.value ? "local" : describeWorkbenchSessionStatus(terminalState.value, { reattaching: reconnectPending.value })));
 // 本地模式徽标附带 shell 名（Local · Zsh），一眼可见当前在哪种 shell 里。
 const sessionPillText = computed(() => {
+  // Telnet 徽标显示明文目标（Telnet · host:port），提示这是非 SSH 连接。
+  if (isTelnetMode.value) return telnetState.value === "connecting" ? t("telnet.connecting") : `${t("telnet.pillPrefix")} · ${telnetTarget.value}`;
   if (!isLocalMode.value || !localSession.value) return t(`sessionStatus.${sessionStatus.value}`);
   const kind = localSession.value.shell.split(/[\\/]/).pop() || localSession.value.shell;
   return `${t("sessionStatus.local")} · ${kind}`;
@@ -1240,7 +1263,7 @@ const commandMarkerDetails = computed(() => commandMarkerTooltip(
 ));
 const connectionIdentity = computed(() => {
   // Connectionless local-terminal tab (including the restored shell): there is no connection identity to show.
-  if (localUiMode.value && !connectionId.value) return t("localTerminal.active");
+  if (localUiMode.value && !connectionId.value) return isTelnetMode.value ? `${t("telnet.pillPrefix")} ${telnetTarget.value}` : t("localTerminal.active");
   const host = connection.value.host || connection.value.name || connectionId.value || "–";
   const identity = connection.value.username ? `${connection.value.username}@${host}` : host;
   const port = connection.value.port && connection.value.port !== 22 ? `:${connection.value.port}` : "";
@@ -2337,6 +2360,12 @@ function executeSuggestion(item: CommandSuggestion) {
 }
 
 function sendTerminalBytes(data: Uint8Array) {
+  // Telnet 会话优先：同一终端视图同一时刻只挂一个会话（SSH/本地/Telnet 互斥），
+  // telnet: 前缀在队列 send 回调里拆成 telnet/terminal/in/{id} 通道。
+  if (telnetSession.value) {
+    terminalInputQueue.enqueue(`telnet:${telnetSession.value.sessionId}`, normalizeTerminalInputBytes(data));
+    return;
+  }
   const sessionId = localSession.value?.sessionId ?? session.value?.sessionId;
   if (!sessionId) return;
   terminalInputQueue.enqueue(sessionId, normalizeTerminalInputBytes(data));
@@ -2350,7 +2379,10 @@ function scheduleFit() {
       fitAddon.fit();
       // trzsz 进度条按终端列宽渲染（filter 内部文本进度条虽未启用，列宽保持同步）。
       trzszFilter?.setTerminalColumns(terminal.cols);
-      if (localSession.value) {
+      if (telnetSession.value) {
+        // Telnet NAWS：sidecar 发 SB NAWS 子协商，尽力而为。
+        void window.dbxPlugin.notify("telnet/resize", { sessionId: telnetSession.value.sessionId, cols: terminal.cols, rows: terminal.rows }).catch(() => undefined);
+      } else if (localSession.value) {
         void window.dbxPlugin.notify("local/terminal/resize", { sessionId: localSession.value.sessionId, cols: terminal.cols, rows: terminal.rows }).catch(() => undefined);
       } else if (session.value) {
         void window.dbxPlugin.notify("ssh/terminal/resize", { sessionId: session.value.sessionId, cols: terminal.cols, rows: terminal.rows }).catch(() => undefined);
@@ -2817,6 +2849,19 @@ function handleBinary(event: DbxPluginBinaryEvent) {
     drainLocalTerminalFrames();
     return;
   }
+  if (event.channel.startsWith("telnet/terminal/out/")) {
+    // Telnet 输出帧与 local/SSH 同形（9 字节 TerminalFrame 前缀），独立
+    // sequence/pending 状态避免与 SSH/本地流互染。
+    const telnetId = event.channel.slice("telnet/terminal/out/".length);
+    if (!telnetSession.value || telnetId !== telnetSession.value.sessionId) return;
+    const payload = bridgeBinaryBytes(event, window.dbxPlugin.decodeBase64);
+    if (payload.length < 9) return;
+    const sequence = readU64(payload, 1);
+    if (sequence <= telnetLastSequence.value) return;
+    telnetPendingFrames.set(sequence, { stream: payload[0], data: payload.slice(9) });
+    drainTelnetFrames();
+    return;
+  }
   const sessionId = activeTerminalSessionId || session.value?.sessionId;
   if (sessionId && event.channel === `ssh/terminal/out/${sessionId}`) {
     const payload = bridgeBinaryBytes(event, window.dbxPlugin.decodeBase64);
@@ -3041,6 +3086,30 @@ function handleEvent(event: DbxPluginEvent) {
   // 输入打进已被 sidecar 回收的本地会话：立即落退出态（覆盖层给重开出口）。
   if (event.method === "local/terminal/error" && event.params.sessionId === localSession.value?.sessionId) {
     markLocalExited(null);
+    return;
+  }
+  // Telnet 生命周期：connecting → connected → closed（error 附带原因文本，
+  // 只在退出覆盖层展示）。侧边触发引擎反馈与 ssh/trigger 同构（无应答内容）。
+  if (event.method === "telnet/session/state" && event.params.sessionId === telnetSession.value?.sessionId) {
+    const state = String(event.params.state || "");
+    if (state === "connected") {
+      telnetState.value = "running";
+      telnetError.value = "";
+    } else if (state === "connecting") {
+      telnetState.value = "connecting";
+    } else if (state === "closed" || state === "error") {
+      markTelnetClosed(state === "error" ? String(event.params.error || "") : "");
+    }
+    return;
+  }
+  if (event.method === "telnet/terminal/error" && event.params.sessionId === telnetSession.value?.sessionId) {
+    markTelnetClosed(null);
+    return;
+  }
+  if (event.method === "telnet/trigger" && event.params.sessionId === telnetSession.value?.sessionId) {
+    const payload = event.params as { sessionId?: string; stage?: number; kind?: string };
+    const stage = Math.max(1, Number(payload.stage) || 1);
+    showNotice(t(payload.kind === "timeout" ? "telnet.triggerTimeout" : "telnet.triggerAnswered", { stage }));
     return;
   }
   if (event.method === "ssh/agent/prompt" && event.params.sessionId === session.value?.sessionId) {
@@ -3443,6 +3512,131 @@ async function closeLocalTerminal() {
   terminal?.focus();
 }
 
+// —— Telnet 会话生命周期（P2-3，与本地终端同款互斥与补发机制）——
+// 退出态统一入口：error 为 null 表示 sidecar 未带原因（会话已被回收），
+// 非空时在退出覆盖层展示（连接失败/对端断开）。
+function markTelnetClosed(error: string | null) {
+  if (!telnetSession.value || telnetState.value === "closed") return;
+  telnetState.value = "closed";
+  if (error !== null) telnetError.value = error;
+}
+
+function drainTelnetFrames() {
+  let frame = telnetPendingFrames.get(telnetLastSequence.value + 1);
+  while (frame) {
+    telnetPendingFrames.delete(telnetLastSequence.value + 1);
+    telnetLastSequence.value += 1;
+    if (frame.stream === 2) {
+      if (new TextDecoder().decode(frame.data) === "telnet-session-closed") markTelnetClosed(null);
+    } else {
+      dispatchTerminalOutput(frame.data);
+    }
+    frame = telnetPendingFrames.get(telnetLastSequence.value + 1);
+  }
+  if (telnetPendingFrames.size > TERMINAL_PENDING_FRAME_LIMIT) {
+    telnetPendingFrames.clear();
+  }
+  const firstPending = Math.min(...telnetPendingFrames.keys());
+  if (Number.isFinite(firstPending) && firstPending > telnetLastSequence.value + 1 && !telnetReplayInFlight && telnetSession.value) {
+    const sessionId = telnetSession.value.sessionId;
+    telnetReplayInFlight = true;
+    const holeAt = telnetLastSequence.value;
+    void window.dbxPlugin
+      .invoke<ReplayResult>("telnet/replay", { sessionId, afterSequence: telnetLastSequence.value })
+      .then((result) => {
+        if (!result.complete) {
+          markTelnetClosed(null);
+          return;
+        }
+        if (telnetLastSequence.value === holeAt) {
+          telnetReplayNoProgress += 1;
+          if (telnetReplayNoProgress >= 3) {
+            telnetLastSequence.value = firstPending - 1;
+            telnetReplayNoProgress = 0;
+          }
+        } else {
+          telnetReplayNoProgress = 0;
+        }
+      })
+      .catch(() => markTelnetClosed(null))
+      .finally(() => {
+        telnetReplayInFlight = false;
+        drainTelnetFrames();
+      });
+  }
+}
+
+async function startTelnetSession(options: TelnetConnectOptions) {
+  // 同一终端视图互斥：残留的 closed 会话先清场再开新连接。
+  if (telnetSession.value && telnetState.value !== "closed") await closeTelnetSession();
+  // 自动应答：规则 + 密文槽打包进 autoLogin（sidecar 复用 triggers 校验，
+  // 槽值只进发送计划、不落日志）。
+  const autoLogin = options.rules
+    ? {
+        rules: options.rules,
+        secrets: [options.secret1 ?? "", options.secret2 ?? ""],
+      }
+    : undefined;
+  try {
+    const info = await window.dbxPlugin.invoke<{ sessionId: string; host: string; port: number }>("telnet/start", {
+      workbenchId: workbenchId.value,
+      host: options.host,
+      port: options.port,
+      enterMode: options.enterMode,
+      backspaceMode: options.backspaceMode,
+      cols: terminal?.cols || 120,
+      rows: terminal?.rows || 32,
+      ...(autoLogin ? { autoLogin } : {}),
+    });
+    if (disposed) {
+      void window.dbxPlugin.invoke("telnet/close", { sessionId: info.sessionId }).catch(() => undefined);
+      return;
+    }
+    telnetSession.value = { sessionId: info.sessionId, host: info.host, port: info.port };
+    telnetState.value = "connecting";
+    telnetError.value = "";
+    telnetLastSequence.value = 0;
+    telnetPendingFrames.clear();
+    telnetReplayNoProgress = 0;
+    await nextTick();
+    scheduleFit();
+    terminal?.focus();
+  } catch (cause) {
+    showError(cause, "terminal");
+  }
+}
+
+async function closeTelnetSession() {
+  const sessionId = telnetSession.value?.sessionId;
+  telnetSession.value = null;
+  telnetState.value = "idle";
+  telnetError.value = "";
+  telnetPendingFrames.clear();
+  telnetConfirmOpen.value = false;
+  if (!sessionId) return;
+  await window.dbxPlugin.invoke("telnet/close", { sessionId }).catch(() => undefined);
+  terminal?.focus();
+}
+
+// 工具栏 Telnet 入口：SSH 会话仍在（或连接中/本地终端占用）时先经确认，
+// 与本地终端入口同款流程。
+function requestTelnet() {
+  if (isTelnetMode.value) return;
+  if (session.value || reconnectPending.value || terminalState.value === "connecting" || localSession.value) {
+    telnetConfirmOpen.value = true;
+    return;
+  }
+  telnetDialogOpen.value = true;
+}
+
+// 确认后：关掉占用终端视图的 SSH/本地会话，再弹 Telnet 连接表单。
+async function confirmTelnetOpen() {
+  telnetConfirmOpen.value = false;
+  await closeSession();
+  if (localSession.value) await closeLocalTerminal();
+  telnetDialogOpen.value = true;
+}
+
 // HOST_PLUGIN_UI_SPEC §8.3/§7.4 workbench/close 两段式关闭：宿主拆除 panel/tab webview
 // 前先通知本 workbench 释放自己的 sidecar scope（PTY 会话），避免孤儿 PTY 活到 sidecar
 // 退出。特 性探测：旧宿主不发 workbench/close，也无此 API。置 disposed 拦住在途的
@@ -3453,10 +3647,12 @@ if (window.dbxPlugin.workbench?.onClose) {
     const ownedSessions = [
       ["local/session/close", localSession.value?.sessionId],
       ["ssh/session/close", session.value?.sessionId],
+      ["telnet/close", telnetSession.value?.sessionId],
     ].filter((pair): pair is [string, string] => typeof pair[1] === "string" && !!pair[1]);
     await Promise.allSettled(ownedSessions.map(([method, sessionId]) => window.dbxPlugin.notify(method, { sessionId })));
     localSession.value = null;
     session.value = undefined;
+    telnetSession.value = null;
   });
 }
 
@@ -3470,8 +3666,12 @@ function dismissRestoredLocalShell() {
 }
 
 // Toolbar local-terminal button: running -> close; restored shell -> reopen directly (nothing to close, skipping
-// SSH confirm flow); an SSH state walks the existing confirm flow.
+// SSH confirm flow); telnet mode -> close the Telnet session; an SSH state walks the existing confirm flow.
 function toggleLocalTerminal() {
+  if (isTelnetMode.value) {
+    void closeTelnetSession();
+    return;
+  }
   if (localShellRestored.value) {
     void restartLocalTerminal();
     return;
@@ -3501,6 +3701,8 @@ async function restartLocalTerminal() {
 // connecting 途中放行会让在途 ssh/session/open 成功后与本地会话抢同一终端
 // 视图），再开本地终端。
 function requestLocalTerminal() {
+  // Telnet 会话占用终端视图时不开本地终端（互斥展示）。
+  if (isTelnetMode.value) return;
   if (isLocalMode.value || localState.value === "starting") return;
   if (session.value || reconnectPending.value || terminalState.value === "connecting") {
     localOpenConfirmOpen.value = true;
@@ -8407,6 +8609,8 @@ function trackStableFocus(event: FocusEvent) {
 // 计数变化驱动聚焦/归还；同层互斥由交互保证。
 const modalOpenStates = computed(() => [
   localOpenConfirmOpen.value,
+  telnetConfirmOpen.value,
+  telnetDialogOpen.value,
   folderPickerTarget.value !== null,
   previewOpen.value,
   pasteConfirm.value,
@@ -8911,10 +9115,12 @@ onBeforeUnmount(() => {
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
+        <!-- Telnet 明文会话入口（P2-3）：与 SSH/本地终端互斥，占用终态先经确认。 -->
+        <button v-if="!localUiMode" class="icon-button icon-amber" :title="t('telnet.open')" @click="requestTelnet"><Globe /></button>
         <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
              已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。 -->
-        <button class="icon-button icon-violet" :class="{ 'is-active': localUiMode }" :title="localUiMode && !localShellRestored ? t('localTerminal.close') : t('localTerminal.open')" @click="toggleLocalTerminal"><TerminalIcon /></button>
-        <div>
+        <button class="icon-button icon-violet" :class="{ 'is-active': localUiMode }" :title="isTelnetMode ? t('telnet.disconnect') : localUiMode && !localShellRestored ? t('localTerminal.close') : t('localTerminal.open')" @click="toggleLocalTerminal"><TerminalIcon /></button>
+        <div v-if="!isTelnetMode">
           <!-- 本地终端设置：多平台 shell 选择（local/shells/list 发现）+ 注入开关，
                记入 sidecar 偏好（iframe 沙箱无 localStorage）。 -->
           <Popover :open="localMenuOpen" @update:open="(open) => { if (!open) localMenuOpen = false; }">
@@ -9311,6 +9517,18 @@ onBeforeUnmount(() => {
             <div class="local-exit-actions">
               <button class="primary-button" @click="restartLocalTerminal">{{ t("localTerminal.restart") }}</button>
               <button @click="localShellRestored ? dismissRestoredLocalShell() : closeLocalTerminal()">{{ t("localTerminal.close") }}</button>
+            </div>
+          </div>
+        </div>
+        <!-- Telnet 退出覆盖层（连接失败/对端断开）：给出关闭出口，展示
+             sidecar 带回的原因文本（明文协议告警在连接弹窗里）。 -->
+        <div v-if="isTelnetMode && telnetState === 'closed'" class="terminal-overlay">
+          <div class="local-exit-card" role="status">
+            <TriangleAlert class="local-exit-icon" />
+            <strong>{{ t("telnet.closed") }}</strong>
+            <span v-if="telnetError" class="mono local-exit-code">{{ telnetError }}</span>
+            <div class="local-exit-actions">
+              <button @click="closeTelnetSession">{{ t("telnet.close") }}</button>
             </div>
           </div>
         </div>
@@ -10392,6 +10610,24 @@ onBeforeUnmount(() => {
       @select="onFolderPicked"
       @close="folderPickerTarget = null"
     />
+
+    <!-- Telnet 连接表单（P2-3）：host/port/回退格/回车 + Expect 自动应答。 -->
+    <TelnetConnectDialog :locale="locale" :open="telnetDialogOpen" @update:open="(open) => (telnetDialogOpen = open)" @connect="startTelnetSession" />
+
+    <!-- Telnet 确认：SSH 会话仍连着（或本地终端占用）时先关闭再弹连接表单 -->
+    <Dialog :open="telnetConfirmOpen" @update:open="(open) => { if (!open) telnetConfirmOpen = false; }">
+      <DialogContent class="modal small-modal" @escape-key-down.prevent>
+        <header>
+          <DialogTitle>{{ t("telnet.openConfirmTitle") }}</DialogTitle>
+          <button :title="t('close')" class="icon-button" @click="telnetConfirmOpen = false"><X /></button>
+        </header>
+        <p class="muted">{{ t("telnet.openConfirm") }}</p>
+        <footer>
+          <button @click="telnetConfirmOpen = false">{{ t("cancel") }}</button>
+          <button class="primary-button" @click="confirmTelnetOpen">{{ t("telnet.open") }}</button>
+        </footer>
+      </DialogContent>
+    </Dialog>
 
     <!-- 本地终端确认：SSH 会话仍连着时先关闭再进入本地模式 -->
     <Dialog :open="localOpenConfirmOpen" @update:open="(open) => { if (!open) localOpenConfirmOpen = false; }">
