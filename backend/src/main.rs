@@ -6,6 +6,7 @@ mod audit_log;
 mod connection_import;
 mod docker;
 mod exec;
+mod file_watch;
 mod forward;
 mod highlight_rules;
 mod host_key;
@@ -62,6 +63,7 @@ struct Plugin {
     local: Arc<local_terminal::LocalTerminalRuntime>,
     telnet: Arc<telnet_session::TelnetSessionRuntime>,
     mcp: Arc<mcp::McpState>,
+    watcher: Arc<file_watch::WatchRuntime>,
 }
 
 impl Plugin {
@@ -76,6 +78,31 @@ impl Plugin {
             ssh,
             local: Arc::new(local_terminal::LocalTerminalRuntime::new()),
             telnet: Arc::new(telnet_session::TelnetSessionRuntime::new()),
+            watcher: Arc::new(file_watch::WatchRuntime::new()),
+        })
+    }
+
+    /// Async liveness probe for the file watchers: an emission only prompts
+    /// when the owning SSH session still exists. Built from `list_sessions`
+    /// because the session table itself stays inside ssh.rs; a listing
+    /// failure must never kill watches, so it reports "alive".
+    fn session_probe(&self) -> file_watch::SessionProbe {
+        let ssh = self.ssh.clone();
+        Arc::new(move |session_id: String| {
+            let ssh = ssh.clone();
+            Box::pin(async move {
+                ssh.list_sessions()
+                    .await
+                    .get("sessions")
+                    .and_then(Value::as_array)
+                    .map(|rows| {
+                        rows.iter().any(|row| {
+                            row.get("sessionId").and_then(Value::as_str)
+                                == Some(session_id.as_str())
+                        })
+                    })
+                    .unwrap_or(true)
+            })
         })
     }
 
@@ -280,6 +307,10 @@ impl Plugin {
             "ssh/session/close" => {
                 let session_id = required_string(&params, "sessionId")?;
                 self.runtime.block_on(self.ssh.close_session(session_id))?;
+                // External-editor watchers belong to the session; the workbench
+                // usually stops them first via watch/stop-all, this is the
+                // backend-side backstop.
+                self.runtime.block_on(self.watcher.stop_session(session_id));
                 Ok(json!({ "success": true }))
             }
             "ssh/forward/list" => Ok(self.ssh.forward_list(&params)),
@@ -630,6 +661,27 @@ impl Plugin {
                     overwrite,
                 ))?;
                 Ok(json!({ "success": true }))
+            }
+            // 外部编辑器回传（仅桌面端）：前端先用 sftp/download 把文件落到
+            // 本地 remote-edit 目录，这里只注册监听；确认内容真变后经
+            // watch/file-modified 事件推回工作台。
+            "watch/start" => {
+                let request: file_watch::WatchStartRequest = parse(params)?;
+                self.runtime.block_on(self.watcher.start(
+                    request,
+                    Arc::new(WatchEventPublisher(emitter.clone())),
+                    self.session_probe(),
+                ))
+            }
+            "watch/stop" => {
+                let watch_id = required_string(&params, "watchId")?;
+                self.runtime.block_on(self.watcher.stop(watch_id))?;
+                Ok(json!({ "success": true }))
+            }
+            "watch/stop-all" => {
+                let session_id = required_string(&params, "sessionId")?;
+                let stopped = self.runtime.block_on(self.watcher.stop_session(session_id));
+                Ok(json!({ "success": true, "stopped": stopped }))
             }
             "sftp/copy" => {
                 let session_id = self.filesystem_session(&params)?;
@@ -1501,6 +1553,23 @@ impl PluginHandler for Plugin {
 
 fn parse<T: DeserializeOwned>(value: Value) -> Result<T, String> {
     serde_json::from_value(value).map_err(|error| format!("Invalid request parameters: {error}"))
+}
+
+/// Forwards confirmed watcher changes to the host as a `watch/file-modified`
+/// event, channel shape matching the other sidecar state broadcasts
+/// (`local/session/state`, `ssh/forward/state`). Emission failures are logged
+/// and otherwise ignored — the registry stays authoritative.
+struct WatchEventPublisher(PluginEmitter);
+
+impl file_watch::EventPublisher for WatchEventPublisher {
+    fn publish(&self, payload: Value) {
+        if let Err(error) = self.0.event("watch/file-modified", payload) {
+            eprintln!(
+                "[ssh-sftp-plugin] watch file-modified event failed: {}",
+                error.message
+            );
+        }
+    }
 }
 
 /// Terminal binary input frames carry an 8-byte BE sequence ahead of the

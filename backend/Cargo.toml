@@ -50,6 +50,11 @@ zeroize = "1"
 # Xshell .xts session archives; deflate is all Xshell writes (zip-bomb
 # guards live in connection_import.rs).
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Local file watching for the "open in external editor" round-trip
+# (watch/start in src/file_watch.rs). Defaults stay on: v6 has no
+# linux_inotify feature (the backend is unconditional there), macos_fsevent
+# is the macOS backend and crossbeam-channel is the default event plumbing.
+notify = "6"
 
 [target.'cfg(windows)'.dependencies]
 pageant = "0.2"
