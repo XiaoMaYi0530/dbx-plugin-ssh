@@ -2613,6 +2613,8 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     // 成功过渡（Termius 式）：先切 success 卡片——进度线填满到顶、终端图标变
     // 对号；replay 在动画期间并行拉取，hold 播完才置 connected 进终端，避免
     // 连接成功瞬间生硬跳变。reduced-motion 下不 hold，立即进终端。
+    // Dock 面板（surface=panel）根本不渲染连接卡片（见模板 terminal-overlay
+    // 的 v-if="!panelSurface"），hold 动画用户看不见——750ms 纯属白等，跳过。
     // 注意 session/directoryTrackingSupported 等响应式状态在 hold 结束后才写入：
     // 提前写入会让 SFTP/工具栏等 watcher 在动画播放期间就开始渲染（画面抖动）。
     connectSucceeded.value = true;
@@ -2624,7 +2626,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       afterSequence: 0,
     });
     if (!replay.complete) throw new Error(t("sessionUnrecoverable"));
-    const holdMs = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : CONNECT_SUCCESS_HOLD_MS;
+    const holdMs = window.matchMedia("(prefers-reduced-motion: reduce)").matches || panelSurface.value ? 0 : CONNECT_SUCCESS_HOLD_MS;
     const remainMs = holdMs - (Date.now() - successShownAt);
     if (remainMs > 0) await new Promise((resolve) => window.setTimeout(resolve, remainMs));
     connectSucceeded.value = false;
@@ -2655,6 +2657,9 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     // host-key 拒绝是秒级永久错误，重试不可能自愈——跳过重试直接进 error 态，
     // 呈现 friendly 文案 + Reconnect 出口（P1-1）。决策细节见 connectRetry.ts。
     const inactive = isConnectionInactiveError(cause);
+    // 预拨号面板的引导竞态：宿主在创建条目时已开始 connect，openSession 只
+    // 是跑在了 connect 推送前面——用短间隔轮询等它落地，而不是 2s 退避梯子。
+    const preconnect = bootRestore && panelSurface.value && hostContext.value.connectionPreconnected === true;
     const decision = decideConnectRetry({
       cause,
       attempt: openRetryAttempt,
@@ -2662,6 +2667,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       attemptMs,
       inactive,
       bootRestore,
+      preconnect,
     });
     if (decision.kind === "retry") {
       openRetryAttempt = decision.attempt;
@@ -7551,7 +7557,8 @@ async function initialize() {
     // 上来直接连（§8.3 面板加载生命周期）：宿主已在点击创建条目时
     // ensureConnected 预拨（connectionPreconnected 旗标），这里跳过 force
     // 重开（force 会复位共享连接），直接 openSession——拨号未完成时由
-    // bootRestore 的有界重试自愈，拨号失败/永久错误走既有分类报错。
+    // preconnect 短间隔轮询自愈（250ms 固定节奏，不再是 2s 退避梯子），
+    // 拨号失败/永久错误走既有分类报错。
     // 旧宿主无旗标：保留原有 force 重开路径。
     else {
       if (panelSurface.value && !hostContext.value.connectionPreconnected) await requestHostReopenConnection();
