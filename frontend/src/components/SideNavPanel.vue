@@ -3,12 +3,13 @@
 // quick（快捷路径）双 tab，可收起为窄条再展开；tab 与收缩状态由 App.vue 持久化
 // 到 localStorage。行右键统一上抛 node-context（打开 / 复制路径 / 复制文件名 /
 // 压缩），由 App.vue 弹菜单。
-// P2-1 追加：otp（OTP 验证码）面板内聚 tab。它是纯面板内状态（不进 App.vue
-// 的持久化协议，App.vue 的 setSftpSideTab 契约保持 "tree" | "quick" 不变），
-// 由本组件内部 extraTab 记忆当前激活项。
+// P2-1/P2-2 追加：otp（OTP 验证码）/ import（会话导入）两个面板内聚 tab。
+// 它们是纯面板内状态（不进 App.vue 的持久化协议，App.vue 的 setSftpSideTab
+// 契约保持 "tree" | "quick" 不变），由本组件内部 extraTab 记忆当前激活项。
 import { computed, ref } from "vue";
-import { ChevronsLeft, ChevronsRight, Folder, FolderTree, Home, KeyRound, RefreshCw, Star } from "@lucide/vue";
+import { ChevronsLeft, ChevronsRight, FileUp, Folder, FolderTree, Home, KeyRound, RefreshCw, Star } from "@lucide/vue";
 import DirTree from "./DirTree.vue";
+import ImportWizard from "./ImportWizard.vue";
 import OtpPanel from "./OtpPanel.vue";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 import type { DirTreeNode } from "../lib/sftpDirTree";
@@ -20,7 +21,7 @@ export interface SftpSideQuickPath {
   home?: boolean;
 }
 
-type ExtraSideTab = "otp";
+type ExtraSideTab = "otp" | "import";
 
 const props = defineProps<{
   tab: "tree" | "quick";
@@ -52,10 +53,10 @@ function onTabChange(value: string | number) {
   emit("update:tab", value as "tree" | "quick");
 }
 
-/** tree/quick 走原持久化协议并清掉内聚 tab；otp 只记在面板内部。 */
+/** tree/quick 走原持久化协议并清掉内聚 tab；otp/import 只记在面板内部。 */
 function onTabsChange(value: string | number) {
   const next = String(value);
-  if (next === "otp") {
+  if (next === "otp" || next === "import") {
     extraTab.value = next;
     return;
   }
@@ -76,6 +77,9 @@ function onTabsChange(value: string | number) {
         </TabsTrigger>
         <TabsTrigger value="otp" class="sftp-side-tab" :title="t('otpPanel.title')">
           <KeyRound />
+        </TabsTrigger>
+        <TabsTrigger value="import" class="sftp-side-tab" :title="t('importWizard.title')">
+          <FileUp />
         </TabsTrigger>
       </TabsList>
       <span class="sftp-side-spacer" />
@@ -113,6 +117,7 @@ function onTabsChange(value: string | number) {
         </button>
       </div>
       <OtpPanel v-else-if="activeTab === 'otp'" :t="t" />
+      <ImportWizard v-else-if="activeTab === 'import'" :t="t" />
     </div>
   </div>
   <div v-else class="sftp-side-rail">
