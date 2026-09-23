@@ -7501,6 +7501,11 @@ async function initialize() {
         else showError(cause);
       });
   });
+  // §8.3 面板加载生命周期：探活与终端创建并行。探活只是一次 sidecar 往返，
+  // 串行执行会把真正耗时的 openSession 压到整个引导的最后。
+  const reattachLookup = readPluginMode(hostContext.value) !== "local-terminal" && connectionId.value && workbenchId.value && !restored.value
+    ? findReattachSession()
+    : Promise.resolve("");
   await nextTick();
   createTerminal();
   // P0 connectionless local-terminal passthrough (HOST_PLUGIN_UI_SPEC §4/§7.1): when the host opens this workbench with
@@ -7536,22 +7541,20 @@ async function initialize() {
     // 宿主切 tab / 左侧菜单重开可能整体重建工作台 webview。只恢复
     // 同一 workbench 的 live session；不能按 connectionId 复用任意会话，
     // 否则打开同一连接的新 Tab 会接管已有 Tab 的 PTY。
-    const reattach = await findReattachSession();
+    const reattach = await reattachLookup;
     if (reattach) await attachSession(reattach, reattach);
     // 上一轮本地终端还活着（webview 重建但 sidecar 未退出）：接回并补发，
     // 避免孤儿 shell 挂在 sidecar 里。
     else if (await reattachLocalSession()) {
       // 本地模式接管终端。
     }
-    // bootRestore: 宿主启动恢复 tab 时会异步重放 connect（见 queryStore
-    // reconnectRestoredPluginTabs），首个 ssh/session/open 可能先于它落地，
-    // inactive 错误在该路径下参与有界重试。
+    // 上来直接连（§8.3 面板加载生命周期）：宿主已在点击创建条目时
+    // ensureConnected 预拨（connectionPreconnected 旗标），这里跳过 force
+    // 重开（force 会复位共享连接），直接 openSession——拨号未完成时由
+    // bootRestore 的有界重试自愈，拨号失败/永久错误走既有分类报错。
+    // 旧宿主无旗标：保留原有 force 重开路径。
     else {
-      // Dock 连接面板（§8.3）：宿主创建面板条目时不像 tab 流程那样先
-      // ensureConnected/repush，sidecar 里没有这条连接，首个 ssh/session/open
-      // 必然 inactive 失败、只能靠用户手点重连。先请宿主重开连接（宿主侧
-      // 会推送凭据并建连）再 open，panel 之外不受影响（tab 已有前置推送）。
-      if (panelSurface.value) await requestHostReopenConnection();
+      if (panelSurface.value && !hostContext.value.connectionPreconnected) await requestHostReopenConnection();
       await openSession(false, true);
     }
   }
