@@ -1,4 +1,5 @@
 mod agent_approvals;
+mod x11;
 mod agent_terminal;
 mod alert_triage;
 mod app_bridge;
