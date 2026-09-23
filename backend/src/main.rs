@@ -3,6 +3,7 @@ mod agent_terminal;
 mod alert_triage;
 mod app_bridge;
 mod audit_log;
+mod connection_import;
 mod exec;
 mod forward;
 mod highlight_rules;
@@ -989,6 +990,12 @@ impl Plugin {
                 let id = required_string(&params, "id")?;
                 sftp_bookmarks::delete(&self.ssh.data_dir(), id)
             }
+            // 会话导入（Xshell .xts / MobaXterm .mxtsessions / WindTerm
+            // .sessions）：parse 只回脱敏预览（凭据以 hasSecret 表示），
+            // commit 按选中下标重新解析并入库（凭据经 vault 加密落盘到
+            // imported-connections.json，0600）。
+            "import/parse" => connection_import::handle_parse(&params),
+            "import/commit" => connection_import::handle_commit(&plugin_data_dir(), &params),
             "filesystem/list" => self.filesystem_list(params),
             "filesystem/read" => self.filesystem_read(params),
             "filesystem/write" => self.filesystem_write(params),
