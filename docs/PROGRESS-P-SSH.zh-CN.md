@@ -3438,6 +3438,8 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 - **执行波折**：M4 首两轮后台 agent 因 API 网络瞬断失败；X11 改由主会话直接实现（兑现 x11.rs 残留）；串口前端第三轮 agent 成功。
 - **全量**：backend cargo **696**（含 x11 12 + serial 参数/生命周期测试）/ clippy 0 / fmt 干净；frontend vitest **861** / vue-tsc 0 / build 过。
 
+- **CI 收口 ✅**：libudev-dev 已入 workflow 三处 apt 步骤（serialport Linux 后端），run 35933731782 全绿——M4 全量 CI 收口完成。
+
 ### M4 遗留（人工门）
 
 1. 真机：X server（XQuartz/VcXsrv）联调、串口硬件联调、GPU/NPU 主机、Windows ConPTY、DBX 桌面端到端。
