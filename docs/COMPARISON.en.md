@@ -12,15 +12,21 @@ positioning and should be verified against the target platform and exact version
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Graphical connection management | Built in | — | Built in | Built in | Built in | Built in | Built in/mobile |
 | Interactive PTY terminal | Built in | Built-in terminal | Built in | Built in | Built in | Built in | Built in |
-| SFTP file workspace | Built in | External `sftp`/client | Plugin/version dependent | Built in/plan dependent | Built in | Built in | Built in/version dependent |
+| Split panes / multiple shells in one window | Via DBX host workbench | External tool (tmux etc.) | Built in | Version dependent | Version dependent | Built in/version dependent | Built in/version dependent |
+| Custom themes / terminal appearance | Follows the DBX host theme | — | Built in (theme/plugin ecosystem) | Version dependent | Version dependent | Built in/version dependent | Version dependent |
+| SFTP file workspace | Built in | External `sftp`/client | Built in/version dependent | Built in/plan dependent | Built in | Built in | Built in/version dependent |
 | SSH Agent / key / password auth | Built in | Built in | Built in/config dependent | Built in/plan dependent | Built in | Built in | Built in |
 | Jump hosts / ProxyJump | Up to three hops | Built in | Config/plugin dependent | Supported/plan dependent | Supported/version dependent | Supported/config dependent | Supported/version dependent |
 | Known Hosts and changed-key rejection | Built in | Built in | Configuration dependent | Supported/config dependent | Supported/config dependent | Supported/config dependent | Supported/version dependent |
-| Port forwarding / SOCKS | Built in/config dependent | Built in | Plugin/config dependent | Supported/plan dependent | Supported/version dependent | Supported/config dependent | Supported/version dependent |
+| Port forwarding / SOCKS | Built in -L/-R (dynamic tunnels via the DBX host) | Built in | Built in (-L/-R/-D/X11) | Supported/plan dependent | Supported/version dependent | Supported/config dependent | Supported/version dependent |
 | Read-only and command safety gates | Built in | Shell/system policy | Plugin/manual policy | Configuration/plan dependent | Manual policy | Manual policy | Config/manual policy |
 | Quick Sudo / TOTP interaction | Built in | External scripts/terminal flow | Plugin/script | Supported/plan dependent | Supported/version dependent | Terminal flow/version dependent | Terminal flow/version dependent |
 | File preview, drag/drop, resumable transfer | Built in | External tool | Plugin/version dependent | Built in/plan dependent | Built in | Built in/version dependent | Built in/version dependent |
-| Connection sync / multi-device workflow | DBX host workbench | — | Config/sync dependent | Core selling point/plan dependent | Version dependent | Cross-platform desktop | Mobile-first |
+| Zmodem / Trzsz transfer | Built in | External tool | Built in | — | Version dependent | Built in | Version dependent |
+| Session recording / replay / GIF export | Built in | External tool | Plugin/script dependent | — | Version dependent | Plugin/version dependent | Version dependent |
+| Command efficiency (history / quick commands / keyword highlight) | Built in | — | Plugin/config dependent | Built in/version dependent | Version dependent | Version dependent | Version dependent |
+| Batch commands across sessions | Built in | External tool | Plugin/config dependent | Version dependent | Version dependent | Built in/version dependent | Version dependent |
+| Connection sync / multi-device workflow | DBX host workbench | — | Built in (account sync)/version dependent | Core selling point/plan dependent | Version dependent | Cross-platform desktop | Mobile-first |
 | MCP automation tools | Built in | — | — | — | — | — | — |
 | DBX host secret binding | Native | — | — | — | — | — | — |
 | RDP | Improving | External tool | Plugin/version dependent | Supported/plan dependent | Supported/version dependent | Version dependent | Version dependent |
@@ -32,6 +38,26 @@ positioning and should be verified against the target platform and exact version
 > governed server operations. RDP, Telnet, and additional remote protocols are still being
 > strengthened. “Improving” does not mean a complete production-ready replacement is already
 > guaranteed; verify the exact capability in the release notes for your target version.
+
+## Positioning versus Tabby
+
+Tabby is a general-purpose terminal: its strengths are terminal tabs and split panes,
+theme/color customization with a plugin ecosystem, multi-protocol support (Telnet/serial),
+and cross-device config sync. DBX SSH & SFTP differs on the server operations chain:
+
+- Stronger authentication and privilege-escalation orchestration: global Quick Sudo
+  profiles, TOTP/2FA auto-answer, sudo allowlists, read-only gates, and host secret
+  binding are all built in; Tabby usually relies on plugins or scripts.
+- 31 built-in MCP automation tools let AI clients operate servers inside the same
+  connection and permission boundary.
+- Session recording/replay with GIF export, batch commands across sessions, resumable
+  transfers, and Zmodem/Trzsz are built in.
+- Up to three-hop ProxyJump with per-hop authentication, 2FA, and host-key verification.
+- Port mapping -L/-R is built in (0.6.0); dynamic SOCKS tunnels, agent forwarding, X11,
+  GSSAPI, and ControlMaster are intentionally not built — covered by the DBX host
+  transport layer or set aside by product decisions.
+- Terminal split panes and custom themes currently follow the DBX host workbench;
+  additional protocols (RDP/Telnet/serial) remain on the roadmap.
 
 ## Position in the DBX plugin family
 
@@ -50,8 +76,8 @@ secret, and workbench boundaries.
 
 - For script-only SSH, choose OpenSSH; it is lightweight and leaves automation boundaries to
   shell and system policy.
-- For terminal tabs and a customizable terminal, Tabby is a general terminal option; SFTP and
-  security controls depend on plugins and configuration.
+- For terminal tabs, split panes, and theme customization, Tabby is a general terminal
+  option; its security controls depend on plugins and configuration.
 - For cross-device connection synchronization, Termius is more cloud/commercial oriented;
   exact capabilities depend on its version and plan.
 - For a desktop tool combining SSH, SFTP, and server status, FinalShell is one direct option.
