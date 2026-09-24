@@ -2605,6 +2605,10 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     const info = await window.dbxPlugin.invoke<SessionInfo>("ssh/session/open", {
       connectionId: connectionId.value,
       workbenchId: workbenchId.value,
+      reuseAuthenticatedTransport: hostContext.value.reuseAuthenticatedTransport === true,
+      reuseAuthenticatedSessionId: typeof hostContext.value.reuseAuthenticatedSessionId === "string"
+        ? hostContext.value.reuseAuthenticatedSessionId
+        : undefined,
       cols: terminal?.cols || 120,
       rows: terminal?.rows || 32,
     }, { timeoutMs: attemptTimeoutMs });
@@ -3117,16 +3121,35 @@ async function reconnectNow() {
 // 旧宿主忽略第三参，退化为原查重行为。connectionId 显式写入 context：宿主的
 // 重推凭据（reinit re-push）与 hostContext 合并都键在 context.connectionId 上，
 // 不能依赖宿主已把它合进 context（旧宿主没有那层合并）。
-function openNewSessionTab() {
-  const api = window.dbxPlugin;
-  if (!api.openWorkbench || !connectionId.value) return;
-  const context: Record<string, unknown> = { ...hostContext.value, connectionId: connectionId.value, workbenchId: randomUUID() };
+function sessionTabContext(reuseAuthenticatedTransport: boolean): Record<string, unknown> {
+  const context: Record<string, unknown> = {
+    ...hostContext.value,
+    connectionId: connectionId.value,
+    workbenchId: randomUUID(),
+    reuseAuthenticatedTransport,
+    reuseAuthenticatedSessionId: reuseAuthenticatedTransport ? session.value?.sessionId : undefined,
+  };
   const persisted = context.workbenchState;
   if (persisted && typeof persisted === "object") {
     const { sessionId: _sessionId, terminalSequence: _terminalSequence, ...rest } = persisted as Record<string, unknown>;
     context.workbenchState = rest;
   }
-  void api.openWorkbench("io.dbx.ssh.workbench", context, { forceNew: true });
+  return context;
+}
+
+function openNewSessionTab() {
+  const api = window.dbxPlugin;
+  if (!api.openWorkbench || !connectionId.value) return;
+  void api.openWorkbench("io.dbx.ssh.workbench", sessionTabContext(false), { forceNew: true });
+}
+
+// 复制会话：新 tab 仍拥有独立 PTY、回放缓冲和 workbenchId，但后端在当前
+// 已认证 SSH transport 上另开 channel，因此堡垒机不会再次发起 MFA。这里不
+// 复制或缓存 OTP；若原 transport 已失效，后端会要求走“新建会话”重新连接。
+function openCopiedSessionTab() {
+  const api = window.dbxPlugin;
+  if (!api.openWorkbench || !connectionId.value || !connected.value) return;
+  void api.openWorkbench("io.dbx.ssh.workbench", sessionTabContext(true), { forceNew: true });
 }
 
 async function restoreTransfers() {
@@ -7732,6 +7755,7 @@ onBeforeUnmount(() => {
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
+        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('copySessionTab')" :disabled="!connectionId || !connected" @click="openCopiedSessionTab"><Copy /></button>
         <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
              已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。 -->
         <button class="icon-button icon-violet" :class="{ 'is-active': localUiMode }" :title="localUiMode && !localShellRestored ? t('localTerminal.close') : t('localTerminal.open')" @click="toggleLocalTerminal"><TerminalIcon /></button>
@@ -9447,5 +9471,3 @@ onBeforeUnmount(() => {
 /* 拖拽过程中全局光标 */
 body.resizing-col { cursor: col-resize !important; user-select: none; }
 </style>
-
-
