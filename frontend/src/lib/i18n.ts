@@ -58,6 +58,7 @@ export const messages = {
         hostKeyPrompt: "Host key confirmation requested",
         hostKeyResolved: "Host key confirmed",
         orphanClosed: "Closed the session opened after cancel",
+        duplicateFallback: "Duplicate source unavailable; reconnecting with a fresh SSH login…",
       },
     },
     terminalSelectCopy: {
@@ -453,6 +454,7 @@ export const messages = {
         hostKeyPrompt: "Se pidió confirmar la clave de host",
         hostKeyResolved: "Clave de host confirmada",
         orphanClosed: "Sesión abierta tras la cancelación cerrada",
+        duplicateFallback: "La sesión de origen ya no está disponible; reconectando con un nuevo inicio de sesión SSH…",
       },
     },
     terminalSelectCopy: {
@@ -841,6 +843,7 @@ export const messages = {
         hostKeyPrompt: "Richiesta conferma della host key",
         hostKeyResolved: "Host key confermata",
         orphanClosed: "Sessione aperta dopo l'annullamento chiusa",
+        duplicateFallback: "La sessione di origine non è più disponibile; riconnessione con un nuovo accesso SSH…",
       },
     },
     terminalSelectCopy: {
@@ -1229,6 +1232,7 @@ export const messages = {
         hostKeyPrompt: "ホスト鍵の確認が求められています",
         hostKeyResolved: "ホスト鍵を確認しました",
         orphanClosed: "キャンセル後に開かれたセッションを閉じました",
+        duplicateFallback: "複製元のセッションを利用できません。新しい SSH ログインで再接続します…",
       },
     },
     terminalSelectCopy: {
@@ -1617,6 +1621,7 @@ export const messages = {
         hostKeyPrompt: "Confirmação da host key solicitada",
         hostKeyResolved: "Host key confirmada",
         orphanClosed: "Sessão aberta após o cancelamento foi fechada",
+        duplicateFallback: "A sessão de origem não está mais disponível; reconectando com um novo login SSH…",
       },
     },
     terminalSelectCopy: {
@@ -2005,6 +2010,7 @@ export const messages = {
         hostKeyPrompt: "请求确认主机密钥",
         hostKeyResolved: "主机密钥已确认",
         orphanClosed: "已关闭取消后建立的会话",
+        duplicateFallback: "复制来源已失效，正在通过新的 SSH 登录重新连接…",
       },
     },
     terminalSelectCopy: {
@@ -2400,6 +2406,7 @@ export const messages = {
         hostKeyPrompt: "請求確認主機金鑰",
         hostKeyResolved: "主機金鑰已確認",
         orphanClosed: "已關閉取消後建立的工作階段",
+        duplicateFallback: "複製來源已失效，正在透過新的 SSH 登入重新連線…",
       },
     },
     terminalSelectCopy: {

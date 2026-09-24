@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -1183,6 +1183,75 @@ impl ReplayBuffer {
 /// the server hands over a `forwarded-tcpip` channel.
 pub type RemoteForwardTable = Mutex<HashMap<(String, u32), forward::RelayTarget>>;
 
+/// Explicit users of one authenticated SSH transport: every registered
+/// session owns one use, and a copied session reserves one before its first
+/// await. That pending reservation closes the open/close race where the last
+/// old session could otherwise tear down a jump chain while the new PTY was
+/// still being created.
+struct TransportLeaseCounter(AtomicUsize);
+
+impl TransportLeaseCounter {
+    fn new() -> Self {
+        Self(AtomicUsize::new(1))
+    }
+
+    fn retain(&self) {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .expect("SSH transport lease count overflow");
+    }
+
+    /// Returns true when the released use was the final one.
+    fn release(&self) -> bool {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            })
+            .expect("SSH transport lease released more than once")
+            == 1
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+struct SharedTransportLease {
+    uses: TransportLeaseCounter,
+    jump_chain: Vec<Arc<Handle<SshClient>>>,
+}
+
+impl SharedTransportLease {
+    fn new(jump_chain: Vec<Arc<Handle<SshClient>>>) -> Self {
+        Self {
+            uses: TransportLeaseCounter::new(),
+            jump_chain,
+        }
+    }
+
+    fn retain(&self) {
+        self.uses.retain();
+    }
+
+    async fn release(&self) {
+        if !self.uses.release() {
+            return;
+        }
+        for jump in &self.jump_chain {
+            let _ = jump
+                .disconnect(
+                    Disconnect::ByApplication,
+                    "DBX SSH session closed",
+                    "English",
+                )
+                .await;
+        }
+    }
+}
+
 /// `workbench_id` is kept with the session so attach can only restore the
 /// session that belongs to the same workbench. A different workbench must open
 /// its own SSH session instead of stealing another tab's PTY.
@@ -1199,9 +1268,9 @@ struct SessionEntry {
     /// the sequence gives `session_id_for_connection` a true creation order.
     created_seq: u64,
     handle: Arc<Handle<SshClient>>,
-    /// Open jump-host connections that carry this session's target tunnel;
-    /// kept alive alongside the target handle.
-    jump_chain: Vec<Arc<Handle<SshClient>>>,
+    /// Reference-counted lifetime for the authenticated transport's jump
+    /// chain. Pending copied-session opens reserve a use before awaiting.
+    transport_lease: Arc<SharedTransportLease>,
     /// Live Quick Sudo / 2FA orchestration, updatable at runtime through
     /// `ssh/settings/set` and shared by the terminal and exec paths.
     orchestration: Arc<RwLock<SudoAuth>>,
@@ -1648,7 +1717,9 @@ impl SshRuntime {
         // old behavior and establishes a fully independent transport.
         let reuse_source = if reuse_authenticated_transport {
             let sessions = self.sessions.read().await;
-            if let Some(source_session_id) = request.reuse_authenticated_session_id.as_deref() {
+            let source = if let Some(source_session_id) =
+                request.reuse_authenticated_session_id.as_deref()
+            {
                 sessions
                     .get(source_session_id)
                     .filter(|entry| {
@@ -1667,7 +1738,24 @@ impl SshRuntime {
                     })
                     .min_by_key(|entry| entry.created_seq)
                     .cloned()
-            }
+            };
+            source
+                .map(|source| {
+                    let orchestration = source
+                        .orchestration
+                        .read()
+                        .map_err(|_| "SSH authentication state is unavailable".to_string())?
+                        .clone();
+                    // Reserve while the sessions read lock still prevents
+                    // close_session from removing/releasing the source.
+                    source.transport_lease.retain();
+                    Ok::<_, String>((
+                        Arc::clone(&source.handle),
+                        Arc::clone(&source.transport_lease),
+                        orchestration,
+                    ))
+                })
+                .transpose()?
         } else {
             None
         };
@@ -1677,20 +1765,15 @@ impl SshRuntime {
                     .to_string(),
             );
         }
-        let (connection, handle, jump_chain, inherited_orchestration, reused_transport) =
-            if let Some(source) = reuse_source {
-                let orchestration = source
-                    .orchestration
-                    .read()
-                    .map_err(|_| "SSH authentication state is unavailable".to_string())?
-                    .clone();
+        let (connection, handle, transport_lease, inherited_orchestration, reused_transport) =
+            if let Some((handle, transport_lease, orchestration)) = reuse_source {
                 eprintln!(
                     "[ssh-trace] open_session connection_id={connection_id} workbench_id={workbench_id} reuse_authenticated_transport=true"
                 );
                 (
                     connection,
-                    Arc::clone(&source.handle),
-                    source.jump_chain.clone(),
+                    handle,
+                    transport_lease,
                     Some(orchestration),
                     true,
                 )
@@ -1710,46 +1793,51 @@ impl SshRuntime {
                 (
                     connection,
                     Arc::new(handle),
-                    jump_chain.into_iter().map(Arc::new).collect::<Vec<_>>(),
+                    Arc::new(SharedTransportLease::new(
+                        jump_chain.into_iter().map(Arc::new).collect::<Vec<_>>(),
+                    )),
                     None,
                     false,
                 )
             };
-        let remote_shell = detect_remote_shell(&handle).await;
-        let directory_tracking_supported = remote_shell.supports_directory_tracking();
-        let mut channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|error| {
+        let terminal = async {
+            let remote_shell = detect_remote_shell(&handle).await;
+            let directory_tracking_supported = remote_shell.supports_directory_tracking();
+            let mut channel = handle.channel_open_session().await.map_err(|error| {
                 if reused_transport {
                     format!("The authenticated SSH connection can no longer be reused; use New session to reconnect: {error}")
                 } else {
                     format!("Failed to open SSH terminal channel: {error}")
                 }
             })?;
-        channel
-            .request_pty(true, "xterm-256color", cols.max(1), rows.max(1), 0, 0, &[])
-            .await
-            .map_err(|error| format!("Failed to request SSH PTY: {error}"))?;
-        // Client-specified SetEnv rides on the interactive session too, in
-        // ssh(1) order: PTY first, env next, shell/exec last. A refused
-        // variable surfaces instead of half-configuring the session.
-        exec::apply_connection_env(&mut channel, &connection.set_env).await?;
-        if connection.remote_command.is_empty() {
             channel
-                .request_shell(true)
+                .request_pty(true, "xterm-256color", cols.max(1), rows.max(1), 0, 0, &[])
                 .await
-                .map_err(|error| format!("Failed to start SSH shell: {error}"))?;
-        } else {
-            // `ssh RemoteCommand`: exec the configured command instead of a
-            // shell, with the PTY still requested. Like ssh(1), every
-            // (re)connect replays the same command - a dropped session that
-            // the workbench reopens intentionally runs it again.
-            channel
-                .exec(true, connection.remote_command.as_bytes())
-                .await
-                .map_err(|error| format!("Failed to start remote command: {error}"))?;
+                .map_err(|error| format!("Failed to request SSH PTY: {error}"))?;
+            // Client-specified SetEnv rides on the interactive session too,
+            // in ssh(1) order: PTY first, env next, shell/exec last.
+            exec::apply_connection_env(&mut channel, &connection.set_env).await?;
+            if connection.remote_command.is_empty() {
+                channel
+                    .request_shell(true)
+                    .await
+                    .map_err(|error| format!("Failed to start SSH shell: {error}"))?;
+            } else {
+                channel
+                    .exec(true, connection.remote_command.as_bytes())
+                    .await
+                    .map_err(|error| format!("Failed to start remote command: {error}"))?;
+            }
+            Ok::<_, String>((remote_shell, directory_tracking_supported, channel))
         }
+        .await;
+        let (remote_shell, directory_tracking_supported, mut channel) = match terminal {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                transport_lease.release().await;
+                return Err(error);
+            }
+        };
 
         let session_id = Uuid::new_v4().to_string();
         let (terminal_tx, mut terminal_rx) = mpsc::channel(256);
@@ -1775,7 +1863,7 @@ impl SshRuntime {
             created_at_secs: unix_now_secs(),
             created_seq: self.session_seq.fetch_add(1, Ordering::Relaxed),
             handle,
-            jump_chain,
+            transport_lease,
             orchestration: orchestration.clone(),
             auto_sudo: Arc::new(Mutex::new(None)),
             triggers: Arc::new(Mutex::new(None)),
@@ -2062,7 +2150,10 @@ impl SshRuntime {
                     "state": "disconnected"
                 }),
             );
-            sessions.write().await.remove(&task_id);
+            let removed = sessions.write().await.remove(&task_id);
+            if let Some(removed) = removed {
+                removed.transport_lease.release().await;
+            }
         });
 
         Ok(json!({
@@ -2683,26 +2774,7 @@ impl SshRuntime {
             .remove(session_id)
             .ok_or("SSH session was not found")?;
         let _ = session.terminal_tx.send(TerminalCommand::Close).await;
-        // Copied sessions share one authenticated target transport (and its
-        // jump chain) while keeping independent PTYs. Closing one copied tab
-        // must not tear down the transport underneath its siblings.
-        let transport_still_in_use = self
-            .sessions
-            .read()
-            .await
-            .values()
-            .any(|entry| Arc::ptr_eq(&entry.handle, &session.handle));
-        if !transport_still_in_use {
-            for jump in &session.jump_chain {
-                let _ = jump
-                    .disconnect(
-                        Disconnect::ByApplication,
-                        "DBX SSH session closed",
-                        "English",
-                    )
-                    .await;
-            }
-        }
+        session.transport_lease.release().await;
         self.cleanup_session_transfers(session_id)?;
         if let Ok(mut cache) = self.metrics_cache.lock() {
             cache.remove(session_id);
@@ -9920,6 +9992,23 @@ matrix-ed25519";
                 runtime.close_session(session_id).await.unwrap();
             }
             server.abort();
+        }
+
+        #[test]
+        fn pending_copy_reservation_keeps_transport_alive_before_session_registration() {
+            let uses = TransportLeaseCounter::new();
+            uses.retain(); // pending copied-session open
+
+            assert_eq!(uses.count(), 2);
+            assert!(
+                !uses.release(),
+                "closing the source must not release a transport reserved by a pending copy"
+            );
+            assert_eq!(uses.count(), 1);
+            assert!(
+                uses.release(),
+                "the final copied session owns the last transport lease"
+            );
         }
 
         #[tokio::test]

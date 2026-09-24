@@ -108,7 +108,13 @@ import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/t
 import { createTerminalInputQueue } from "./lib/terminalInputQueue";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
-import { decideConnectRetry } from "./lib/connectRetry";
+import { decideConnectRetry, isDuplicatedTransportUnavailableError } from "./lib/connectRetry";
+import {
+  createSessionTransportReuseState,
+  fallbackToFreshTransport,
+  markSessionTransportOpenSucceeded,
+  sessionTransportOpenParams,
+} from "./lib/sessionTransportReuse";
 import { createConnectLog } from "./lib/connectLog";
 import { pickModalFocusTarget } from "./lib/modalFocus";
 import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
@@ -459,6 +465,7 @@ const uploadInput = ref<HTMLInputElement>();
 const zmodemInput = ref<HTMLInputElement>();
 const trzszInput = ref<HTMLInputElement>();
 const hostContext = ref<Record<string, unknown>>({});
+let transportReuseState = createSessionTransportReuseState({});
 // Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
 // and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
 // Declared early: the batch bar / sftp pane initializers below must know the surface at setup time.
@@ -2605,10 +2612,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     const info = await window.dbxPlugin.invoke<SessionInfo>("ssh/session/open", {
       connectionId: connectionId.value,
       workbenchId: workbenchId.value,
-      reuseAuthenticatedTransport: hostContext.value.reuseAuthenticatedTransport === true,
-      reuseAuthenticatedSessionId: typeof hostContext.value.reuseAuthenticatedSessionId === "string"
-        ? hostContext.value.reuseAuthenticatedSessionId
-        : undefined,
+      ...sessionTransportOpenParams(transportReuseState),
       cols: terminal?.cols || 120,
       rows: terminal?.rows || 32,
     }, { timeoutMs: attemptTimeoutMs });
@@ -2619,6 +2623,11 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       connectLog.push("warn", t("connectCard.log.orphanClosed"));
       return;
     }
+    // Duplicate is an open-time intent, not a permanent reconnect policy.
+    // Once its PTY exists, this tab owns an ordinary session; a later network
+    // drop must be able to run a fresh login instead of replaying the old
+    // source session id forever.
+    markSessionTransportOpenSucceeded(transportReuseState, info.sessionId);
     activeTerminalSessionId = info.sessionId;
     lastSequence = 0;
     // A fresh session restarts sequence numbering: buffered frames from the
@@ -2664,6 +2673,17 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     connectSucceeded.value = false;
     // 用户已取消：不重试、不呈现错误，卡片停在已取消态等 Connect 重新发起。
     if (connectCancelled.value) return;
+    // The selected source may close between opening the child workbench and
+    // its first sidecar call. Downgrade once, explicitly, to a normal login;
+    // subsequent failures follow the ordinary permanent-error policy.
+    if (
+      isDuplicatedTransportUnavailableError(cause)
+      && fallbackToFreshTransport(transportReuseState)
+    ) {
+      connectLog.push("warn", t("connectCard.log.duplicateFallback"));
+      await openSession(false, bootRestore, true);
+      return;
+    }
     const attemptMs = Date.now() - attemptStarted;
     // "Connection is not active"：sidecar 连接注册表还没有该连接。boot 恢复
     // 场景（宿主启动时为恢复的插件 tab 重放 connect 生命周期）这是暂时态，
@@ -7501,6 +7521,7 @@ async function initialize() {
     api.ready,
     api.request<Record<string, unknown>>("host.getContext"),
   ]);
+  transportReuseState = createSessionTransportReuseState(hostContext.value);
   locale.value = api.locale || "zh-CN";
   restoreUiState();
   const appearanceAppliedAtBoot = Boolean(api.appearance || api.theme);

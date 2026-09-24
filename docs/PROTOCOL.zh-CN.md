@@ -4,7 +4,11 @@
 
 Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`sessionId` 或 `taskId` 为键。`connection/connect` 只接收并缓存宿主注入的连接配置；`connection/disconnect` 会关闭该连接下的终端、SFTP 子系统和传输任务。工作台不会接收密码字段。
 
-工作台的“新建会话”保持独立 transport 语义，会重新完成 SSH 认证（堡垒机可再次要求 MFA）；“复制会话（免再次验证）”则向 `ssh/session/open` 传 `reuseAuthenticatedTransport: true` 和当前 `reuseAuthenticatedSessionId`，在用户所点窗口当前存活且已认证的 transport 上新开独立 PTY channel。复制会话拥有独立 `sessionId`、`workbenchId`、回放缓冲和终端任务，不复制或缓存 OTP；没有可复用 transport 时直接提示使用“新建会话”，不会暗中弹出新的 MFA。关闭任一复制会话只关闭自己的 channel，最后一个共享会话关闭后才释放跳板链。
+工作台的“新建会话”保持独立 transport 语义，会重新完成 SSH 认证（堡垒机可再次要求 MFA）；“复制会话（免再次验证）”则向 `ssh/session/open` 传 `reuseAuthenticatedTransport: true` 和当前 `reuseAuthenticatedSessionId`，在用户所点窗口当前存活且已认证的 transport 上新开独立 PTY channel。复制会话拥有独立 `sessionId`、`workbenchId`、回放缓冲和终端任务，不复制或缓存 OTP。打开复制 channel 前会先预占共享 transport 引用，因此源会话在 channel/PTY/shell 建立期间关闭也不会提前释放跳板链；关闭任一复制会话只关闭自己的 channel，最后一个共享引用释放后才断开跳板链。每个复制会话都会额外占用一个 SSH channel，数量受服务端 `MaxSessions` 限制（OpenSSH 常见默认值为 10）；超过限制时 `open` 返回 channel 建立失败。
+
+显式传入 `reuseAuthenticatedSessionId` 时严格 fail closed：指定来源不存在、已关闭或连接不匹配都会返回 `No live authenticated SSH connection`。前端收到该错误后只降级一次，以普通“新建会话”语义重新登录，允许堡垒机再次要求 MFA；该错误同时属于永久重试错误，不进入对同一失效 sessionId 的退避重试。只传 `reuseAuthenticatedTransport: true` 的旧调用方保留兼容行为：后端会从同一连接中确定性选取最早创建的存活会话，因此 transport 来源不保证对应调用方当前显示的窗口。
+
+复制会话继承来源会话在连接时解析出的内存态 sudo 编排快照（`SudoAuth`），包括 `password_command` 当时的解析结果；复制时不会再次运行 `password_command`。会话建立后的设置同步仍按各会话现有更新机制独立生效。
 
 第一阶段不声明 `test` 能力。真实 SSH 握手在 `ssh/session/open` 发起，主机密钥确认完成前不会调用密码认证。
 
@@ -14,7 +18,7 @@ Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`se
 
 | 方法 | 作用 |
 | --- | --- |
-| `ssh/session/open`、`ssh/session/close` | 创建、关闭 PTY 会话（`open` 可选 `reuseAuthenticatedTransport` + `reuseAuthenticatedSessionId`，复用指定同连接存活会话的认证 transport 并新开独立 channel；连接 `remote_command` 非空时 exec 该命令替代 shell，`set_env` 随会话注入；连接配置 `triggers` 时挂载自动交互触发器引擎，命中发 `ssh/trigger` 事件，见「自动交互触发器（Expect）与外部密码管理器」节） |
+| `ssh/session/open`、`ssh/session/close` | 创建、关闭 PTY 会话（`open` 可选 `reuseAuthenticatedTransport` + `reuseAuthenticatedSessionId`，复用指定同连接存活会话的认证 transport 并新开独立 channel；显式 ID 不可用时 fail closed，只有布尔参数时兼容选择同连接最早存活会话；复用会继承来源会话已解析的 sudo 编排快照；连接 `remote_command` 非空时 exec 该命令替代 shell，`set_env` 随会话注入；连接配置 `triggers` 时挂载自动交互触发器引擎，命中发 `ssh/trigger` 事件，见「自动交互触发器（Expect）与外部密码管理器」节） |
 | `ssh/terminal/resize` | 调整 PTY 行列 |
 | `ssh/terminal/replay` | 从指定序号补发终端输出 |
 | `ssh/host-key/resolve` | 处理工作台内的主机密钥确认 |
