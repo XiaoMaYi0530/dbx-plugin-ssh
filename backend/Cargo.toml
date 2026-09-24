@@ -1,6 +1,6 @@
 [package]
 name = "dbx-plugin-ssh"
-version = "0.7.0-beta.2"
+version = "0.7.0-beta.3"
 edition = "2021"
 license = "MIT"
 authors = ["jinpy"]
@@ -35,6 +35,7 @@ portable-pty = "0.9.0"
 # Apache-2.0 (verified via `cargo info`). See src/otp_store.rs.
 rqrr = "0.9"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+
 # Terminal trigger (expect) stage patterns — see src/triggers.rs.
 regex = "1"
 russh = { version = "0.62", features = ["des"] }

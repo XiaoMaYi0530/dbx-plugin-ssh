@@ -140,7 +140,7 @@ import { searchCommands, commandSuggestionQueryAcceptable, type CommandSuggestio
 import { canShowSuggestions, createSuggestionGuardState, type SuggestionGuardState } from "./lib/suggestionGuard";
 import { clampTransferConcurrency, runTransfers, sanitizeTransferDuplicatePolicy, type TransferDuplicatePolicy } from "./lib/transferQueue";
 import { filterQuickCommands, normalizeQuickCommands, QUICK_COMMANDS_LIMIT, quickCommandText, type QuickCommand } from "./lib/quickCommands";
-import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
+import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, normalizeLocalBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
 import { readPluginMode, readPluginShell, resolveWorkbenchId } from "./lib/pluginContext";
 import { clampFontSize } from "./lib/terminalZoom";
@@ -546,6 +546,10 @@ const uploadInput = ref<HTMLInputElement>();
 const zmodemInput = ref<HTMLInputElement>();
 const trzszInput = ref<HTMLInputElement>();
 const hostContext = ref<Record<string, unknown>>({});
+// Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
+// and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
+// Declared early: the batch bar / sftp pane initializers below must know the surface at setup time.
+const panelSurface = computed(() => hostContext.value.surface === "panel");
 // 宿主未下发 appearance 前的兜底：DBX `.dark` 规范令牌。
 const appearance = ref(resolveAppearance());
 const terminalState = ref<"connecting" | "connected" | "disconnected" | "error">("connecting");
@@ -774,7 +778,10 @@ function loadBatchBarOpen(): boolean {
   }
 }
 
-const batchBarOpen = ref(loadBatchBarOpen());
+// Dock panel surface keeps the bar closed unconditionally: the panel is a single
+// focused terminal, and the sandbox has no localStorage so the persisted
+// default (open) would otherwise win.
+const batchBarOpen = ref(panelSurface.value ? false : loadBatchBarOpen());
 const batchTargetsOpen = ref(false);
 const batchLoading = ref(false);
 const batchSending = ref(false);
@@ -784,6 +791,14 @@ const batchDraft = ref("");
 const batchError = ref("");
 const batchSummary = ref<BatchSendSummary>();
 const batchQuickPickId = ref("");
+// hostContext 由 initialize() 异步填充，panelSurface 在 setup 时还是 false——
+// 初始门控永远打不中（这就是"批量命令条关不掉"的根因）。改为响应式强制：
+// panel 成立即收批量条、关 SFTP 窗格（无窗格即无目录列表/SFTP 流量）。
+watch(panelSurface, (panel) => {
+  if (!panel) return;
+  batchBarOpen.value = false;
+  sftpPaneOpen.value = false;
+}, { immediate: true });
 // 保存为快速命令的内联名称态（保存走 ssh/quickCommands/save，全局共享）。
 const batchSaveMode = ref(false);
 const batchSaveName = ref("");
@@ -1143,9 +1158,6 @@ const serialPendingFrames = new Map<number, { stream: number; data: Uint8Array }
 const isSerialMode = computed(() => serialSession.value !== null);
 const serialTarget = computed(() => (serialSession.value ? `${serialSession.value.port}@${serialSession.value.baudRate}` : ""));
 const localUiMode = computed(() => isLocalMode.value || localShellRestored.value || isTelnetMode.value || isSerialMode.value);
-// Bottom dock panel surface (surface=panel, host §8.3): hide the workbench identity block so the panel
-// and focus the terminal itself; multi-open/shell switching goes through the panel "+" menu (bridge openWorkbench opens another panel).
-const panelSurface = computed(() => hostContext.value.surface === "panel");
 // —— 本地终端偏好（sidecar preferences.json 持久化；iframe 沙箱无 localStorage）——
 // shell 空串 = 跟随自动探测；integration 缺省开。
 const localShellPref = ref("");
@@ -1440,8 +1452,11 @@ function restoreUiState() {
   currentPath.value = typeof state.sftpPath === "string" ? normalizeRemotePath(state.sftpPath) : "/";
   splitRatio.value = typeof state.splitRatio === "number" && state.splitRatio >= 35 && state.splitRatio <= 80 ? state.splitRatio : 58;
   paneOrder.value = state.paneOrder === "sftp-left" ? "sftp-left" : "terminal-left";
-  sftpPaneOpen.value = resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
-  followDirectory.value = state.followDirectory === true;
+  // Dock panel surface: the SFTP pane stays closed (no auto-list/auto-connect);
+  // users who want SFTP open the workbench tab.
+  sftpPaneOpen.value = panelSurface.value ? false : resolveSftpPaneOpen(state, sftpPaneDefaultOpen.value);
+  // Dock panel surface：目录跟随是 SFTP 域能力，面板一律关闭。
+  followDirectory.value = panelSurface.value ? false : state.followDirectory === true;
   sudoMode.value = state.sudoMode === true && canWrite.value;
   // 一次性迁移：六列默认上线前的旧偏好重置为全开（之后用户自定义照常持久化）。
   const legacyColumns = state.visibleColumns != null && state.columnsV2 !== true;
@@ -1916,8 +1931,11 @@ function createTerminal() {
     searchResultIndex.value = resultCount > 0 && resultIndex >= 0 ? resultIndex + 1 : 0;
     searchMatchState.value = resultCount > 0 ? "match" : "no-match";
   });
+  // Named handler: main's WKWebView input-loss fallback shares this route.
+  // Gate is local-terminal aware (a4): no SSH session AND no local shell means
+  // there is no PTY to receive input.
   const routeTerminalData = (data: string) => {
-    if (!session.value) return;
+    if (!session.value && !localSession.value) return;
     // 文件传输占用路由：trzsz 持有流时，传输中的输入进 filter（Ctrl+C 停传输、
     // 其余吞掉），等待协商期直接吞掉（防止杂散键入干扰 trz 握手）；zmodem 持有
     // 流时输入保持阻塞，否则走普通 PTY 键盘写入（8 字节序号前缀已封装）。
@@ -3426,6 +3444,8 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     // 成功过渡（Termius 式）：先切 success 卡片——进度线填满到顶、终端图标变
     // 对号；replay 在动画期间并行拉取，hold 播完才置 connected 进终端，避免
     // 连接成功瞬间生硬跳变。reduced-motion 下不 hold，立即进终端。
+    // Dock 面板（surface=panel）根本不渲染连接卡片（见模板 terminal-overlay
+    // 的 v-if="!panelSurface"），hold 动画用户看不见——750ms 纯属白等，跳过。
     // 注意 session/directoryTrackingSupported 等响应式状态在 hold 结束后才写入：
     // 提前写入会让 SFTP/工具栏等 watcher 在动画播放期间就开始渲染（画面抖动）。
     connectSucceeded.value = true;
@@ -3437,7 +3457,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       afterSequence: 0,
     });
     if (!replay.complete) throw new Error(t("sessionUnrecoverable"));
-    const holdMs = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : CONNECT_SUCCESS_HOLD_MS;
+    const holdMs = window.matchMedia("(prefers-reduced-motion: reduce)").matches || panelSurface.value ? 0 : CONNECT_SUCCESS_HOLD_MS;
     const remainMs = holdMs - (Date.now() - successShownAt);
     if (remainMs > 0) await new Promise((resolve) => window.setTimeout(resolve, remainMs));
     connectSucceeded.value = false;
@@ -3468,6 +3488,9 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
     // host-key 拒绝是秒级永久错误，重试不可能自愈——跳过重试直接进 error 态，
     // 呈现 friendly 文案 + Reconnect 出口（P1-1）。决策细节见 connectRetry.ts。
     const inactive = isConnectionInactiveError(cause);
+    // 预拨号面板的引导竞态：宿主在创建条目时已开始 connect，openSession 只
+    // 是跑在了 connect 推送前面——用短间隔轮询等它落地，而不是 2s 退避梯子。
+    const preconnect = bootRestore && panelSurface.value && hostContext.value.connectionPreconnected === true;
     const decision = decideConnectRetry({
       cause,
       attempt: openRetryAttempt,
@@ -3475,6 +3498,7 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       attemptMs,
       inactive,
       bootRestore,
+      preconnect,
     });
     if (decision.kind === "retry") {
       openRetryAttempt = decision.attempt;
@@ -3566,7 +3590,8 @@ async function afterSessionConnected() {
   if (reconnectWasPending) {
     reconnectWasPending = false;
     const restored = describeReconnectRestoredNotice({ wasReconnecting: true, path: currentPath.value });
-    if (restored) showNotice(t(restored.key, restored.values));
+    // Dock panel surface：目录提示属 SFTP/目录跟随域，面板里不弹。
+    if (restored && !panelSurface.value) showNotice(t(restored.key, restored.values));
   }
 }
 
@@ -8083,12 +8108,22 @@ async function refreshBatchTargets() {
   batchError.value = "";
   try {
     const response = await window.dbxPlugin.invoke<{ sessions: unknown }>("ssh/sessions/list");
-    batchTargets.value = normalizeBatchTargets(response.sessions);
-    // 剔除已关闭会话；选择为空时默认只预选当前会话（批量写入影响所有被选主机，宁缺毋滥）。
+    // 批量目标包含本地终端：同是"向 PTY 键盘写入"，发送阶段按通道分流。
+    let targets = normalizeBatchTargets(response.sessions);
+    try {
+      const local = await window.dbxPlugin.invoke<{ sessions?: unknown }>("local/session/list", {}, { timeoutMs: 5000 });
+      targets = [...targets, ...normalizeLocalBatchTargets(local?.sessions)];
+    } catch {
+      // 旧 sidecar 无本地会话能力：只保留 SSH 目标。
+    }
+    batchTargets.value = targets;
+    // 剔除已关闭会话；选择为空时默认只预选当前会话（本地面板预选本地会话；
+    // 批量写入影响所有被选主机，宁缺毋滥）。
     const known = new Set(batchTargets.value.map((target) => target.sessionId));
     batchSelected.value = batchSelected.value.filter((id) => known.has(id));
+    const currentSessionId = session.value?.sessionId ?? localSession.value?.sessionId;
     if (!batchSelected.value.length) {
-      batchSelected.value = session.value?.sessionId && known.has(session.value.sessionId) ? [session.value.sessionId] : [];
+      batchSelected.value = currentSessionId && known.has(currentSessionId) ? [currentSessionId] : [];
     }
   } catch (cause) {
     batchTargets.value = [];
@@ -8156,11 +8191,25 @@ async function sendBatchCommand() {
   batchError.value = "";
   batchSummary.value = undefined;
   try {
-    const response = await window.dbxPlugin.invoke<{ results: unknown }>("ssh/terminal/batchInput", {
-      sessionIds: batchSelected.value,
-      command,
-    });
-    batchSummary.value = summarizeBatchResults(response.results);
+    // 目标按通道分流：SSH 走 sidecar 批量写入；本地终端复用输入队列（同一
+    // 序号框架，保持与键入一致的顺序语义），命令补 \r 回车与键入等价。
+    const selectedSet = new Set(batchSelected.value);
+    const sshIds = batchTargets.value.filter((target) => !target.local && selectedSet.has(target.sessionId)).map((target) => target.sessionId);
+    const localIds = batchTargets.value.filter((target) => target.local && selectedSet.has(target.sessionId)).map((target) => target.sessionId);
+    const results: unknown[] = [];
+    if (sshIds.length) {
+      const response = await window.dbxPlugin.invoke<{ results: unknown }>("ssh/terminal/batchInput", { sessionIds: sshIds, command });
+      if (Array.isArray(response.results)) results.push(...response.results);
+    }
+    for (const sessionId of localIds) {
+      try {
+        terminalInputQueue.enqueue(sessionId, new TextEncoder().encode(`${command}\r`));
+        results.push({ sessionId, success: true });
+      } catch (cause) {
+        results.push({ sessionId, success: false, error: cause instanceof Error ? cause.message : String(cause) });
+      }
+    }
+    batchSummary.value = summarizeBatchResults(results);
     if (batchSummary.value.sent) {
       // 发送成功即清空输入与下拉选中（对齐原弹窗语义），命令入历史供 ↑↓ 回选。
       commandHistory.value = pushCommandHistory(commandHistory.value, command);
@@ -9489,6 +9538,11 @@ async function initialize() {
   unsubscribeFileDrop = api.fileTransfer?.onDrop((files) => {
     void handleHostFileDrop(files);
   });
+  // §8.3 面板加载生命周期：探活与终端创建并行。探活只是一次 sidecar 往返，
+  // 串行执行会把真正耗时的 openSession 压到整个引导的最后。
+  const reattachLookup = readPluginMode(hostContext.value) !== "local-terminal" && connectionId.value && workbenchId.value && !restored.value
+    ? findReattachSession()
+    : Promise.resolve("");
   await nextTick();
   createTerminal();
   // P0 connectionless local-terminal passthrough (HOST_PLUGIN_UI_SPEC §4/§7.1): when the host opens this workbench with
@@ -9524,17 +9578,23 @@ async function initialize() {
     // 宿主切 tab / 左侧菜单重开可能整体重建工作台 webview。只恢复
     // 同一 workbench 的 live session；不能按 connectionId 复用任意会话，
     // 否则打开同一连接的新 Tab 会接管已有 Tab 的 PTY。
-    const reattach = await findReattachSession();
+    const reattach = await reattachLookup;
     if (reattach) await attachSession(reattach, reattach);
     // 上一轮本地终端还活着（webview 重建但 sidecar 未退出）：接回并补发，
     // 避免孤儿 shell 挂在 sidecar 里。
     else if (await reattachLocalSession()) {
       // 本地模式接管终端。
     }
-    // bootRestore: 宿主启动恢复 tab 时会异步重放 connect（见 queryStore
-    // reconnectRestoredPluginTabs），首个 ssh/session/open 可能先于它落地，
-    // inactive 错误在该路径下参与有界重试。
-    else await openSession(false, true);
+    // 上来直接连（§8.3 面板加载生命周期）：宿主已在点击创建条目时
+    // ensureConnected 预拨（connectionPreconnected 旗标），这里跳过 force
+    // 重开（force 会复位共享连接），直接 openSession——拨号未完成时由
+    // preconnect 短间隔轮询自愈（250ms 固定节奏，不再是 2s 退避梯子），
+    // 拨号失败/永久错误走既有分类报错。
+    // 旧宿主无旗标：保留原有 force 重开路径。
+    else {
+      if (panelSurface.value && !hostContext.value.connectionPreconnected) await requestHostReopenConnection();
+      await openSession(false, true);
+    }
   }
 }
 
@@ -9776,6 +9836,7 @@ onBeforeUnmount(() => {
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
         <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
+        <!-- main 新增的端口转发入口同属 SSH 专属：沿用 A4 惯例在本地模式整体隐藏。 -->
         <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('forwards.title')" :disabled="!session" @click="forwardsOpen = true"><Network /></button>
         <label v-if="!localUiMode" class="follow-directory-control" :title="t('followTerminal')">
           <Switch size="sm" :model-value="followDirectory" :disabled="!connected" @update:model-value="setDirectoryTracking" />
@@ -9783,7 +9844,7 @@ onBeforeUnmount(() => {
         </label>
         <span class="toolbar-separator" aria-hidden="true" />
         <button v-if="!localUiMode" class="icon-button icon-neutral" :title="t('commandTitle')" :disabled="!connected" @click="openCommandDialog"><SquareTerminal /></button>
-        <button v-if="!localUiMode" class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
+        <button v-if="!localUiMode && !panelSurface" class="icon-button icon-neutral" :class="{ 'is-active': batchBarOpen }" :title="t('batchSendTitle')" :aria-pressed="batchBarOpen" :disabled="!connected" @click="toggleBatchBar"><ListChecks /></button>
         <div v-if="!localUiMode">
           <Popover :open="quickMenuOpen" @update:open="(open) => { if (!open) quickMenuOpen = false; }">
             <PopoverAnchor as-child>
@@ -10076,8 +10137,9 @@ onBeforeUnmount(() => {
           <span class="record-countdown-hint">{{ t("recordingCountdownHint") }}</span>
         </div>
         <!-- SSH 连接卡片：本地/串口/Telnet 会话占用的终端视图不再叠 SSH-only
-             卡片（互斥展示；Telnet 原实现漏了该分支，一并补上）。 -->
-        <div v-if="!isLocalMode && !localShellRestored && !isSerialMode && !isTelnetMode && terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
+             卡片（互斥展示；Telnet 原实现漏了该分支，一并补上）。Dock panel
+             surface 不再有 loading 遮罩（面板直出终端区域）。 -->
+        <div v-if="!panelSurface && !isLocalMode && !localShellRestored && !isSerialMode && !isTelnetMode && terminalState !== 'connected' && !reconnectPending" class="terminal-overlay">
           <ConnectingCard
             :locale="locale"
             :name="connection.name || connectionIdentity"

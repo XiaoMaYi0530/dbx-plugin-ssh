@@ -523,6 +523,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 - `local/session/list` 供 webview 重载后接回仍活着的 shell；`workbench/close` 会回收该工作台的本地会话；sidecar 退出即全部终止（本地 PTY 生命周期 = sidecar 生命周期）。
 - 安全语义：入口为工作台显式按钮（未连接也可用；SSH 会话在连时经确认先关闭），无自动开启路径；manifest 权限集不变（复用 `host.binary`），本机命令执行能力与用户自身终端同级，无提权。
 - 偏好（`local/preferences/*` 白名单新增）：`localShell`（字符串 ≤200，空=自动探测）、`localShellIntegration`（布尔，缺省 true）。shell 选择器在工作台本地终端按钮旁的设置菜单（`local/shells/list` 发现 + 注入开关），徽标显示 `Local · <shell>`，重开按钮在本地会话存活时保持可用（restart 语义：关当前 → 按新偏好重开）。
+
 ## 主机密钥确认通道(requestUserInput)
 
 首次连接(或主机密钥变更)时,sidecar 的确认请求按以下顺序选通道:
