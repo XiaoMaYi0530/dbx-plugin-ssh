@@ -3445,3 +3445,11 @@ onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）�
 1. 真机：X server（XQuartz/VcXsrv）联调、串口硬件联调、GPU/NPU 主机、Windows ConPTY、DBX 桌面端到端。
 2. VNC（引擎选型+压测）、RDP（vendored fork+CredSSP 评审）——维持人工评审门。
 3. 串口 MVP 已知限制：JSON 写通道、无 replay/resize、ports 列表 USB 后缀需手输剥离。
+
+## M5 轮排期（2026-09-24，用户指令"直接进入M5"）
+
+- 已派发（后台并发，worktree np5-vnc / np5-docker-term，分支 parity-vnc / parity-docker-term）：
+  1. **VNC 会话**（差距项 2d）：spike 先行（上游 HsuJv/vnc-rs 0.6.0 async client 尽调：API 面/许可证/有界分配审查，对比 NyaTerm 0.5.3 加固 fork），可行即 MVP——None/VNC-Auth（密码 ≤8 字节提示）、Raw/ZRLE 优先、44 字节 patch 帧走现有二进制通道、前端画布复用 remote-desktop 渲染层思路、断线 generation 重连；vnc/ 前缀协议 + "New VNC session" 入口（localUiMode 互斥）。Tight JPEG 显式报错不实现（范围裁剪）。依赖评审随 PR。
+  2. **Docker"在终端打开"升级**（M3 遗留 6）：命令经 App.vue 内部通道直填输入行（复用 M1 动作链接的 fill 通道），替代"经 sendTerminalBytes 直写 PTY"；顺带补 Docker 面板 e2e 截图。
+- 维持人工门：RDP（vendored fork+CredSSP 评审）、真机验收、PR 合入。
+- M5 完成判据：两分支合入 integration、全量绿（cargo ≥696 / vitest ≥861 只增不减）、e2e、push 后 CI 十一门 success。
