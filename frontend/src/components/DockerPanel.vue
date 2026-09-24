@@ -5,18 +5,19 @@
 // 只读采集走 docker/list；动作走 docker/action（后端负责白名单、容器 id 门、
 // 只读连接拒绝、执行前审计与 Quick Sudo 回落）。会话 id 由面板自行从
 // ssh/sessions/list 解析（最近的存活会话）——SideNavPanel 容器不透传 session。
-// 注意：受 App.vue 不可改约束，「在终端打开」退化为复制 docker exec 命令到
-// 剪贴板 + 说明文案，由用户粘贴回车（不代按回车）。
+// 「在终端打开」（M3 遗留 6）：面板不直接写 PTY，改为 emit 语义的 window 自定义
+// 事件（SideNavPanel 不透传事件且不在本次改动范围），由 App.vue 走「填入输入行
+// 不回车」通道——命令落到 shell 输入行原地，用户确认后再回车执行。
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   Check,
-  Copy,
   Loader2,
   Play,
   RefreshCw,
   RotateCw,
   ScrollText,
   Square,
+  Terminal,
   Trash2,
   X,
 } from "@lucide/vue";
@@ -277,21 +278,23 @@ async function loadLogs(): Promise<void> {
   }
 }
 
-// —— 「在终端打开」（复制 exec 命令 + 说明文案）—————————————————
-const copiedId = ref("");
-let copiedReset: ReturnType<typeof setTimeout> | undefined;
+// —— 「在终端打开」（window 事件 → App.vue 填入输入行，不回车）——————————
+// 事件名与 App.vue 的监听保持一致；detail 只带命令字符串。无终端会话时由
+// App.vue 侧 toast 提示先连接（面板无法感知终端状态）。
+const DOCKER_OPEN_IN_TERMINAL_EVENT = "dbx:docker-open-in-terminal";
 
-async function copyExecCommand(container: DockerContainer): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(dockerExecCommand(container.id));
-    copiedId.value = container.id;
-    if (copiedReset) clearTimeout(copiedReset);
-    copiedReset = setTimeout(() => {
-      copiedId.value = "";
-    }, 2000);
-  } catch {
-    // 剪贴板不可用（宿主未授权等）只失去提示，不打断面板。
-  }
+const fillRequestedId = ref("");
+let fillReset: ReturnType<typeof setTimeout> | undefined;
+
+function openInTerminal(container: DockerContainer): void {
+  window.dispatchEvent(
+    new CustomEvent(DOCKER_OPEN_IN_TERMINAL_EVENT, { detail: { command: dockerExecCommand(container.id) } }),
+  );
+  fillRequestedId.value = container.id;
+  if (fillReset) clearTimeout(fillReset);
+  fillReset = setTimeout(() => {
+    fillRequestedId.value = "";
+  }, 2000);
 }
 
 const running = (container: DockerContainer): boolean => container.state === "running";
@@ -423,12 +426,12 @@ const running = (container: DockerContainer): boolean => container.state === "ru
               <button
                 type="button"
                 class="icon-button"
-                :class="{ 'is-copied': copiedId === container.id }"
-                :title="props.t('docker.terminalHint')"
-                @click="copyExecCommand(container)"
+                :class="{ 'is-copied': fillRequestedId === container.id }"
+                :title="props.t('docker.terminalOpenTip')"
+                @click="openInTerminal(container)"
               >
-                <Check v-if="copiedId === container.id" />
-                <Copy v-else />
+                <Check v-if="fillRequestedId === container.id" />
+                <Terminal v-else />
               </button>
             </td>
           </tr>

@@ -4835,6 +4835,25 @@ function handleActionLinkActivate(match: ActionLinkMatch, event: MouseEvent) {
   terminal?.focus();
 }
 
+// ---- Docker 面板「在终端打开」（M3 遗留 6）----
+// DockerPanel 挂在 SideNavPanel 内（后者不透传事件且不在本次改动范围），面板经
+// window 自定义事件把命令字符串直达这里；走与建议浮层同款的「填入输入行不回车」
+// 通道（replaceTerminalLineWith）：命令落在 shell 输入行原地，用户确认后自行回车。
+// 无终端会话时 toast 提示先连接，不静默丢弃。
+function handleDockerOpenInTerminal(event: Event) {
+  const command = (event as CustomEvent<{ command?: string }>).detail?.command ?? "";
+  if (!command) return;
+  const hasTerminalSession = Boolean(
+    localSession.value ?? session.value ?? serialSession.value ?? telnetSession.value,
+  );
+  if (!terminal || !hasTerminalSession) {
+    showNotice(t("docker.terminalNeedSession"));
+    return;
+  }
+  replaceTerminalLineWith(command, false);
+  terminal.focus();
+}
+
 function showActionLinkHintAt(match: ActionLinkMatch, event: MouseEvent) {
   const host = terminalHost.value;
   if (!host) return;
@@ -9547,6 +9566,7 @@ onMounted(() => {
   document.addEventListener("focusout", onTooltipFocusOut);
   document.addEventListener("pointerdown", hideTooltip, true);
   document.addEventListener("wheel", hideTooltip, true);
+  window.addEventListener("dbx:docker-open-in-terminal", handleDockerOpenInTerminal);
   hostFontObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["style"] });
   void hydrateQuickCommands();
   void hydrateHighlightRules();
@@ -9559,6 +9579,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   disposed = true;
+  window.removeEventListener("dbx:docker-open-in-terminal", handleDockerOpenInTerminal);
   document.removeEventListener("mouseover", onTooltipOver);
   document.removeEventListener("mouseout", onTooltipOut);
   document.removeEventListener("focusin", onTooltipFocusIn);
